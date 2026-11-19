@@ -282,7 +282,7 @@ Traces for future training are a view over `events` + `model_calls` + `approvals
 
 ```text
 kestrel/
-├── Cargo.toml                 # MSRV 1.88 (matches travsr and rmcp 3.x)
+├── Cargo.toml                 # MSRV 1.89 (rusqlite 0.41)
 ├── crates/
 │   ├── kestrel-types/         # Agent spec, Run, Event, Capability, errors
 │   ├── kestrel-store/         # EventLog + state: SQLite (local), Postgres (server)
