@@ -186,7 +186,6 @@ fn start_serve(f: &Fixture) -> ChildGuard {
     ChildGuard::spawn(cmd)
 }
 
-/// Submits a run from a separate `kestrel run` process.
 /// Makes the fixture dir a git repo with one commit, so a `git-worktree` agent submitted from it
 /// gets its worktree from this throwaway repo instead of the repo the tests run in.
 fn init_fixture_repo(f: &Fixture) {
@@ -215,6 +214,7 @@ fn init_fixture_repo(f: &Fixture) {
     git(&["commit", "-q", "-m", "fixture"]);
 }
 
+/// Submits a run from a separate `kestrel run` process.
 fn submit(f: &Fixture) -> RunId {
     init_fixture_repo(f);
     let good = f.good_agent();
