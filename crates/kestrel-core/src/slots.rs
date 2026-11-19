@@ -4,9 +4,6 @@
 //! one place that counts them, so the engine and the M2 `join` (a parent waiting on children
 //! releases its slot and reacquires it afterwards) share the same rules.
 
-// The engine does not use Slots yet (tests come first).
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 use kestrel_types::RunId;
@@ -21,51 +18,58 @@ pub(crate) struct Slots {
 impl Slots {
     /// A pool of `cap` slots, all free.
     pub(crate) fn new(cap: usize) -> Slots {
-        let _ = cap;
-        todo!("Slots::new")
+        Slots {
+            cap,
+            held: HashSet::new(),
+        }
     }
 
     /// The configured number of slots.
+    #[cfg(test)]
     pub(crate) fn cap(&self) -> usize {
-        todo!("Slots::cap")
+        self.cap
     }
 
     /// Slots currently held.
+    #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
-        todo!("Slots::used")
+        self.held.len()
     }
 
     /// Slots not held (`cap - used`).
+    #[cfg(test)]
     pub(crate) fn free(&self) -> usize {
-        todo!("Slots::free")
+        self.cap.saturating_sub(self.held.len())
     }
 
     /// Whether `run` holds a slot.
     pub(crate) fn holds(&self, run: RunId) -> bool {
-        let _ = run;
-        todo!("Slots::holds")
+        self.held.contains(&run)
     }
 
     /// Takes a slot for `run`. True if `run` now holds one: it got a free slot, or it already
     /// held one (idempotent, never takes a second). False, changing nothing, when the pool is
     /// full and `run` holds none.
     pub(crate) fn try_acquire(&mut self, run: RunId) -> bool {
-        let _ = run;
-        todo!("Slots::try_acquire")
+        if self.held.contains(&run) {
+            return true;
+        }
+        if self.held.len() >= self.cap {
+            return false;
+        }
+        self.held.insert(run)
     }
 
     /// Takes a slot back for a run that released it earlier (a parent after `join`). Same rules
     /// as [`Slots::try_acquire`]; the separate name documents the intent at the call site.
     pub(crate) fn reacquire(&mut self, run: RunId) -> bool {
-        let _ = run;
-        todo!("Slots::reacquire")
+        self.try_acquire(run)
     }
 
     /// Frees `run`'s slot. True if it held one; false, changing nothing, if it did not (so a
     /// double release can never push the free count above the cap).
     pub(crate) fn release(&mut self, run: RunId) -> bool {
-        let _ = run;
-        todo!("Slots::release")
+        self.held.remove(&run)
     }
 }
 
