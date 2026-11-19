@@ -14,7 +14,7 @@ use kestrel_sandbox::{
     BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect,
 };
 use kestrel_store::Store;
-use kestrel_types::{MicroUsd, ModelCallRecord, RunId, Tier};
+use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -567,8 +567,16 @@ impl BudgetGuard for StoreDeps {
 #[async_trait]
 impl MeterSink for StoreDeps {
     async fn record(&self, rec: ModelCallRecord) {
+        // Spend first: it must count even if the event cannot be written.
         if let Err(e) = self.0.record_model_call(&rec) {
-            eprintln!("error: recording a model call for run {}: {e}", rec.run_id);
+            eprintln!(
+                "kestrel: recording a model call for run {}: {e}",
+                rec.run_id
+            );
+        }
+        let run = rec.run_id;
+        if let Err(e) = self.0.append(run, EventKind::ModelCall(rec)) {
+            eprintln!("kestrel: adding a model_call event to run {run}: {e}");
         }
     }
 }
@@ -1012,7 +1020,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             .expect("events")
             .into_iter()
             .filter_map(|e| match e.kind {
-                kestrel_types::EventKind::ModelCall(rec) => Some((e.seq, rec)),
+                EventKind::ModelCall(rec) => Some((e.seq, rec)),
                 _ => None,
             })
             .collect()
@@ -1070,7 +1078,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             engine_side
                 .append(
                     run,
-                    kestrel_types::EventKind::AgentLog {
+                    EventKind::AgentLog {
                         line: format!("log {n}"),
                     },
                 )
