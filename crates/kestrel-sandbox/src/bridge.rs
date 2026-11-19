@@ -2,6 +2,7 @@
 //! `kestrel-gw` network reach the gateway running on the host, and nothing else.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,7 +11,8 @@ use url::Url;
 use crate::{CommandRunner, SandboxError, check_image};
 
 /// Pinned `socat` image used when [`BridgeSpec::image`] is not set.
-pub const DEFAULT_BRIDGE_IMAGE: &str = "alpine/socat:1.8.0.3";
+pub const DEFAULT_BRIDGE_IMAGE: &str =
+    "alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e";
 /// Name of the bridge container. Sandboxes reach it by IP, not by this name.
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
@@ -87,7 +89,9 @@ impl GatewayBridge {
         runner: Arc<dyn CommandRunner>,
         host_port: u16,
         spec: BridgeSpec,
+        db: &Path,
     ) -> Result<GatewayBridge, SandboxError> {
+        let _ = db; // skeleton (#29): the implementation derives the name and labels from it.
         if host_port == 0 {
             return Err(SandboxError::InvalidBridgePort);
         }
@@ -150,6 +154,22 @@ impl GatewayBridge {
                 Err(e)
             }
         }
+    }
+
+    /// The 8 hex chars naming the bridge of the database at `db`: the first 8 of the 16-digit
+    /// lower-case hex FNV-1a 64 hash of the absolute path (`std::path::absolute`, no symlink
+    /// resolution) as bytes. Used in the container name and the `kestrel.db` label.
+    #[must_use]
+    pub fn instance_id(db: &Path) -> String {
+        let _ = db;
+        todo!("#29: FNV-1a 64 of the absolute database path, first 8 hex chars")
+    }
+
+    /// `kestrel-gateway-<id>`.
+    #[must_use]
+    pub fn container_name(id: &str) -> String {
+        let _ = id;
+        todo!("#29")
     }
 
     /// Removes the container. Idempotent; failures are ignored (the next `start` replaces it).

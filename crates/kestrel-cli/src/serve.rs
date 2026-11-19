@@ -318,11 +318,12 @@ async fn start_bridge(
     docker: bool,
     advertise: Option<&Url>,
     port: u16,
+    db: &Path,
 ) -> Result<Option<GatewayBridge>, Failure> {
     if !docker || advertise.is_some() {
         return Ok(None);
     }
-    GatewayBridge::start(runner, port, BridgeSpec::default())
+    GatewayBridge::start(runner, port, BridgeSpec::default(), db)
         .await
         .map(Some)
         .map_err(|e| Failure::runtime(e.to_string()))
@@ -400,6 +401,7 @@ async fn run(
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
+        Path::new("/tmp/kestrel-skeleton.db"), // skeleton (#29): the resolved database path
     )
     .await?;
     let bridge_url = bridge.as_ref().map(GatewayBridge::url);
@@ -968,12 +970,13 @@ budget: { usd: 0.000010, wall_clock: 10m }
             (false, Some(&advertise)),
         ] {
             let r = recorder(0);
-            let bridge = start_bridge(r.clone(), docker, advertise, 7070).await;
+            let bridge =
+                start_bridge(r.clone(), docker, advertise, 7070, Path::new("/tmp/k.db")).await;
             assert!(bridge.expect("ok").is_none());
             assert_eq!(call_count(&r), 0);
         }
         let r = recorder(0);
-        let bridge = start_bridge(r.clone(), true, None, 7070)
+        let bridge = start_bridge(r.clone(), true, None, 7070, Path::new("/tmp/k.db"))
             .await
             .expect("started")
             .expect("bridge");
@@ -985,7 +988,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
 
     #[tokio::test]
     async fn a_failing_bridge_is_a_runtime_error() {
-        let e = start_bridge(recorder(1), true, None, 7070)
+        let e = start_bridge(recorder(1), true, None, 7070, Path::new("/tmp/k.db"))
             .await
             .expect_err("fails");
         assert!(e.message.contains("boom"), "{}", e.message);
