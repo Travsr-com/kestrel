@@ -199,11 +199,13 @@ pub async fn start(anthropic_base: &str, openai_base: &str, allow_budget: bool) 
 }
 
 /// A base URL nothing listens on: bind an ephemeral port, then drop the listener.
+/// A base URL where every connection is refused.
+///
+/// Port 1 is privileged, so no test process can bind it, and nothing listens there on CI
+/// or dev machines. Binding port 0 and dropping the listener was racy: a test running in
+/// parallel could grab the freed port and answer.
 pub async fn dead_base_url() -> String {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    format!("http://{addr}")
+    "http://127.0.0.1:1".to_string()
 }
 
 // ---------------------------------------------------------------------------
