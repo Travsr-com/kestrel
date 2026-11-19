@@ -819,6 +819,20 @@ version = "0.1.0"
 [[package]]
 name = "kestrel-core"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "kestrel-agent",
+ "kestrel-sandbox",
+ "kestrel-store",
+ "kestrel-types",
+ "rusqlite",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "url",
+]
 
 [[package]]
 name = "kestrel-gateway"
@@ -853,6 +867,7 @@ dependencies = [
 name = "kestrel-store"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "kestrel-types",
  "rusqlite",
  "serde",

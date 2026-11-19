@@ -12,3 +12,19 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+kestrel-types.workspace = true
+kestrel-store.workspace = true
+kestrel-sandbox.workspace = true
+kestrel-agent.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
+futures.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true

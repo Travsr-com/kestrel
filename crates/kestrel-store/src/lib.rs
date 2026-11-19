@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -48,6 +48,9 @@ pub enum StoreError {
         "database schema version {found} is newer than this binary supports ({supported}); upgrade kestrel"
     )]
     SchemaTooNew { found: i64, supported: i64 },
+    /// The OS random source failed while making a run token.
+    #[error("no randomness for a run token: {0}")]
+    Random(String),
 }
 
 /// One row of the `runs` table.
@@ -116,6 +119,24 @@ CREATE TABLE control (
 );
 ";
 
+/// v2: the full agent spec of each run, as JSON, so a later engine can resume the run. A side
+/// table rather than a new `runs` column, so `runs` keeps its v1 shape.
+const SCHEMA_V2: &str = "
+CREATE TABLE run_specs (
+    run_id TEXT PRIMARY KEY,
+    spec   TEXT NOT NULL
+);
+";
+
+/// v3: a random token per run. The gateway URL of a run carries it, so run ids (visible in
+/// listings and logs) never grant gateway access.
+const SCHEMA_V3: &str = "
+CREATE TABLE run_tokens (
+    token  TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE
+);
+";
+
 /// RFC 3339 timestamp, stored as JSON text like the rest of the typed columns.
 #[derive(Serialize, Deserialize)]
 struct Ts(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
@@ -156,10 +177,13 @@ impl Store {
 
     // runs
 
-    /// Creates a run in `Queued`. Writes no event, so the run's first appended event gets seq 1.
+    /// Creates a run in `Queued` and stores its full spec (see [`Store::run_spec`]). Writes no
+    /// event, so the run's first appended event gets seq 1.
     pub fn create_run(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
         let id = RunId::new();
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO runs (id, agent, input, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id.to_string(),
@@ -169,7 +193,79 @@ impl Store {
                 serde_json::to_string(&Ts(OffsetDateTime::now_utc()))?,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO run_specs (run_id, spec) VALUES (?1, ?2)",
+            params![id.to_string(), serde_json::to_string(agent)?],
+        )?;
+        tx.execute(
+            "INSERT INTO run_tokens (token, run_id) VALUES (?1, ?2)",
+            params![new_token()?, id.to_string()],
+        )?;
+        tx.commit()?;
         Ok(id)
+    }
+
+    /// Changes the budget limit in a run's stored spec, so the change survives a restart.
+    /// [`StoreError::NotFound`] when the run has no stored spec.
+    pub fn set_budget(&self, id: RunId, limit: MicroUsd) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let spec: Option<String> = tx
+            .query_row(
+                "SELECT spec FROM run_specs WHERE run_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut spec: AgentSpec = match spec {
+            Some(s) => serde_json::from_str(&s)?,
+            None => return Err(StoreError::NotFound(id)),
+        };
+        spec.budget.limit = limit;
+        tx.execute(
+            "UPDATE run_specs SET spec = ?1 WHERE run_id = ?2",
+            params![serde_json::to_string(&spec)?, id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The run's gateway token. `None` for an unknown run or one created before schema v3.
+    pub fn run_token(&self, id: RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT token FROM run_tokens WHERE run_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The run a gateway token belongs to, if any.
+    pub fn run_by_token(&self, token: &str) -> Result<Option<RunId>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT run_id FROM run_tokens WHERE token = ?1",
+                [token],
+                |r| run_id_col(r, 0),
+            )
+            .optional()?)
+    }
+
+    /// The spec a run was created with. `None` for an unknown run, or for a run created before
+    /// schema v2 (those have no stored spec).
+    pub fn run_spec(&self, id: RunId) -> Result<Option<AgentSpec>> {
+        let spec: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT spec FROM run_specs WHERE run_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(spec.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
     pub fn get_run(&self, id: RunId) -> Result<Option<RunRow>> {
@@ -409,12 +505,28 @@ fn ensure_run(tx: &Transaction<'_>, run: RunId) -> Result<()> {
 fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Re-read under the write lock: another handle may have migrated since the first check.
-    if check_version(&tx)? < 1 {
+    let found = check_version(&tx)?;
+    if found < 1 {
         tx.execute_batch(SCHEMA_V1)?;
+    }
+    if found < 2 {
+        tx.execute_batch(SCHEMA_V2)?;
+    }
+    if found < 3 {
+        tx.execute_batch(SCHEMA_V3)?;
+    }
+    if found < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+/// 128 random bits from the OS, as 32 lowercase hex characters.
+fn new_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| StoreError::Random(e.to_string()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Appends one event with the run's next seq. Callers hold an IMMEDIATE transaction, so no other
