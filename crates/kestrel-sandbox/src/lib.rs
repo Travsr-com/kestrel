@@ -423,7 +423,9 @@ impl Cli {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
             self.run(runner, &argv, Some("already exists")).await?;
         }
-        let stdout = self.run(runner, &self.create_argv(spec, user), None).await?;
+        let stdout = self
+            .run(runner, &self.create_argv(spec, user), None)
+            .await?;
         Ok(SandboxHandle {
             id: check_id(stdout.trim())?.to_string(),
         })
