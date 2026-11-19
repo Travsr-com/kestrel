@@ -38,6 +38,13 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+    /// The repo path is not valid UTF-8, so it cannot be passed to git as a text argument.
+    #[error("repo path `{}` is not valid UTF-8", repo.display())]
+    NonUtf8Repo { repo: PathBuf },
+    /// The run's directory already exists but is not a usable workspace: it is a regular file,
+    /// or (for a git clone) it has no `.git` entry. `reason` says which.
+    #[error("existing workspace `{}` is not usable: {reason}", path.display())]
+    BadExisting { path: PathBuf, reason: String },
     /// The workspace path would fail the sandbox's mount validation: it is relative, not
     /// UTF-8, or contains `,` `=` `"` or a newline.
     #[error(
@@ -90,6 +97,7 @@ impl Workspaces {
         }
         match spec {
             WorkspaceSpec::EmptyDir => create_dir(&path).await?,
+            WorkspaceSpec::GitClone { .. } => todo!("#22: git clone --local --no-hardlinks"),
             WorkspaceSpec::GitWorktree { repo } => {
                 let git = |args: &[&str]| -> Vec<String> {
                     let repo = repo.to_string_lossy().into_owned();
@@ -117,6 +125,14 @@ impl Workspaces {
             }
         }
         Ok(path)
+    }
+
+    /// Brings the run's branch home: runs ONLY from the source `repo` (never inside the clone,
+    /// whose config and hooks the agent controls) and creates `kestrel/run-<id tail>` there.
+    pub async fn fetch_back(&self, _run: RunId, _repo: &Path) -> Result<(), WorkspaceError> {
+        todo!(
+            "#22: git -C <repo> -c core.hooksPath=/dev/null fetch --no-tags <clone> <branch>:<branch>"
+        )
     }
 
     /// Runs one git command; failing to start git is an `Io` error at `repo`.

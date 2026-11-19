@@ -142,6 +142,12 @@ pub enum WorkspaceSpec {
     GitWorktree {
         repo: PathBuf,
     },
+    /// A per-run `git clone --local --no-hardlinks` of `repo` (issue #22). `depth` makes the
+    /// clone shallow. From YAML, `repo` is `.` and `depth` comes from `sandbox.clone_depth`.
+    GitClone {
+        repo: PathBuf,
+        depth: Option<u32>,
+    },
     EmptyDir,
 }
 
