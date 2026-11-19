@@ -67,6 +67,13 @@ cache_write_per_mtok = "3.75"
 > bridge network, so the default bind may not work. Set `listen` and `gateway.advertise_url`
 > yourself there.
 
+> **Docker Desktop (macOS and Windows) does not work with the default bind.** The docker bridge
+> address lives inside a VM there, so set `gateway.advertise_url` or `gateway.listen` yourself.
+> (Kestrel's gVisor driver is Linux only today anyway.)
+>
+> **If `docker network inspect bridge` lists an IPv6 range first,** Kestrel cannot read the bridge
+> IP. Set `gateway.listen` explicitly.
+
 > **Add a price for every model you use.** A call to a model with no price entry is not counted
 > against the run's budget.
 

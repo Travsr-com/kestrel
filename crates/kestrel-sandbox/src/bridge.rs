@@ -18,6 +18,21 @@ pub const DEFAULT_BRIDGE_IMAGE: &str =
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
+/// `--pids-limit` of the container. It counts `socat` itself (PID 1) and every forked child, so
+/// it must stay at least `MAX_CHILDREN + 2`, or the limit trips before `socat` refuses a child.
+const PIDS_LIMIT: u32 = 64;
+/// `max-children` of the `socat` listener.
+const MAX_CHILDREN: u32 = 32;
+/// `-T`: seconds without data in either direction before `socat` closes a connection. It is an
+/// inactivity timeout, so a model stream that is silent for more than five minutes is cut.
+const IDLE_TIMEOUT_SECS: u32 = 300;
+
+/// Docker's container name charset: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
+fn is_container_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
 
 /// How to build the bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +141,11 @@ impl GatewayBridge {
             .await
             .map_err(step("remove-stale"))?;
         for stale in stale.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            // Names are data from docker: never let one become an option of `docker rm`.
+            if !is_container_name(stale) {
+                eprintln!("kestrel: ignoring unexpected container name from docker ps");
+                continue;
+            }
             remove(&*runner, stale)
                 .await
                 .map_err(step("remove-stale"))?;
@@ -136,7 +156,7 @@ impl GatewayBridge {
             _ => {}
         }
 
-        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children=64");
+        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={MAX_CHILDREN}");
         let target = format!("TCP:host.docker.internal:{host_port}");
         let run = argv(&[
             "docker",
@@ -160,14 +180,14 @@ impl GatewayBridge {
             "--security-opt",
             "no-new-privileges",
             "--pids-limit",
-            "64",
+            &PIDS_LIMIT.to_string(),
             "--memory",
             "64m",
             "--user",
             "65534:65534",
             &spec.image,
             "-T",
-            "300",
+            &IDLE_TIMEOUT_SECS.to_string(),
             &listen,
             &target,
         ]);
@@ -248,5 +268,25 @@ impl GatewayBridge {
     #[must_use]
     pub fn url(&self) -> Url {
         self.url.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pids_limit_leaves_room_for_socat_and_all_its_children() {
+        const { assert!(PIDS_LIMIT >= MAX_CHILDREN + 2) };
+    }
+
+    #[test]
+    fn container_names_follow_dockers_charset() {
+        for ok in ["a", "kestrel-gateway-b29b95f5", "a.b_c-d", "0x"] {
+            assert!(is_container_name(ok), "{ok}");
+        }
+        for bad in ["", "-f", "--volumes", "a b", "_x", ".x", "a/b", "a\u{e9}"] {
+            assert!(!is_container_name(bad), "{bad}");
+        }
     }
 }

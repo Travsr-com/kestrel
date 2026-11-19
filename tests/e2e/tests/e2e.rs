@@ -168,7 +168,7 @@ impl Env {
         );
         let mock = Mock::start();
         let config = dir.path().join("config.toml");
-        std::fs::write(&config, config_toml(mock.addr)).expect("write config");
+        std::fs::write(&config, config_toml(mock.addr, free_port())).expect("write config");
         // Private, like a real config: serve warns about a config other users can read.
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
             .expect("chmod config");
@@ -374,12 +374,25 @@ impl Drop for Serve {
     }
 }
 
-fn config_toml(upstream: SocketAddr) -> String {
-    // The gateway listens on all interfaces: the `kestrel-gateway` bridge container reaches it
-    // from the Docker network through the host, not through loopback.
+/// A port nothing listens on right now: bind port 0 on loopback and drop the socket. The port is
+/// fixed in the config, so a restarted serve (scenario 2) binds the same one again. tokio's
+/// `TcpListener::bind` sets SO_REUSEADDR on Unix, so the killed serve's sockets in TIME_WAIT do
+/// not block that rebind.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+fn config_toml(upstream: SocketAddr, port: u16) -> String {
+    // `gateway.listen` is left out on purpose: serve binds the docker bridge IP it finds with
+    // `docker network inspect bridge`, which is the default path the bridge container uses to
+    // reach the gateway on the host. Only the port is fixed.
     format!(
         "[gateway]\n\
-         listen = \"0.0.0.0:0\"\n\n\
+         port = {port}\n\n\
          [engine]\n\
          max_concurrent_runs = 4\n\n\
          [providers.anthropic]\n\
