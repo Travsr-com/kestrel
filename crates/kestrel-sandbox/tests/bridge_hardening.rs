@@ -368,3 +368,23 @@ async fn stop_removes_only_this_databases_container() {
         Some(&s(&["docker", "rm", "--force", "kestrel-gateway-8f7e10f1"]))
     );
 }
+
+#[tokio::test]
+async fn names_from_docker_ps_that_are_not_container_names_are_never_removed() {
+    // Names are data: a flag-like or malformed line must not reach `docker rm`.
+    let runner = runner(
+        "--volumes\n-f\na b\n_x\n.hidden\nkestrel-gateway-b29b95f5\nok.name_1-2\n \n",
+    );
+    start(&runner, DB_A).await.expect("bridge starts");
+    assert_eq!(
+        removed_names(&runner),
+        vec!["kestrel-gateway-b29b95f5", "ok.name_1-2"]
+    );
+}
+
+#[tokio::test]
+async fn only_invalid_names_means_nothing_is_removed() {
+    let runner = runner("--volumes\n-f\na b\n");
+    start(&runner, DB_A).await.expect("bridge starts");
+    assert!(removed_names(&runner).is_empty(), "{:?}", runner.runs());
+}
