@@ -880,7 +880,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
     fn the_gateway_url_prefers_advertise_then_bridge_then_the_bound_address() {
         let bound: SocketAddr = "127.0.0.1:7070".parse().expect("addr");
         let advertise = url("https://gw.example.com/");
-        let bridge = url("http://kestrel-gateway:7070/");
+        let bridge = url("http://172.18.0.2:7070/");
         let pick = |a: Option<&Url>, b: Option<&Url>| gateway_url_for(a, b, bound).expect("url");
         assert_eq!(pick(Some(&advertise), Some(&bridge)), advertise);
         assert_eq!(pick(Some(&advertise), None), advertise);
@@ -921,7 +921,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 .push(argv.to_vec());
             Ok(kestrel_sandbox::CommandOutput {
                 status: self.status,
-                stdout: String::new(),
+                stdout: if argv.get(1).map(String::as_str) == Some("inspect") {
+                    "172.18.0.2\n".into()
+                } else {
+                    String::new()
+                },
                 stderr: "boom".into(),
             })
         }
@@ -965,10 +969,10 @@ budget: { usd: 0.000010, wall_clock: 10m }
             .await
             .expect("started")
             .expect("bridge");
-        assert_eq!(bridge.url().as_str(), "http://kestrel-gateway:7070/");
-        assert_eq!(call_count(&r), 4);
-        bridge.stop().await;
+        assert_eq!(bridge.url().as_str(), "http://172.18.0.2:7070/");
         assert_eq!(call_count(&r), 5);
+        bridge.stop().await;
+        assert_eq!(call_count(&r), 6);
     }
 
     #[tokio::test]

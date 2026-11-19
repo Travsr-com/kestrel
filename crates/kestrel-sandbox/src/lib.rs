@@ -59,7 +59,7 @@ pub enum SandboxError {
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
     InvalidId { id: String },
-    /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run` or `connect`.
+    /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run`, `connect` or `inspect`.
     #[error("gateway bridge step `{step}` failed: {stderr}")]
     Bridge { step: &'static str, stderr: String },
     /// The bridge port is 0.

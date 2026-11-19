@@ -1,6 +1,7 @@
 //! The gateway bridge: a small `socat` container that lets sandboxes on the `--internal`
 //! `kestrel-gw` network reach the gateway running on the host, and nothing else.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,7 +11,7 @@ use crate::{CommandRunner, SandboxError, check_image};
 
 /// Pinned `socat` image used when [`BridgeSpec::image`] is not set.
 pub const DEFAULT_BRIDGE_IMAGE: &str = "alpine/socat:1.8.0.3";
-/// Name of the bridge container, and the host name sandboxes use to reach it.
+/// Name of the bridge container. Sandboxes reach it by IP, not by this name.
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
@@ -53,10 +54,10 @@ fn remove_argv() -> Vec<String> {
     argv(&["docker", "rm", "--force", BRIDGE_NAME])
 }
 
-/// Runs one docker command. `Err` carries the text for [`SandboxError::Bridge`].
-async fn docker(runner: &dyn CommandRunner, argv: &[String]) -> Result<(), String> {
+/// Runs one docker command and returns its stdout. `Err` carries the text for [`SandboxError::Bridge`].
+async fn docker(runner: &dyn CommandRunner, argv: &[String]) -> Result<String, String> {
     match runner.run(argv).await {
-        Ok(out) if out.status == 0 => Ok(()),
+        Ok(out) if out.status == 0 => Ok(out.stdout),
         Ok(out) => Err(out.stderr.trim().to_string()),
         Err(e) => Err(e.to_string()),
     }
@@ -64,6 +65,16 @@ async fn docker(runner: &dyn CommandRunner, argv: &[String]) -> Result<(), Strin
 
 fn step(name: &'static str) -> impl Fn(String) -> SandboxError {
     move |stderr| SandboxError::Bridge { step: name, stderr }
+}
+
+/// `http://<ip>:<port>/` from the `inspect` answer, which must be exactly one IPv4 address.
+fn bridge_url(answer: &str, port: u16) -> Result<Url, SandboxError> {
+    let bad = |what: String| step("inspect")(what);
+    let ip: Ipv4Addr = answer
+        .trim()
+        .parse()
+        .map_err(|_| bad("the bridge has no IPv4 address on kestrel-gw".to_string()))?;
+    Url::parse(&format!("http://{ip}:{port}/")).map_err(|e| bad(e.to_string()))
 }
 
 impl GatewayBridge {
@@ -81,8 +92,6 @@ impl GatewayBridge {
             return Err(SandboxError::InvalidBridgePort);
         }
         check_image(&spec.image)?;
-        let url = Url::parse(&format!("http://{BRIDGE_NAME}:{host_port}/"))
-            .map_err(|_| SandboxError::InvalidBridgePort)?;
 
         match docker(&*runner, &remove_argv()).await {
             Err(e) if !e.contains("No such container") => return Err(step("remove-stale")(e)),
@@ -113,20 +122,34 @@ impl GatewayBridge {
             &target,
         ]);
         let connect = argv(&["docker", "network", "connect", NETWORK, BRIDGE_NAME]);
-        let started = match docker(&*runner, &run).await {
-            Ok(()) => docker(&*runner, &connect).await.map_err(step("connect")),
-            Err(e) => Err(step("run")(e)),
-        };
-        if let Err(e) = started {
-            // Best effort: the original error is the one worth reporting.
-            let _ = docker(&*runner, &remove_argv()).await;
-            return Err(e);
+        // The name is not used by sandboxes: Docker's DNS does not answer inside gVisor, so they
+        // reach the bridge by its IP on the internal network.
+        let inspect = argv(&[
+            "docker",
+            "inspect",
+            "--format",
+            &format!("{{{{(index .NetworkSettings.Networks \"{NETWORK}\").IPAddress}}}}"),
+            BRIDGE_NAME,
+        ]);
+        let started = async {
+            docker(&*runner, &run).await.map_err(step("run"))?;
+            docker(&*runner, &connect).await.map_err(step("connect"))?;
+            let answer = docker(&*runner, &inspect).await.map_err(step("inspect"))?;
+            bridge_url(&answer, host_port)
         }
-        Ok(GatewayBridge {
-            runner,
-            url,
-            stopped: AtomicBool::new(false),
-        })
+        .await;
+        match started {
+            Ok(url) => Ok(GatewayBridge {
+                runner,
+                url,
+                stopped: AtomicBool::new(false),
+            }),
+            Err(e) => {
+                // Best effort: the original error is the one worth reporting.
+                let _ = docker(&*runner, &remove_argv()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Removes the container. Idempotent; failures are ignored (the next `start` replaces it).
@@ -141,7 +164,7 @@ impl GatewayBridge {
         }
     }
 
-    /// `http://kestrel-gateway:<host_port>/`, the URL sandboxes use.
+    /// `http://<bridge ip>:<host_port>/`, the URL sandboxes use.
     #[must_use]
     pub fn url(&self) -> Url {
         self.url.clone()
