@@ -64,7 +64,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --fail-under-lines 95
 cargo deny check
-grep -rnP '[\x{2013}\x{2014}]' --exclude-dir=target --exclude-dir=node_modules . && exit 1 || true
+./scripts/check-dashes.sh
 ```
 
 Tests that need real sandboxes (gVisor, Apple `container`, Firecracker) or network are behind the
