@@ -172,6 +172,17 @@ impl Engine {
         }
     }
 
+    /// Gives every run a workspace from `workspaces`, mounted at `/workspace` in its sandbox
+    /// (`LaunchSpec.workspace`). The workspace is prepared before the sandbox is created; a run
+    /// whose workspace cannot be prepared fails without a sandbox. A `git-worktree` repo path
+    /// must be absolute (the CLI resolves it at submit time); a relative one fails the run.
+    ///
+    /// Without this, runs get no workspace (`LaunchSpec.workspace` is `None`), as before.
+    pub fn with_workspaces(self, workspaces: Workspaces) -> Engine {
+        let _ = (self, workspaces);
+        todo!("#17: wire Workspaces into the engine")
+    }
+
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
     /// engine on the same database can resume the run.
     pub async fn submit(&self, spec: AgentSpec, input: String) -> Result<RunId> {
