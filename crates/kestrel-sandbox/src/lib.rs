@@ -350,7 +350,7 @@ impl Cli {
         }
     }
 
-    fn create_argv(&self, spec: &LaunchSpec) -> Vec<String> {
+    fn create_argv(&self, spec: &LaunchSpec, user: Option<(u32, u32)>) -> Vec<String> {
         let suffix = if self.apple { "M" } else { "m" };
         let network = match spec.network {
             NetworkPolicy::None => "none",
@@ -366,6 +366,9 @@ impl Cli {
             "--network".to_string(),
             network.to_string(),
         ]);
+        if let Some((uid, gid)) = user {
+            argv.extend(["--user".to_string(), format!("{uid}:{gid}")]);
+        }
         if let Some(ws) = &spec.workspace {
             argv.extend([
                 "--mount".to_string(),
@@ -380,12 +383,17 @@ impl Cli {
                 Some(("KESTREL_GATEWAY_URL", gateway.as_str()))
             }
         };
-        for (k, v) in spec
+        let mut env: Vec<(&str, &str)> = spec
             .env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
-            .chain(gateway)
-        {
+            .collect();
+        if user.is_some() && !spec.env.contains_key("HOME") {
+            // A non-root user may have no writable home in the image.
+            env.push(("HOME", "/tmp"));
+            env.sort();
+        }
+        for (k, v) in env.into_iter().chain(gateway) {
             argv.extend(["--env".to_string(), format!("{k}={v}")]);
         }
         argv.push(spec.image.clone());
@@ -401,16 +409,21 @@ impl Cli {
     ) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
+        let mut user = None;
         if let Some(ws) = &spec.workspace {
             validate_workspace_path(ws)?;
-            // TODO(#24): add `--user <uid>:<gid>` and `HOME=/tmp` from this owner.
-            let _ = owner(ws);
+            let ids = owner(ws).map_err(|source| SandboxError::WorkspaceUnreadable {
+                path: ws.display().to_string(),
+                source,
+            })?;
+            // Root-owned workspace: Kestrel runs as root, nothing to map.
+            user = (ids != (0, 0)).then_some(ids);
         }
         if let NetworkPolicy::GatewayOnly { .. } = spec.network {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
             self.run(runner, &argv, Some("already exists")).await?;
         }
-        let stdout = self.run(runner, &self.create_argv(spec), None).await?;
+        let stdout = self.run(runner, &self.create_argv(spec, user), None).await?;
         Ok(SandboxHandle {
             id: check_id(stdout.trim())?.to_string(),
         })
