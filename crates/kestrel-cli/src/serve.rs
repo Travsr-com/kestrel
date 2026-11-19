@@ -301,6 +301,13 @@ fn uses_docker(drivers: &[Box<dyn SandboxDriver>]) -> bool {
         .any(|d| matches!(d.name(), "gvisor" | "docker-runc"))
 }
 
+/// The bridge reaches the gateway through the host, so a loopback-only gateway would refuse it
+/// and every sandbox model call would fail. `bridge` is true when serve would start the bridge.
+fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<(), Failure> {
+    let _ = (bridge, addr);
+    Ok(())
+}
+
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
 async fn start_bridge(
     runner: Arc<dyn CommandRunner>,
@@ -964,5 +971,23 @@ budget: { usd: 0.000010, wall_clock: 10m }
             .await
             .expect_err("fails");
         assert!(e.message.contains("boom"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_loopback_gateway_with_a_bridge_is_a_config_error() {
+        let loopback: SocketAddr = "127.0.0.1:7070".parse().expect("addr");
+        let v6_loopback: SocketAddr = "[::1]:7070".parse().expect("addr");
+        let open: SocketAddr = "0.0.0.0:7070".parse().expect("addr");
+        for addr in [loopback, v6_loopback] {
+            let e = check_bridge_listen(true, addr).expect_err("loopback with a bridge");
+            assert_eq!(e.code, crate::EXIT_USAGE);
+            for needle in ["gateway.listen", "0.0.0.0:7070", "gateway.advertise_url"] {
+                assert!(e.message.contains(needle), "{}", e.message);
+            }
+            // No bridge (advertise_url set, or a driver that needs none): loopback is fine.
+            assert!(check_bridge_listen(false, addr).is_ok());
+        }
+        assert!(check_bridge_listen(true, open).is_ok());
+        assert!(check_bridge_listen(false, open).is_ok());
     }
 }
