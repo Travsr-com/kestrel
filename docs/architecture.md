@@ -68,7 +68,7 @@ steer all of it live from a UI.
                 ▼                                               ▼
 ┌──────────── Sandbox (per run) ─────────────┐   ┌──────── Kestrel Gateway ─────────┐
 │ driver: gVisor | Firecracker | Apple VM    │   │ Anthropic + OpenAI compatible     │
-│ workspace: git worktree / snapshot         │   │ 1 mask secrets & PII              │
+│ workspace: per-run git clone / snapshot    │   │ 1 mask secrets & PII              │
 │ runtime: native agent | claude-code |      │──►│ 2 route: rules → role tier → KEV  │
 │          opencode | codex | custom image   │   │ 3 cache-aware prompt shaping      │
 │ env: *_BASE_URL → gateway, MCP → kestrel   │   │ 4 budget check, meter cost        │
@@ -87,7 +87,7 @@ steer all of it live from a UI.
 | **Run** | One execution of an Agent. Has `parent_run_id` and `root_run_id`, so spawned children form a tree. |
 | **Trigger** | What starts a Run: manual (CLI/UI), cron, webhook, or an event watcher (a condition on another run's events or an external feed). |
 | **Capability token** | Signed, attenuable grant (Biscuit, via `biscuit-auth`). Children receive an attenuated copy. |
-| **Workspace** | Reusable setup object: git worktree, repo snapshot, or empty dir, mounted into a sandbox. |
+| **Workspace** | Reusable setup object: a per-run git clone, repo snapshot, or empty dir, mounted into a sandbox. |
 | **Approval** | A pending human decision. Suspends the run until resolved from UI, CLI or chat. |
 
 Example Agent definition (the UI edits the same structure as a form):
@@ -328,11 +328,18 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 * Accept: a coding task runs headless in a sandbox, survives a server restart while suspended, and reports exact cost.
 
 **M2. Parallel and spawn, plus the UI**
-* `kestrel.spawn` / `kestrel.join` with Biscuit attenuation, budget carving, depth and concurrency limits.
-* Git worktree workspaces; Travsr wired over MCP.
-* UI: Fleet, Run (spawn tree, live stream), Approvals.
-* Accept: one run fans out to 5+ parallel children in separate worktrees with no conflicts; a child cannot use a tool
-  or host its parent lacks (negative tests); the UI shows the whole tree live.
+* `kestrel.spawn` / `kestrel.join` with Biscuit attenuation, budget carving, depth and concurrency limits. A parent
+  waiting in `join` releases its concurrency slot, so a full cap cannot deadlock.
+* Sandboxes reach these tools only through the gateway: `kestrel.*` at `/r/{token}/mcp` and Travsr at
+  `/r/{token}/travsr`, authorised by the run token. A separate MCP port would be unreachable from a sandbox.
+* Per-run git clone workspaces (branch `kestrel/run-<id>`, #22) instead of worktrees; Travsr wired over MCP.
+* Parent and root run link in the store (schema v4); explicit subnets for per-run networks, since Docker's default
+  address pools hold only about 30 networks.
+* `kestrel-server`: HTTP and WebSocket API for the UI (loopback and token by default), serving the embedded UI.
+* UI: Fleet, Run (spawn tree, live stream), Approvals. The 95% coverage rule also applies to `ui/src` (vitest).
+* Accept: one run fans out to 5+ parallel children in separate per-run clones with no conflicts; a child cannot use a
+  tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget; the UI
+  shows the whole tree live.
 
 **M3. Cheaper**
 * Role tiers, prompt-cache shaping, hard budgets, rule routing, secret masking, Costs view.
@@ -371,6 +378,9 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 | First chat surface | Google Chat via Pub/Sub pull |
 | Meetings | Live meeting bot, Google Meet first, headless-browser approach (Meet Media API is being sunset) |
 | Repo | Separate `Kestrel` repo; Travsr used only over MCP |
+| Workspaces | Per-run git clones (#22), not git worktrees: a worktree's `.git` points outside the sandbox mount, so git fails inside it. The YAML value `git-worktree` stays until #22 renames it |
+| Sandbox tool access | `kestrel.*` and Travsr MCP are served under the gateway path (`/r/{token}/mcp`, `/r/{token}/travsr`), because the gateway is a sandbox's only way out |
+| UI coverage | The 95% line rule covers Rust and the Svelte UI (vitest), enforced in CI |
 
 ## 9. Open questions
 
