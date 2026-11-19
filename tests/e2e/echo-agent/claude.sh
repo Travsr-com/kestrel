@@ -7,7 +7,7 @@
 #
 # Files written to /workspace:
 #   env.txt      the environment (scenario 4: no real provider key)
-#   egress.txt   one line per outside host tried, "blocked ..." or "reachable ..." (scenario 3)
+#   egress.txt   one line per outside host tried, "blocked <curl exit code> <url>" or "reachable <url>" (scenario 3)
 #   README.txt   one line appended, so a tracked file changes (scenario 1)
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
@@ -35,10 +35,12 @@ env > /workspace/env.txt
 
 : > /workspace/egress.txt
 for url in https://example.com https://1.1.1.1; do
-  if curl -s -o /dev/null --max-time 5 "$url"; then
+  curl -s -o /dev/null --max-time 5 "$url"
+  code=$?
+  if [ "$code" -eq 0 ]; then
     echo "reachable $url" >> /workspace/egress.txt
   else
-    echo "blocked $url (curl exit $?)" >> /workspace/egress.txt
+    echo "blocked $code $url" >> /workspace/egress.txt
   fi
 done
 

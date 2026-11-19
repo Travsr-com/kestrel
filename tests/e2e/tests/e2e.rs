@@ -286,6 +286,10 @@ impl Env {
             let terminal = ["Completed", "Failed", "Cancelled"]
                 .iter()
                 .any(|t| status.starts_with(t));
+            if terminal || start.elapsed() >= RUN_DEADLINE {
+                // Show what the run did (for example the echo agent's "gateway call failed").
+                eprintln!("events of run {id}:\n{}", self.dump_events(id));
+            }
             assert!(
                 !terminal,
                 "run {id} ended as {status}, wanted {want}: {row}"
@@ -313,6 +317,29 @@ impl Env {
             }
         }
         panic!("no worktree on a kestrel/run-*{tail} branch in the test repo:\n{out}")
+    }
+
+    /// The run's events as text, for failure messages. `watch` follows a live run forever, so it
+    /// is stopped after a short wait. Never panics.
+    fn dump_events(&self, id: &str) -> String {
+        let Ok(mut child) = self
+            .cmd(&["watch", id, "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return "(could not start kestrel watch)".to_string();
+        };
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = child.kill();
+        match child.wait_with_output() {
+            Ok(out) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => format!("(watch failed: {e})"),
+        }
     }
 
     /// Every event of a finished run, through `kestrel watch --json`.
@@ -534,7 +561,16 @@ fn s3_sandbox_cannot_reach_other_hosts() {
     let lines: Vec<&str> = egress.lines().collect();
     assert_eq!(lines.len(), 2, "two hosts tried: {egress:?}");
     for line in lines {
-        assert!(line.starts_with("blocked "), "egress should fail: {line}");
+        // "blocked <curl exit code> <url>". Only a DNS failure (6), a refused connection (7) or
+        // a timeout (28) proves the network is closed. A TLS or certificate code (35, 60) would
+        // mean the host answered, so the block would be vacuous.
+        let mut parts = line.split(' ');
+        assert_eq!(parts.next(), Some("blocked"), "egress should fail: {line}");
+        let code = parts.next().and_then(|c| c.parse::<i32>().ok());
+        assert!(
+            matches!(code, Some(6 | 7 | 28)),
+            "egress failed for the wrong reason: {line}"
+        );
     }
     // The same sandbox did reach the gateway, so the block is selective.
     assert_eq!(env.mock.keys_seen().len(), 1);
