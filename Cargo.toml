@@ -38,6 +38,7 @@ serde-saphyr = { version = "0.0.29", default-features = false, features = ["dese
 thiserror    = "2"
 anyhow       = "1"
 uuid         = { version = "1", features = ["v7", "serde"] }
+getrandom    = "0.4"
 time         = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 rusqlite     = { version = "0.41", features = ["bundled"] }
 tracing      = "0.1"

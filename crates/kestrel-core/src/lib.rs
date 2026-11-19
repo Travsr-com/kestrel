@@ -18,7 +18,7 @@ use kestrel_sandbox::{LaunchSpec, NetworkPolicy, SandboxDriver, SandboxHandle};
 use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
 use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
-    SuspendReason,
+    SuspendReason, Tier,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -64,6 +64,27 @@ impl Default for Limits {
     }
 }
 
+/// Provider model name for each model tier. A tier missing from the map uses its default.
+pub type ModelMap = HashMap<Tier, String>;
+
+/// The model a tier maps to when the [`ModelMap`] does not name one. These are defaults only:
+/// override them in config to follow new model releases or another provider.
+pub fn default_model(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Cheap => "claude-haiku-5-5",
+        Tier::Mid => "claude-sonnet-5-5",
+        Tier::Frontier => "claude-opus-5-5",
+    }
+}
+
+/// The default [`ModelMap`]: every tier mapped to its [`default_model`].
+pub fn default_models() -> ModelMap {
+    [Tier::Cheap, Tier::Mid, Tier::Frontier]
+        .into_iter()
+        .map(|t| (t, default_model(t).to_string()))
+        .collect()
+}
+
 /// What [`Engine::recover`] found and did at startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
@@ -86,7 +107,7 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// * Resuming a paused or budget-suspended run starts the stopped sandbox again, which restarts
 ///   the agent command from the beginning. The container survives, the agent's process does not.
 /// * A run resumed by a new engine after a restart gets a fresh sandbox, and its wall clock starts
-///   over. A `SetBudget` lives in memory only, so it is lost on restart.
+///   over.
 /// * A run holds its concurrency slot while it is suspended (its sandbox still exists). A command
 ///   for a suspended run that no actor holds (after a restart) starts one even past the cap.
 /// * The wall clock counts only time spent `Provisioning` or `Running`, not time suspended.
@@ -101,19 +122,40 @@ struct Inner {
     adapters: AdapterFactory,
     gateway_url: Url,
     limits: Limits,
+    models: ModelMap,
 }
 
 /// Control channels of the run actors, by run.
 type Actors = HashMap<RunId, mpsc::UnboundedSender<ControlCommand>>;
 
 impl Engine {
-    /// `drivers` are in preference order: `SandboxTier::Auto` takes the first one.
+    /// `drivers` are in preference order: `SandboxTier::Auto` takes the first one. Model tiers
+    /// map to [`default_models`]; use [`Engine::with_models`] to choose them.
     pub fn new(
         store: Arc<Store>,
         drivers: Vec<Box<dyn SandboxDriver>>,
         adapters: AdapterFactory,
         gateway_url: Url,
         limits: Limits,
+    ) -> Engine {
+        Self::with_models(
+            store,
+            drivers,
+            adapters,
+            gateway_url,
+            limits,
+            default_models(),
+        )
+    }
+
+    /// Like [`Engine::new`], with the model name for each tier taken from `models`.
+    pub fn with_models(
+        store: Arc<Store>,
+        drivers: Vec<Box<dyn SandboxDriver>>,
+        adapters: AdapterFactory,
+        gateway_url: Url,
+        limits: Limits,
+        models: ModelMap,
     ) -> Engine {
         Engine {
             inner: Arc::new(Inner {
@@ -122,6 +164,7 @@ impl Engine {
                 adapters,
                 gateway_url,
                 limits,
+                models,
             }),
         }
     }
@@ -252,7 +295,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Starts an actor for `run`, which is in `status`. Fails the run if its spec is not stored.
+    /// Starts an actor for `run`, which is in `status`. Fails the run if its spec or gateway
+    /// token is not stored (runs from before schema v3).
     fn spawn(
         self: &Arc<Self>,
         run: RunId,
@@ -261,13 +305,15 @@ impl Inner {
         actors: &mut Actors,
         tasks: &mut JoinSet<()>,
     ) -> Result<()> {
-        let Some(spec) = self.store.run_spec(run)? else {
-            let failed = RunStatus::Failed("no agent spec is stored for this run".into());
+        let (Some(spec), Some(token)) = (self.store.run_spec(run)?, self.store.run_token(run)?)
+        else {
+            let failed =
+                RunStatus::Failed("no agent spec or run token is stored for this run".into());
             self.store.transition(run, &status, failed)?;
             return Ok(());
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let actor = Actor::new(self.clone(), run, spec, input, status, rx);
+        let actor = Actor::new(self.clone(), run, spec, input, token, status, rx);
         tasks.spawn(actor.run());
         actors.insert(run, tx);
         Ok(())
@@ -292,13 +338,21 @@ impl Inner {
         self.drivers.iter().position(|d| d.name() == name)
     }
 
-    /// The per-run gateway URL, `{gateway}/r/{run}`. The run id is the run token.
-    fn run_gateway(&self, run: RunId) -> Url {
+    /// The per-run gateway URL, `{gateway}/r/{token}`.
+    fn run_gateway(&self, token: &str) -> Url {
         let mut url = self.gateway_url.clone();
         if let Ok(mut path) = url.path_segments_mut() {
-            path.pop_if_empty().push("r").push(&run.to_string());
+            path.pop_if_empty().push("r").push(token);
         }
         url
+    }
+
+    /// The provider model name for `tier`.
+    fn model(&self, tier: Tier) -> String {
+        self.models
+            .get(&tier)
+            .cloned()
+            .unwrap_or_else(|| default_model(tier).to_string())
     }
 
     /// Best effort: destroys the last sandbox a previous engine provisioned for `run`.
@@ -354,6 +408,8 @@ struct Actor {
     id: RunId,
     spec: AgentSpec,
     input: String,
+    /// Gateway token of this run, see [`Store::run_token`].
+    token: String,
     status: RunStatus,
     adapter: Box<dyn RuntimeAdapter>,
     sandbox: Option<Sandbox>,
@@ -368,6 +424,7 @@ impl Actor {
         id: RunId,
         spec: AgentSpec,
         input: String,
+        token: String,
         status: RunStatus,
         cmds: mpsc::UnboundedReceiver<ControlCommand>,
     ) -> Actor {
@@ -381,6 +438,7 @@ impl Actor {
             id,
             spec,
             input,
+            token,
             status,
             adapter,
             sandbox: None,
@@ -473,8 +531,8 @@ impl Actor {
     fn launch_spec(&self) -> Result<LaunchSpec> {
         let ctx = RunContext {
             run_id: self.id,
-            gateway_url: self.inner.run_gateway(self.id),
-            model: self.spec.model_policy.default.to_string(),
+            gateway_url: self.inner.run_gateway(&self.token),
+            model: self.inner.model(self.spec.model_policy.default),
         };
         let plan = self.adapter.launch_plan(&self.spec, &self.input, &ctx)?;
         Ok(LaunchSpec {
@@ -570,6 +628,8 @@ impl Actor {
                 Ok(Next::Stop)
             }
             C::SetBudget(limit) => {
+                // Stored first, so the new limit survives a restart.
+                self.inner.store.set_budget(self.id, limit)?;
                 self.spec.budget.limit = limit;
                 // One warning per limit.
                 self.warned = false;
