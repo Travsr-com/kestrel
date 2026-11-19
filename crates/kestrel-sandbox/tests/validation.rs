@@ -12,7 +12,7 @@ use std::sync::Arc;
 use common::{FakeRunner, ID, spec};
 use kestrel_sandbox::{
     AppleContainerDriver, CommandOutput, GvisorDriver, LaunchSpec, NetworkPolicy, SandboxDriver,
-    SandboxError, SandboxHandle,
+    SandboxError, SandboxHandle, validate_workspace_path,
 };
 use url::Url;
 
@@ -100,6 +100,26 @@ async fn non_utf8_workspace_is_rejected() {
     let mut s = spec();
     s.workspace = Some(PathBuf::from(OsStr::from_bytes(b"/srv/\xff")));
     rejected(s, invalid_workspace).await;
+}
+
+/// The public rule other crates use: good paths come back as text, bad ones are rejected.
+#[test]
+fn validate_workspace_path_is_public_and_returns_the_text() {
+    use std::path::Path;
+    assert_eq!(
+        validate_workspace_path(Path::new("/srv/ws/run-1")).ok(),
+        Some("/srv/ws/run-1")
+    );
+    for bad in [
+        "ws/one",
+        "/srv/ws,source=/",
+        "/srv/a=b",
+        "/srv/\"ws",
+        "/srv/ws\nx",
+    ] {
+        let err = validate_workspace_path(Path::new(bad)).expect_err("must reject");
+        assert!(invalid_workspace(&err), "{bad:?}: {err:?}");
+    }
 }
 
 // C: container ids.

@@ -357,7 +357,7 @@ impl Cli {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
         if let Some(ws) = &spec.workspace {
-            check_workspace(ws)?;
+            validate_workspace_path(ws)?;
         }
         if let NetworkPolicy::GatewayOnly { .. } = spec.network {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
@@ -506,17 +506,16 @@ fn check_image(image: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_workspace(path: &Path) -> Result<()> {
-    let ok = path.is_absolute()
-        && path
-            .to_str()
-            .is_some_and(|p| !p.contains([',', '=', '"', '\n', '\r']));
-    if ok {
-        return Ok(());
+/// Checks that `path` can be mounted as a workspace: absolute, UTF-8, and free of `,` `=` `"`
+/// and newlines, which would change the `--mount` options. Returns the path as text.
+/// Drivers run this in `create`; callers that make workspaces can run it up front.
+pub fn validate_workspace_path(path: &Path) -> Result<&str> {
+    match path.to_str() {
+        Some(text) if path.is_absolute() && !text.contains([',', '=', '"', '\n', '\r']) => Ok(text),
+        _ => Err(SandboxError::InvalidWorkspace {
+            path: path.display().to_string(),
+        }),
     }
-    Err(SandboxError::InvalidWorkspace {
-        path: path.display().to_string(),
-    })
 }
 
 fn check_id(id: &str) -> Result<&str> {
