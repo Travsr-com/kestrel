@@ -121,9 +121,9 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     let mut models = default_models();
     for (tier, model) in raw.models {
         let t: Tier = format!("tier:{tier}").parse().map_err(|_| {
-            Failure::usage(format!(
-                "models.{tier}: unknown tier (expected cheap, mid or frontier)"
-            ))
+            Failure::usage(
+                "models: unknown tier name (expected cheap, mid or frontier)".to_string(),
+            )
         })?;
         models.insert(t, model);
     }
@@ -132,7 +132,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         let field = |name: &str, v: &str| {
             MicroUsd::parse_decimal(v).ok_or_else(|| {
                 Failure::usage(format!(
-                    "prices.\"{model}\".{name}: `{v}` is not a non-negative USD amount"
+                    "prices: {name} is not a non-negative USD amount like 3.00"
                 ))
             })
         };
@@ -159,10 +159,32 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     })
 }
 
+/// Names that may appear in a config error. Anything else quoted in an error came from the
+/// user and may be an API key, so it is masked.
+const CONFIG_NAMES: &[&str] = &[
+    "gateway",
+    "listen",
+    "engine",
+    "max_concurrent_runs",
+    "providers",
+    "anthropic",
+    "openai",
+    "base_url",
+    "api_key",
+    "models",
+    "cheap",
+    "mid",
+    "frontier",
+    "prices",
+    "input_per_mtok",
+    "output_per_mtok",
+    "cache_read_per_mtok",
+    "cache_write_per_mtok",
+];
+
 /// A TOML error as `<path>:<line>:<column>: <message>`. Never quotes the source line, which may
-/// hold an API key, and masks the value the error points at.
+/// hold an API key, and masks every quoted part of the message that is not a config name.
 fn toml_error(path: &Path, text: &str, e: &toml::de::Error) -> Failure {
-    let mut message = e.message().trim().replace('\n', "; ");
     let mut place = String::new();
     if let Some(span) = e.span() {
         let before = text.get(..span.start).unwrap_or_default();
@@ -170,19 +192,33 @@ fn toml_error(path: &Path, text: &str, e: &toml::de::Error) -> Failure {
         let line_start = before.rfind('\n').map_or(0, |i| i + 1);
         let column = span.start - line_start + 1;
         place = format!(":{line}:{column}");
-        // The span is in a value when an `=` comes before it on its line. Mask that value
-        // wherever the message repeats it, for example "invalid type: integer `12345`".
-        let line_text = text[line_start..].lines().next().unwrap_or_default();
-        if let Some((_, value)) = line_text.split_once('=')
-            && before[line_start..].contains('=')
-        {
-            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            if !value.is_empty() {
-                message = message.replace(value, "***");
-            }
-        }
     }
+    let message = mask_quoted(e.message().trim()).replace('\n', "; ");
     Failure::usage(format!("{}{place}: {message}", path.display()))
+}
+
+/// Replaces the inside of every `` `...` `` and `"..."` segment with `***`, unless it is a known
+/// config name or only punctuation (as in "expected `\"`"). An unclosed quote masks the rest.
+fn mask_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(open) = rest.find(['`', '"']) {
+        let quote = &rest[open..=open];
+        out.push_str(&rest[..=open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(quote) else {
+            out.push_str("***");
+            return out;
+        };
+        let inner = &after[..close];
+        let safe = CONFIG_NAMES.contains(&inner)
+            || (inner.len() <= 2 && !inner.chars().any(char::is_alphanumeric));
+        out.push_str(if safe { inner } else { "***" });
+        out.push_str(quote);
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A warning when a config file holding API keys is readable by other users.
@@ -224,7 +260,7 @@ fn provider(name: &str, raw: Option<RawProvider>) -> Result<Option<ProviderConfi
 }
 
 fn parse_url(key: &str, url: &str) -> Result<Url, Failure> {
-    Url::parse(url).map_err(|e| Failure::usage(format!("{key}: `{url}`: {e}")))
+    Url::parse(url).map_err(|_| Failure::usage(format!("{key}: not a valid absolute URL")))
 }
 
 /// Debug builds only: `--sandbox-driver fake` swaps the real drivers for the fake one.
@@ -287,7 +323,7 @@ async fn run(
     };
     let listener = TcpListener::bind(&config.listen)
         .await
-        .map_err(|e| Failure::runtime(format!("gateway.listen `{}`: {e}", config.listen)))?;
+        .map_err(|e| Failure::runtime(format!("gateway.listen: cannot listen there: {e}")))?;
     let addr = listener
         .local_addr()
         .map_err(|e| Failure::runtime(e.to_string()))?;
@@ -518,7 +554,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
 
     #[test]
     fn bad_values_name_their_key() {
-        assert!(err(&format!("{ANTHROPIC}[models]\nhuge = \"x\"\n")).contains("models.huge"));
+        let tier = err(&format!("{ANTHROPIC}[models]\nhuge = \"x\"\n"));
+        assert!(
+            tier.contains("models: unknown tier name") && !tier.contains("huge"),
+            "{tier}"
+        );
         assert!(
             err(&format!("{ANTHROPIC}[engine]\nmax_concurrent_runs = 0\n"))
                 .contains("engine.max_concurrent_runs")
@@ -527,7 +567,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
             err("[providers.openai]\napi_key = \"k\"\nbase_url = \"not a url\"\n")
                 .contains("providers.openai.base_url")
         );
-        assert!(err(&format!("{ANTHROPIC}[gatway]\n")).contains("gatway"));
+        let typo = err(&format!("{ANTHROPIC}[gatway]\n"));
+        assert!(
+            typo.contains("`***`") && typo.contains("`gateway`"),
+            "{typo}"
+        );
     }
 
     #[test]
@@ -637,5 +681,23 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let w = permission_warning(&path).expect("warning");
         assert!(w.contains("640") && w.contains("chmod 600"), "{w}");
         assert_eq!(permission_warning(&path.with_extension("gone")), None);
+    }
+
+    #[test]
+    fn mask_quoted_keeps_only_config_names_and_punctuation() {
+        assert_eq!(
+            mask_quoted("unknown field `api_kye`, expected `base_url` or `api_key`"),
+            "unknown field `***`, expected `base_url` or `api_key`"
+        );
+        assert_eq!(
+            mask_quoted("invalid string\nexpected `\"`, `'`"),
+            "invalid string\nexpected `\"`, `'`"
+        );
+        assert_eq!(
+            mask_quoted("invalid type: string \"sk-x\", expected usize"),
+            "invalid type: string \"***\", expected usize"
+        );
+        assert_eq!(mask_quoted("bad `sk-unclosed"), "bad `***");
+        assert_eq!(mask_quoted("no quotes"), "no quotes");
     }
 }
