@@ -667,6 +667,46 @@ budget: { usd: 0.000010, wall_clock: 10m }
         assert_eq!(e.message, "engine broke");
     }
 
+    /// Ctrl-C cancels the shutdown token. The gateway stops at once, and the engine needs a few
+    /// more steps to wind down. That order must be a clean shutdown, not a crashed gateway, and the
+    /// engine must still be driven to the end.
+    #[tokio::test]
+    async fn an_interrupt_that_stops_the_gateway_first_is_a_clean_shutdown() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = CancellationToken::new();
+        let gateway_token = shutdown.clone();
+        let gateway = tokio::spawn(async move {
+            gateway_token.cancelled().await;
+            Ok(())
+        });
+        let engine_token = shutdown.clone();
+        let wound_down = Arc::new(AtomicBool::new(false));
+        let flag = wound_down.clone();
+        let engine = async move {
+            engine_token.cancelled().await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            flag.store(true, Ordering::SeqCst);
+            Ok::<(), String>(())
+        };
+        let interrupt = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            interrupt.cancel();
+        });
+
+        supervise(engine, gateway, shutdown)
+            .await
+            .expect("an interrupt is a clean shutdown");
+        assert!(
+            wound_down.load(Ordering::SeqCst),
+            "the engine must finish winding down"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn only_private_config_files_pass_without_a_warning() {
