@@ -341,7 +341,7 @@ async fn socat_gets_an_inactivity_timeout_and_a_child_limit() {
         s(&[
             "-T",
             "300",
-            "TCP-LISTEN:7070,fork,reuseaddr,max-children=64",
+            "TCP-LISTEN:7070,fork,reuseaddr,max-children=32",
             "TCP:host.docker.internal:7070",
         ])
     );

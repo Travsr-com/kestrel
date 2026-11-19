@@ -81,7 +81,7 @@ fn run(port: u16) -> Vec<String> {
         IMAGE,
         "-T",
         "300",
-        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=64"),
+        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=32"),
         &format!("TCP:host.docker.internal:{port}"),
     ])
 }
