@@ -13,7 +13,7 @@ use kestrel_sandbox::{
 
 fn alpine(argv: &[&str]) -> LaunchSpec {
     LaunchSpec {
-        image: "alpine".to_string(),
+        image: "alpine:3.20".to_string(),
         argv: argv.iter().map(|a| (*a).to_string()).collect(),
         env: BTreeMap::new(),
         workspace: None,

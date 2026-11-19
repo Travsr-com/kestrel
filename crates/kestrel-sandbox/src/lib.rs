@@ -4,7 +4,7 @@
 //! and never spawn a real process.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -43,6 +43,19 @@ pub enum SandboxError {
     /// Happens for example after an engine restart.
     #[error("sandbox `{id}` was not started by this driver, so its exit status is unknown")]
     NotAttached { id: String },
+    /// The image is empty or starts with `-`, so the CLI would read it as a flag.
+    #[error("invalid image `{image}`: must be non-empty and must not start with `-`")]
+    InvalidImage { image: String },
+    /// The workspace path is relative, not UTF-8, or has characters that would change the
+    /// `--mount` options (`,`, `=`, `"` or a newline).
+    #[error(
+        "invalid workspace path `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
+    )]
+    InvalidWorkspace { path: String },
+    /// A container id that is empty, starts with `-`, or has characters outside
+    /// `[A-Za-z0-9_.-]`.
+    #[error("invalid container id `{id}`")]
+    InvalidId { id: String },
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -109,7 +122,8 @@ pub type OutputStream = Pin<Box<dyn Stream<Item = OutputLine> + Send>>;
 pub type ExitFuture = Pin<Box<dyn Future<Output = std::io::Result<i32>> + Send>>;
 
 /// A started process: its output lines, and its exit code once it ends.
-/// `exit` resolves even if `output` is never read.
+/// Keep polling `output` while awaiting `exit`: a full pipe blocks the child, and dropping
+/// `output` early can kill a child that still writes (SIGPIPE), so `exit` reports -1.
 pub struct SpawnedProcess {
     pub output: OutputStream,
     pub exit: ExitFuture,
@@ -132,7 +146,8 @@ pub trait CommandRunner: Send + Sync {
     async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess>;
 }
 
-/// The real runner: spawns host processes.
+/// The real runner: spawns host processes. See [`SpawnedProcess`]: keep reading the output
+/// stream while awaiting the exit, or the child can block on a full pipe or die with -1.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessRunner;
 
@@ -340,13 +355,17 @@ impl Cli {
 
     async fn create(&self, runner: &dyn CommandRunner, spec: &LaunchSpec) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
+        check_image(&spec.image)?;
+        if let Some(ws) = &spec.workspace {
+            check_workspace(ws)?;
+        }
         if let NetworkPolicy::GatewayOnly { .. } = spec.network {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
             self.run(runner, &argv, Some("already exists")).await?;
         }
         let stdout = self.run(runner, &self.create_argv(spec), None).await?;
         Ok(SandboxHandle {
-            id: stdout.trim().to_string(),
+            id: check_id(stdout.trim())?.to_string(),
         })
     }
 
@@ -356,7 +375,7 @@ impl Cli {
         exits: &Exits,
         h: &SandboxHandle,
     ) -> Result<OutputStream> {
-        let argv = self.argv(&["start", "--attach", &h.id]);
+        let argv = self.argv(&["start", "--attach", check_id(&h.id)?]);
         let process = runner
             .spawn(&argv)
             .await
@@ -388,7 +407,8 @@ impl Cli {
             })?;
             return Ok(ExitStatus { code });
         }
-        let stdout = self.run(runner, &self.argv(&["wait", &h.id]), None).await?;
+        let argv = self.argv(&["wait", check_id(&h.id)?]);
+        let stdout = self.run(runner, &argv, None).await?;
         let code = stdout
             .trim()
             .parse()
@@ -401,7 +421,7 @@ impl Cli {
     }
 
     async fn stop(&self, runner: &dyn CommandRunner, h: &SandboxHandle) -> Result<()> {
-        let argv = self.argv(&["stop", &h.id]);
+        let argv = self.argv(&["stop", check_id(&h.id)?]);
         self.run(runner, &argv, Some(self.not_found))
             .await
             .map(drop)
@@ -415,7 +435,7 @@ impl Cli {
     ) -> Result<()> {
         exits.remove(&h.id);
         let rm = if self.apple { "delete" } else { "rm" };
-        let argv = self.argv(&[rm, "--force", &h.id]);
+        let argv = self.argv(&[rm, "--force", check_id(&h.id)?]);
         self.run(runner, &argv, Some(self.not_found))
             .await
             .map(drop)
@@ -447,14 +467,68 @@ impl Exits {
     }
 }
 
-/// Rejects `*_API_KEY` vars with a real-looking value. Empty values and masked
-/// placeholders such as `[SECRET_3]` pass.
+/// Key suffixes (upper-cased) whose values are treated as secrets.
+const SECRET_SUFFIXES: [&str; 5] = [
+    "_API_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_PASSWORD",
+    "AWS_SECRET_ACCESS_KEY",
+];
+
+/// Rejects secret-named env vars (case-insensitive) with a real-looking value. Empty values
+/// and masked placeholders of exactly the form `[SECRET_<digits>]` pass.
 fn check_secrets(env: &BTreeMap<String, String>) -> Result<()> {
-    let real = |v: &str| !v.is_empty() && !(v.starts_with('[') && v.ends_with(']'));
-    match env.iter().find(|(k, v)| k.ends_with("_API_KEY") && real(v)) {
+    let secret_key = |k: &str| {
+        let k = k.to_ascii_uppercase();
+        SECRET_SUFFIXES.iter().any(|s| k.ends_with(s))
+    };
+    let placeholder = |v: &str| {
+        v.strip_prefix("[SECRET_")
+            .and_then(|r| r.strip_suffix(']'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    match env
+        .iter()
+        .find(|(k, v)| secret_key(k) && !v.is_empty() && !placeholder(v))
+    {
         Some((key, _)) => Err(SandboxError::SecretInEnv { key: key.clone() }),
         None => Ok(()),
     }
+}
+
+fn check_image(image: &str) -> Result<()> {
+    if image.is_empty() || image.starts_with('-') {
+        return Err(SandboxError::InvalidImage {
+            image: image.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn check_workspace(path: &Path) -> Result<()> {
+    let ok = path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|p| !p.contains([',', '=', '"', '\n', '\r']));
+    if ok {
+        return Ok(());
+    }
+    Err(SandboxError::InvalidWorkspace {
+        path: path.display().to_string(),
+    })
+}
+
+fn check_id(id: &str) -> Result<&str> {
+    let ok = !id.is_empty()
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if ok {
+        return Ok(id);
+    }
+    Err(SandboxError::InvalidId { id: id.to_string() })
 }
 
 macro_rules! cli_driver {
@@ -502,6 +576,10 @@ pub struct GvisorDriver {
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
+///
+/// `wait` reports the exit of the `start --attach` process, so keep polling the stream from
+/// `start` while waiting: a full pipe blocks the container, and dropping the stream early can
+/// make the exit report -1.
 pub struct AppleContainerDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,

@@ -70,5 +70,5 @@ jobs:
           sudo runsc install
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | grep -q runsc
-      - run: docker pull alpine
+      - run: docker pull alpine:3.20
       - run: cargo test -p kestrel-sandbox --features integration
