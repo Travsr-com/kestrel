@@ -24,4 +24,5 @@ tokio-stream.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+tower.workspace = true
 wiremock.workspace = true

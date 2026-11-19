@@ -42,15 +42,15 @@ async fn fractional_micro_dollar_cost_rounds_up() {
     assert_eq!(recs[0].cost, Some(MicroUsd(1)));
 }
 
-/// A request body that is not JSON is still forwarded unchanged; the record has an empty
-/// model, which is not in the price table, so `cost` is `None`.
+/// A request body that is not JSON is still forwarded unchanged. The record takes the model
+/// from the response, which here is not in the price table, so `cost` is `None`.
 #[tokio::test]
 async fn non_json_request_is_forwarded_and_unpriced() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
-            anthropic_response(CLAUDE_MODEL, 3, 4, 0, 0).into_bytes(),
+            anthropic_response(UNPRICED_MODEL, 3, 4, 0, 0).into_bytes(),
             "application/json",
         ))
         .mount(&upstream)
@@ -70,7 +70,7 @@ async fn non_json_request_is_forwarded_and_unpriced() {
     let reqs = upstream.received_requests().await.unwrap();
     assert_eq!(reqs[0].body, b"not json");
     let recs = h.sink.wait_for(1).await;
-    assert_eq!(recs[0].model, "");
+    assert_eq!(recs[0].model, UNPRICED_MODEL);
     assert_eq!((recs[0].tokens_in, recs[0].tokens_out), (3, 4));
     assert_eq!(recs[0].cost, None);
 }
