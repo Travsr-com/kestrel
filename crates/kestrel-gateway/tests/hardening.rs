@@ -321,3 +321,33 @@ async fn oversized_body_is_413_in_provider_format() {
         assert!(sink.records().is_empty());
     }
 }
+
+/// The provider answers with a dated snapshot of a priced model: it is priced via the
+/// longest matching price-table prefix, and the record keeps the snapshot name.
+#[tokio::test]
+async fn dated_snapshot_model_priced_by_prefix() {
+    let upstream = MockServer::start().await;
+    let snapshot = format!("{OPENAI_MODEL}-2024-07-18");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            openai_response(&snapshot, 2_000_000, 1_000_000, 1_000_000).into_bytes(),
+            "application/json",
+        ))
+        .mount(&upstream)
+        .await;
+    let h = start(&upstream.uri(), &upstream.uri(), true).await;
+
+    let resp = h
+        .client
+        .post(h.openai_url(RUN_TOKEN))
+        .body(openai_request(OPENAI_MODEL, false))
+        .send()
+        .await
+        .unwrap();
+    let _ = resp.bytes().await.unwrap();
+
+    let recs = h.sink.wait_for(1).await;
+    assert_eq!(recs[0].model, snapshot);
+    assert_eq!(recs[0].cost, Some(MicroUsd(825_000)));
+}

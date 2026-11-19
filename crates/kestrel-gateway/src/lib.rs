@@ -250,7 +250,7 @@ impl Call {
         let model = response_model.unwrap_or(self.model);
         let usage_or_zero = usage.unwrap_or_default();
         let cost = match usage {
-            Some(u) => self.state.cfg.prices.get(&model).and_then(|p| cost(&u, p)),
+            Some(u) => price_for(&self.state.cfg.prices, &model).and_then(|p| cost(&u, p)),
             None => Some(MicroUsd(0)),
         };
         let rec = ModelCallRecord {
@@ -509,6 +509,24 @@ impl UsageParser {
     }
 }
 
+/// Price for `model`: the exact table entry, or else the longest table key that is a prefix
+/// of `model` followed by `-`, so a dated snapshot such as `gpt-4o-mini-2024-07-18` prices
+/// as `gpt-4o-mini` (and not as a shorter `gpt-4o`). Safe because the model name comes from
+/// the provider's response, not the client.
+fn price_for<'a>(prices: &'a HashMap<String, ModelPrice>, model: &str) -> Option<&'a ModelPrice> {
+    prices.get(model).or_else(|| {
+        prices
+            .iter()
+            .filter(|(key, _)| {
+                model
+                    .strip_prefix(key.as_str())
+                    .is_some_and(|rest| rest.starts_with('-'))
+            })
+            .max_by_key(|(key, _)| key.len())
+            .map(|(_, price)| price)
+    })
+}
+
 /// Cost of `u` at price `p`, rounding any fractional micro-dollar up so budgets never
 /// under-count. `None` only if the result does not fit in `MicroUsd`.
 fn cost(u: &Usage, p: &ModelPrice) -> Option<MicroUsd> {
@@ -549,6 +567,45 @@ mod tests {
             cache_read,
             cache_write,
         }
+    }
+
+    fn table(entries: &[(&str, i64)]) -> HashMap<String, ModelPrice> {
+        entries
+            .iter()
+            .map(|(name, input)| (name.to_string(), price(*input, 0, 0, 0)))
+            .collect()
+    }
+
+    #[test]
+    fn price_for_dated_snapshot_uses_prefix_entry() {
+        let t = table(&[("gpt-4o-mini", 150_000)]);
+        assert_eq!(
+            price_for(&t, "gpt-4o-mini-2024-07-18"),
+            Some(&price(150_000, 0, 0, 0))
+        );
+        assert_eq!(price_for(&t, "gpt-4o-mini"), Some(&price(150_000, 0, 0, 0)));
+    }
+
+    #[test]
+    fn price_for_longest_prefix_wins() {
+        let t = table(&[("gpt-4o", 2_500_000), ("gpt-4o-mini", 150_000)]);
+        assert_eq!(
+            price_for(&t, "gpt-4o-mini-2024-07-18"),
+            Some(&price(150_000, 0, 0, 0))
+        );
+        assert_eq!(
+            price_for(&t, "gpt-4o-2024-08-06"),
+            Some(&price(2_500_000, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn price_for_unrelated_or_non_dash_names_is_none() {
+        let t = table(&[("gpt-4o", 2_500_000), ("claude-sonnet-4-5", 3_000_000)]);
+        assert_eq!(price_for(&t, "llama-3-70b"), None);
+        // A prefix must be followed by `-`: `gpt-4oz` is not a snapshot of `gpt-4o`.
+        assert_eq!(price_for(&t, "gpt-4oz"), None);
+        assert_eq!(price_for(&t, ""), None);
     }
 
     #[test]
