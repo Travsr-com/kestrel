@@ -40,12 +40,22 @@ pub trait MeterSink: Send + Sync {
 }
 
 /// One upstream provider: where to send requests and which key to use.
-#[derive(Debug, Clone)]
+/// `Debug` prints the key as `***`, so it never lands in a log.
+#[derive(Clone)]
 pub struct ProviderConfig {
     /// Origin of the provider API, without the `/v1/...` path, e.g. `https://api.anthropic.com`.
     pub base_url: Url,
     /// The provider API key. Any key the client sends is dropped in favour of this one.
     pub api_key: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url.as_str())
+            .field("api_key", &"***")
+            .finish()
+    }
 }
 
 /// Prices for one model, in `MicroUsd` per million tokens.

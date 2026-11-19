@@ -83,3 +83,21 @@ fn s9_run_id_is_uuid_v7() {
     let id = RunId::new().to_string();
     assert_eq!(id.as_bytes()[14], b'7', "{id}");
 }
+
+#[test]
+fn parse_decimal_is_exact_and_rejects_everything_else() {
+    assert_eq!(MicroUsd::parse_decimal("5"), Some(MicroUsd(5_000_000)));
+    assert_eq!(MicroUsd::parse_decimal("2.50"), Some(MicroUsd(2_500_000)));
+    assert_eq!(MicroUsd::parse_decimal("0.000001"), Some(MicroUsd(1)));
+    for bad in [
+        "",
+        "-1",
+        "abc",
+        "1e3",
+        "0.0000001",
+        "+1",
+        "99999999999999999999",
+    ] {
+        assert_eq!(MicroUsd::parse_decimal(bad), None, "{bad:?}");
+    }
+}

@@ -624,6 +624,61 @@ pub struct HostInfo {
     pub apple_container: bool,
 }
 
+impl HostInfo {
+    /// Probes this host: its OS and CPU, the runtimes registered with docker, and whether the
+    /// Apple `container` CLI is installed. Runs real commands via [`ProcessRunner`].
+    pub async fn current() -> HostInfo {
+        Self::probe(&ProcessRunner, std::env::consts::OS, std::env::consts::ARCH).await
+    }
+
+    /// Like [`HostInfo::current`], with commands run through `runner` and `os` and `arch`
+    /// spelled as in [`std::env::consts`]. A command that fails counts as "not installed".
+    pub async fn probe(runner: &dyn CommandRunner, os: &str, arch: &str) -> HostInfo {
+        let ok = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            async move {
+                match runner.run(&argv).await {
+                    Ok(out) if out.status == 0 => Some(out.stdout),
+                    _ => None,
+                }
+            }
+        };
+        let os = match os {
+            "linux" => Os::Linux,
+            "macos" => {
+                let version = ok(&["sw_vers", "-productVersion"])
+                    .await
+                    .unwrap_or_default();
+                let major = version.trim().split('.').next().unwrap_or_default();
+                Os::MacOs {
+                    major: major.parse().unwrap_or(0),
+                }
+            }
+            "windows" => Os::Windows,
+            _ => Os::Other,
+        };
+        let arch = match arch {
+            "x86_64" => Arch::X86_64,
+            "aarch64" => Arch::Aarch64,
+            _ => Arch::Other,
+        };
+        let runtimes = ok(&[
+            "docker",
+            "info",
+            "--format",
+            "{{range $name, $_ := .Runtimes}}{{$name}} {{end}}",
+        ])
+        .await
+        .unwrap_or_default();
+        HostInfo {
+            os,
+            arch,
+            docker_runtimes: runtimes.split_whitespace().map(String::from).collect(),
+            apple_container: ok(&["container", "--version"]).await.is_some(),
+        }
+    }
+}
+
 const INSTALL: &str = "Linux: install gVisor and register `runsc` with docker \
 (https://gvisor.dev/docs/user_guide/install/). macOS 26+ on Apple Silicon: install Apple \
 `container` (https://github.com/apple/container). To accept weak isolation for trusted \
