@@ -1000,4 +1000,90 @@ budget: { usd: 0.000010, wall_clock: 10m }
         assert!(check_bridge_listen(true, open).is_ok());
         assert!(check_bridge_listen(false, open).is_ok());
     }
+
+    fn run_in(store: &Store) -> RunId {
+        let spec = AgentSpec::from_yaml(YAML).expect("spec");
+        store.create_run(&spec, "x").expect("create")
+    }
+
+    fn model_calls(store: &Store, run: RunId) -> Vec<(u64, ModelCallRecord)> {
+        store
+            .events_since(run, 0)
+            .expect("events")
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                kestrel_types::EventKind::ModelCall(rec) => Some((e.seq, rec)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn metering_a_call_adds_spend_and_one_model_call_event() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let run = run_in(&store);
+        let deps = StoreDeps(store.clone());
+        let first = call(run, 3);
+        let second = call(run, 4);
+        deps.record(first.clone()).await;
+        deps.record(second.clone()).await;
+        assert_eq!(store.spent(run).expect("spent"), MicroUsd(7));
+        let seen = model_calls(&store, run);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].1, first);
+        assert_eq!(seen[1].1, second);
+        assert_eq!(seen[1].0, seen[0].0 + 1, "consecutive seqs");
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_call_is_an_event_but_costs_nothing() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let run = run_in(&store);
+        let mut rec = call(run, 0);
+        rec.cost = None;
+        StoreDeps(store.clone()).record(rec.clone()).await;
+        assert_eq!(store.spent(run).expect("spent"), MicroUsd(0));
+        let seen = model_calls(&store, run);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, rec);
+    }
+
+    #[tokio::test]
+    async fn a_call_for_an_unknown_run_appends_nothing_and_does_not_panic() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let known = run_in(&store);
+        StoreDeps(store.clone()).record(call(RunId::new(), 5)).await;
+        assert!(model_calls(&store, known).is_empty());
+        assert_eq!(store.spent(known).expect("spent"), MicroUsd(0));
+    }
+
+    #[tokio::test]
+    async fn metering_keeps_event_seqs_gapless_next_to_another_writer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("kestrel.db");
+        let gateway_side = Arc::new(Store::open(&path).expect("store"));
+        let engine_side = Store::open(&path).expect("store");
+        let run = run_in(&gateway_side);
+        let deps = StoreDeps(gateway_side.clone());
+        for n in 0..5 {
+            deps.record(call(run, 1)).await;
+            engine_side
+                .append(
+                    run,
+                    kestrel_types::EventKind::AgentLog {
+                        line: format!("log {n}"),
+                    },
+                )
+                .expect("append");
+        }
+        let seqs: Vec<u64> = gateway_side
+            .events_since(run, 0)
+            .expect("events")
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        let expected: Vec<u64> = (seqs[0]..seqs[0] + 10).collect();
+        assert_eq!(seqs, expected, "no gaps, no duplicates");
+        assert_eq!(model_calls(&gateway_side, run).len(), 5);
+    }
 }
