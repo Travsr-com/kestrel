@@ -306,7 +306,15 @@ async fn s4_after_a_restart_suspended_runs_hold_no_slot_and_commands_respect_the
     until_capped("r2 resumed", &h, &all, 1, || h.is(r2, &Running)).await;
     assert!(h.is(r3, &Suspended(SuspendReason::Approval(aid))));
     finish(s2);
-    until_capped("r3 resumed", &h, &[q, r1, r2, r3], 1, || h.is(r3, &Running)).await;
+    // r3 is left out of the capped wait: until it resumes it is `Suspended(Approval)`, which the
+    // status-based `holds_slot` counts as holding, although after the restart its sandbox is gone
+    // and it holds nothing (see the comment above). Once it is running it must hold the only slot.
+    until_capped("r3 resumed", &h, &all, 1, || h.is(r3, &Running)).await;
+    assert_eq!(
+        held(&h, &[q, r1, r2, r3]),
+        1,
+        "once r3 runs, it holds the only slot"
+    );
     finish(s3);
     until("all completed", || {
         all.iter().all(|id| h.is(*id, &Completed))
