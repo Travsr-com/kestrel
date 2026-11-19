@@ -70,6 +70,8 @@ pub enum EventKind {
 pub struct Event {
     pub run_id: RunId,
     pub seq: u64,
+    /// Stored and sent as an RFC 3339 string, e.g. `2026-11-19T06:33:10.548Z`.
+    #[serde(with = "time::serde::rfc3339")]
     pub ts: OffsetDateTime,
     pub kind: EventKind,
 }
