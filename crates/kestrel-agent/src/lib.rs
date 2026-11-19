@@ -17,7 +17,7 @@ pub use opencode::OpenCodeAdapter;
 
 /// Value given to the runtime as its API key. The gateway holds the real provider key, so the sandbox
 /// never sees one.
-pub const API_KEY_PLACEHOLDER: &str = "kestrel-gateway-placeholder";
+pub const API_KEY_PLACEHOLDER: &str = kestrel_types::GATEWAY_KEY_PLACEHOLDER;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {

@@ -26,3 +26,29 @@ async fn a_real_looking_provider_key_is_still_refused() {
         assert!(runner.all_calls().is_empty());
     }
 }
+
+#[tokio::test]
+async fn the_gateway_placeholder_passes_but_only_exactly() {
+    let ok = kestrel_types::GATEWAY_KEY_PLACEHOLDER;
+    let near_misses = [
+        format!("{ok}x"),
+        format!("x{ok}"),
+        format!(" {ok}"),
+        format!("{ok} "),
+        ok.to_uppercase(),
+        ok[..ok.len() - 1].to_string(),
+        format!("{ok}{ok}"),
+    ];
+    for key in ["ANTHROPIC_API_KEY", "openai_api_key", "GH_TOKEN"] {
+        let driver = GvisorDriver::new(FakeRunner::ok());
+        let mut launch = spec();
+        launch.env.insert(key.into(), ok.into());
+        driver.create(&launch).await.expect("exact placeholder");
+        for bad in &near_misses {
+            let mut launch = spec();
+            launch.env.insert(key.into(), bad.clone());
+            let err = driver.create(&launch).await.expect_err(bad);
+            assert!(matches!(err, SandboxError::SecretInEnv { .. }), "{bad}");
+        }
+    }
+}
