@@ -331,6 +331,16 @@ fn parse_fixed(s: &str, places: u32) -> Option<u64> {
     whole.checked_mul(scale)?.checked_add(frac_val)
 }
 
+impl MicroUsd {
+    /// Parses a non-negative dollar amount like `2.50` exactly. `None` for anything else: a sign,
+    /// an exponent, more than 6 decimal places, or an amount too large to hold.
+    pub fn parse_decimal(s: &str) -> Option<MicroUsd> {
+        parse_fixed(s, 6)
+            .and_then(|v| i64::try_from(v).ok())
+            .map(MicroUsd)
+    }
+}
+
 fn parse_usd(s: &str) -> Result<MicroUsd, SpecError> {
     if s.starts_with('-') {
         return Err(invalid(
@@ -338,15 +348,12 @@ fn parse_usd(s: &str) -> Result<MicroUsd, SpecError> {
             format_args!("`{s}` must not be negative"),
         ));
     }
-    parse_fixed(s, 6)
-        .and_then(|v| i64::try_from(v).ok())
-        .map(MicroUsd)
-        .ok_or_else(|| {
-            invalid(
-                "budget.usd",
-                format_args!("`{s}` is not a dollar amount with at most 6 decimal places"),
-            )
-        })
+    MicroUsd::parse_decimal(s).ok_or_else(|| {
+        invalid(
+            "budget.usd",
+            format_args!("`{s}` is not a dollar amount with at most 6 decimal places"),
+        )
+    })
 }
 
 /// `2` is two cores, `500m` is half a core.
