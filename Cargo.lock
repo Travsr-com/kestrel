@@ -826,6 +826,7 @@ dependencies = [
  "kestrel-sandbox",
  "kestrel-store",
  "kestrel-types",
+ "rusqlite",
  "tempfile",
  "thiserror",
  "tokio",
