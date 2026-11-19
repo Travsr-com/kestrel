@@ -14,11 +14,9 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
 url.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
 
 [features]
 # Tests that need a real sandbox runtime (gVisor). Run with `--features integration`.
