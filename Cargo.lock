@@ -1001,6 +1001,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kestrel-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "kestrel-gateway"
 version = "0.1.0"
 dependencies = [

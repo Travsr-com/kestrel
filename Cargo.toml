@@ -8,6 +8,7 @@ members = [
     "crates/kestrel-gateway",
     "crates/kestrel-agent",
     "crates/kestrel-cli",
+    "tests/e2e",
 ]
 
 [workspace.package]
