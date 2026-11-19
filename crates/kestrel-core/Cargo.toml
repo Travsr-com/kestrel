@@ -28,3 +28,4 @@ async-trait.workspace = true
 futures.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
+uuid.workspace = true

@@ -8,7 +8,11 @@
 //! Each active run has its own task (a run actor). It is the only writer of that run's status, so
 //! control commands are applied while the run is busy, for example while `create` is still blocked.
 
+pub mod workspace;
+pub use workspace::{WorkspaceError, Workspaces};
+
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +22,7 @@ use kestrel_sandbox::{LaunchSpec, NetworkPolicy, SandboxDriver, SandboxHandle};
 use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
 use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
-    SuspendReason, Tier,
+    SuspendReason, Tier, WorkspaceSpec,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -38,6 +42,12 @@ pub enum EngineError {
     /// No configured sandbox driver matches the agent's sandbox tier.
     #[error("no sandbox driver available for this agent")]
     NoDriver,
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    /// A `git-worktree` repo path that is relative. The engine does not guess a base dir; the
+    /// CLI resolves the path when it submits the run.
+    #[error("git-worktree repo `{}` must be an absolute path", repo.display())]
+    RelativeRepo { repo: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -111,7 +121,6 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// * A run holds its concurrency slot while it is suspended (its sandbox still exists). A command
 ///   for a suspended run that no actor holds (after a restart) starts one even past the cap.
 /// * The wall clock counts only time spent `Provisioning` or `Running`, not time suspended.
-/// * Workspaces are not prepared yet: the sandbox gets no `/workspace` mount.
 pub struct Engine {
     inner: Arc<Inner>,
 }
@@ -123,6 +132,8 @@ struct Inner {
     gateway_url: Url,
     limits: Limits,
     models: ModelMap,
+    /// Per-run workspaces, when configured with [`Engine::with_workspaces`].
+    workspaces: Option<Arc<Workspaces>>,
 }
 
 /// Control channels of the run actors, by run.
@@ -165,8 +176,24 @@ impl Engine {
                 gateway_url,
                 limits,
                 models,
+                workspaces: None,
             }),
         }
+    }
+
+    /// Gives every run a workspace from `workspaces`, mounted at `/workspace` in its sandbox
+    /// (`LaunchSpec.workspace`). The workspace is prepared before the sandbox is created; a run
+    /// whose workspace cannot be prepared fails without a sandbox. A `git-worktree` repo path
+    /// must be absolute (the CLI resolves it at submit time); a relative one fails the run.
+    ///
+    /// Without this, runs get no workspace (`LaunchSpec.workspace` is `None`), as before.
+    /// Call it on a new engine, before `start` or `recover`: once the engine has handed out
+    /// its state to running tasks, the workspaces are not applied.
+    pub fn with_workspaces(mut self, workspaces: Workspaces) -> Engine {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.workspaces = Some(Arc::new(workspaces));
+        }
+        self
     }
 
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
@@ -496,7 +523,8 @@ impl Actor {
             .driver_for(self.spec.sandbox.tier)
             .ok_or(EngineError::NoDriver)?;
         let driver = &inner.drivers[idx];
-        let launch = self.launch_spec()?;
+        let mut launch = self.launch_spec()?;
+        launch.workspace = self.workspace().await?;
         let mut create = driver.create(&launch);
         let created = loop {
             let deadline = self.clock.deadline();
@@ -526,6 +554,21 @@ impl Actor {
             },
         )?;
         Ok(Some(sb))
+    }
+
+    /// Prepares this run's workspace, if the engine has workspaces. Reuses an existing one, so
+    /// a resumed run gets the same directory back.
+    async fn workspace(&self) -> Result<Option<PathBuf>> {
+        let Some(workspaces) = &self.inner.workspaces else {
+            return Ok(None);
+        };
+        let spec = &self.spec.sandbox.workspace;
+        if let WorkspaceSpec::GitWorktree { repo } = spec
+            && !repo.is_absolute()
+        {
+            return Err(EngineError::RelativeRepo { repo: repo.clone() });
+        }
+        Ok(Some(workspaces.prepare(self.id, spec).await?))
     }
 
     fn launch_spec(&self) -> Result<LaunchSpec> {
