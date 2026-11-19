@@ -7,13 +7,16 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use kestrel_types::{
     AgentSpec, ApprovalId, Event, EventKind, MicroUsd, ModelCallRecord, RunId, RunStatus,
 };
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -137,8 +140,7 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         check_version(&conn)?;
         if wal {
-            // Returns the resulting mode as a row, so it is read rather than executed.
-            conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+            enable_wal(&conn)?;
         }
         migrate(&mut conn)?;
         Ok(Store {
@@ -255,6 +257,7 @@ impl Store {
     pub fn append(&self, run: RunId, kind: EventKind) -> Result<Event> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_run(&tx, run)?;
         let event = insert_event(&tx, run, kind)?;
         tx.commit()?;
         Ok(event)
@@ -303,12 +306,16 @@ impl Store {
     // control channel (CLI -> engine)
 
     pub fn push_control(&self, run: RunId, cmd: ControlCommand) -> Result<i64> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_run(&tx, run)?;
+        tx.execute(
             "INSERT INTO control (run_id, cmd) VALUES (?1, ?2)",
             params![run.to_string(), serde_json::to_string(&cmd)?],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Claims every unclaimed command. Each command is returned by exactly one call, even with
@@ -350,6 +357,52 @@ fn check_version(conn: &Connection) -> Result<i64> {
         });
     }
     Ok(found)
+}
+
+/// Switches a file to WAL. SQLite does not call the busy handler for this switch, so when several
+/// processes open a brand-new file at once it can fail with `SQLITE_BUSY` straight away. Retry
+/// with a short backoff, bounded by [`BUSY_TIMEOUT`].
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match switch_to_wal(conn) {
+            Err(e) if is_busy(&e) && Instant::now() < deadline => {
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
+/// Reads the mode first: an already-WAL file (every open after the first) needs no lock.
+fn switch_to_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        // Returns the resulting mode as a row, so it is read rather than executed.
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+    }
+    Ok(())
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Fails with [`StoreError::NotFound`] unless `run` exists, so no orphan rows are written.
+fn ensure_run(tx: &Transaction<'_>, run: RunId) -> Result<()> {
+    let found = tx
+        .query_row(
+            "SELECT 1 FROM runs WHERE id = ?1",
+            [run.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?;
+    found.ok_or(StoreError::NotFound(run))
 }
 
 /// Brings the schema up to [`SCHEMA_VERSION`]. A no-op when it is already there.
@@ -475,6 +528,38 @@ mod tests {
             Err(StoreError::NotFound(r)) => assert_eq!(r, id),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn writes_to_unknown_run_are_not_found_and_write_nothing() {
+        let store = Store::open_in_memory().expect("open");
+        let ghost = RunId::new();
+        let msg = EventKind::AgentMessage { text: "x".into() };
+        match store.append(ghost, msg) {
+            Err(StoreError::NotFound(r)) => assert_eq!(r, ghost),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match store.push_control(ghost, ControlCommand::Cancel) {
+            Err(StoreError::NotFound(r)) => assert_eq!(r, ghost),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        let count = |table: &str| -> i64 {
+            store
+                .conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count("events"), 0);
+        assert_eq!(count("control"), 0);
+    }
+
+    #[test]
+    fn busy_and_locked_are_retryable_other_errors_are_not() {
+        let err = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        assert!(is_busy(&err(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(is_busy(&err(rusqlite::ffi::SQLITE_LOCKED)));
+        assert!(!is_busy(&err(rusqlite::ffi::SQLITE_CORRUPT)));
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
     }
 
     #[test]
