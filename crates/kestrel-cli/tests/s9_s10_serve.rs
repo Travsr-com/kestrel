@@ -187,10 +187,40 @@ fn start_serve(f: &Fixture) -> ChildGuard {
 }
 
 /// Submits a run from a separate `kestrel run` process.
+/// Makes the fixture dir a git repo with one commit, so a `git-worktree` agent submitted from it
+/// gets its worktree from this throwaway repo instead of the repo the tests run in.
+fn init_fixture_repo(f: &Fixture) {
+    let dir = f.dir.path();
+    if dir.join(".git").exists() {
+        return;
+    }
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=kestrel-test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("README.txt"), "fixture repo\n").expect("write README");
+    git(&["add", "README.txt"]);
+    git(&["commit", "-q", "-m", "fixture"]);
+}
+
 fn submit(f: &Fixture) -> RunId {
+    init_fixture_repo(f);
     let good = f.good_agent();
     let out = f
         .kestrel()
+        .current_dir(f.dir.path())
         .args(["run", path_str(&good), "--input", "say hi"])
         .timeout(DEADLINE)
         .assert()
