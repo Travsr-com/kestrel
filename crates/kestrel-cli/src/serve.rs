@@ -1,7 +1,7 @@
 //! `kestrel serve`: the engine and the LLM gateway in one process, until SIGINT.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -84,6 +84,12 @@ struct RawPrice {
 #[derive(Debug)]
 struct Config {
     listen: String,
+    /// True when the config file sets `gateway.listen`; an explicit value is always respected.
+    #[allow(dead_code)] // skeleton (#29)
+    listen_explicit: bool,
+    /// `gateway.port`: the port of the default bind (the docker bridge IP). Default 7070.
+    #[allow(dead_code)] // skeleton (#29)
+    port: Option<u16>,
     /// Where sandboxes reach the gateway, when the operator sets it.
     advertise_url: Option<Url>,
     limits: Limits,
@@ -154,6 +160,8 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     let advertise_url = raw.gateway.advertise_url.map(advertise_url).transpose()?;
     Ok(Config {
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
+        listen_explicit: false, // skeleton (#29)
+        port: None,             // skeleton (#29)
         advertise_url,
         limits: Limits {
             max_concurrent_runs: max,
@@ -303,13 +311,80 @@ fn uses_docker(drivers: &[Box<dyn SandboxDriver>]) -> bool {
 
 /// The bridge reaches the gateway through the host, so a loopback-only gateway would refuse it
 /// and every sandbox model call would fail. `bridge` is true when serve would start the bridge.
-fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<(), Failure> {
+///
+/// `Ok(Some(warning))` for a bind that exposes the gateway beyond the docker bridge (`0.0.0.0`,
+/// `::`); `Ok(None)` when there is nothing to say.
+#[allow(clippy::unnecessary_wraps)] // skeleton (#29)
+fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<Option<String>, Failure> {
     if bridge && addr.ip().is_loopback() {
         return Err(Failure::usage(format!(
             "gateway.listen is {addr}, but sandboxes reach the gateway through a container, which a loopback address refuses. Bind a non-loopback address such as 0.0.0.0:7070 (or the docker bridge IP), or set gateway.advertise_url"
         )));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Port of the default gateway bind.
+const DEFAULT_PORT: u16 = 7070;
+
+/// Where the gateway binds. An explicit `gateway.listen` is returned unchanged. Otherwise, with
+/// `bridge_ip` (the docker bridge gateway IP), `<bridge_ip>:<port>`; without it,
+/// `127.0.0.1:<port>`. `port` is `gateway.port`, default 7070.
+#[allow(dead_code)] // skeleton (#29)
+fn gateway_bind(listen: Option<&str>, port: Option<u16>, bridge_ip: Option<Ipv4Addr>) -> String {
+    let _ = (listen, port, bridge_ip, DEFAULT_PORT);
+    todo!("#29")
+}
+
+/// The one IPv4 address `docker network inspect bridge --format {{(index .IPAM.Config 0).Gateway}}`
+/// prints (surrounding whitespace allowed). Anything else is a runtime failure.
+#[allow(dead_code)] // skeleton (#29)
+fn parse_bridge_ip(stdout: &str) -> Result<Ipv4Addr, Failure> {
+    let _ = stdout;
+    todo!("#29")
+}
+
+/// Asks docker for the bridge network's gateway IP, through `runner`. A non-zero exit or an I/O
+/// error is a runtime failure that names `docker network inspect bridge` and `gateway.listen`.
+#[allow(dead_code)] // skeleton (#29)
+async fn discover_bridge_ip(runner: &dyn CommandRunner) -> Result<Ipv4Addr, Failure> {
+    let _ = runner;
+    todo!("#29")
+}
+
+/// The gateway bind string. Runs docker (once) only when `bridge` is true and `listen` is not
+/// set explicitly; otherwise it never touches `runner`.
+#[allow(dead_code)] // skeleton (#29)
+async fn resolve_listen(
+    runner: &dyn CommandRunner,
+    listen: Option<&str>,
+    port: Option<u16>,
+    bridge: bool,
+) -> Result<String, Failure> {
+    let _ = (runner, listen, port, bridge);
+    todo!("#29")
+}
+
+/// The lock file of `db`: the database file name plus `.serve.lock`, in the same directory.
+#[allow(dead_code)] // skeleton (#29)
+fn serve_lock_path(db: &Path) -> PathBuf {
+    let _ = db;
+    todo!("#29")
+}
+
+/// Holds the exclusive lock of one `kestrel serve` per database until dropped (or the process
+/// dies). Taken with `std::fs::File::try_lock`, so no `unsafe` is needed.
+#[allow(dead_code)] // skeleton (#29)
+struct ServeLock {
+    _file: std::fs::File,
+}
+
+/// Creates `serve_lock_path(db)` if needed and takes the exclusive lock. A second holder gets a
+/// runtime failure (exit 1) whose message names the lock file.
+#[allow(dead_code)] // skeleton (#29)
+fn acquire_serve_lock(db: &Path) -> Result<ServeLock, Failure> {
+    let _ = db;
+    todo!("#29")
 }
 
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
@@ -998,18 +1073,292 @@ budget: { usd: 0.000010, wall_clock: 10m }
     fn a_loopback_gateway_with_a_bridge_is_a_config_error() {
         let loopback: SocketAddr = "127.0.0.1:7070".parse().expect("addr");
         let v6_loopback: SocketAddr = "[::1]:7070".parse().expect("addr");
-        let open: SocketAddr = "0.0.0.0:7070".parse().expect("addr");
         for addr in [loopback, v6_loopback] {
             let e = check_bridge_listen(true, addr).expect_err("loopback with a bridge");
             assert_eq!(e.code, crate::EXIT_USAGE);
-            for needle in ["gateway.listen", "0.0.0.0:7070", "gateway.advertise_url"] {
+            for needle in ["gateway.listen", "docker bridge", "gateway.advertise_url"] {
                 assert!(e.message.contains(needle), "{}", e.message);
             }
+            assert!(
+                !e.message.contains("0.0.0.0:7070"),
+                "no longer advises 0.0.0.0: {}",
+                e.message
+            );
             // No bridge (advertise_url set, or a driver that needs none): loopback is fine.
-            assert!(check_bridge_listen(false, addr).is_ok());
+            assert_eq!(check_bridge_listen(false, addr).expect("ok"), None);
         }
-        assert!(check_bridge_listen(true, open).is_ok());
-        assert!(check_bridge_listen(false, open).is_ok());
+    }
+
+    #[test]
+    fn an_all_interfaces_gateway_with_a_bridge_is_a_warning_about_the_lan() {
+        for text in ["0.0.0.0:7070", "[::]:7070"] {
+            let addr: SocketAddr = text.parse().expect("addr");
+            let warning = check_bridge_listen(true, addr)
+                .expect("a warning is not an error")
+                .expect("a warning");
+            assert!(warning.contains(text), "{warning}");
+            assert!(warning.contains("LAN"), "{warning}");
+            assert!(warning.contains("gateway.listen"), "{warning}");
+            // Without a bridge the existing generic warning in `run` is enough.
+            assert_eq!(check_bridge_listen(false, addr).expect("ok"), None);
+        }
+    }
+
+    #[test]
+    fn the_docker_bridge_ip_or_another_specific_address_is_silent() {
+        for text in ["172.17.0.1:7070", "192.168.1.5:9000", "10.0.0.2:7070"] {
+            let addr: SocketAddr = text.parse().expect("addr");
+            assert_eq!(check_bridge_listen(true, addr).expect("ok"), None, "{text}");
+            assert_eq!(
+                check_bridge_listen(false, addr).expect("ok"),
+                None,
+                "{text}"
+            );
+        }
+    }
+
+    fn ip(text: &str) -> Ipv4Addr {
+        text.parse().expect("ip")
+    }
+
+    #[test]
+    fn the_bind_decision_table() {
+        let bridge = Some(ip("172.17.0.1"));
+        // An explicit listen is respected as written, whatever else is set.
+        assert_eq!(
+            gateway_bind(Some("0.0.0.0:9000"), Some(1234), bridge),
+            "0.0.0.0:9000"
+        );
+        assert_eq!(
+            gateway_bind(Some("127.0.0.1:0"), None, bridge),
+            "127.0.0.1:0"
+        );
+        assert_eq!(gateway_bind(Some("10.1.2.3:80"), None, None), "10.1.2.3:80");
+        // Not explicit, bridge IP known: bind the docker bridge, port 7070 or gateway.port.
+        assert_eq!(gateway_bind(None, None, bridge), "172.17.0.1:7070");
+        assert_eq!(gateway_bind(None, Some(9000), bridge), "172.17.0.1:9000");
+        // Not explicit, no bridge: the loopback default, with gateway.port if set.
+        assert_eq!(gateway_bind(None, None, None), DEFAULT_LISTEN);
+        assert_eq!(gateway_bind(None, Some(9000), None), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn the_bridge_gateway_answer_is_one_ipv4_address() {
+        assert_eq!(
+            parse_bridge_ip("172.17.0.1\n").expect("ip"),
+            ip("172.17.0.1")
+        );
+        assert_eq!(
+            parse_bridge_ip("  192.168.64.1 \r\n").expect("ip"),
+            ip("192.168.64.1")
+        );
+        for bad in [
+            "",
+            "\n",
+            "garbage",
+            "<no value>",
+            "::1",
+            "999.1.1.1",
+            "172.17.0.1 172.18.0.1",
+            "172.17.0.1/16",
+            "172.17.0.1\n172.18.0.1\n",
+        ] {
+            let e = parse_bridge_ip(bad).expect_err(bad);
+            assert_eq!(e.code, crate::EXIT_RUNTIME, "{bad:?}");
+            assert!(
+                e.message.contains("docker bridge"),
+                "{bad:?}: {}",
+                e.message
+            );
+        }
+    }
+
+    /// A runner that answers every command the same way and records the argv.
+    struct Scripted {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        answer: std::io::Result<kestrel_sandbox::CommandOutput>,
+    }
+
+    impl Scripted {
+        fn new(status: i32, stdout: &str, stderr: &str) -> Scripted {
+            Scripted {
+                calls: std::sync::Mutex::new(Vec::new()),
+                answer: Ok(kestrel_sandbox::CommandOutput {
+                    status,
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                }),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for Scripted {
+        async fn run(&self, argv: &[String]) -> std::io::Result<kestrel_sandbox::CommandOutput> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(argv.to_vec());
+            match &self.answer {
+                Ok(out) => Ok(kestrel_sandbox::CommandOutput {
+                    status: out.status,
+                    stdout: out.stdout.clone(),
+                    stderr: out.stderr.clone(),
+                }),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            }
+        }
+        async fn spawn(
+            &self,
+            _argv: &[String],
+        ) -> std::io::Result<kestrel_sandbox::SpawnedProcess> {
+            Err(std::io::Error::other("no spawn"))
+        }
+    }
+
+    fn inspect_argv() -> Vec<String> {
+        [
+            "docker",
+            "network",
+            "inspect",
+            "bridge",
+            "--format",
+            "{{(index .IPAM.Config 0).Gateway}}",
+        ]
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn discovery_runs_the_pinned_docker_command_and_parses_the_answer() {
+        let r = Scripted::new(0, "172.17.0.1\n", "");
+        assert_eq!(discover_bridge_ip(&r).await.expect("ip"), ip("172.17.0.1"));
+        assert_eq!(r.calls(), vec![inspect_argv()]);
+    }
+
+    #[tokio::test]
+    async fn discovery_failures_are_runtime_errors_that_say_what_to_do() {
+        let cases = [
+            Scripted::new(0, "", ""),
+            Scripted::new(0, "not an ip", ""),
+            Scripted::new(1, "", "Cannot connect to the Docker daemon"),
+            Scripted {
+                calls: std::sync::Mutex::new(Vec::new()),
+                answer: Err(std::io::Error::other("docker: not found")),
+            },
+        ];
+        for r in cases {
+            let e = discover_bridge_ip(&r).await.expect_err("fails");
+            assert_eq!(e.code, crate::EXIT_RUNTIME);
+            for needle in ["docker network inspect bridge", "gateway.listen"] {
+                assert!(e.message.contains(needle), "{}", e.message);
+            }
+        }
+        let daemon = Scripted::new(1, "", "Cannot connect to the Docker daemon");
+        let e = discover_bridge_ip(&daemon).await.expect_err("fails");
+        assert!(e.message.contains("Cannot connect"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn docker_is_asked_only_for_a_bridge_without_an_explicit_listen() {
+        // Explicit listen: respected, docker never asked.
+        let r = Scripted::new(0, "172.17.0.1\n", "");
+        let bind = resolve_listen(&r, Some("0.0.0.0:7070"), Some(1), true).await;
+        assert_eq!(bind.expect("bind"), "0.0.0.0:7070");
+        // No bridge needed: loopback default, docker never asked.
+        let bind = resolve_listen(&r, None, None, false).await;
+        assert_eq!(bind.expect("bind"), DEFAULT_LISTEN);
+        assert!(r.calls().is_empty());
+        // Bridge and no explicit listen: the docker bridge IP, one call.
+        let bind = resolve_listen(&r, None, None, true).await;
+        assert_eq!(bind.expect("bind"), "172.17.0.1:7070");
+        let bind = resolve_listen(&r, None, Some(9000), true).await;
+        assert_eq!(bind.expect("bind"), "172.17.0.1:9000");
+        assert_eq!(r.calls(), vec![inspect_argv(), inspect_argv()]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_discovery_fails_the_bind_unless_listen_is_explicit() {
+        let r = Scripted::new(1, "", "daemon down");
+        assert!(resolve_listen(&r, None, None, true).await.is_err());
+        let bind = resolve_listen(&r, Some("127.0.0.1:0"), None, true).await;
+        assert_eq!(
+            bind.expect("explicit listen needs no docker"),
+            "127.0.0.1:0"
+        );
+    }
+
+    #[test]
+    fn gateway_port_and_listen_are_read_from_the_config() {
+        let (_dir, path) = write(&format!("[gateway]\nport = 9000\n{ANTHROPIC}"));
+        let c = load_config(&path).expect("config");
+        assert_eq!(c.port, Some(9000));
+        assert!(!c.listen_explicit);
+        let (_dir, path) = write(&format!("[gateway]\nlisten = \"127.0.0.1:1\"\n{ANTHROPIC}"));
+        let c = load_config(&path).expect("config");
+        assert!(c.listen_explicit);
+        assert_eq!(c.listen, "127.0.0.1:1");
+        assert_eq!(c.port, None);
+        let (_dir, path) = write(ANTHROPIC);
+        let c = load_config(&path).expect("config");
+        assert!(!c.listen_explicit);
+        assert_eq!(c.port, None);
+    }
+
+    #[test]
+    fn a_bad_gateway_port_is_a_usage_error_naming_the_key() {
+        for bad in ["0", "70000", "-1", "\"7070\"", "true"] {
+            let msg = err(&format!("[gateway]\nport = {bad}\n{ANTHROPIC}"));
+            assert!(msg.contains("port"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn the_lock_file_sits_next_to_the_database() {
+        assert_eq!(
+            serve_lock_path(Path::new("/data/kestrel.db")),
+            PathBuf::from("/data/kestrel.db.serve.lock")
+        );
+        assert_eq!(
+            serve_lock_path(Path::new("other.sqlite")),
+            PathBuf::from("other.sqlite.serve.lock")
+        );
+    }
+
+    #[test]
+    fn a_second_serve_on_the_same_database_is_refused_naming_the_lock_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join("kestrel.db");
+        let first = acquire_serve_lock(&db).expect("first lock");
+        let lock = serve_lock_path(&db);
+        assert!(lock.exists());
+        let e = acquire_serve_lock(&db)
+            .err()
+            .expect("second lock is refused");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(
+            e.message.contains(&lock.display().to_string()),
+            "{}",
+            e.message
+        );
+        drop(first);
+        acquire_serve_lock(&db).expect("the lock is free again after the first holder drops");
+    }
+
+    #[test]
+    fn two_databases_lock_independently() {
+        let dir = tempfile::tempdir().expect("dir");
+        let a = acquire_serve_lock(&dir.path().join("a.db")).expect("a");
+        let b = acquire_serve_lock(&dir.path().join("b.db")).expect("b");
+        drop((a, b));
     }
 
     fn run_in(store: &Store) -> RunId {
