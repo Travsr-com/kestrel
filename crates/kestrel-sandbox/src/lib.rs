@@ -16,6 +16,9 @@ use futures::{FutureExt, Stream};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
 
+mod bridge;
+pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
+
 /// Errors from sandbox drivers and host detection.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -56,6 +59,12 @@ pub enum SandboxError {
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
     InvalidId { id: String },
+    /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run` or `connect`.
+    #[error("gateway bridge step `{step}` failed: {stderr}")]
+    Bridge { step: &'static str, stderr: String },
+    /// The bridge port is 0.
+    #[error("invalid bridge port 0")]
+    InvalidBridgePort,
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
