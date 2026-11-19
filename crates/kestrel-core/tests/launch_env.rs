@@ -66,7 +66,7 @@ fn launch_spec(runtime: Runtime, name: &str) -> LaunchSpec {
 
 #[tokio::test]
 async fn adapter_launch_envs_pass_the_gvisor_secret_check() {
-    let driver = GvisorDriver::new(Arc::new(Fake));
+    let driver = GvisorDriver::new(Arc::new(Fake)).with_workspace_owner(|_| Ok((0, 0)));
     for (runtime, name) in [
         (Runtime::ClaudeCode, "claude-code"),
         (Runtime::OpenCode, "opencode"),
@@ -81,7 +81,7 @@ async fn adapter_launch_envs_pass_the_gvisor_secret_check() {
 
 #[tokio::test]
 async fn adapter_launch_envs_pass_the_apple_container_secret_check() {
-    let driver = AppleContainerDriver::new(Arc::new(Fake));
+    let driver = AppleContainerDriver::new(Arc::new(Fake)).with_workspace_owner(|_| Ok((0, 0)));
     for (runtime, name) in [
         (Runtime::ClaudeCode, "claude-code"),
         (Runtime::OpenCode, "opencode"),

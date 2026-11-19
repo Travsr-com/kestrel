@@ -96,8 +96,7 @@ jobs:
           docker info --format '{{json .Runtimes}}' | grep -q runsc
       - run: docker pull alpine:3.20
       - run: docker pull alpine/socat:1.8.0.3
-      # The agent runs as the runner's uid, so it can write the workspace bind mount.
-      - run: docker build --build-arg UID="$(id -u)" -t kestrel-echo-agent:test tests/e2e/echo-agent
+      - run: docker build -t kestrel-echo-agent:test tests/e2e/echo-agent
       - run: cargo build -p kestrel-cli
       # Proves the path sandboxes use: host server, socat bridge, bridge IP on an internal network,
       # reached from a runsc container. Docker DNS is not used (it does not answer under runsc).

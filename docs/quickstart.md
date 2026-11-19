@@ -13,6 +13,9 @@ meeting agents come in later milestones (see [architecture](architecture.md)).
 * An **Anthropic API key**.
 * A **container image for your agent**. It must contain the `claude` command (Claude Code), run as a
   non-root user, and have `curl`. Kestrel does not publish an image yet.
+
+  Kestrel runs the sandbox as the user who owns the workspace, so the image must not rely on a
+  particular uid or a writable home directory. `HOME` is set to `/tmp`.
 * A **git repository** with at least one commit for the agent to work in.
 
 ## 1. Build

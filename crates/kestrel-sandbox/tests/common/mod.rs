@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
 use kestrel_sandbox::{
@@ -130,9 +130,32 @@ pub fn spec() -> LaunchSpec {
         image: "alpine:3.20".to_string(),
         argv: s(&["sh", "-c", "echo hi"]),
         env,
-        workspace: Some(PathBuf::from("/tmp/kestrel/ws-1")),
+        workspace: Some(PathBuf::from(ws())),
         cpu_millis: 1500,
         memory_mb: 512,
         network: NetworkPolicy::None,
     }
+}
+
+/// A real workspace directory, shared by every test in the process and owned by the user
+/// running the tests. Drivers read its owner to pick `--user`.
+pub fn ws() -> &'static Path {
+    static WS: OnceLock<tempfile::TempDir> = OnceLock::new();
+    #[allow(clippy::expect_used)]
+    WS.get_or_init(|| tempfile::tempdir().expect("create workspace dir"))
+        .path()
+}
+
+/// The `--mount` value for [`ws`].
+pub fn ws_mount() -> String {
+    format!("type=bind,source={},target=/workspace", ws().display())
+}
+
+/// The `--user` value drivers must pass for [`ws`]: `uid:gid` of the directory's owner.
+#[cfg(unix)]
+pub fn ws_user() -> String {
+    use std::os::unix::fs::MetadataExt;
+    #[allow(clippy::expect_used)]
+    let meta = std::fs::metadata(ws()).expect("stat workspace dir");
+    format!("{}:{}", meta.uid(), meta.gid())
 }
