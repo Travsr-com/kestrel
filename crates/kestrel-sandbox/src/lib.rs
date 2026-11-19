@@ -66,6 +66,14 @@ pub enum SandboxError {
     /// The bridge port is 0.
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
+    /// The workspace directory could not be inspected (missing, no permission, ...), so the
+    /// host user to run the sandbox as is unknown.
+    #[error("cannot read the owner of workspace `{path}`: {source}")]
+    WorkspaceUnreadable {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -77,6 +85,28 @@ pub enum NetworkPolicy {
     None,
     /// Only the Kestrel gateway is reachable.
     GatewayOnly { gateway: Url },
+}
+
+/// Returns the `(uid, gid)` that owns a workspace directory. Injected into drivers so tests do
+/// not need root; the default reads the directory's real owner.
+pub type OwnerLookup = Arc<dyn Fn(&Path) -> std::io::Result<(u32, u32)> + Send + Sync>;
+
+/// The real lookup: the owner of `dir` on disk (unix only).
+#[cfg(unix)]
+fn host_owner(dir: &Path) -> std::io::Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir)?;
+    Ok((meta.uid(), meta.gid()))
+}
+
+/// No host user to map to off unix: report root, which adds no `--user`.
+#[cfg(not(unix))]
+fn host_owner(_dir: &Path) -> std::io::Result<(u32, u32)> {
+    Ok((0, 0))
+}
+
+fn default_owner() -> OwnerLookup {
+    Arc::new(host_owner)
 }
 
 /// What to run and with which limits.
@@ -363,11 +393,18 @@ impl Cli {
         argv
     }
 
-    async fn create(&self, runner: &dyn CommandRunner, spec: &LaunchSpec) -> Result<SandboxHandle> {
+    async fn create(
+        &self,
+        runner: &dyn CommandRunner,
+        owner: &OwnerLookup,
+        spec: &LaunchSpec,
+    ) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
         if let Some(ws) = &spec.workspace {
             validate_workspace_path(ws)?;
+            // TODO(#24): add `--user <uid>:<gid>` and `HOME=/tmp` from this owner.
+            let _ = owner(ws);
         }
         if let NetworkPolicy::GatewayOnly { .. } = spec.network {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
@@ -549,7 +586,17 @@ macro_rules! cli_driver {
                 Self {
                     runner,
                     exits: Exits::default(),
+                    owner: default_owner(),
                 }
+            }
+
+            /// Replaces how the workspace owner is read. For tests that cannot be root.
+            pub fn with_workspace_owner(
+                mut self,
+                lookup: impl Fn(&Path) -> std::io::Result<(u32, u32)> + Send + Sync + 'static,
+            ) -> Self {
+                self.owner = Arc::new(lookup);
+                self
             }
         }
 
@@ -562,7 +609,7 @@ macro_rules! cli_driver {
                 $cli.strong
             }
             async fn create(&self, spec: &LaunchSpec) -> Result<SandboxHandle> {
-                $cli.create(self.runner.as_ref(), spec).await
+                $cli.create(self.runner.as_ref(), &self.owner, spec).await
             }
             async fn start(&self, h: &SandboxHandle) -> Result<OutputStream> {
                 $cli.start(self.runner.as_ref(), &self.exits, h).await
@@ -584,6 +631,7 @@ macro_rules! cli_driver {
 pub struct GvisorDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    owner: OwnerLookup,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
@@ -594,12 +642,14 @@ pub struct GvisorDriver {
 pub struct AppleContainerDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    owner: OwnerLookup,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
 pub struct DockerRuncDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    owner: OwnerLookup,
 }
 
 cli_driver!(GvisorDriver, GVISOR);
