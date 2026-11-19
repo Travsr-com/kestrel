@@ -380,16 +380,24 @@ async fn supervise<E: std::fmt::Display>(
         Ok(Err(e)) => Err(Failure::runtime(format!("gateway: {e}"))),
         Err(e) => Err(Failure::runtime(format!("gateway: {e}"))),
     };
+    tokio::pin!(engine);
     tokio::select! {
-        result = engine => {
+        result = &mut engine => {
             shutdown.cancel();
             let served = gateway(server.await, true);
             result.map_err(|e| Failure::runtime(e.to_string()))?;
             served
         }
         result = &mut server => {
+            // Ctrl-C cancels `shutdown` first, so the gateway can finish before the engine does.
+            // That is a clean shutdown: only a stop nobody asked for is an error.
+            let asked_to_stop = shutdown.is_cancelled();
             shutdown.cancel();
-            gateway(result, false)
+            let served = gateway(result, asked_to_stop);
+            if asked_to_stop {
+                engine.await.map_err(|e| Failure::runtime(e.to_string()))?;
+            }
+            served
         }
     }
 }
