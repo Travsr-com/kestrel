@@ -9,8 +9,8 @@ use common::{FakeRunner, ID, s, spec};
 use futures::StreamExt;
 use kestrel_sandbox::{
     AppleContainerDriver, Arch, CommandOutput, CommandRunner, DockerRuncDriver, ExitStatus,
-    GvisorDriver, HostInfo, NetworkPolicy, Os, OutputLine, OutputStream, ProcessRunner,
-    SandboxDriver, SandboxError, SandboxHandle, StdStream, detect,
+    GvisorDriver, HostInfo, NetworkPolicy, Os, OutputLine, ProcessRunner, SandboxDriver,
+    SandboxError, SandboxHandle, SpawnedProcess, StdStream, detect,
 };
 use url::Url;
 
@@ -94,12 +94,88 @@ async fn gvisor_wait_rejects_garbage_output() {
 }
 
 #[tokio::test]
-async fn apple_wait_is_unsupported() {
+async fn apple_wait_returns_exit_code_of_start() {
+    for code in [0, 7] {
+        let runner = FakeRunner::exiting(Vec::new(), code);
+        let driver = AppleContainerDriver::new(runner.clone());
+
+        let lines: Vec<OutputLine> = driver
+            .start(&handle())
+            .await
+            .expect("start")
+            .collect()
+            .await;
+        assert!(lines.is_empty());
+        // Twice: the remembered exit status can be awaited more than once.
+        for _ in 0..2 {
+            let status = driver.wait(&handle()).await.expect("wait");
+            assert_eq!(status, ExitStatus { code });
+            assert_eq!(status.success(), code == 0);
+        }
+        assert_eq!(runner.runs(), Vec::<Vec<String>>::new(), "no CLI wait call");
+    }
+}
+
+#[tokio::test]
+async fn apple_wait_on_never_started_handle_is_not_attached() {
     let runner = FakeRunner::ok();
     let driver = AppleContainerDriver::new(runner.clone());
-    let err = driver.wait(&handle()).await.expect_err("unsupported");
-    assert!(matches!(err, SandboxError::Spawn { .. }), "{err:?}");
+
+    let err = driver.wait(&handle()).await.expect_err("never started");
+
+    match &err {
+        SandboxError::NotAttached { id } => assert_eq!(id, ID),
+        other => panic!("expected NotAttached, got {other:?}"),
+    }
+    assert!(err.to_string().contains(ID), "{err}");
     assert!(runner.all_calls().is_empty());
+}
+
+#[tokio::test]
+async fn apple_destroy_forgets_the_exit_status() {
+    let driver = AppleContainerDriver::new(FakeRunner::exiting(Vec::new(), 0));
+    drop(driver.start(&handle()).await.expect("start"));
+    driver.destroy(&handle()).await.expect("destroy");
+    let err = driver.wait(&handle()).await.expect_err("forgotten");
+    assert!(matches!(err, SandboxError::NotAttached { .. }), "{err:?}");
+}
+
+/// A runner whose spawned process exits with an I/O error.
+struct ExitFails;
+
+#[async_trait::async_trait]
+impl CommandRunner for ExitFails {
+    async fn run(&self, _: &[String]) -> std::io::Result<CommandOutput> {
+        Ok(CommandOutput::default())
+    }
+    async fn spawn(&self, _: &[String]) -> std::io::Result<SpawnedProcess> {
+        Ok(SpawnedProcess {
+            output: Box::pin(futures::stream::empty()),
+            exit: Box::pin(async { Err(std::io::Error::other("lost the child")) }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn apple_wait_reports_exit_io_error() {
+    let driver = AppleContainerDriver::new(Arc::new(ExitFails));
+    drop(driver.start(&handle()).await.expect("start"));
+    let err = driver.wait(&handle()).await.expect_err("io error");
+    assert!(matches!(err, SandboxError::Spawn { .. }), "{err:?}");
+    assert!(err.to_string().contains("lost the child"), "{err}");
+}
+
+#[tokio::test]
+async fn apple_not_found_text_from_real_cli_is_tolerated() {
+    // Exact text from apple/container `ContainerLookup.swift`.
+    let runner = FakeRunner::with(|_| CommandOutput {
+        status: 1,
+        stdout: String::new(),
+        stderr: format!("Error: notFound: \"container with ID {ID} not found\"\n"),
+    });
+    let driver = AppleContainerDriver::new(runner);
+    driver.stop(&handle()).await.expect("stop");
+    driver.destroy(&handle()).await.expect("destroy");
 }
 
 #[tokio::test]
@@ -190,7 +266,7 @@ impl CommandRunner for Broken {
             "no docker",
         ))
     }
-    async fn spawn(&self, _: &[String]) -> std::io::Result<OutputStream> {
+    async fn spawn(&self, _: &[String]) -> std::io::Result<SpawnedProcess> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no docker",
@@ -257,6 +333,14 @@ async fn process_runner_run_captures_output_and_status() {
 }
 
 #[tokio::test]
+async fn process_runner_spawn_reports_exit_code() {
+    let process = ProcessRunner.spawn(&s(&["false"])).await.expect("spawn");
+    assert_eq!(process.exit.await.expect("exit"), 1);
+    let process = ProcessRunner.spawn(&s(&["true"])).await.expect("spawn");
+    assert_eq!(process.exit.await.expect("exit"), 0);
+}
+
+#[tokio::test]
 async fn process_runner_rejects_empty_and_missing_programs() {
     assert!(ProcessRunner.run(&[]).await.is_err());
     assert!(ProcessRunner.spawn(&[]).await.is_err());
@@ -272,6 +356,7 @@ async fn process_runner_spawn_tags_lines_by_stream() {
         .spawn(&argv)
         .await
         .expect("spawn")
+        .output
         .collect()
         .await;
     let line = |stream, text: &str| OutputLine {

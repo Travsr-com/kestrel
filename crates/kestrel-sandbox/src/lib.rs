@@ -3,15 +3,16 @@
 //! Every process a driver starts goes through a [`CommandRunner`], so unit tests swap in a fake
 //! and never spawn a real process.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::future::{BoxFuture, Shared};
+use futures::{FutureExt, Stream};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
 
@@ -38,6 +39,10 @@ pub enum SandboxError {
     /// An env var that looks like a real secret was passed to the sandbox.
     #[error("refusing to launch: env var `{key}` looks like a real secret")]
     SecretInEnv { key: String },
+    /// `wait` needs the exit status of a `start` this driver ran, and it never started `id`.
+    /// Happens for example after an engine restart.
+    #[error("sandbox `{id}` was not started by this driver, so its exit status is unknown")]
+    NotAttached { id: String },
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -100,6 +105,16 @@ pub struct OutputLine {
 /// Output lines in the order they were produced.
 pub type OutputStream = Pin<Box<dyn Stream<Item = OutputLine> + Send>>;
 
+/// Resolves to the exit code of a spawned process (-1 if it was killed by a signal).
+pub type ExitFuture = Pin<Box<dyn Future<Output = std::io::Result<i32>> + Send>>;
+
+/// A started process: its output lines, and its exit code once it ends.
+/// `exit` resolves even if `output` is never read.
+pub struct SpawnedProcess {
+    pub output: OutputStream,
+    pub exit: ExitFuture,
+}
+
 /// Result of a command run to completion.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommandOutput {
@@ -113,8 +128,8 @@ pub struct CommandOutput {
 pub trait CommandRunner: Send + Sync {
     /// Run to completion and capture output.
     async fn run(&self, argv: &[String]) -> std::io::Result<CommandOutput>;
-    /// Start and stream stdout and stderr lines as they arrive.
-    async fn spawn(&self, argv: &[String]) -> std::io::Result<OutputStream>;
+    /// Start, stream stdout and stderr lines as they arrive, and report the exit code.
+    async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess>;
 }
 
 /// The real runner: spawns host processes.
@@ -133,7 +148,7 @@ impl CommandRunner for ProcessRunner {
         })
     }
 
-    async fn spawn(&self, argv: &[String]) -> std::io::Result<OutputStream> {
+    async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess> {
         let mut child = command(argv)?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -141,12 +156,20 @@ impl CommandRunner for ProcessRunner {
         let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
             return Err(std::io::Error::other("child has no stdout or stderr pipe"));
         };
-        // Reap the child in the background so it never lingers as a zombie.
-        tokio::spawn(async move { child.wait().await });
-        Ok(Box::pin(futures::stream::select(
-            lines(out, StdStream::Stdout),
-            lines(err, StdStream::Stderr),
-        )))
+        // Reap the child in the background so it never lingers as a zombie, even if nobody
+        // awaits `exit`.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let code = child.wait().await.map(|s| s.code().unwrap_or(-1));
+            tx.send(code).ok();
+        });
+        Ok(SpawnedProcess {
+            output: Box::pin(futures::stream::select(
+                lines(out, StdStream::Stdout),
+                lines(err, StdStream::Stderr),
+            )),
+            exit: Box::pin(async move { rx.await.map_err(std::io::Error::other)? }),
+        })
     }
 }
 
@@ -327,27 +350,43 @@ impl Cli {
         })
     }
 
-    async fn start(&self, runner: &dyn CommandRunner, h: &SandboxHandle) -> Result<OutputStream> {
+    async fn start(
+        &self,
+        runner: &dyn CommandRunner,
+        exits: &Exits,
+        h: &SandboxHandle,
+    ) -> Result<OutputStream> {
         let argv = self.argv(&["start", "--attach", &h.id]);
-        runner
+        let process = runner
             .spawn(&argv)
             .await
             .map_err(|source| SandboxError::Spawn {
                 program: self.program.to_string(),
                 source,
-            })
+            })?;
+        if self.apple {
+            exits.insert(&h.id, process.exit);
+        }
+        Ok(process.output)
     }
 
-    async fn wait(&self, runner: &dyn CommandRunner, h: &SandboxHandle) -> Result<ExitStatus> {
+    async fn wait(
+        &self,
+        runner: &dyn CommandRunner,
+        exits: &Exits,
+        h: &SandboxHandle,
+    ) -> Result<ExitStatus> {
         if self.apple {
-            // The Apple CLI has no `wait` command and does not report exit codes after the fact.
-            return Err(SandboxError::Spawn {
-                program: "container wait".to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "the Apple container CLI cannot report a container's exit code",
-                ),
-            });
+            // The Apple CLI has no `wait` command and does not report exit codes after the fact,
+            // so the exit code is the one of the `start --attach` process.
+            let exit = exits
+                .get(&h.id)
+                .ok_or_else(|| SandboxError::NotAttached { id: h.id.clone() })?;
+            let code = exit.await.map_err(|e| SandboxError::Spawn {
+                program: self.program.to_string(),
+                source: std::io::Error::new(e.kind(), e.to_string()),
+            })?;
+            return Ok(ExitStatus { code });
         }
         let stdout = self.run(runner, &self.argv(&["wait", &h.id]), None).await?;
         let code = stdout
@@ -368,12 +407,43 @@ impl Cli {
             .map(drop)
     }
 
-    async fn destroy(&self, runner: &dyn CommandRunner, h: &SandboxHandle) -> Result<()> {
+    async fn destroy(
+        &self,
+        runner: &dyn CommandRunner,
+        exits: &Exits,
+        h: &SandboxHandle,
+    ) -> Result<()> {
+        exits.remove(&h.id);
         let rm = if self.apple { "delete" } else { "rm" };
         let argv = self.argv(&[rm, "--force", &h.id]);
         self.run(runner, &argv, Some(self.not_found))
             .await
             .map(drop)
+    }
+}
+
+type SharedExit = Shared<BoxFuture<'static, std::result::Result<i32, Arc<std::io::Error>>>>;
+
+/// Exit futures of the `start --attach` processes a driver ran, by sandbox id.
+#[derive(Default)]
+struct Exits(Mutex<HashMap<String, SharedExit>>);
+
+impl Exits {
+    fn map(&self) -> MutexGuard<'_, HashMap<String, SharedExit>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn insert(&self, id: &str, exit: ExitFuture) {
+        let shared = exit.map(|r| r.map_err(Arc::new)).boxed().shared();
+        self.map().insert(id.to_string(), shared);
+    }
+
+    fn get(&self, id: &str) -> Option<SharedExit> {
+        self.map().get(id).cloned()
+    }
+
+    fn remove(&self, id: &str) {
+        self.map().remove(id);
     }
 }
 
@@ -391,7 +461,10 @@ macro_rules! cli_driver {
     ($ty:ident, $cli:ident) => {
         impl $ty {
             pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-                Self { runner }
+                Self {
+                    runner,
+                    exits: Exits::default(),
+                }
             }
         }
 
@@ -407,16 +480,16 @@ macro_rules! cli_driver {
                 $cli.create(self.runner.as_ref(), spec).await
             }
             async fn start(&self, h: &SandboxHandle) -> Result<OutputStream> {
-                $cli.start(self.runner.as_ref(), h).await
+                $cli.start(self.runner.as_ref(), &self.exits, h).await
             }
             async fn wait(&self, h: &SandboxHandle) -> Result<ExitStatus> {
-                $cli.wait(self.runner.as_ref(), h).await
+                $cli.wait(self.runner.as_ref(), &self.exits, h).await
             }
             async fn stop(&self, h: &SandboxHandle) -> Result<()> {
                 $cli.stop(self.runner.as_ref(), h).await
             }
             async fn destroy(&self, h: &SandboxHandle) -> Result<()> {
-                $cli.destroy(self.runner.as_ref(), h).await
+                $cli.destroy(self.runner.as_ref(), &self.exits, h).await
             }
         }
     };
@@ -425,16 +498,19 @@ macro_rules! cli_driver {
 /// `docker create --runtime=runsc`.
 pub struct GvisorDriver {
     runner: Arc<dyn CommandRunner>,
+    exits: Exits,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
 pub struct AppleContainerDriver {
     runner: Arc<dyn CommandRunner>,
+    exits: Exits,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
 pub struct DockerRuncDriver {
     runner: Arc<dyn CommandRunner>,
+    exits: Exits,
 }
 
 cli_driver!(GvisorDriver, GVISOR);

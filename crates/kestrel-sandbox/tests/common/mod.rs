@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use kestrel_sandbox::{
-    CommandOutput, CommandRunner, LaunchSpec, NetworkPolicy, OutputLine, OutputStream,
+    CommandOutput, CommandRunner, LaunchSpec, NetworkPolicy, OutputLine, SpawnedProcess,
 };
 
 /// Container id the fake prints on stdout for every successful call.
@@ -21,6 +21,8 @@ pub struct FakeRunner {
     spawns: Mutex<Vec<Vec<String>>>,
     respond: Box<Responder>,
     lines: Vec<OutputLine>,
+    /// Exit code every spawned process reports.
+    exit: i32,
 }
 
 impl FakeRunner {
@@ -40,6 +42,7 @@ impl FakeRunner {
             spawns: Mutex::new(Vec::new()),
             respond: Box::new(respond),
             lines: Vec::new(),
+            exit: 0,
         })
     }
 
@@ -54,7 +57,17 @@ impl FakeRunner {
                 stderr: String::new(),
             }),
             lines,
+            exit: 0,
         })
+    }
+
+    /// Every call succeeds; `spawn` streams `lines` and then exits with `code`.
+    pub fn exiting(lines: Vec<OutputLine>, code: i32) -> Arc<Self> {
+        let mut runner = Self::streaming(lines);
+        if let Some(r) = Arc::get_mut(&mut runner) {
+            r.exit = code;
+        }
+        runner
     }
 
     /// Every argv passed to `run`, in order.
@@ -91,12 +104,15 @@ impl CommandRunner for FakeRunner {
         Ok((self.respond)(argv))
     }
 
-    async fn spawn(&self, argv: &[String]) -> std::io::Result<OutputStream> {
+    async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess> {
         self.spawns
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(argv.to_vec());
-        Ok(Box::pin(futures::stream::iter(self.lines.clone())))
+        Ok(SpawnedProcess {
+            output: Box::pin(futures::stream::iter(self.lines.clone())),
+            exit: Box::pin(futures::future::ready(Ok(self.exit))),
+        })
     }
 }
 
