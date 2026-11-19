@@ -24,7 +24,26 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    pub fn can_transition_to(&self, _next: &RunStatus) -> bool {
-        todo!()
+    /// True once the run can no longer change state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed(_) | Self::Cancelled)
+    }
+
+    /// Lifecycle from `docs/architecture.md` section 3.2:
+    /// `Queued -> Provisioning -> Running <-> Suspended`, `Running -> Completed`,
+    /// any non-terminal state `-> Failed | Cancelled`. Terminal states have no exits.
+    pub fn can_transition_to(&self, next: &RunStatus) -> bool {
+        use RunStatus::*;
+        if self.is_terminal() {
+            return false;
+        }
+        matches!(
+            (self, next),
+            (_, Failed(_) | Cancelled)
+                | (Queued, Provisioning)
+                | (Provisioning, Running)
+                | (Running, Suspended(_) | Completed)
+                | (Suspended(_), Running)
+        )
     }
 }
