@@ -30,7 +30,7 @@ fn serve_gives_an_empty_dir_run_a_workspace_next_to_the_db() {
     let f = Fixture::new();
     let agent = f.write(
         "empty.yaml",
-        &GOOD_YAML.replace("workspace: git-worktree", "workspace: empty-dir"),
+        &GOOD_YAML.replace("workspace: git-clone", "workspace: empty-dir"),
     );
     let out = f
         .kestrel()
@@ -78,8 +78,8 @@ fn run_resolves_the_worktree_repo_against_the_current_dir() {
         .success();
     let id = run_id(&out.get_output().stdout);
     let spec = f.store().run_spec(id).expect("spec").expect("stored");
-    let WorkspaceSpec::GitWorktree { repo } = spec.sandbox.workspace else {
-        panic!("not a worktree: {:?}", spec.sandbox.workspace)
+    let WorkspaceSpec::GitClone { repo, .. } = spec.sandbox.workspace else {
+        panic!("not a git clone: {:?}", spec.sandbox.workspace)
     };
     assert!(repo.is_absolute(), "{}", repo.display());
     assert_eq!(

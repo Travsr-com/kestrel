@@ -183,7 +183,7 @@ impl Env {
     }
 
     /// A command for the kestrel binary, isolated in this env's dirs and run from the repo, so
-    /// `workspace: git-worktree` (repo `.`) resolves to the test repo.
+    /// `workspace: git-clone` (repo `.`) resolves to the test repo.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(kestrel_bin());
         cmd.args(args)
@@ -247,7 +247,7 @@ impl Env {
              runtime: claude-code\n\
              role: Echo test agent\n\
              model_policy:\n  default: tier:cheap\n\
-             sandbox:\n  tier: gvisor\n  image: kestrel-echo-agent:test\n  cpu: \"1\"\n  memory: 512Mi\n  workspace: git-worktree\n\
+             sandbox:\n  tier: gvisor\n  image: kestrel-echo-agent:test\n  cpu: \"1\"\n  memory: 512Mi\n  workspace: git-clone\n\
              budget:\n  usd: \"{budget_usd}\"\n  wall_clock: 10m\n"
         );
         std::fs::write(&path, yaml).expect("write agent file");

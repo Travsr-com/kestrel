@@ -134,7 +134,10 @@ fn spec_ws(workspace: WorkspaceSpec) -> AgentSpec {
 }
 
 fn worktree(repo: impl Into<PathBuf>) -> AgentSpec {
-    spec_ws(WorkspaceSpec::GitWorktree { repo: repo.into() })
+    spec_ws(WorkspaceSpec::GitClone {
+        repo: repo.into(),
+        depth: None,
+    })
 }
 
 /// The workspace each `create` was given, in order.
@@ -365,15 +368,18 @@ async fn s4_relative_repo_path_fails_with_a_clear_message_and_runs_no_git() {
 
 #[tokio::test(start_paused = true)]
 async fn s4_yaml_default_repo_dot_is_relative_and_fails_the_same_way() {
-    // `workspace: git-worktree` in YAML means repo `.`; the CLI must resolve it before submit.
+    // `workspace: git-clone` in YAML means repo `.`; the CLI must resolve it before submit.
     let yaml = "name: tester\nruntime: claude-code\nrole: tester\n\
                 model_policy: { default: tier:mid }\n\
-                sandbox: { tier: auto, image: fake-image, cpu: 1, memory: 512Mi, workspace: git-worktree }\n\
+                sandbox: { tier: auto, image: fake-image, cpu: 1, memory: 512Mi, workspace: git-clone }\n\
                 budget: { usd: \"1\", wall_clock: 1h }\n";
     let spec = AgentSpec::from_yaml(yaml).expect("spec parses");
     assert_eq!(
         spec.sandbox.workspace,
-        WorkspaceSpec::GitWorktree { repo: ".".into() }
+        WorkspaceSpec::GitClone {
+            repo: ".".into(),
+            depth: None
+        }
     );
 
     let (_tmp, root) = ws_root();

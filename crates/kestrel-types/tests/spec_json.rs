@@ -10,7 +10,7 @@ fn agent_spec_round_trips_through_json() {
         model_policy: { default: tier:mid, escalate: tier:frontier }\n\
         capabilities: { mcp: [github], network: [api.github.com], secrets: [GH_TOKEN], \
         spawn: { max_children: 2, max_depth: 1, agents: [helper] } }\n\
-        sandbox: { tier: apple-container, image: img, cpu: 1.5, memory: 2Gi, workspace: git-worktree }\n\
+        sandbox: { tier: apple-container, image: img, cpu: 1.5, memory: 2Gi, workspace: git-clone }\n\
         budget: { usd: 0.25, wall_clock: 90s }\n\
         approvals: { required_for: [gh.merge] }\n\
         memory: { kind: notes }\n\

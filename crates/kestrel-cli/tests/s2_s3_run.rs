@@ -16,7 +16,7 @@ name: bad
 runtime: claude-code
 role: tester
 model_policy: { default: tier:mid }
-sandbox: { tier: auto, cpu: 1, memory: 1Gi, workspace: git-worktree }
+sandbox: { tier: auto, cpu: 1, memory: 1Gi, workspace: git-clone }
 budget: { usd: -1.00, wall_clock: 10m }
 "#;
 

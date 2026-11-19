@@ -9,7 +9,7 @@ use tempfile::TempDir;
 fn agent() -> AgentSpec {
     let yaml = "name: keeper\nruntime: opencode\nrole: r\nmodel_policy: { default: tier:cheap, escalate: tier:frontier }\n\
         capabilities: { mcp: [github], network: [api.github.com] }\n\
-        sandbox: { tier: gvisor, image: img, cpu: 500m, memory: 1Gi, workspace: git-worktree }\n\
+        sandbox: { tier: gvisor, image: img, cpu: 500m, memory: 1Gi, workspace: git-clone }\n\
         budget: { usd: 2.50, wall_clock: 30m }\n\
         approvals: { required_for: [gh.comment] }\n";
     AgentSpec::from_yaml(yaml).expect("fixture parses")

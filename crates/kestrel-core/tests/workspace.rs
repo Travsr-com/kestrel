@@ -148,8 +148,9 @@ fn repo() -> PathBuf {
 }
 
 fn git_spec(repo: &Path) -> WorkspaceSpec {
-    WorkspaceSpec::GitWorktree {
+    WorkspaceSpec::GitClone {
         repo: repo.to_path_buf(),
+        depth: None,
     }
 }
 
