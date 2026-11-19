@@ -10,6 +10,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -168,6 +169,9 @@ impl Env {
         let mock = Mock::start();
         let config = dir.path().join("config.toml");
         std::fs::write(&config, config_toml(mock.addr)).expect("write config");
+        // Private, like a real config: serve warns about a config other users can read.
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
         let db = dir.path().join("kestrel.db");
         Env {
             dir,
