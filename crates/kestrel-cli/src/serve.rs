@@ -46,6 +46,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawGateway {
     listen: Option<String>,
+    /// Kept as a raw value so a wrong type is reported against the key.
+    port: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key, not as a TOML error.
     advertise_url: Option<toml::Value>,
 }
@@ -85,10 +87,8 @@ struct RawPrice {
 struct Config {
     listen: String,
     /// True when the config file sets `gateway.listen`; an explicit value is always respected.
-    #[allow(dead_code)] // skeleton (#29)
     listen_explicit: bool,
     /// `gateway.port`: the port of the default bind (the docker bridge IP). Default 7070.
-    #[allow(dead_code)] // skeleton (#29)
     port: Option<u16>,
     /// Where sandboxes reach the gateway, when the operator sets it.
     advertise_url: Option<Url>,
@@ -158,10 +158,11 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         prices.insert(model, price);
     }
     let advertise_url = raw.gateway.advertise_url.map(advertise_url).transpose()?;
+    let port = raw.gateway.port.map(gateway_port).transpose()?;
     Ok(Config {
+        listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
-        listen_explicit: false, // skeleton (#29)
-        port: None,             // skeleton (#29)
+        port,
         advertise_url,
         limits: Limits {
             max_concurrent_runs: max,
@@ -176,11 +177,21 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     })
 }
 
+/// `gateway.port`: an integer from 1 to 65535.
+fn gateway_port(value: toml::Value) -> Result<u16, Failure> {
+    value
+        .as_integer()
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| Failure::usage("gateway.port must be a whole number from 1 to 65535"))
+}
+
 /// Names that may appear in a config error. Anything else quoted in an error came from the
 /// user and may be an API key, so it is masked.
 const CONFIG_NAMES: &[&str] = &[
     "gateway",
     "listen",
+    "port",
     "advertise_url",
     "engine",
     "max_concurrent_runs",
@@ -314,14 +325,20 @@ fn uses_docker(drivers: &[Box<dyn SandboxDriver>]) -> bool {
 ///
 /// `Ok(Some(warning))` for a bind that exposes the gateway beyond the docker bridge (`0.0.0.0`,
 /// `::`); `Ok(None)` when there is nothing to say.
-#[allow(clippy::unnecessary_wraps)] // skeleton (#29)
 fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<Option<String>, Failure> {
-    if bridge && addr.ip().is_loopback() {
+    if !bridge {
+        return Ok(None);
+    }
+    if addr.ip().is_loopback() {
         return Err(Failure::usage(format!(
-            "gateway.listen is {addr}, but sandboxes reach the gateway through a container, which a loopback address refuses. Bind a non-loopback address such as 0.0.0.0:7070 (or the docker bridge IP), or set gateway.advertise_url"
+            "gateway.listen is {addr}, but sandboxes reach the gateway through a container, which a loopback address refuses. Remove gateway.listen to bind the docker bridge IP, set a non-loopback address, or set gateway.advertise_url"
         )));
     }
-    Ok(None)
+    Ok(addr.ip().is_unspecified().then(|| {
+        format!(
+            "warning: gateway.listen is {addr}, so the gateway is reachable from your LAN and only run tokens protect it. Remove gateway.listen to bind the docker bridge IP instead"
+        )
+    }))
 }
 
 /// Port of the default gateway bind.
@@ -330,61 +347,102 @@ const DEFAULT_PORT: u16 = 7070;
 /// Where the gateway binds. An explicit `gateway.listen` is returned unchanged. Otherwise, with
 /// `bridge_ip` (the docker bridge gateway IP), `<bridge_ip>:<port>`; without it,
 /// `127.0.0.1:<port>`. `port` is `gateway.port`, default 7070.
-#[allow(dead_code)] // skeleton (#29)
 fn gateway_bind(listen: Option<&str>, port: Option<u16>, bridge_ip: Option<Ipv4Addr>) -> String {
-    let _ = (listen, port, bridge_ip, DEFAULT_PORT);
-    todo!("#29")
+    if let Some(listen) = listen {
+        return listen.to_string();
+    }
+    let host = bridge_ip.unwrap_or(Ipv4Addr::LOCALHOST);
+    format!("{host}:{}", port.unwrap_or(DEFAULT_PORT))
 }
+
+/// What to do when the docker bridge IP cannot be found.
+const BRIDGE_HINT: &str =
+    "set gateway.listen (for example to your docker bridge IP and a port) to skip the lookup";
 
 /// The one IPv4 address `docker network inspect bridge --format {{(index .IPAM.Config 0).Gateway}}`
 /// prints (surrounding whitespace allowed). Anything else is a runtime failure.
-#[allow(dead_code)] // skeleton (#29)
 fn parse_bridge_ip(stdout: &str) -> Result<Ipv4Addr, Failure> {
-    let _ = stdout;
-    todo!("#29")
+    stdout.trim().parse().map_err(|_| {
+        Failure::runtime(format!(
+            "docker network inspect bridge did not print one IPv4 address for the docker bridge ({:?}); {BRIDGE_HINT}",
+            stdout.trim()
+        ))
+    })
 }
 
 /// Asks docker for the bridge network's gateway IP, through `runner`. A non-zero exit or an I/O
 /// error is a runtime failure that names `docker network inspect bridge` and `gateway.listen`.
-#[allow(dead_code)] // skeleton (#29)
 async fn discover_bridge_ip(runner: &dyn CommandRunner) -> Result<Ipv4Addr, Failure> {
-    let _ = runner;
-    todo!("#29")
+    let argv: Vec<String> = [
+        "docker",
+        "network",
+        "inspect",
+        "bridge",
+        "--format",
+        "{{(index .IPAM.Config 0).Gateway}}",
+    ]
+    .iter()
+    .map(|p| (*p).to_string())
+    .collect();
+    let fail = |why: String| {
+        Failure::runtime(format!(
+            "cannot find the docker bridge IP: docker network inspect bridge failed ({why}); {BRIDGE_HINT}"
+        ))
+    };
+    let out = runner.run(&argv).await.map_err(|e| fail(e.to_string()))?;
+    if out.status != 0 {
+        return Err(fail(out.stderr.trim().to_string()));
+    }
+    parse_bridge_ip(&out.stdout)
 }
 
 /// The gateway bind string. Runs docker (once) only when `bridge` is true and `listen` is not
 /// set explicitly; otherwise it never touches `runner`.
-#[allow(dead_code)] // skeleton (#29)
 async fn resolve_listen(
     runner: &dyn CommandRunner,
     listen: Option<&str>,
     port: Option<u16>,
     bridge: bool,
 ) -> Result<String, Failure> {
-    let _ = (runner, listen, port, bridge);
-    todo!("#29")
+    let bridge_ip = if bridge && listen.is_none() {
+        Some(discover_bridge_ip(runner).await?)
+    } else {
+        None
+    };
+    Ok(gateway_bind(listen, port, bridge_ip))
 }
 
 /// The lock file of `db`: the database file name plus `.serve.lock`, in the same directory.
-#[allow(dead_code)] // skeleton (#29)
 fn serve_lock_path(db: &Path) -> PathBuf {
-    let _ = db;
-    todo!("#29")
+    let mut name = db.as_os_str().to_os_string();
+    name.push(".serve.lock");
+    PathBuf::from(name)
 }
 
 /// Holds the exclusive lock of one `kestrel serve` per database until dropped (or the process
 /// dies). Taken with `std::fs::File::try_lock`, so no `unsafe` is needed.
-#[allow(dead_code)] // skeleton (#29)
 struct ServeLock {
     _file: std::fs::File,
 }
 
 /// Creates `serve_lock_path(db)` if needed and takes the exclusive lock. A second holder gets a
 /// runtime failure (exit 1) whose message names the lock file.
-#[allow(dead_code)] // skeleton (#29)
 fn acquire_serve_lock(db: &Path) -> Result<ServeLock, Failure> {
-    let _ = db;
-    todo!("#29")
+    let path = serve_lock_path(db);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| Failure::runtime(format!("{}: {e}", path.display())))?;
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => Failure::runtime(format!(
+            "another kestrel serve is already using this database (lock file {}). Stop it first",
+            path.display()
+        )),
+        std::fs::TryLockError::Error(e) => Failure::runtime(format!("{}: {e}", path.display())),
+    })?;
+    Ok(ServeLock { _file: file })
 }
 
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
@@ -435,11 +493,15 @@ pub(crate) fn serve(db: Option<PathBuf>, args: ServeArgs, out: Output) -> Result
     let drivers = test_drivers(&args)?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| Failure::runtime(format!("starting the async runtime: {e}")))?;
+    // One serve per database: the lock is held until this function returns, and before any
+    // bridge or socket exists.
+    let db = db_path(db)?;
+    let _lock = acquire_serve_lock(&db)?;
     rt.block_on(run(db, config, drivers, out))
 }
 
 async fn run(
-    db: Option<PathBuf>,
+    db: PathBuf,
     config: Config,
     drivers: Option<Vec<Box<dyn SandboxDriver>>>,
     out: Output,
@@ -458,25 +520,31 @@ async fn run(
         None => detect(&HostInfo::current().await, false)
             .map_err(|e| Failure::runtime(e.to_string()))?,
     };
-    let listener = TcpListener::bind(&config.listen)
+    let docker = uses_docker(&drivers);
+    let needs_bridge = docker && config.advertise_url.is_none();
+    let explicit = config.listen_explicit.then_some(config.listen.as_str());
+    let listen = resolve_listen(&ProcessRunner, explicit, config.port, needs_bridge).await?;
+    let listener = TcpListener::bind(&listen)
         .await
         .map_err(|e| Failure::runtime(format!("gateway.listen: cannot listen there: {e}")))?;
     let addr = listener
         .local_addr()
         .map_err(|e| Failure::runtime(e.to_string()))?;
-    if !addr.ip().is_loopback() {
+    // The discovered docker bridge IP is the expected bind, so it is not worth a warning.
+    let discovered = needs_bridge && explicit.is_none();
+    if let Some(warning) = check_bridge_listen(needs_bridge, addr)? {
+        eprintln!("{warning}");
+    } else if !discovered && !addr.ip().is_loopback() {
         eprintln!(
             "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
         );
     }
-    let docker = uses_docker(&drivers);
-    check_bridge_listen(docker && config.advertise_url.is_none(), addr)?;
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
-        Path::new("/tmp/kestrel-skeleton.db"), // skeleton (#29): the resolved database path
+        &db,
     )
     .await?;
     let bridge_url = bridge.as_ref().map(GatewayBridge::url);
@@ -488,7 +556,7 @@ async fn run(
                 gateway_url,
                 shutdown,
             };
-            serve_bound(db, config, drivers, bound, out).await
+            serve_bound(&db, config, drivers, bound, out).await
         }
         Err(e) => Err(e),
     };
@@ -508,7 +576,7 @@ struct Bound {
 }
 
 async fn serve_bound(
-    db: Option<PathBuf>,
+    db: &Path,
     config: Config,
     drivers: Vec<Box<dyn SandboxDriver>>,
     bound: Bound,
@@ -520,10 +588,9 @@ async fn serve_bound(
         gateway_url,
         shutdown,
     } = bound;
-    let db = db_path(db)?;
-    let store = Arc::new(open(Some(db.clone()))?);
+    let store = Arc::new(open(Some(db.to_path_buf()))?);
     // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
-    let workspace_root = std::path::absolute(&db)
+    let workspace_root = std::path::absolute(db)
         .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
         .parent()
         .map(|d| d.join("workspaces"))
@@ -1351,6 +1418,16 @@ budget: { usd: 0.000010, wall_clock: 10m }
         );
         drop(first);
         acquire_serve_lock(&db).expect("the lock is free again after the first holder drops");
+    }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_created_is_a_runtime_error() {
+        let dir = tempfile::tempdir().expect("dir");
+        let e = acquire_serve_lock(&dir.path().join("missing").join("k.db"))
+            .err()
+            .expect("no directory");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("k.db.serve.lock"), "{}", e.message);
     }
 
     #[test]

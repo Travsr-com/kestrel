@@ -107,9 +107,13 @@ jobs:
           (cd "$RUNNER_TEMP/smoke-www" && nohup python3 -m http.server 8080 --bind 0.0.0.0 > "$RUNNER_TEMP/smoke-http.log" 2>&1 & echo $! > "$RUNNER_TEMP/smoke-http.pid")
           sleep 1
           docker network create --internal kestrel-gw
+          # The same flags the Kestrel bridge uses: read-only, non-root, no capabilities.
           docker run --detach --name kestrel-gateway --network bridge \
             --add-host host.docker.internal:host-gateway --restart no \
-            alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e TCP-LISTEN:8080,fork,reuseaddr TCP:host.docker.internal:8080
+            --cap-drop ALL --read-only --security-opt no-new-privileges \
+            --pids-limit 64 --memory 64m --user 65534:65534 \
+            alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e \
+            -T 300 TCP-LISTEN:8080,fork,reuseaddr,max-children=64 TCP:host.docker.internal:8080
           docker network connect kestrel-gw kestrel-gateway
           ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "kestrel-gw").IPAddress}}' kestrel-gateway)
           echo "bridge ip: $ip"
