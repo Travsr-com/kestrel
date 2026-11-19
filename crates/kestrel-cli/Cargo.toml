@@ -11,8 +11,22 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
+[lib]
+name = "kestrel_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "kestrel"
 path = "src/main.rs"
+
+[dependencies]
+kestrel-types.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+kestrel-types.workspace = true
+kestrel-store.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true

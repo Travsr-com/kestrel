@@ -1,3 +1,5 @@
-//! The kestrel command-line tool.
+//! The kestrel command-line tool. All logic lives in the library so coverage measures it.
 
-fn main() {}
+fn main() -> std::process::ExitCode {
+    kestrel_cli::main()
+}
