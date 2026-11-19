@@ -2,7 +2,11 @@
 //! tolerated errors, cleanup after a failing step, idempotent stop and input validation.
 //!
 //! Step names carried by `SandboxError::Bridge`: `remove-stale`, `create-network`, `run`,
-//! `connect`.
+//! `connect`, `inspect`.
+//!
+//! The bridge URL uses the bridge's IP on `kestrel-gw`, read by `inspect`: CI showed that Docker's
+//! embedded DNS does not resolve the name from a gVisor sandbox (`getent hosts kestrel-gateway`
+//! exited 2 under `--runtime=runsc`, CI run 44563862878).
 
 #![allow(clippy::expect_used)]
 
@@ -54,6 +58,37 @@ fn connect() -> Vec<String> {
     ])
 }
 
+const IP: &str = "172.18.0.2";
+
+fn inspect() -> Vec<String> {
+    s(&[
+        "docker",
+        "inspect",
+        "--format",
+        "{{(index .NetworkSettings.Networks \"kestrel-gw\").IPAddress}}",
+        "kestrel-gateway",
+    ])
+}
+
+fn ip_out(text: &str) -> CommandOutput {
+    CommandOutput {
+        status: 0,
+        stdout: text.to_string(),
+        stderr: String::new(),
+    }
+}
+
+/// Every command succeeds, and `inspect` answers with [`IP`] and a newline.
+fn happy() -> Arc<FakeRunner> {
+    FakeRunner::with(|argv| {
+        if argv == inspect().as_slice() {
+            ip_out(&format!("{IP}\n"))
+        } else {
+            ok()
+        }
+    })
+}
+
 fn fail(stderr: &str) -> CommandOutput {
     CommandOutput {
         status: 1,
@@ -71,6 +106,8 @@ fn failing(bad: Vec<String>, stderr: &'static str) -> Arc<FakeRunner> {
     FakeRunner::with(move |argv| {
         if argv == bad.as_slice() {
             fail(stderr)
+        } else if argv == inspect().as_slice() {
+            ip_out(IP)
         } else {
             ok()
         }
@@ -82,23 +119,26 @@ async fn start(runner: &Arc<FakeRunner>, port: u16) -> Result<GatewayBridge, San
 }
 
 #[tokio::test]
-async fn start_runs_the_four_steps_in_order_with_exact_argv() {
-    let runner = FakeRunner::with(|_| ok());
+async fn start_runs_the_five_steps_in_order_with_exact_argv() {
+    let runner = happy();
     start(&runner, 7070).await.expect("bridge starts");
-    assert_eq!(runner.runs(), vec![rm(), network(), run(7070), connect()]);
+    assert_eq!(
+        runner.runs(),
+        vec![rm(), network(), run(7070), connect(), inspect()]
+    );
     assert!(runner.spawns().is_empty(), "no streaming process is needed");
 }
 
 #[tokio::test]
 async fn the_port_is_used_in_both_socat_addresses() {
-    let runner = FakeRunner::with(|_| ok());
+    let runner = happy();
     start(&runner, 18080).await.expect("bridge starts");
     assert_eq!(runner.runs()[2], run(18080));
 }
 
 #[tokio::test]
 async fn the_container_publishes_no_ports_and_never_restarts() {
-    let runner = FakeRunner::with(|_| ok());
+    let runner = happy();
     start(&runner, 7070).await.expect("bridge starts");
     let argv = &runner.runs()[2];
     for flag in ["-p", "--publish", "-P", "--publish-all", "--privileged"] {
@@ -121,7 +161,7 @@ async fn the_default_image_is_pinned() {
 
 #[tokio::test]
 async fn a_custom_image_is_used_as_is() {
-    let runner = FakeRunner::with(|_| ok());
+    let runner = happy();
     let spec = BridgeSpec {
         image: "registry.local/socat:9".to_string(),
     };
@@ -133,12 +173,12 @@ async fn a_custom_image_is_used_as_is() {
 }
 
 #[tokio::test]
-async fn url_is_the_bridge_name_and_the_port() {
-    let runner = FakeRunner::with(|_| ok());
+async fn url_is_the_bridge_ip_and_the_port() {
+    let runner = happy();
     let bridge = start(&runner, 7070).await.expect("bridge starts");
-    assert_eq!(bridge.url().as_str(), "http://kestrel-gateway:7070/");
+    assert_eq!(bridge.url().as_str(), "http://172.18.0.2:7070/");
     let other = start(&runner, 65535).await.expect("bridge starts");
-    assert_eq!(other.url().as_str(), "http://kestrel-gateway:65535/");
+    assert_eq!(other.url().as_str(), "http://172.18.0.2:65535/");
 }
 
 #[tokio::test]
@@ -151,13 +191,15 @@ async fn a_stale_bridge_is_removed_first_and_a_missing_one_is_fine() {
         let runner = FakeRunner::with(move |argv| {
             if argv == rm().as_slice() {
                 rm_result.clone()
+            } else if argv == inspect().as_slice() {
+                ip_out(IP)
             } else {
                 ok()
             }
         });
         start(&runner, 7070).await.expect("bridge starts");
         assert_eq!(runner.runs()[0], rm());
-        assert_eq!(runner.runs().len(), 4);
+        assert_eq!(runner.runs().len(), 5);
     }
 }
 
@@ -168,7 +210,10 @@ async fn an_existing_network_is_fine() {
         "Error response from daemon: network with name kestrel-gw already exists",
     );
     start(&runner, 7070).await.expect("bridge starts");
-    assert_eq!(runner.runs(), vec![rm(), network(), run(7070), connect()]);
+    assert_eq!(
+        runner.runs(),
+        vec![rm(), network(), run(7070), connect(), inspect()]
+    );
 }
 
 #[tokio::test]
@@ -267,6 +312,8 @@ async fn cleanup_failing_too_still_reports_the_original_error() {
             && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
         {
             fail("rm broke")
+        } else if argv == inspect().as_slice() {
+            ip_out(IP)
         } else {
             ok()
         }
@@ -276,13 +323,66 @@ async fn cleanup_failing_too_still_reports_the_original_error() {
 }
 
 #[tokio::test]
+async fn a_failing_inspect_removes_the_container_again() {
+    let runner = failing(inspect(), "No such container");
+    let err = start(&runner, 7070).await.expect_err("fails");
+    assert!(
+        matches!(
+            err,
+            SandboxError::Bridge {
+                step: "inspect",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("inspect"), "{err}");
+    assert_eq!(
+        runner.runs(),
+        vec![rm(), network(), run(7070), connect(), inspect(), rm()]
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_an_ipv4_address_removes_the_container_again() {
+    for answer in [
+        "",
+        "\n",
+        "kestrel-gateway",
+        "172.18.0.2 extra",
+        "::1",
+        "999.1.1.1",
+    ] {
+        let runner = FakeRunner::with(move |argv| {
+            if argv == inspect().as_slice() {
+                ip_out(answer)
+            } else {
+                ok()
+            }
+        });
+        let err = start(&runner, 7070).await.expect_err(answer);
+        assert!(
+            matches!(
+                err,
+                SandboxError::Bridge {
+                    step: "inspect",
+                    ..
+                }
+            ),
+            "{answer:?}: {err:?}"
+        );
+        assert_eq!(runner.runs().last(), Some(&rm()), "{answer:?}");
+    }
+}
+
+#[tokio::test]
 async fn stop_removes_the_container_once_and_is_idempotent() {
-    let runner = FakeRunner::with(|_| ok());
+    let runner = happy();
     let bridge = start(&runner, 7070).await.expect("bridge starts");
     bridge.stop().await;
     assert_eq!(runner.runs().last(), Some(&rm()));
     let after_first = runner.runs().len();
-    assert_eq!(after_first, 5);
+    assert_eq!(after_first, 6);
     bridge.stop().await;
     assert_eq!(runner.runs().len(), after_first, "second stop runs nothing");
 }
@@ -299,6 +399,8 @@ async fn stop_ignores_a_container_that_is_already_gone_or_a_failing_rm() {
                 && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
             {
                 fail(stderr)
+            } else if argv == inspect().as_slice() {
+                ip_out(IP)
             } else {
                 ok()
             }
@@ -311,7 +413,7 @@ async fn stop_ignores_a_container_that_is_already_gone_or_a_failing_rm() {
 
 #[tokio::test]
 async fn port_zero_is_rejected_before_any_command() {
-    let runner = FakeRunner::with(|_| ok());
+    let runner = happy();
     let err = start(&runner, 0).await.expect_err("port 0");
     assert!(matches!(err, SandboxError::InvalidBridgePort), "{err:?}");
     assert!(runner.all_calls().is_empty());
@@ -320,7 +422,7 @@ async fn port_zero_is_rejected_before_any_command() {
 #[tokio::test]
 async fn bad_images_are_rejected_before_any_command() {
     for image in ["", "-v", "--privileged", "--rm=true"] {
-        let runner = FakeRunner::with(|_| ok());
+        let runner = happy();
         let spec = BridgeSpec {
             image: image.to_string(),
         };
