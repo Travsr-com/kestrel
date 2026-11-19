@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1763531592750,"sessionID":"ses_7d1f0c2a9b8e4f3a","part":{"id":"prt_01","sessionID":"ses_7d1f0c2a9b8e4f3a","messageID":"msg_01","type":"step-start","snapshot":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"}}
+{"type":"error","timestamp":1763531593000,"sessionID":"ses_7d1f0c2a9b8e4f3a","error":{"type":"unknown","message":"Provider returned 401: invalid x-api-key"}}
