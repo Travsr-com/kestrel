@@ -490,6 +490,26 @@ fn s1_run_completes_edits_workspace_and_reports_exact_cost() {
         format!("{README_START}echo-agent: edit the readme\n")
     );
 
+    // Issue #24: the sandbox runs as the workspace owner. The image's user is uid 1000 and the CI
+    // runner is not, so a file the agent CREATES (env.txt, unlike README.txt, did not exist before)
+    // must belong to the host user, and the host must be able to delete it.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let workspace = env.workspace(&id);
+        let host_uid = std::fs::metadata(&workspace).expect("workspace dir").uid();
+        let created = workspace.join("env.txt");
+        let agent_uid = std::fs::metadata(&created)
+            .expect("env.txt, created by the agent")
+            .uid();
+        if host_uid != 0 {
+            assert_eq!(
+                agent_uid, host_uid,
+                "files the agent creates belong to the host user, not to the image's user or root"
+            );
+        }
+        std::fs::remove_file(&created).expect("the host can delete a file the agent created");
+    }
+
     // Model traffic went through the gateway: the mock saw exactly one call, with the real key.
     assert_eq!(env.mock.keys_seen(), vec![FAKE_KEY.to_string()]);
 
