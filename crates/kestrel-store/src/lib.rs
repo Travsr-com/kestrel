@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -116,6 +116,15 @@ CREATE TABLE control (
 );
 ";
 
+/// v2: the full agent spec of each run, as JSON, so a later engine can resume the run. A side
+/// table rather than a new `runs` column, so `runs` keeps its v1 shape.
+const SCHEMA_V2: &str = "
+CREATE TABLE run_specs (
+    run_id TEXT PRIMARY KEY,
+    spec   TEXT NOT NULL
+);
+";
+
 /// RFC 3339 timestamp, stored as JSON text like the rest of the typed columns.
 #[derive(Serialize, Deserialize)]
 struct Ts(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
@@ -156,10 +165,13 @@ impl Store {
 
     // runs
 
-    /// Creates a run in `Queued`. Writes no event, so the run's first appended event gets seq 1.
+    /// Creates a run in `Queued` and stores its full spec (see [`Store::run_spec`]). Writes no
+    /// event, so the run's first appended event gets seq 1.
     pub fn create_run(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
         let id = RunId::new();
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO runs (id, agent, input, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id.to_string(),
@@ -169,7 +181,26 @@ impl Store {
                 serde_json::to_string(&Ts(OffsetDateTime::now_utc()))?,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO run_specs (run_id, spec) VALUES (?1, ?2)",
+            params![id.to_string(), serde_json::to_string(agent)?],
+        )?;
+        tx.commit()?;
         Ok(id)
+    }
+
+    /// The spec a run was created with. `None` for an unknown run, or for a run created before
+    /// schema v2 (those have no stored spec).
+    pub fn run_spec(&self, id: RunId) -> Result<Option<AgentSpec>> {
+        let spec: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT spec FROM run_specs WHERE run_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(spec.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
     pub fn get_run(&self, id: RunId) -> Result<Option<RunRow>> {
@@ -409,8 +440,14 @@ fn ensure_run(tx: &Transaction<'_>, run: RunId) -> Result<()> {
 fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Re-read under the write lock: another handle may have migrated since the first check.
-    if check_version(&tx)? < 1 {
+    let found = check_version(&tx)?;
+    if found < 1 {
         tx.execute_batch(SCHEMA_V1)?;
+    }
+    if found < 2 {
+        tx.execute_batch(SCHEMA_V2)?;
+    }
+    if found < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
