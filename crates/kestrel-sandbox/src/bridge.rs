@@ -2,6 +2,7 @@
 //! `kestrel-gw` network reach the gateway running on the host, and nothing else.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,11 +11,28 @@ use url::Url;
 use crate::{CommandRunner, SandboxError, check_image};
 
 /// Pinned `socat` image used when [`BridgeSpec::image`] is not set.
-pub const DEFAULT_BRIDGE_IMAGE: &str = "alpine/socat:1.8.0.3";
-/// Name of the bridge container. Sandboxes reach it by IP, not by this name.
+pub const DEFAULT_BRIDGE_IMAGE: &str =
+    "alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e";
+/// Prefix of the bridge container name, followed by `-<instance id>`. Sandboxes reach the
+/// container by IP, not by name.
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
+/// `--pids-limit` of the container. It counts `socat` itself (PID 1) and every forked child, so
+/// it must stay at least `MAX_CHILDREN + 2`, or the limit trips before `socat` refuses a child.
+const PIDS_LIMIT: u32 = 64;
+/// `max-children` of the `socat` listener.
+const MAX_CHILDREN: u32 = 32;
+/// `-T`: seconds without data in either direction before `socat` closes a connection. It is an
+/// inactivity timeout, so a model stream that is silent for more than five minutes is cut.
+const IDLE_TIMEOUT_SECS: u32 = 300;
+
+/// Docker's container name charset: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
+fn is_container_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
 
 /// How to build the bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +53,7 @@ impl Default for BridgeSpec {
 pub struct GatewayBridge {
     runner: Arc<dyn CommandRunner>,
     url: Url,
+    name: String,
     stopped: AtomicBool,
 }
 
@@ -50,8 +69,16 @@ fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|p| (*p).to_string()).collect()
 }
 
-fn remove_argv() -> Vec<String> {
-    argv(&["docker", "rm", "--force", BRIDGE_NAME])
+fn remove_argv(name: &str) -> Vec<String> {
+    argv(&["docker", "rm", "--force", name])
+}
+
+/// Removes `name`; a container that is already gone is fine.
+async fn remove(runner: &dyn CommandRunner, name: &str) -> Result<(), String> {
+    match docker(runner, &remove_argv(name)).await {
+        Err(e) if !e.contains("No such container") => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Runs one docker command and returns its stdout. `Err` carries the text for [`SandboxError::Bridge`].
@@ -87,15 +114,41 @@ impl GatewayBridge {
         runner: Arc<dyn CommandRunner>,
         host_port: u16,
         spec: BridgeSpec,
+        db: &Path,
     ) -> Result<GatewayBridge, SandboxError> {
         if host_port == 0 {
             return Err(SandboxError::InvalidBridgePort);
         }
         check_image(&spec.image)?;
 
-        match docker(&*runner, &remove_argv()).await {
-            Err(e) if !e.contains("No such container") => return Err(step("remove-stale")(e)),
-            _ => {}
+        let id = Self::instance_id(db);
+        let name = Self::container_name(&id);
+        let managed = "kestrel.managed=bridge";
+        let db_label = format!("kestrel.db={id}");
+        // Only containers carrying both labels for this database are ever removed.
+        let list = argv(&[
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={managed}"),
+            "--filter",
+            &format!("label={db_label}"),
+            "--format",
+            "{{.Names}}",
+        ]);
+        let stale = docker(&*runner, &list)
+            .await
+            .map_err(step("remove-stale"))?;
+        for stale in stale.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            // Names are data from docker: never let one become an option of `docker rm`.
+            if !is_container_name(stale) {
+                eprintln!("kestrel: ignoring unexpected container name from docker ps");
+                continue;
+            }
+            remove(&*runner, stale)
+                .await
+                .map_err(step("remove-stale"))?;
         }
         let network = argv(&["docker", "network", "create", "--internal", NETWORK]);
         match docker(&*runner, &network).await {
@@ -103,25 +156,42 @@ impl GatewayBridge {
             _ => {}
         }
 
-        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr");
+        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={MAX_CHILDREN}");
         let target = format!("TCP:host.docker.internal:{host_port}");
         let run = argv(&[
             "docker",
             "run",
             "--detach",
             "--name",
-            BRIDGE_NAME,
+            &name,
+            "--label",
+            managed,
+            "--label",
+            &db_label,
             "--network",
             "bridge",
             "--add-host",
             "host.docker.internal:host-gateway",
             "--restart",
             "no",
+            "--cap-drop",
+            "ALL",
+            "--read-only",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            &PIDS_LIMIT.to_string(),
+            "--memory",
+            "64m",
+            "--user",
+            "65534:65534",
             &spec.image,
+            "-T",
+            &IDLE_TIMEOUT_SECS.to_string(),
             &listen,
             &target,
         ]);
-        let connect = argv(&["docker", "network", "connect", NETWORK, BRIDGE_NAME]);
+        let connect = argv(&["docker", "network", "connect", NETWORK, &name]);
         // The name is not used by sandboxes: Docker's DNS does not answer inside gVisor, so they
         // reach the bridge by its IP on the internal network.
         let inspect = argv(&[
@@ -129,10 +199,19 @@ impl GatewayBridge {
             "inspect",
             "--format",
             &format!("{{{{(index .NetworkSettings.Networks \"{NETWORK}\").IPAddress}}}}"),
-            BRIDGE_NAME,
+            &name,
         ]);
+        if let Err(e) = docker(&*runner, &run).await {
+            if e.contains("already in use") {
+                // Someone else owns the name: do not remove it, and say why.
+                return Err(step("run")(format!(
+                    "the container name {name} is taken by a container without the label {managed} for this database, so Kestrel will not remove it. Remove it yourself or use another database path. Docker said: {e}"
+                )));
+            }
+            let _ = docker(&*runner, &remove_argv(&name)).await;
+            return Err(step("run")(e));
+        }
         let started = async {
-            docker(&*runner, &run).await.map_err(step("run"))?;
             docker(&*runner, &connect).await.map_err(step("connect"))?;
             let answer = docker(&*runner, &inspect).await.map_err(step("inspect"))?;
             bridge_url(&answer, host_port)
@@ -142,14 +221,37 @@ impl GatewayBridge {
             Ok(url) => Ok(GatewayBridge {
                 runner,
                 url,
+                name,
                 stopped: AtomicBool::new(false),
             }),
             Err(e) => {
                 // Best effort: the original error is the one worth reporting.
-                let _ = docker(&*runner, &remove_argv()).await;
+                let _ = docker(&*runner, &remove_argv(&name)).await;
                 Err(e)
             }
         }
+    }
+
+    /// The 8 hex chars naming the bridge of the database at `db`: the first 8 of the 16-digit
+    /// lower-case hex FNV-1a 64 hash of the absolute path (`std::path::absolute`, no symlink
+    /// resolution) as bytes. Used in the container name and the `kestrel.db` label.
+    #[must_use]
+    pub fn instance_id(db: &Path) -> String {
+        let path = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
+        let hash = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+        format!("{hash:016x}")[..8].to_string()
+    }
+
+    /// `kestrel-gateway-<id>`.
+    #[must_use]
+    pub fn container_name(id: &str) -> String {
+        format!("{BRIDGE_NAME}-{id}")
     }
 
     /// Removes the container. Idempotent; failures are ignored (the next `start` replaces it).
@@ -157,9 +259,7 @@ impl GatewayBridge {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Err(e) = docker(&*self.runner, &remove_argv()).await
-            && !e.contains("No such container")
-        {
+        if let Err(e) = remove(&*self.runner, &self.name).await {
             eprintln!("kestrel: gateway bridge stop failed: {e}");
         }
     }
@@ -168,5 +268,25 @@ impl GatewayBridge {
     #[must_use]
     pub fn url(&self) -> Url {
         self.url.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pids_limit_leaves_room_for_socat_and_all_its_children() {
+        const { assert!(PIDS_LIMIT >= MAX_CHILDREN + 2) };
+    }
+
+    #[test]
+    fn container_names_follow_dockers_charset() {
+        for ok in ["a", "kestrel-gateway-b29b95f5", "a.b_c-d", "0x"] {
+            assert!(is_container_name(ok), "{ok}");
+        }
+        for bad in ["", "-f", "--volumes", "a b", "_x", ".x", "a/b", "a\u{e9}"] {
+            assert!(!is_container_name(bad), "{bad}");
+        }
     }
 }

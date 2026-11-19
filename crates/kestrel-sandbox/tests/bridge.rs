@@ -12,6 +12,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use common::{FakeRunner, s};
@@ -19,10 +20,30 @@ use kestrel_sandbox::{
     BridgeSpec, CommandOutput, DEFAULT_BRIDGE_IMAGE, GatewayBridge, SandboxError,
 };
 
-const IMAGE: &str = "alpine/socat:1.8.0.3";
+const IMAGE: &str =
+    "alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e";
+/// The database the bridge belongs to, and the id and container name derived from it (#29).
+const DB: &str = "/tmp/a/kestrel.db";
+const ID: &str = "b29b95f5";
+const NAME: &str = "kestrel-gateway-b29b95f5";
 
 fn rm() -> Vec<String> {
-    s(&["docker", "rm", "--force", "kestrel-gateway"])
+    s(&["docker", "rm", "--force", NAME])
+}
+
+/// Lists the containers that carry both ownership labels for this database.
+fn ps() -> Vec<String> {
+    s(&[
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "label=kestrel.managed=bridge",
+        "--filter",
+        &format!("label=kestrel.db={ID}"),
+        "--format",
+        "{{.Names}}",
+    ])
 }
 
 fn network() -> Vec<String> {
@@ -35,27 +56,38 @@ fn run(port: u16) -> Vec<String> {
         "run",
         "--detach",
         "--name",
-        "kestrel-gateway",
+        NAME,
+        "--label",
+        "kestrel.managed=bridge",
+        "--label",
+        &format!("kestrel.db={ID}"),
         "--network",
         "bridge",
         "--add-host",
         "host.docker.internal:host-gateway",
         "--restart",
         "no",
+        "--cap-drop",
+        "ALL",
+        "--read-only",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "64",
+        "--memory",
+        "64m",
+        "--user",
+        "65534:65534",
         IMAGE,
-        &format!("TCP-LISTEN:{port},fork,reuseaddr"),
+        "-T",
+        "300",
+        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=32"),
         &format!("TCP:host.docker.internal:{port}"),
     ])
 }
 
 fn connect() -> Vec<String> {
-    s(&[
-        "docker",
-        "network",
-        "connect",
-        "kestrel-gw",
-        "kestrel-gateway",
-    ])
+    s(&["docker", "network", "connect", "kestrel-gw", NAME])
 }
 
 const IP: &str = "172.18.0.2";
@@ -66,7 +98,7 @@ fn inspect() -> Vec<String> {
         "inspect",
         "--format",
         "{{(index .NetworkSettings.Networks \"kestrel-gw\").IPAddress}}",
-        "kestrel-gateway",
+        NAME,
     ])
 }
 
@@ -115,7 +147,7 @@ fn failing(bad: Vec<String>, stderr: &'static str) -> Arc<FakeRunner> {
 }
 
 async fn start(runner: &Arc<FakeRunner>, port: u16) -> Result<GatewayBridge, SandboxError> {
-    GatewayBridge::start(runner.clone(), port, BridgeSpec::default()).await
+    GatewayBridge::start(runner.clone(), port, BridgeSpec::default(), Path::new(DB)).await
 }
 
 #[tokio::test]
@@ -124,7 +156,7 @@ async fn start_runs_the_five_steps_in_order_with_exact_argv() {
     start(&runner, 7070).await.expect("bridge starts");
     assert_eq!(
         runner.runs(),
-        vec![rm(), network(), run(7070), connect(), inspect()]
+        vec![ps(), network(), run(7070), connect(), inspect()]
     );
     assert!(runner.spawns().is_empty(), "no streaming process is needed");
 }
@@ -165,7 +197,7 @@ async fn a_custom_image_is_used_as_is() {
     let spec = BridgeSpec {
         image: "registry.local/socat:9".to_string(),
     };
-    GatewayBridge::start(runner.clone(), 7070, spec)
+    GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
         .await
         .expect("bridge starts");
     assert!(runner.runs()[2].contains(&"registry.local/socat:9".to_string()));
@@ -186,10 +218,12 @@ async fn a_stale_bridge_is_removed_first_and_a_missing_one_is_fine() {
     // Stale container exists: rm succeeds. No container: rm says so on stderr.
     for rm_result in [
         ok(),
-        fail("Error response from daemon: No such container: kestrel-gateway"),
+        fail("Error response from daemon: No such container: kestrel-gateway-b29b95f5"),
     ] {
         let runner = FakeRunner::with(move |argv| {
-            if argv == rm().as_slice() {
+            if argv == ps().as_slice() {
+                ip_out(&format!("{NAME}\n"))
+            } else if argv == rm().as_slice() {
                 rm_result.clone()
             } else if argv == inspect().as_slice() {
                 ip_out(IP)
@@ -198,8 +232,9 @@ async fn a_stale_bridge_is_removed_first_and_a_missing_one_is_fine() {
             }
         });
         start(&runner, 7070).await.expect("bridge starts");
-        assert_eq!(runner.runs()[0], rm());
-        assert_eq!(runner.runs().len(), 5);
+        assert_eq!(runner.runs()[0], ps());
+        assert_eq!(runner.runs()[1], rm());
+        assert_eq!(runner.runs().len(), 6);
     }
 }
 
@@ -212,13 +247,21 @@ async fn an_existing_network_is_fine() {
     start(&runner, 7070).await.expect("bridge starts");
     assert_eq!(
         runner.runs(),
-        vec![rm(), network(), run(7070), connect(), inspect()]
+        vec![ps(), network(), run(7070), connect(), inspect()]
     );
 }
 
 #[tokio::test]
 async fn other_rm_errors_are_not_tolerated_and_nothing_else_runs() {
-    let runner = failing(rm(), "permission denied");
+    let runner = FakeRunner::with(|argv| {
+        if argv == ps().as_slice() {
+            ip_out(&format!("{NAME}\n"))
+        } else if argv == rm().as_slice() {
+            fail("permission denied")
+        } else {
+            ok()
+        }
+    });
     let err = start(&runner, 7070).await.expect_err("fails");
     assert!(
         matches!(
@@ -233,7 +276,7 @@ async fn other_rm_errors_are_not_tolerated_and_nothing_else_runs() {
     assert!(err.to_string().contains("permission denied"), "{err}");
     assert_eq!(
         runner.runs(),
-        vec![rm()],
+        vec![ps(), rm()],
         "no container exists yet, no extra cleanup"
     );
 }
@@ -257,7 +300,7 @@ async fn a_failing_network_create_names_the_step_and_creates_nothing() {
         text.contains("create-network") && text.contains("daemon not running"),
         "{text}"
     );
-    assert_eq!(runner.runs(), vec![rm(), network()]);
+    assert_eq!(runner.runs(), vec![ps(), network()]);
 }
 
 #[tokio::test]
@@ -273,7 +316,7 @@ async fn a_failing_run_removes_the_container_again() {
         text.contains("run") && text.contains("pull access denied"),
         "{text}"
     );
-    assert_eq!(runner.runs(), vec![rm(), network(), run(7070), rm()]);
+    assert_eq!(runner.runs(), vec![ps(), network(), run(7070), rm()]);
 }
 
 #[tokio::test]
@@ -297,7 +340,7 @@ async fn a_failing_connect_removes_the_container_again() {
     );
     assert_eq!(
         runner.runs(),
-        vec![rm(), network(), run(7070), connect(), rm()]
+        vec![ps(), network(), run(7070), connect(), rm()]
     );
 }
 
@@ -339,7 +382,7 @@ async fn a_failing_inspect_removes_the_container_again() {
     assert!(err.to_string().contains("inspect"), "{err}");
     assert_eq!(
         runner.runs(),
-        vec![rm(), network(), run(7070), connect(), inspect(), rm()]
+        vec![ps(), network(), run(7070), connect(), inspect(), rm()]
     );
 }
 
@@ -390,7 +433,7 @@ async fn stop_removes_the_container_once_and_is_idempotent() {
 #[tokio::test]
 async fn stop_ignores_a_container_that_is_already_gone_or_a_failing_rm() {
     for stderr in [
-        "Error: No such container: kestrel-gateway",
+        "Error: No such container: kestrel-gateway-b29b95f5",
         "daemon not running",
     ] {
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -426,7 +469,7 @@ async fn bad_images_are_rejected_before_any_command() {
         let spec = BridgeSpec {
             image: image.to_string(),
         };
-        let err = GatewayBridge::start(runner.clone(), 7070, spec)
+        let err = GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
             .await
             .expect_err("bad image");
         assert!(

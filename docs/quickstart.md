@@ -34,7 +34,8 @@ Kestrel warns you if other users can read it.
 
 ```toml
 [gateway]
-listen = "0.0.0.0:7070"
+# Leave `listen` out. With Docker, Kestrel binds the gateway to the Docker bridge IP
+# (usually 172.17.0.1) on port 7070. Change the port with `port = 7070`.
 
 [engine]
 max_concurrent_runs = 4
@@ -55,8 +56,23 @@ cache_write_per_mtok = "3.75"
 ```
 
 > **The gateway cannot listen on loopback.** Sandboxes reach it through a container, which a
-> loopback address refuses, so `kestrel serve` exits with an error if you try. Only the per-run
-> token protects the gateway, so use a firewall or a private network.
+> loopback address refuses, so `kestrel serve` exits with an error if you set one. Without a
+> `listen` setting, Kestrel binds the Docker bridge IP, so the gateway is not exposed to your LAN.
+> If you set `listen = "0.0.0.0:7070"`, Kestrel warns you: the gateway is then reachable from
+> your LAN, and only the per-run token protects it.
+
+> **A host firewall can block the gateway.** Traffic from containers (`docker0`) to the host must be
+> allowed. `ufw` and an `INPUT` policy of `DROP` often block it. Allow it with, for example,
+> `sudo ufw allow in on docker0 to any port 7070`. Rootless Docker and Podman use a different
+> bridge network, so the default bind may not work. Set `listen` and `gateway.advertise_url`
+> yourself there.
+
+> **Docker Desktop (macOS and Windows) does not work with the default bind.** The docker bridge
+> address lives inside a VM there, so set `gateway.advertise_url` or `gateway.listen` yourself.
+> (Kestrel's gVisor driver is Linux only today anyway.)
+>
+> **If `docker network inspect bridge` lists an IPv6 range first,** Kestrel cannot read the bridge
+> IP. Set `gateway.listen` explicitly.
 
 > **Add a price for every model you use.** A call to a model with no price entry is not counted
 > against the run's budget.
