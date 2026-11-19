@@ -8,6 +8,9 @@
 //! Each active run has its own task (a run actor). It is the only writer of that run's status, so
 //! control commands are applied while the run is busy, for example while `create` is still blocked.
 
+pub mod workspace;
+pub use workspace::{WorkspaceError, Workspaces};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
