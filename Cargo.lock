@@ -819,6 +819,19 @@ version = "0.1.0"
 [[package]]
 name = "kestrel-core"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "kestrel-agent",
+ "kestrel-sandbox",
+ "kestrel-store",
+ "kestrel-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "url",
+]
 
 [[package]]
 name = "kestrel-gateway"

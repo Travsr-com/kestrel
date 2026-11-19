@@ -29,6 +29,7 @@ kestrel-agent   = { path = "crates/kestrel-agent" }
 # Shared third-party versions. Add new ones here, not in crate manifests.
 tokio        = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-util   = "0.7"
 futures      = "0.3"
 async-trait  = "0.1"
 serde        = { version = "1", features = ["derive"] }
