@@ -11,7 +11,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use kestrel_types::{ApprovalId, RunId};
+use kestrel_store::{ControlCommand, Store, StoreError};
+use kestrel_types::{ApprovalId, MicroUsd, RunId};
+
+mod commands;
+#[cfg(debug_assertions)]
+mod fake;
+mod paths;
+mod serve;
 
 /// Success.
 pub const EXIT_OK: u8 = 0;
@@ -103,17 +110,99 @@ pub fn main() -> ExitCode {
     ExitCode::from(dispatch(cli))
 }
 
-/// Runs one parsed command and returns its exit code.
+/// Runs one parsed command and returns its exit code. Errors go to stderr.
 pub fn dispatch(cli: Cli) -> u8 {
+    match execute(cli) {
+        Ok(()) => EXIT_OK,
+        Err(e) => {
+            eprintln!("error: {}", e.message);
+            e.code
+        }
+    }
+}
+
+fn execute(cli: Cli) -> Result<(), Failure> {
+    let out = Output { json: cli.json };
+    let db = cli.db;
     match cli.command {
-        Command::Serve(_) => todo!("kestrel serve"),
-        Command::Run(_) => todo!("kestrel run"),
-        Command::Watch { .. } => todo!("kestrel watch"),
-        Command::Ps { .. } => todo!("kestrel ps"),
-        Command::Approve { .. } => todo!("kestrel approve"),
-        Command::Pause { .. } => todo!("kestrel pause"),
-        Command::Resume { .. } => todo!("kestrel resume"),
-        Command::Cancel { .. } => todo!("kestrel cancel"),
-        Command::Budget { .. } => todo!("kestrel budget"),
+        Command::Serve(args) => serve::serve(db, args, out),
+        Command::Run(args) => commands::run(db, args, out),
+        Command::Watch { run_id } => commands::watch(&open(db)?, run_id, out),
+        Command::Ps { all } => commands::ps(&open(db)?, all, out),
+        Command::Approve {
+            approval_id,
+            reject,
+        } => commands::approve(&open(db)?, approval_id, reject, out),
+        Command::Pause { run_id } => {
+            commands::steer(&open(db)?, run_id, ControlCommand::Pause, out)
+        }
+        Command::Resume { run_id } => {
+            commands::steer(&open(db)?, run_id, ControlCommand::Resume, out)
+        }
+        Command::Cancel { run_id } => {
+            commands::steer(&open(db)?, run_id, ControlCommand::Cancel, out)
+        }
+        Command::Budget { run_id, usd } => {
+            let limit = MicroUsd::parse_decimal(&usd).ok_or_else(|| {
+                Failure::usage(format!(
+                    "`{usd}` is not a dollar amount (use a non-negative number like 5 or 2.50)"
+                ))
+            })?;
+            commands::steer(&open(db)?, run_id, ControlCommand::SetBudget(limit), out)
+        }
+    }
+}
+
+/// A failed command: what to print and which exit code to use.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub(crate) code: u8,
+    pub(crate) message: String,
+}
+
+impl Failure {
+    pub(crate) fn usage(message: impl Into<String>) -> Failure {
+        Failure {
+            code: EXIT_USAGE,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn runtime(message: impl Into<String>) -> Failure {
+        Failure {
+            code: EXIT_RUNTIME,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<StoreError> for Failure {
+    fn from(e: StoreError) -> Failure {
+        Failure::runtime(e.to_string())
+    }
+}
+
+/// How to print results.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Output {
+    pub(crate) json: bool,
+}
+
+/// Opens the store at `db`, or at the default path under the user data dir.
+pub(crate) fn open(db: Option<PathBuf>) -> Result<Store, Failure> {
+    let path = db_path(db)?;
+    Store::open(&path).map_err(|e| Failure::runtime(format!("{}: {e}", path.display())))
+}
+
+/// `db`, or `kestrel.db` under the user data dir (created if needed).
+pub(crate) fn db_path(db: Option<PathBuf>) -> Result<PathBuf, Failure> {
+    match db {
+        Some(p) => Ok(p),
+        None => {
+            let dir = paths::data_dir()?.join("kestrel");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| Failure::runtime(format!("{}: {e}", dir.display())))?;
+            Ok(dir.join("kestrel.db"))
+        }
     }
 }
