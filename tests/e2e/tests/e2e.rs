@@ -306,21 +306,16 @@ impl Env {
         }
     }
 
-    /// The run's workspace: its git worktree of the test repo, on branch `kestrel/run-<id tail>`.
+    /// The run's workspace: its own git clone of the test repo, at `<db dir>/workspaces/<run id>`
+    /// (`kestrel serve` keeps workspaces next to the database), on branch `kestrel/run-<id tail>`.
     fn workspace(&self, id: &str) -> PathBuf {
-        let tail = &id[id.len().saturating_sub(12)..];
-        let out = git(&self.repo, &["worktree", "list", "--porcelain"]);
-        let mut path = None;
-        for line in out.lines() {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(p));
-            } else if let Some(b) = line.strip_prefix("branch refs/heads/kestrel/run-")
-                && b.ends_with(tail)
-            {
-                return path.expect("worktree line before branch line");
-            }
-        }
-        panic!("no worktree on a kestrel/run-*{tail} branch in the test repo:\n{out}")
+        let path = self.dir.path().join("workspaces").join(id);
+        assert!(
+            path.join(".git").is_dir(),
+            "no git clone at {} (a worktree would have a `.git` file)",
+            path.display()
+        );
+        path
     }
 
     /// The run's events as text, for failure messages. `watch` follows a live run forever, so it
@@ -695,5 +690,75 @@ fn s5_watch_mid_run_replays_from_start_and_follows() {
         env.events(&id).len(),
         events.len(),
         "watch saw every event the run has"
+    );
+}
+
+/// Scenario 6 (issue #22): the agent runs `git status`, `git add` and `git commit` inside its
+/// gVisor sandbox. The commit lands on `kestrel/run-<id tail>` in the run's clone only; the source
+/// repo gets nothing until `fetch_back` brings the branch home.
+#[test]
+fn s6_agent_can_commit_in_its_clone() {
+    let env = Env::new();
+    let _serve = env.serve();
+    let id = env.submit("5", "commit your work git=1");
+    env.wait_status(&id, "Completed");
+
+    let tail = &id[id.len().saturating_sub(12)..];
+    let branch = format!("kestrel/run-{tail}");
+    let workspace = env.workspace(&id);
+    let report = std::fs::read_to_string(workspace.join("git.txt"))
+        .expect("git.txt (written by the agent after its commit)");
+    let lines: Vec<&str> = report.lines().collect();
+    assert!(
+        lines.contains(&format!("branch={branch}").as_str()),
+        "the agent was not on its run branch:\n{report}"
+    );
+    for ok in ["status_rc=0", "add_rc=0", "commit_rc=0"] {
+        assert!(lines.contains(&ok), "{ok} missing:\n{report}");
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("log=") && l.ends_with("agent commit")),
+        "no `agent commit` in git log:\n{report}"
+    );
+
+    // The source repo is untouched: still only `main`, still only the initial commit.
+    let source_branches = git(&env.repo, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(source_branches.trim(), "main");
+    assert_eq!(
+        git(&env.repo, &["rev-list", "--all", "--count"]).trim(),
+        "1"
+    );
+    assert!(!env.repo.join("agent-commit.txt").exists());
+
+    // fetch_back (from the source repo, hooks off) brings the commit home as the run branch.
+    let run: kestrel_types::RunId = id.parse().expect("run id");
+    let workspaces = kestrel_core::Workspaces::new(
+        env.dir.path().join("workspaces"),
+        std::sync::Arc::new(kestrel_sandbox::ProcessRunner),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(workspaces.fetch_back(run, &env.repo))
+        .expect("fetch_back");
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{branch}:agent-commit.txt")]).trim(),
+        "agent work"
+    );
+    assert_eq!(
+        git(
+            &env.repo,
+            &["branch", "--format=%(refname:short)", "--list", &branch]
+        )
+        .trim(),
+        branch
+    );
+    assert_eq!(
+        git(&env.repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "main",
+        "fetch_back must not move the user's checkout"
     );
 }

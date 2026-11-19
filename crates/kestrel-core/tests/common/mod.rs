@@ -670,3 +670,21 @@ pub async fn settle_for(ticks: u32) {
 pub async fn settle() {
     settle_for(10).await;
 }
+
+/// Lets a test compile against both `Engine::with_workspaces` signatures: today's `-> Engine` and
+/// the possible `-> Result<Engine, E>` (issue #22, leftover 3 of #21).
+pub trait Applied {
+    fn into_result(self) -> Result<Engine, String>;
+}
+
+impl Applied for Engine {
+    fn into_result(self) -> Result<Engine, String> {
+        Ok(self)
+    }
+}
+
+impl<E: std::fmt::Display> Applied for Result<Engine, E> {
+    fn into_result(self) -> Result<Engine, String> {
+        self.map_err(|e| e.to_string())
+    }
+}

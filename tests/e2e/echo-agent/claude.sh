@@ -9,6 +9,8 @@
 #   env.txt      the environment (scenario 4: no real provider key)
 #   egress.txt   one line per outside host tried, "blocked <curl exit code> <url>" or "reachable <url>" (scenario 3)
 #   README.txt   one line appended, so a tracked file changes (scenario 1)
+#   git.txt      only when the input contains `git=1` (scenario 6): the agent commits inside its
+#                git clone and records `branch=`, `status_rc=`, `add_rc=`, `commit_rc=` and `log=`
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
@@ -63,6 +65,31 @@ if [ -n "$secs" ] && [ ! -e /workspace/.echo-agent-slept ]; then
   touch /workspace/.echo-agent-slept
   sleep "$secs"
 fi
+
+case "$input" in
+  *git=1*)
+    # What a real coding agent does: configure an identity, look, write, add, commit. All of it
+    # inside /workspace, which must be a self-contained git clone for this to work.
+    export HOME=/tmp
+    cd /workspace || exit 1
+    git config user.email agent@example.invalid
+    git config user.name "echo agent"
+    git status --porcelain > /dev/null 2>&1
+    status_rc=$?
+    echo "agent work" > agent-commit.txt
+    git add agent-commit.txt
+    add_rc=$?
+    git commit -q -m "agent commit" > /tmp/commit.out 2>&1
+    commit_rc=$?
+    {
+      echo "branch=$(git rev-parse --abbrev-ref HEAD 2>&1)"
+      echo "status_rc=$status_rc"
+      echo "add_rc=$add_rc"
+      echo "commit_rc=$commit_rc"
+      echo "log=$(git log --oneline -1 2>&1)"
+    } > /workspace/git.txt
+    ;;
+esac
 
 echo "echo-agent: $input" >> /workspace/README.txt
 

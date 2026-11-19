@@ -2,7 +2,12 @@
 //! through [`Workspaces`] and mounts it with `LaunchSpec.workspace`.
 //!
 //! Every test runs on a paused clock with the fake driver and adapter from `common`. Git goes
-//! through `FakeGit` (below), except `s2_...`, which runs the real `git` against a temp repo.
+//! through `FakeGit` (below), except the `..._real_git` tests, which run the real `git` against a
+//! temp repo and skip with a message when git is not installed.
+//!
+//! Section numbers follow the scenarios of issue #17: 1 empty-dir, 2 two git runs, 3 not a repo,
+//! 4 resume after a restart, 5 path validation (asserted inside `s1`). Rules the engine adds
+//! on top have no number: `rel_...` (relative repo) and `none_...` (engine without workspaces).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -30,8 +35,8 @@ use RunStatus::{Completed, Running, Suspended};
 
 const NOT_A_REPO: &str = "fatal: not a git repository (or any of the parent directories): .git";
 
-/// Records every git argv. `ok == true` behaves like git in a healthy repo (`worktree add`
-/// creates the directory); `ok == false` fails every command like git outside a repository.
+/// Records every git argv. `ok == true` behaves like git in a healthy repo (`clone` creates the
+/// directory with a `.git` entry); `ok == false` fails every command like git outside a repository.
 struct FakeGit {
     ok: bool,
     calls: Mutex<Vec<Vec<String>>>,
@@ -59,13 +64,13 @@ impl FakeGit {
             .clone()
     }
 
-    fn worktree_adds(&self) -> usize {
-        self.calls().iter().filter(|a| is_worktree_add(a)).count()
+    fn clones(&self) -> usize {
+        self.calls().iter().filter(|a| is_clone(a)).count()
     }
 }
 
-fn is_worktree_add(argv: &[String]) -> bool {
-    argv.windows(2).any(|w| w[0] == "worktree" && w[1] == "add")
+fn is_clone(argv: &[String]) -> bool {
+    argv.get(1).is_some_and(|a| a == "clone")
 }
 
 #[async_trait]
@@ -82,11 +87,10 @@ impl CommandRunner for FakeGit {
                 stderr: NOT_A_REPO.into(),
             });
         }
-        if is_worktree_add(argv) {
-            // `git worktree add -b <branch> <path> <commit>`: the path is second to last.
-            let path = PathBuf::from(&argv[argv.len() - 2]);
-            std::fs::create_dir_all(&path)?;
-            std::fs::write(path.join(".git"), "gitdir: /elsewhere\n")?;
+        if is_clone(argv) {
+            // `git clone ... <source> <path>`: the path is last.
+            let path = PathBuf::from(argv.last().expect("clone target"));
+            std::fs::create_dir_all(path.join(".git"))?;
         }
         Ok(CommandOutput {
             status: 0,
@@ -123,7 +127,9 @@ fn with_workspaces(h: &mut Harness, workspaces: Workspaces) {
             poll_interval: POLL,
         },
     )
-    .with_workspaces(workspaces);
+    .with_workspaces(workspaces)
+    .into_result()
+    .expect("workspaces applied");
     h.engine = Arc::new(engine);
 }
 
@@ -133,7 +139,7 @@ fn spec_ws(workspace: WorkspaceSpec) -> AgentSpec {
     s
 }
 
-fn worktree(repo: impl Into<PathBuf>) -> AgentSpec {
+fn clone_of(repo: impl Into<PathBuf>) -> AgentSpec {
     spec_ws(WorkspaceSpec::GitClone {
         repo: repo.into(),
         depth: None,
@@ -158,6 +164,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "user.name=Kestrel Test",
             "-c",
             "user.email=test@kestrel.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
         ])
         .args(args)
         .output()
@@ -168,6 +178,20 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// True when `git` can be run. Real-git tests return early, with a message, when it cannot.
+fn git_available() -> bool {
+    Command::new("git").arg("--version").output().is_ok()
+}
+
+macro_rules! need_git {
+    () => {
+        if !git_available() {
+            eprintln!("SKIPPED {}: `git` is not on PATH", module_path!());
+            return;
+        }
+    };
 }
 
 /// A real git repo with one commit, in a temp dir.
@@ -232,7 +256,8 @@ async fn s1_two_empty_dir_runs_get_different_workspaces() {
 // 2 ---------------------------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
-async fn s2_two_git_worktree_runs_on_one_repo_get_separate_worktrees_real_git() {
+async fn s2_two_git_clone_runs_on_one_repo_get_separate_clones_real_git() {
+    need_git!();
     let (_repo_dir, repo) = real_repo();
     let (_tmp, root) = ws_root();
     let mut h = Harness::new(4);
@@ -243,8 +268,8 @@ async fn s2_two_git_worktree_runs_on_one_repo_get_separate_worktrees_real_git() 
     let _a = h.driver.live();
     let _b = h.driver.live();
     h.start();
-    let a = h.submit(worktree(&repo)).await;
-    let b = h.submit(worktree(&repo)).await;
+    let a = h.submit(clone_of(&repo)).await;
+    let b = h.submit(clone_of(&repo)).await;
 
     until("both running", || h.is(a, &Running) && h.is(b, &Running)).await;
 
@@ -272,13 +297,23 @@ async fn s2_two_git_worktree_runs_on_one_repo_get_separate_worktrees_real_git() 
     assert_ne!(branches[0], branches[1]);
     assert!(branches.iter().all(|b| b.starts_with("kestrel/run-")));
 
-    // A file written in one is not visible in the other.
+    // A file written in one is not visible in the other, or in the source repo.
     std::fs::write(ws[0].join("only-here.txt"), "a").unwrap();
     assert!(!ws[1].join("only-here.txt").exists());
+    assert!(!repo.join("only-here.txt").exists());
+
+    // The run branches live in the clones only; the source repo keeps just its own branch.
+    assert_eq!(
+        git(
+            &repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"]
+        ),
+        "main"
+    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn s2_two_git_worktree_runs_with_fake_git_add_one_worktree_each() {
+async fn s2_two_git_clone_runs_with_fake_git_clone_once_each() {
     let (_tmp, root) = ws_root();
     let mut h = Harness::new(4);
     let git = FakeGit::healthy();
@@ -286,15 +321,15 @@ async fn s2_two_git_worktree_runs_with_fake_git_add_one_worktree_each() {
     let _a = h.driver.live();
     let _b = h.driver.live();
     h.start();
-    let a = h.submit(worktree("/srv/repo")).await;
-    let b = h.submit(worktree("/srv/repo")).await;
+    let a = h.submit(clone_of("/srv/repo")).await;
+    let b = h.submit(clone_of("/srv/repo")).await;
 
     until("both running", || h.is(a, &Running) && h.is(b, &Running)).await;
 
     let ws: Vec<PathBuf> = launched_workspaces(&h).into_iter().flatten().collect();
     assert_eq!(ws.len(), 2);
     assert_ne!(ws[0], ws[1]);
-    assert_eq!(git.worktree_adds(), 2);
+    assert_eq!(git.clones(), 2);
 }
 
 // 3 ---------------------------------------------------------------------------------------------
@@ -305,7 +340,7 @@ async fn s3_repo_that_is_not_a_git_repo_fails_the_run_before_any_sandbox() {
     let mut h = Harness::new(4);
     with_workspaces(&mut h, Workspaces::new(root, FakeGit::not_a_repo()));
     h.start();
-    let id = h.submit(worktree("/srv/not-a-repo")).await;
+    let id = h.submit(clone_of("/srv/not-a-repo")).await;
 
     until("run failed", || failed(&h, id)).await;
     settle().await;
@@ -325,12 +360,13 @@ async fn s3_repo_that_is_not_a_git_repo_fails_the_run_before_any_sandbox() {
 
 #[tokio::test(start_paused = true)]
 async fn s3_real_non_repo_dir_fails_the_run_before_any_sandbox_real_git() {
+    need_git!();
     let plain = tempfile::tempdir().expect("temp dir");
     let (_tmp, root) = ws_root();
     let mut h = Harness::new(4);
     with_workspaces(&mut h, Workspaces::new(root, Arc::new(ProcessRunner)));
     h.start();
-    let id = h.submit(worktree(plain.path())).await;
+    let id = h.submit(clone_of(plain.path())).await;
 
     until("run failed", || failed(&h, id)).await;
 
@@ -339,16 +375,16 @@ async fn s3_real_non_repo_dir_fails_the_run_before_any_sandbox_real_git() {
     assert_eq!(h.driver.count(&Call::Create), 0);
 }
 
-// 4 ---------------------------------------------------------------------------------------------
+// rel ------------------------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
-async fn s4_relative_repo_path_fails_with_a_clear_message_and_runs_no_git() {
+async fn rel_relative_repo_path_fails_with_a_clear_message_and_runs_no_git() {
     let (_tmp, root) = ws_root();
     let mut h = Harness::new(4);
     let git = FakeGit::healthy();
     with_workspaces(&mut h, Workspaces::new(root, git.clone()));
     h.start();
-    let id = h.submit(worktree("some/repo")).await;
+    let id = h.submit(clone_of("some/repo")).await;
 
     until("run failed", || failed(&h, id)).await;
     settle().await;
@@ -367,7 +403,31 @@ async fn s4_relative_repo_path_fails_with_a_clear_message_and_runs_no_git() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn s4_yaml_default_repo_dot_is_relative_and_fails_the_same_way() {
+async fn rel_relative_repo_path_with_a_clone_depth_is_rejected_the_same_way() {
+    let (_tmp, root) = ws_root();
+    let mut h = Harness::new(4);
+    let git = FakeGit::healthy();
+    with_workspaces(&mut h, Workspaces::new(root, git.clone()));
+    h.start();
+    let id = h
+        .submit(spec_ws(WorkspaceSpec::GitClone {
+            repo: "some/repo".into(),
+            depth: Some(1),
+        }))
+        .await;
+
+    until("run failed", || failed(&h, id)).await;
+
+    let msg = h.is_failed(id).unwrap();
+    assert!(
+        msg.contains("some/repo") && msg.contains("absolute"),
+        "{msg}"
+    );
+    assert!(git.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn rel_yaml_default_repo_dot_is_relative_and_fails_the_same_way() {
     // `workspace: git-clone` in YAML means repo `.`; the CLI must resolve it before submit.
     let yaml = "name: tester\nruntime: claude-code\nrole: tester\n\
                 model_policy: { default: tier:mid }\n\
@@ -398,10 +458,10 @@ async fn s4_yaml_default_repo_dot_is_relative_and_fails_the_same_way() {
     assert_eq!(h.driver.count(&Call::Create), 0);
 }
 
-// 5 ---------------------------------------------------------------------------------------------
+// 4 ---------------------------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
-async fn s5_run_resumed_by_a_new_engine_reuses_its_workspace_without_git() {
+async fn s4_run_resumed_by_a_new_engine_reuses_its_workspace_without_git() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("kestrel.db");
     let root = dir.path().join("workspaces");
@@ -413,11 +473,11 @@ async fn s5_run_resumed_by_a_new_engine_reuses_its_workspace_without_git() {
         with_workspaces(&mut first, Workspaces::new(root.clone(), git.clone()));
         let _s = first.driver.live();
         first.start();
-        let id = first.submit(worktree("/srv/repo")).await;
+        let id = first.submit(clone_of("/srv/repo")).await;
         until("running", || first.is(id, &Running)).await;
         first.control(id, ControlCommand::Pause);
         until("paused", || first.is(id, &paused)).await;
-        assert_eq!(git.worktree_adds(), 1);
+        assert_eq!(git.clones(), 1);
         let ws = launched_workspaces(&first);
         assert_eq!(ws, vec![Some(root.join(id.to_string()))]);
         (id, ws[0].clone().unwrap())
@@ -435,17 +495,21 @@ async fn s5_run_resumed_by_a_new_engine_reuses_its_workspace_without_git() {
     until("running again", || h.is(id, &Running)).await;
 
     assert_eq!(launched_workspaces(&h), vec![Some(first_ws)]);
-    assert_eq!(git.worktree_adds(), 0, "the existing worktree is reused");
+    assert_eq!(
+        git.clones(),
+        0,
+        "the existing clone is reused without any git"
+    );
 }
 
-// 6 ---------------------------------------------------------------------------------------------
+// none -----------------------------------------------------------------------------------------
 //
 // `SandboxSpec.workspace` is a required `WorkspaceSpec` with no default: a YAML spec without the
 // field does not parse, so "no workspace" can only mean an engine built without `Workspaces`.
 // That engine behaves as before #17: no workspace is mounted.
 
 #[test]
-fn s6_spec_without_workspace_field_does_not_parse() {
+fn none_spec_without_workspace_field_does_not_parse() {
     let yaml = "name: tester\nruntime: claude-code\nrole: tester\n\
                 model_policy: { default: tier:mid }\n\
                 sandbox: { tier: auto, image: fake-image, cpu: 1, memory: 512Mi }\n\
@@ -454,7 +518,7 @@ fn s6_spec_without_workspace_field_does_not_parse() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn s6_engine_without_workspaces_mounts_nothing_as_before() {
+async fn none_engine_without_workspaces_mounts_nothing_as_before() {
     let mut h = Harness::new(4);
     h.driver.script(&["ok:done"], 0);
     h.start();
