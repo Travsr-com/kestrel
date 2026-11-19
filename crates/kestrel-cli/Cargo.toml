@@ -1,0 +1,18 @@
+[package]
+name = "kestrel-cli"
+description = "The kestrel command-line tool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "kestrel"
+path = "src/main.rs"

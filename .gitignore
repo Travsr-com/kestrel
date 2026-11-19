@@ -1,0 +1,9 @@
+# Private research notes, kept out of the public repo.
+travsr_kestrel_draft_architecture_plan.md
+Research.md
+
+/target
+node_modules/
+*.profraw
+lcov.info
+.env

@@ -1,0 +1,14 @@
+[package]
+name = "kestrel-store"
+description = "Append-only event log and run state on SQLite."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

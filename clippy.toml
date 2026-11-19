@@ -1,0 +1,5 @@
+msrv = "1.88"
+# unwrap/expect are denied in library code (see [workspace.lints] in Cargo.toml),
+# but allowed in tests, where a panic is the right way to fail.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

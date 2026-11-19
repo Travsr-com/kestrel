@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: lint, test, coverage (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-deny
+      - name: No em-dashes
+        run: ./scripts/check-dashes.sh
+      - name: No AI attribution in commits
+        if: github.event_name == 'pull_request'
+        run: |
+          if git log --format=%B "origin/${{ github.base_ref }}..HEAD" 2>/dev/null \
+             | grep -iE 'co-authored-by:.*(claude|anthropic|copilot|openai|gpt|agent)|generated with'; then
+            echo "error: AI attribution found in commit messages" >&2; exit 1
+          fi
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests with coverage gate (95% lines)
+        run: cargo llvm-cov --workspace --fail-under-lines 95
+      - run: cargo deny check
+
+  macos:
+    name: test (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
