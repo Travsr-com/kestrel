@@ -304,7 +304,11 @@ fn uses_docker(drivers: &[Box<dyn SandboxDriver>]) -> bool {
 /// The bridge reaches the gateway through the host, so a loopback-only gateway would refuse it
 /// and every sandbox model call would fail. `bridge` is true when serve would start the bridge.
 fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<(), Failure> {
-    let _ = (bridge, addr);
+    if bridge && addr.ip().is_loopback() {
+        return Err(Failure::usage(format!(
+            "gateway.listen is {addr}, but sandboxes reach the gateway through a container, which a loopback address refuses. Bind a non-loopback address such as 0.0.0.0:7070 (or the docker bridge IP), or set gateway.advertise_url"
+        )));
+    }
     Ok(())
 }
 
@@ -389,9 +393,11 @@ async fn run(
             "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
         );
     }
+    let docker = uses_docker(&drivers);
+    check_bridge_listen(docker && config.advertise_url.is_none(), addr)?;
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
-        uses_docker(&drivers),
+        docker,
         config.advertise_url.as_ref(),
         addr.port(),
     )
