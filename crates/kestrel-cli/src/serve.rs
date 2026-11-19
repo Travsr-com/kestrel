@@ -1,6 +1,7 @@
 //! `kestrel serve`: the engine and the LLM gateway in one process, until SIGINT.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,9 +10,11 @@ use kestrel_core::{AdapterFactory, Engine, Limits, ModelMap, Workspaces, default
 use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
 };
-use kestrel_sandbox::{HostInfo, ProcessRunner, SandboxDriver, detect};
+use kestrel_sandbox::{
+    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect,
+};
 use kestrel_store::Store;
-use kestrel_types::{MicroUsd, ModelCallRecord, RunId, Tier};
+use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -43,6 +46,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawGateway {
     listen: Option<String>,
+    /// Kept as a raw value so a wrong type is reported against the key, not as a TOML error.
+    advertise_url: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -79,6 +84,8 @@ struct RawPrice {
 #[derive(Debug)]
 struct Config {
     listen: String,
+    /// Where sandboxes reach the gateway, when the operator sets it.
+    advertise_url: Option<Url>,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -144,8 +151,10 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         };
         prices.insert(model, price);
     }
+    let advertise_url = raw.gateway.advertise_url.map(advertise_url).transpose()?;
     Ok(Config {
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
+        advertise_url,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -164,6 +173,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
 const CONFIG_NAMES: &[&str] = &[
     "gateway",
     "listen",
+    "advertise_url",
     "engine",
     "max_concurrent_runs",
     "providers",
@@ -259,6 +269,65 @@ fn provider(name: &str, raw: Option<RawProvider>) -> Result<Option<ProviderConfi
     }))
 }
 
+/// `gateway.advertise_url`: an absolute http or https URL. The value is never echoed.
+fn advertise_url(value: toml::Value) -> Result<Url, Failure> {
+    value
+        .as_str()
+        .and_then(|text| Url::parse(text).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        .ok_or_else(|| {
+            Failure::usage("gateway.advertise_url: must be an absolute http or https URL")
+        })
+}
+
+/// The URL sandboxes use to reach the gateway: the operator's `advertise_url`, else the bridge,
+/// else the address the gateway bound.
+fn gateway_url_for(
+    advertise: Option<&Url>,
+    bridge: Option<&Url>,
+    bound: SocketAddr,
+) -> Result<Url, Failure> {
+    match (advertise, bridge) {
+        (Some(url), _) | (None, Some(url)) => Ok(url.clone()),
+        (None, None) => parse_url("gateway.listen", &format!("http://{bound}/")),
+    }
+}
+
+/// True when a selected driver runs sandboxes in docker, so they need the bridge to reach the
+/// gateway. The debug-only fake driver and Apple container do not.
+fn uses_docker(drivers: &[Box<dyn SandboxDriver>]) -> bool {
+    drivers
+        .iter()
+        .any(|d| matches!(d.name(), "gvisor" | "docker-runc"))
+}
+
+/// The bridge reaches the gateway through the host, so a loopback-only gateway would refuse it
+/// and every sandbox model call would fail. `bridge` is true when serve would start the bridge.
+fn check_bridge_listen(bridge: bool, addr: SocketAddr) -> Result<(), Failure> {
+    if bridge && addr.ip().is_loopback() {
+        return Err(Failure::usage(format!(
+            "gateway.listen is {addr}, but sandboxes reach the gateway through a container, which a loopback address refuses. Bind a non-loopback address such as 0.0.0.0:7070 (or the docker bridge IP), or set gateway.advertise_url"
+        )));
+    }
+    Ok(())
+}
+
+/// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
+async fn start_bridge(
+    runner: Arc<dyn CommandRunner>,
+    docker: bool,
+    advertise: Option<&Url>,
+    port: u16,
+) -> Result<Option<GatewayBridge>, Failure> {
+    if !docker || advertise.is_some() {
+        return Ok(None);
+    }
+    GatewayBridge::start(runner, port, BridgeSpec::default())
+        .await
+        .map(Some)
+        .map_err(|e| Failure::runtime(e.to_string()))
+}
+
 fn parse_url(key: &str, url: &str) -> Result<Url, Failure> {
     Url::parse(url).map_err(|_| Failure::usage(format!("{key}: not a valid absolute URL")))
 }
@@ -308,14 +377,6 @@ async fn run(
         stop.cancel();
     });
 
-    let db = db_path(db)?;
-    let store = Arc::new(open(Some(db.clone()))?);
-    // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
-    let workspace_root = std::path::absolute(&db)
-        .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
-        .parent()
-        .map(|d| d.join("workspaces"))
-        .ok_or_else(|| Failure::runtime(format!("{}: no parent dir", db.display())))?;
     let drivers = match drivers {
         Some(d) => d,
         None => detect(&HostInfo::current().await, false)
@@ -327,7 +388,69 @@ async fn run(
     let addr = listener
         .local_addr()
         .map_err(|e| Failure::runtime(e.to_string()))?;
-    let gateway_url = parse_url("gateway.listen", &format!("http://{addr}/"))?;
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
+        );
+    }
+    let docker = uses_docker(&drivers);
+    check_bridge_listen(docker && config.advertise_url.is_none(), addr)?;
+    let bridge = start_bridge(
+        Arc::new(ProcessRunner),
+        docker,
+        config.advertise_url.as_ref(),
+        addr.port(),
+    )
+    .await?;
+    let bridge_url = bridge.as_ref().map(GatewayBridge::url);
+    let result = match gateway_url_for(config.advertise_url.as_ref(), bridge_url.as_ref(), addr) {
+        Ok(gateway_url) => {
+            let bound = Bound {
+                listener,
+                addr,
+                gateway_url,
+                shutdown,
+            };
+            serve_bound(db, config, drivers, bound, out).await
+        }
+        Err(e) => Err(e),
+    };
+    // Every way out of serving, clean or not, removes the bridge.
+    if let Some(bridge) = &bridge {
+        bridge.stop().await;
+    }
+    result
+}
+
+/// The gateway socket and what depends on it.
+struct Bound {
+    listener: TcpListener,
+    addr: SocketAddr,
+    gateway_url: Url,
+    shutdown: CancellationToken,
+}
+
+async fn serve_bound(
+    db: Option<PathBuf>,
+    config: Config,
+    drivers: Vec<Box<dyn SandboxDriver>>,
+    bound: Bound,
+    out: Output,
+) -> Result<(), Failure> {
+    let Bound {
+        listener,
+        addr,
+        gateway_url,
+        shutdown,
+    } = bound;
+    let db = db_path(db)?;
+    let store = Arc::new(open(Some(db.clone()))?);
+    // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
+    let workspace_root = std::path::absolute(&db)
+        .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
+        .parent()
+        .map(|d| d.join("workspaces"))
+        .ok_or_else(|| Failure::runtime(format!("{}: no parent dir", db.display())))?;
 
     let adapters: AdapterFactory = Arc::new(kestrel_agent::adapter_for);
     let engine = Engine::with_models(
@@ -444,8 +567,16 @@ impl BudgetGuard for StoreDeps {
 #[async_trait]
 impl MeterSink for StoreDeps {
     async fn record(&self, rec: ModelCallRecord) {
+        // Spend first: it must count even if the event cannot be written.
         if let Err(e) = self.0.record_model_call(&rec) {
-            eprintln!("error: recording a model call for run {}: {e}", rec.run_id);
+            eprintln!(
+                "kestrel: recording a model call for run {}: {e}",
+                rec.run_id
+            );
+        }
+        let run = rec.run_id;
+        if let Err(e) = self.0.append(run, EventKind::ModelCall(rec)) {
+            eprintln!("kestrel: adding a model_call event to run {run}: {e}");
         }
     }
 }
@@ -747,5 +878,220 @@ budget: { usd: 0.000010, wall_clock: 10m }
         );
         assert_eq!(mask_quoted("bad `sk-unclosed"), "bad `***");
         assert_eq!(mask_quoted("no quotes"), "no quotes");
+    }
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).expect("url")
+    }
+
+    #[test]
+    fn the_gateway_url_prefers_advertise_then_bridge_then_the_bound_address() {
+        let bound: SocketAddr = "127.0.0.1:7070".parse().expect("addr");
+        let advertise = url("https://gw.example.com/");
+        let bridge = url("http://172.18.0.2:7070/");
+        let pick = |a: Option<&Url>, b: Option<&Url>| gateway_url_for(a, b, bound).expect("url");
+        assert_eq!(pick(Some(&advertise), Some(&bridge)), advertise);
+        assert_eq!(pick(Some(&advertise), None), advertise);
+        assert_eq!(pick(None, Some(&bridge)), bridge);
+        assert_eq!(pick(None, None).as_str(), "http://127.0.0.1:7070/");
+    }
+
+    #[test]
+    fn advertise_url_is_read_and_checked_without_echo() {
+        let (_dir, path) = write(&format!(
+            "[gateway]\nadvertise_url = \"http://kestrel-gateway:7070/\"\n{ANTHROPIC}"
+        ));
+        let c = load_config(&path).expect("config");
+        assert_eq!(
+            c.advertise_url.expect("set").as_str(),
+            "http://kestrel-gateway:7070/"
+        );
+        let (_dir, path) = write(ANTHROPIC);
+        assert!(load_config(&path).expect("config").advertise_url.is_none());
+        for bad in ["\"secret-host/x\"", "\"ftp://secret-host/\"", "\"\"", "42"] {
+            let msg = err(&format!("[gateway]\nadvertise_url = {bad}\n{ANTHROPIC}"));
+            assert!(msg.contains("gateway.advertise_url"), "{msg}");
+            assert!(!msg.contains("secret-host"), "{msg}");
+        }
+    }
+
+    struct Recorder {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        status: i32,
+    }
+
+    #[async_trait]
+    impl CommandRunner for Recorder {
+        async fn run(&self, argv: &[String]) -> std::io::Result<kestrel_sandbox::CommandOutput> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(argv.to_vec());
+            Ok(kestrel_sandbox::CommandOutput {
+                status: self.status,
+                stdout: if argv.get(1).map(String::as_str) == Some("inspect") {
+                    "172.18.0.2\n".into()
+                } else {
+                    String::new()
+                },
+                stderr: "boom".into(),
+            })
+        }
+        async fn spawn(
+            &self,
+            _argv: &[String],
+        ) -> std::io::Result<kestrel_sandbox::SpawnedProcess> {
+            Err(std::io::Error::other("no spawn"))
+        }
+    }
+
+    fn recorder(status: i32) -> Arc<Recorder> {
+        Arc::new(Recorder {
+            calls: std::sync::Mutex::new(Vec::new()),
+            status,
+        })
+    }
+
+    fn call_count(r: &Recorder) -> usize {
+        r.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[tokio::test]
+    async fn the_bridge_starts_only_for_docker_without_an_advertise_url() {
+        let advertise = url("http://gw.example.com/");
+        for (docker, advertise) in [
+            (false, None),
+            (true, Some(&advertise)),
+            (false, Some(&advertise)),
+        ] {
+            let r = recorder(0);
+            let bridge = start_bridge(r.clone(), docker, advertise, 7070).await;
+            assert!(bridge.expect("ok").is_none());
+            assert_eq!(call_count(&r), 0);
+        }
+        let r = recorder(0);
+        let bridge = start_bridge(r.clone(), true, None, 7070)
+            .await
+            .expect("started")
+            .expect("bridge");
+        assert_eq!(bridge.url().as_str(), "http://172.18.0.2:7070/");
+        assert_eq!(call_count(&r), 5);
+        bridge.stop().await;
+        assert_eq!(call_count(&r), 6);
+    }
+
+    #[tokio::test]
+    async fn a_failing_bridge_is_a_runtime_error() {
+        let e = start_bridge(recorder(1), true, None, 7070)
+            .await
+            .expect_err("fails");
+        assert!(e.message.contains("boom"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_loopback_gateway_with_a_bridge_is_a_config_error() {
+        let loopback: SocketAddr = "127.0.0.1:7070".parse().expect("addr");
+        let v6_loopback: SocketAddr = "[::1]:7070".parse().expect("addr");
+        let open: SocketAddr = "0.0.0.0:7070".parse().expect("addr");
+        for addr in [loopback, v6_loopback] {
+            let e = check_bridge_listen(true, addr).expect_err("loopback with a bridge");
+            assert_eq!(e.code, crate::EXIT_USAGE);
+            for needle in ["gateway.listen", "0.0.0.0:7070", "gateway.advertise_url"] {
+                assert!(e.message.contains(needle), "{}", e.message);
+            }
+            // No bridge (advertise_url set, or a driver that needs none): loopback is fine.
+            assert!(check_bridge_listen(false, addr).is_ok());
+        }
+        assert!(check_bridge_listen(true, open).is_ok());
+        assert!(check_bridge_listen(false, open).is_ok());
+    }
+
+    fn run_in(store: &Store) -> RunId {
+        let spec = AgentSpec::from_yaml(YAML).expect("spec");
+        store.create_run(&spec, "x").expect("create")
+    }
+
+    fn model_calls(store: &Store, run: RunId) -> Vec<(u64, ModelCallRecord)> {
+        store
+            .events_since(run, 0)
+            .expect("events")
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::ModelCall(rec) => Some((e.seq, rec)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn metering_a_call_adds_spend_and_one_model_call_event() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let run = run_in(&store);
+        let deps = StoreDeps(store.clone());
+        let first = call(run, 3);
+        let second = call(run, 4);
+        deps.record(first.clone()).await;
+        deps.record(second.clone()).await;
+        assert_eq!(store.spent(run).expect("spent"), MicroUsd(7));
+        let seen = model_calls(&store, run);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].1, first);
+        assert_eq!(seen[1].1, second);
+        assert_eq!(seen[1].0, seen[0].0 + 1, "consecutive seqs");
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_call_is_an_event_but_costs_nothing() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let run = run_in(&store);
+        let mut rec = call(run, 0);
+        rec.cost = None;
+        StoreDeps(store.clone()).record(rec.clone()).await;
+        assert_eq!(store.spent(run).expect("spent"), MicroUsd(0));
+        let seen = model_calls(&store, run);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, rec);
+    }
+
+    #[tokio::test]
+    async fn a_call_for_an_unknown_run_appends_nothing_and_does_not_panic() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let known = run_in(&store);
+        StoreDeps(store.clone()).record(call(RunId::new(), 5)).await;
+        assert!(model_calls(&store, known).is_empty());
+        assert_eq!(store.spent(known).expect("spent"), MicroUsd(0));
+    }
+
+    #[tokio::test]
+    async fn metering_keeps_event_seqs_gapless_next_to_another_writer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("kestrel.db");
+        let gateway_side = Arc::new(Store::open(&path).expect("store"));
+        let engine_side = Store::open(&path).expect("store");
+        let run = run_in(&gateway_side);
+        let deps = StoreDeps(gateway_side.clone());
+        for n in 0..5 {
+            deps.record(call(run, 1)).await;
+            engine_side
+                .append(
+                    run,
+                    EventKind::AgentLog {
+                        line: format!("log {n}"),
+                    },
+                )
+                .expect("append");
+        }
+        let seqs: Vec<u64> = gateway_side
+            .events_since(run, 0)
+            .expect("events")
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        let expected: Vec<u64> = (seqs[0]..seqs[0] + 10).collect();
+        assert_eq!(seqs, expected, "no gaps, no duplicates");
+        assert_eq!(model_calls(&gateway_side, run).len(), 5);
     }
 }

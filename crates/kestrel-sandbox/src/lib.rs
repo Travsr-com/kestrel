@@ -13,8 +13,12 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, Stream};
+use kestrel_types::GATEWAY_KEY_PLACEHOLDER;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
+
+mod bridge;
+pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
 
 /// Errors from sandbox drivers and host detection.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +60,12 @@ pub enum SandboxError {
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
     InvalidId { id: String },
+    /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run`, `connect` or `inspect`.
+    #[error("gateway bridge step `{step}` failed: {stderr}")]
+    Bridge { step: &'static str, stderr: String },
+    /// The bridge port is 0.
+    #[error("invalid bridge port 0")]
+    InvalidBridgePort,
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -477,16 +487,18 @@ const SECRET_SUFFIXES: [&str; 5] = [
 ];
 
 /// Rejects secret-named env vars (case-insensitive) with a real-looking value. Empty values
-/// and masked placeholders of exactly the form `[SECRET_<digits>]` pass.
+/// and placeholders pass: masked ones of exactly the form `[SECRET_<digits>]`, and exactly
+/// [`GATEWAY_KEY_PLACEHOLDER`], which the adapters give agents instead of a provider key.
 fn check_secrets(env: &BTreeMap<String, String>) -> Result<()> {
     let secret_key = |k: &str| {
         let k = k.to_ascii_uppercase();
         SECRET_SUFFIXES.iter().any(|s| k.ends_with(s))
     };
     let placeholder = |v: &str| {
-        v.strip_prefix("[SECRET_")
-            .and_then(|r| r.strip_suffix(']'))
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        v == GATEWAY_KEY_PLACEHOLDER
+            || v.strip_prefix("[SECRET_")
+                .and_then(|r| r.strip_suffix(']'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     };
     match env
         .iter()

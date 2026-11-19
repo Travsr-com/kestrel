@@ -72,3 +72,77 @@ jobs:
           docker info --format '{{json .Runtimes}}' | grep -q runsc
       - run: docker pull alpine:3.20
       - run: cargo test -p kestrel-sandbox --features integration
+
+  e2e:
+    name: end-to-end (gVisor, M1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install gVisor runsc (https://gvisor.dev/docs/user_guide/install/)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+      - name: Register runsc with docker
+        run: |
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc
+      - run: docker pull alpine:3.20
+      - run: docker pull alpine/socat:1.8.0.3
+      # The agent runs as the runner's uid, so it can write the workspace bind mount.
+      - run: docker build --build-arg UID="$(id -u)" -t kestrel-echo-agent:test tests/e2e/echo-agent
+      - run: cargo build -p kestrel-cli
+      # Proves the path sandboxes use: host server, socat bridge, bridge IP on an internal network,
+      # reached from a runsc container. Docker DNS is not used (it does not answer under runsc).
+      - name: Smoke test the gateway bridge under runsc
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke-www"
+          echo ok > "$RUNNER_TEMP/smoke-www/bridge-smoke.txt"
+          (cd "$RUNNER_TEMP/smoke-www" && nohup python3 -m http.server 8080 --bind 0.0.0.0 > "$RUNNER_TEMP/smoke-http.log" 2>&1 & echo $! > "$RUNNER_TEMP/smoke-http.pid")
+          sleep 1
+          docker network create --internal kestrel-gw
+          docker run --detach --name kestrel-gateway --network bridge \
+            --add-host host.docker.internal:host-gateway --restart no \
+            alpine/socat:1.8.0.3 TCP-LISTEN:8080,fork,reuseaddr TCP:host.docker.internal:8080
+          docker network connect kestrel-gw kestrel-gateway
+          ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "kestrel-gw").IPAddress}}' kestrel-gateway)
+          echo "bridge ip: $ip"
+          test -n "$ip"
+          out=$(docker run --rm --runtime=runsc --network kestrel-gw alpine:3.20 wget -q -T 5 -O- "http://$ip:8080/")
+          echo "$out"
+          echo "$out" | grep -q bridge-smoke.txt
+          if docker run --rm --runtime=runsc --network kestrel-gw alpine:3.20 wget -q -T 5 -O- http://example.com/; then
+            echo "egress to example.com is open" >&2
+            exit 1
+          fi
+      - name: Clean up the bridge smoke test
+        if: always()
+        run: |
+          docker logs kestrel-gateway || true
+          cat "$RUNNER_TEMP/smoke-http.log" || true
+          kill "$(cat "$RUNNER_TEMP/smoke-http.pid")" || true
+          docker rm --force kestrel-gateway || true
+          docker network rm kestrel-gw || true
+      - name: End-to-end scenarios
+        run: KESTREL_BIN="$PWD/target/debug/kestrel" cargo test -p kestrel-e2e --features e2e -- --test-threads=1 --nocapture
+      - name: Docker diagnostics
+        if: failure()
+        run: |
+          ip addr || true
+          ss -ltnp || true
+          docker ps -a || true
+          docker network ls || true
+          docker network inspect kestrel-gw || true
+          docker logs kestrel-gateway || true
+          for name in $(docker ps -a --filter name=kestrel --format '{{.Names}}'); do
+            echo "=== docker logs $name ==="
+            docker logs "$name" 2>&1 || true
+          done
+          true

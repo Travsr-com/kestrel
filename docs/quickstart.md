@@ -31,7 +31,7 @@ Kestrel warns you if other users can read it.
 
 ```toml
 [gateway]
-listen = "127.0.0.1:7070"
+listen = "0.0.0.0:7070"
 
 [engine]
 max_concurrent_runs = 4
@@ -50,6 +50,10 @@ output_per_mtok = "15.00"
 cache_read_per_mtok = "0.30"
 cache_write_per_mtok = "3.75"
 ```
+
+> **The gateway cannot listen on loopback.** Sandboxes reach it through a container, which a
+> loopback address refuses, so `kestrel serve` exits with an error if you try. Only the per-run
+> token protects the gateway, so use a firewall or a private network.
 
 > **Add a price for every model you use.** A call to a model with no price entry is not counted
 > against the run's budget.

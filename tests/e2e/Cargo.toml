@@ -1,0 +1,29 @@
+[package]
+name = "kestrel-e2e"
+description = "End-to-end tests: the kestrel binary, a real gVisor sandbox and a mock provider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Opt-in: needs Docker, gVisor `runsc`, the echo agent image and KESTREL_BIN.
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["e2e"]
+
+[dev-dependencies]
+axum.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
