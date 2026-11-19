@@ -29,7 +29,12 @@ pub const EXIT_USAGE: u8 = 2;
 
 /// Run and watch fleets of AI agents.
 #[derive(Debug, Parser)]
-#[command(name = "kestrel", version, about, arg_required_else_help = true)]
+#[command(
+    name = "kestrel",
+    version,
+    about = "Run and watch fleets of AI agents.",
+    arg_required_else_help = true
+)]
 pub struct Cli {
     /// Database file. Defaults to `kestrel.db` under the user data dir.
     #[arg(long, global = true, value_name = "PATH")]
@@ -50,7 +55,10 @@ pub enum Command {
     /// Submit a run and print its id.
     Run(RunArgs),
     /// Follow a run's events live.
-    Watch { run_id: RunId },
+    Watch {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
+    },
     /// List active runs.
     Ps {
         /// List finished runs too.
@@ -59,19 +67,30 @@ pub enum Command {
     },
     /// Resolve a pending approval.
     Approve {
+        /// Approval id, as shown by `kestrel watch`.
         approval_id: ApprovalId,
         /// Reject instead of approve.
         #[arg(long)]
         reject: bool,
     },
     /// Pause a run.
-    Pause { run_id: RunId },
+    Pause {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
+    },
     /// Resume a paused or suspended run.
-    Resume { run_id: RunId },
+    Resume {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
+    },
     /// Cancel a run.
-    Cancel { run_id: RunId },
+    Cancel {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
+    },
     /// Set a run's budget in USD.
     Budget {
+        /// Run id, as printed by `kestrel run`.
         run_id: RunId,
         /// New limit in USD, for example 5 or 2.50.
         #[arg(allow_negative_numbers = true)]

@@ -21,8 +21,9 @@ use url::Url;
 use crate::commands::say;
 use crate::{Failure, Output, ServeArgs, db_path, open, paths};
 
-/// The config file, as written. See `tests/s9_s10_serve.rs` for an example.
-#[derive(Debug, Default, Deserialize)]
+/// The config file, as written. The raw structs have no `Debug`, so a key can never be printed
+/// from them. See `tests/s9_s10_serve.rs` for an example.
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
@@ -38,26 +39,26 @@ struct RawConfig {
     prices: BTreeMap<String, RawPrice>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGateway {
     listen: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEngine {
     max_concurrent_runs: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProviders {
     anthropic: Option<RawProvider>,
     openai: Option<RawProvider>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProvider {
     base_url: Option<String>,
@@ -65,7 +66,7 @@ struct RawProvider {
 }
 
 /// USD per million tokens, as exact decimal strings.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrice {
     input_per_mtok: String,
@@ -91,8 +92,7 @@ const OPENAI_URL: &str = "https://api.openai.com";
 fn load_config(path: &Path) -> Result<Config, Failure> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Failure::usage(format!("{}: {e}", path.display())))?;
-    let raw: RawConfig =
-        toml::from_str(&text).map_err(|e| Failure::usage(format!("{}: {e}", path.display())))?;
+    let raw: RawConfig = toml::from_str(&text).map_err(|e| toml_error(path, &text, &e))?;
 
     let anthropic = provider("anthropic", raw.providers.anthropic)?;
     let openai = provider("openai", raw.providers.openai)?;
@@ -159,6 +159,50 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     })
 }
 
+/// A TOML error as `<path>:<line>:<column>: <message>`. Never quotes the source line, which may
+/// hold an API key, and masks the value the error points at.
+fn toml_error(path: &Path, text: &str, e: &toml::de::Error) -> Failure {
+    let mut message = e.message().trim().replace('\n', "; ");
+    let mut place = String::new();
+    if let Some(span) = e.span() {
+        let before = text.get(..span.start).unwrap_or_default();
+        let line = before.matches('\n').count() + 1;
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let column = span.start - line_start + 1;
+        place = format!(":{line}:{column}");
+        // The span is in a value when an `=` comes before it on its line. Mask that value
+        // wherever the message repeats it, for example "invalid type: integer `12345`".
+        let line_text = text[line_start..].lines().next().unwrap_or_default();
+        if let Some((_, value)) = line_text.split_once('=')
+            && before[line_start..].contains('=')
+        {
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !value.is_empty() {
+                message = message.replace(value, "***");
+            }
+        }
+    }
+    Failure::usage(format!("{}{place}: {message}", path.display()))
+}
+
+/// A warning when a config file holding API keys is readable by other users.
+#[cfg(unix)]
+fn permission_warning(path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "warning: {} holds API keys but other users can read it (mode {mode:o}); run chmod 600 on it",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn permission_warning(_path: &Path) -> Option<String> {
+    None
+}
+
 /// A provider section, if present. Its `api_key` must be set and non-empty; no environment
 /// variable fills it in.
 fn provider(name: &str, raw: Option<RawProvider>) -> Result<Option<ProviderConfig>, Failure> {
@@ -204,6 +248,9 @@ pub(crate) fn serve(db: Option<PathBuf>, args: ServeArgs, out: Output) -> Result
         None => paths::config_dir()?.join("kestrel").join("config.toml"),
     };
     let config = load_config(&path)?;
+    if let Some(warning) = permission_warning(&path) {
+        eprintln!("{warning}");
+    }
     let drivers = test_drivers(&args)?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| Failure::runtime(format!("starting the async runtime: {e}")))?;
@@ -281,15 +328,33 @@ async fn run(
             "kestrel is running, gateway on http://{addr}/. Ctrl-C stops it."
         ))?;
     }
+    supervise(engine.run_forever(shutdown.clone()), server, shutdown).await
+}
 
-    let engine_result = engine.run_forever(shutdown.clone()).await;
-    shutdown.cancel();
-    let server_result = server.await;
-    engine_result.map_err(|e| Failure::runtime(e.to_string()))?;
-    match server_result {
-        Ok(Ok(())) => Ok(()),
+/// Runs the engine until it stops, and stops it early if the gateway dies. Either one stopping
+/// cancels `shutdown` so the other stops too. A gateway that ends before shutdown is an error.
+async fn supervise<E: std::fmt::Display>(
+    engine: impl Future<Output = Result<(), E>>,
+    mut server: tokio::task::JoinHandle<std::io::Result<()>>,
+    shutdown: CancellationToken,
+) -> Result<(), Failure> {
+    let gateway = |r: Result<std::io::Result<()>, tokio::task::JoinError>, expected: bool| match r {
+        Ok(Ok(())) if expected => Ok(()),
+        Ok(Ok(())) => Err(Failure::runtime("gateway stopped unexpectedly")),
         Ok(Err(e)) => Err(Failure::runtime(format!("gateway: {e}"))),
         Err(e) => Err(Failure::runtime(format!("gateway: {e}"))),
+    };
+    tokio::select! {
+        result = engine => {
+            shutdown.cancel();
+            let served = gateway(server.await, true);
+            result.map_err(|e| Failure::runtime(e.to_string()))?;
+            served
+        }
+        result = &mut server => {
+            shutdown.cancel();
+            gateway(result, false)
+        }
     }
 }
 
@@ -463,5 +528,114 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 .contains("providers.openai.base_url")
         );
         assert!(err(&format!("{ANTHROPIC}[gatway]\n")).contains("gatway"));
+    }
+
+    #[test]
+    fn config_debug_hides_api_keys() {
+        let (_dir, path) = write(
+            "[providers.anthropic]\napi_key = \"sk-ant-hidden-1\"\n\
+             [providers.openai]\napi_key = \"sk-oai-hidden-2\"\n",
+        );
+        let text = format!("{:?}", load_config(&path).expect("config"));
+        assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn toml_errors_name_the_line_but_never_the_value() {
+        for (config, secret) in [
+            (
+                "[providers.anthropic]\napi_key = sk-ant-SECRET1\n",
+                "SECRET1",
+            ),
+            (
+                "[providers.anthropic]\napi_kye = \"sk-ant-SECRET2\"\n",
+                "SECRET2",
+            ),
+            (
+                "[providers.anthropic]\napi_key = 4242424242\n",
+                "4242424242",
+            ),
+            (
+                "[providers.anthropic]\napi_key = 'sk-SECRET3'\nx = [\n",
+                "SECRET3",
+            ),
+        ] {
+            let msg = err(config);
+            assert!(!msg.contains(secret), "{msg}");
+            assert!(msg.contains("config.toml:"), "{msg}");
+        }
+        assert!(err("[providers.anthropic]\napi_key = 4242424242\n").contains("config.toml:2:"));
+    }
+
+    fn server(result: std::io::Result<()>) -> tokio::task::JoinHandle<std::io::Result<()>> {
+        tokio::spawn(async move { result })
+    }
+
+    #[tokio::test]
+    async fn a_dead_gateway_stops_the_engine_with_an_error() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let engine = async move {
+            token.cancelled().await;
+            Ok::<(), String>(())
+        };
+        let failed = server(Err(std::io::Error::other("accept failed")));
+        let e = supervise(engine, failed, shutdown.clone())
+            .await
+            .expect_err("gateway error");
+        assert!(e.message.contains("accept failed"), "{}", e.message);
+        assert!(shutdown.is_cancelled());
+
+        let engine = std::future::pending::<Result<(), String>>();
+        let e = supervise(engine, server(Ok(())), CancellationToken::new())
+            .await
+            .expect_err("early stop");
+        assert!(e.message.contains("unexpectedly"), "{}", e.message);
+
+        let panicked = tokio::spawn(async { panic!("gateway panic") });
+        let engine = std::future::pending::<Result<(), String>>();
+        let e = supervise(engine, panicked, CancellationToken::new())
+            .await
+            .expect_err("panic");
+        assert!(e.message.starts_with("gateway:"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn the_engine_stopping_stops_the_gateway() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let gateway = tokio::spawn(async move {
+            token.cancelled().await;
+            Ok(())
+        });
+        supervise(async { Ok::<(), String>(()) }, gateway, shutdown.clone())
+            .await
+            .expect("clean stop");
+        assert!(shutdown.is_cancelled());
+
+        let e = supervise(
+            async { Err::<(), String>("engine broke".into()) },
+            server(Ok(())),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("engine error");
+        assert_eq!(e.message, "engine broke");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_private_config_files_pass_without_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = write(ANTHROPIC);
+        let set = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        set(0o600);
+        assert_eq!(permission_warning(&path), None);
+        set(0o640);
+        let w = permission_warning(&path).expect("warning");
+        assert!(w.contains("640") && w.contains("chmod 600"), "{w}");
+        assert_eq!(permission_warning(&path.with_extension("gone")), None);
     }
 }
