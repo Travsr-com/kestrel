@@ -351,3 +351,62 @@ async fn dated_snapshot_model_priced_by_prefix() {
     assert_eq!(recs[0].model, snapshot);
     assert_eq!(recs[0].cost, Some(MicroUsd(825_000)));
 }
+
+/// A long non-streaming call: the upstream waits before sending headers, and the client
+/// gives up first. The provider still bills the call, so the gateway lets it finish and
+/// writes exactly one record with the real usage.
+#[tokio::test]
+async fn client_leaving_before_headers_still_meters_the_call() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(
+                    anthropic_response(CLAUDE_MODEL, 1200, 350, 8000, 2000).into_bytes(),
+                    "application/json",
+                )
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&upstream)
+        .await;
+    let h = start(&upstream.uri(), &upstream.uri(), true).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let sent = client
+        .post(h.anthropic_url(RUN_TOKEN))
+        .body(anthropic_request(CLAUDE_MODEL, false))
+        .send()
+        .await;
+    assert!(sent.is_err(), "client must give up before headers arrive");
+    drop(client);
+
+    let recs = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let recs = h.sink.records();
+            if !recs.is_empty() {
+                return recs;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no record within 3s although the upstream answered");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.sink.records().len(), 1, "{recs:?}");
+    let rec = &recs[0];
+    assert_eq!(rec.status, 200);
+    assert_eq!(
+        (
+            rec.tokens_in,
+            rec.tokens_out,
+            rec.tokens_cache_read,
+            rec.tokens_cache_write
+        ),
+        (1200, 350, 8000, 2000)
+    );
+    assert_eq!(rec.cost, Some(MicroUsd(18_750)));
+}

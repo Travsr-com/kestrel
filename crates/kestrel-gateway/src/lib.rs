@@ -333,19 +333,34 @@ async fn proxy(
     };
     out_headers.insert(key.0, key_value);
 
-    let sent = state
-        .http
-        .post(url)
-        .headers(out_headers)
-        .body(body)
-        .send()
-        .await;
-    let upstream_resp = match sent {
+    let request = state.http.post(url).headers(out_headers).body(body);
+    // The upstream call runs in its own task, so a client that leaves (even before the
+    // response headers arrive) cannot cancel it. The provider bills a call it has started,
+    // so the task always finishes it and writes exactly one record. Timeouts bound it.
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(forward(call, request, resp_tx));
+    match resp_rx.await {
+        Ok(resp) => resp,
+        Err(_) => provider.error(StatusCode::BAD_GATEWAY, "gateway call task failed"),
+    }
+}
+
+/// Send the upstream request, hand the response to the waiting handler, then pipe the body
+/// and write the record.
+async fn forward(
+    call: Call,
+    request: reqwest::RequestBuilder,
+    resp_tx: tokio::sync::oneshot::Sender<Response>,
+) {
+    let provider = call.provider;
+    let upstream_resp = match request.send().await {
         Ok(r) => r,
         Err(_) => {
             call.record(StatusCode::BAD_GATEWAY.as_u16(), None, None)
                 .await;
-            return provider.error(StatusCode::BAD_GATEWAY, "upstream provider is unreachable");
+            let _ = resp_tx
+                .send(provider.error(StatusCode::BAD_GATEWAY, "upstream provider is unreachable"));
+            return;
         }
     };
 
@@ -361,41 +376,46 @@ async fn proxy(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"));
 
-    // Pipe the upstream body to the client chunk by chunk, teeing each chunk to the usage
-    // parser. The record is written once the body ends, the upstream fails or stalls past
-    // the idle timeout, or the client goes away (even while the upstream is silent).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
-    let mut upstream_body = upstream_resp.bytes_stream();
-    tokio::spawn(async move {
-        let mut parser = UsageParser::new(provider, is_sse);
-        loop {
-            let next = tokio::select! {
-                next = upstream_body.next() => next,
-                () = tx.closed() => break,
-            };
-            let Some(item) = next else { break };
-            let failed = item.is_err();
-            if let Ok(chunk) = &item {
-                parser.feed(chunk);
-            }
-            if tx.send(item).await.is_err() || failed {
-                break;
-            }
-        }
-        drop(tx);
-        drop(upstream_body);
-        let (usage, response_model) = parser.finish();
-        // A failed call is not billed: zero tokens, zero cost.
-        let usage = status.is_success().then_some(usage);
-        call.record(status.as_u16(), usage, response_model).await;
-    });
-
     let mut resp = Response::new(Body::from_stream(
         tokio_stream::wrappers::ReceiverStream::new(rx),
     ));
     *resp.status_mut() = status;
     *resp.headers_mut() = resp_headers;
-    resp
+    // If the client left before the headers, nobody will read the body: drain it anyway so
+    // the record has the real usage (bounded by the idle timeout).
+    let client_gone = resp_tx.send(resp).is_err();
+
+    // Pipe the upstream body to the client chunk by chunk, teeing each chunk to the usage
+    // parser. The record is written once the body ends, the upstream fails or stalls past
+    // the idle timeout, or the client goes away mid-body (even while the upstream is silent).
+    let mut upstream_body = upstream_resp.bytes_stream();
+    let mut parser = UsageParser::new(provider, is_sse);
+    loop {
+        let next = if client_gone {
+            upstream_body.next().await
+        } else {
+            tokio::select! {
+                next = upstream_body.next() => next,
+                () = tx.closed() => break,
+            }
+        };
+        let Some(item) = next else { break };
+        let failed = item.is_err();
+        if let Ok(chunk) = &item {
+            parser.feed(chunk);
+        }
+        // An upstream error is forwarded too, so the client sees the stream was cut.
+        if (!client_gone && tx.send(item).await.is_err()) || failed {
+            break;
+        }
+    }
+    drop(tx);
+    drop(upstream_body);
+    let (usage, response_model) = parser.finish();
+    // A failed call is not billed: zero tokens, zero cost.
+    let usage = status.is_success().then_some(usage);
+    call.record(status.as_u16(), usage, response_model).await;
 }
 
 /// Token counts for one call. `input` excludes cache reads and writes.
