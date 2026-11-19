@@ -7,3 +7,10 @@ node_modules/
 *.profraw
 lcov.info
 .env
+
+# travsr local code graph. Never commit it, the WAL file changes on every read.
+/.travsr/
+
+# travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)
+/.mcp.json
+# travsr:end
