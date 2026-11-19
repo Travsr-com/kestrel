@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use kestrel_types::{AgentSpec, EventKind, RunId, Runtime};
+use serde_json::Value;
 use url::Url;
 
 mod claude_code;
@@ -61,6 +62,56 @@ pub trait RuntimeAdapter: Send + Sync {
 
 /// A fresh adapter for `r`. Use one adapter per run: it may keep state across lines of one stream.
 pub fn adapter_for(r: Runtime) -> Box<dyn RuntimeAdapter> {
-    let _ = r;
-    todo!()
+    match r {
+        Runtime::ClaudeCode => Box::new(ClaudeCodeAdapter::default()),
+        Runtime::OpenCode => Box::new(OpenCodeAdapter),
+    }
+}
+
+/// A plan for `runtime`. The image is the spec's sandbox image, or the stock image for `runtime` when the
+/// spec names none. The env holds only `env`: nothing is copied from the host environment.
+fn plan(
+    spec: &AgentSpec,
+    runtime: Runtime,
+    argv: &[&str],
+    env: &[(&str, &str)],
+) -> Result<LaunchPlan> {
+    if spec.runtime != runtime {
+        return Err(AgentError::RuntimeMismatch {
+            spec: spec.runtime,
+            adapter: runtime,
+        });
+    }
+    let image = spec.sandbox.image.clone();
+    Ok(LaunchPlan {
+        image: image.unwrap_or_else(|| format!("ghcr.io/travsr-com/kestrel-{runtime}:latest")),
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    })
+}
+
+/// Parses `line` as a JSON object and hands it to `f`. Blank lines are ignored and anything that is not
+/// JSON becomes an [`EventKind::AgentLog`], so nothing the runtime prints is lost.
+fn parse_json(line: &str, f: impl FnOnce(&Value) -> Option<ParsedLine>) -> ParsedLine {
+    if line.trim().is_empty() {
+        return ParsedLine::Ignore;
+    }
+    match serde_json::from_str::<Value>(line) {
+        Ok(value) => f(&value).unwrap_or(ParsedLine::Ignore),
+        Err(_) => ParsedLine::Events(vec![EventKind::AgentLog {
+            line: line.to_string(),
+        }]),
+    }
+}
+
+/// `Events(events)`, or `None` when there are none.
+fn events(events: Vec<EventKind>) -> Option<ParsedLine> {
+    (!events.is_empty()).then_some(ParsedLine::Events(events))
+}
+
+fn str_of(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_string)
 }

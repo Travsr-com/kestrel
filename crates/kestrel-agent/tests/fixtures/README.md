@@ -8,7 +8,7 @@ One JSON object per line, as each runtime writes to stdout.
 
 ## Claude Code (`claude-code/`)
 
-Launch: `claude --bare -p --output-format stream-json --verbose --model <model> --permission-mode bypassPermissions <input>`.
+Launch: `claude --bare -p --output-format stream-json --verbose --model <model> --permission-mode bypassPermissions -- <input>`.
 
 | File | What it covers |
 | :--- | :--- |
@@ -31,7 +31,7 @@ URL (no request left the machine): the run failed, yet the result kept `subtype:
 
 ## OpenCode (`opencode/`)
 
-Launch: `opencode run --standalone --format json --auto --model anthropic/<model> <input>`.
+Launch: `opencode run --standalone --format json --auto --model anthropic/<model> -- <input>`.
 
 | File | What it covers |
 | :--- | :--- |
@@ -45,7 +45,7 @@ OpenCode V2 docs do not describe the JSON events, so the shapes come from the em
   `{ type, timestamp, sessionID, ...data }`.
 * Flags (`--format json`, `--model`, `--auto`, `--standalone`): <https://opencode.ai/docs/cli/commands/> and
   the V1 flag table at <https://opencode.ai/v1/docs/cli/>
-* Gateway URL via `providers.anthropic.settings.baseURL`: <https://opencode.ai/docs/providers/>
+* Gateway URL via `providers.anthropic.settings.baseURL` (the run root plus `/v1`): <https://opencode.ai/docs/providers/>
 * Inline config via `OPENCODE_CONFIG_CONTENT`: V1 env table at <https://opencode.ai/v1/docs/cli/>, still
   read in V2 by `packages/core/src/config.ts` in the same repo.
 
