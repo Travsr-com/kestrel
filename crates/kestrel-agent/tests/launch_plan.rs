@@ -52,6 +52,7 @@ fn s1_claude_code_plan_matches_snapshot() {
             MODEL,
             "--permission-mode",
             "bypassPermissions",
+            "--",
             TASK,
         ])
     );
@@ -83,6 +84,7 @@ fn s2_opencode_plan_matches_snapshot() {
             "--auto",
             "--model",
             &model,
+            "--",
             TASK,
         ])
     );
@@ -97,10 +99,12 @@ fn s2_opencode_plan_matches_snapshot() {
         Ok(v) => v,
         Err(e) => panic!("OPENCODE_CONFIG_CONTENT is not JSON: {e}"),
     };
+    // The Anthropic provider appends `/messages` to its base URL, so the base ends in `/v1`.
+    let base_url = format!("{GATEWAY}/v1");
     assert_eq!(
         config,
         serde_json::json!({
-            "providers": { "anthropic": { "settings": { "baseURL": GATEWAY } } }
+            "providers": { "anthropic": { "settings": { "baseURL": base_url } } }
         })
     );
 }
@@ -132,6 +136,29 @@ fn s3_hostile_input_is_one_unchanged_argv_element() {
             "{runtime}: input leaked into env: {:?}",
             plan.env
         );
+    }
+}
+
+#[test]
+fn s3_leading_dash_input_stays_one_argv_element_after_separator() {
+    for input in ["-rf", "--model evil", "-"] {
+        for runtime in Runtime::ALL {
+            let plan = plan(runtime, input);
+            let n = plan.argv.len();
+            assert!(n >= 2, "{runtime}: argv too short: {:?}", plan.argv);
+            assert_eq!(
+                &plan.argv[n - 2..],
+                &strings(&["--", input])[..],
+                "{runtime}: input must be the one argv element after `--`: {:?}",
+                plan.argv
+            );
+            let exact = plan.argv.iter().filter(|a| a.as_str() == input).count();
+            assert_eq!(
+                exact, 1,
+                "{runtime}: input appears more than once: {:?}",
+                plan.argv
+            );
+        }
     }
 }
 
