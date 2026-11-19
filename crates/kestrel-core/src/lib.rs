@@ -8,12 +8,13 @@
 //! Each active run has its own task (a run actor). It is the only writer of that run's status, so
 //! control commands are applied while the run is busy, for example while `create` is still blocked.
 
+mod slots;
 pub mod workspace;
 pub use workspace::{WorkspaceError, Workspaces};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -29,6 +30,8 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+use slots::Slots;
 
 /// Errors from the engine.
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +62,8 @@ pub type AdapterFactory = Arc<dyn Fn(Runtime) -> Box<dyn RuntimeAdapter> + Send 
 /// Engine-wide limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Runs past this many stay `Queued` until a slot frees up.
+    /// Concurrency slots. Runs past this many stay `Queued` until a slot frees up. See the
+    /// [`Engine`] docs for which runs hold a slot.
     pub max_concurrent_runs: usize,
     /// How often `run_forever` polls the store for queued runs, control commands and spend.
     pub poll_interval: Duration,
@@ -112,14 +116,32 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 
 /// The run engine.
 ///
+/// # Concurrency slots
+///
+/// A run holds one of `Limits::max_concurrent_runs` slots only while its sandbox runs or is being
+/// provisioned: `Provisioning`, `Running` and `Suspended(Approval)` (the sandbox keeps running
+/// while an approval is pending). `Suspended(Budget | Manual | Error)` has a stopped sandbox and
+/// holds no slot, so a parent waiting on children (M2) cannot deadlock the pool. A terminal run
+/// releases its slot once, after its sandbox is destroyed.
+///
+/// Resuming a run whose sandbox is stopped needs a free slot (a `Resume`, or an `Approve` after a
+/// restart). If none is free the command stays pending: the run stays suspended and the command
+/// is not dropped. `SetBudget` and `Cancel` still apply at once, and a `Cancel` removes the
+/// pending resume. A resume still pending when the engine stops is lost and must be sent again
+/// (the run stays suspended). After [`Engine::recover`] no run holds a slot, and commands for the
+/// recovered runs wait for one like any other.
+///
+/// Everything waiting for a slot, `Queued` runs and pending resumes alike, is served in one FIFO
+/// order. Each waiter gets an arrival number. Within one scheduler tick, newly seen `Queued` runs
+/// are numbered first (in creation order), then newly claimed resume commands (in control id
+/// order). Slots go to the lowest arrival number first.
+///
 /// Known M1 limitations:
 ///
 /// * Resuming a paused or budget-suspended run starts the stopped sandbox again, which restarts
 ///   the agent command from the beginning. The container survives, the agent's process does not.
 /// * A run resumed by a new engine after a restart gets a fresh sandbox, and its wall clock starts
 ///   over.
-/// * A run holds its concurrency slot while it is suspended (its sandbox still exists). A command
-///   for a suspended run that no actor holds (after a restart) starts one even past the cap.
 /// * The wall clock counts only time spent `Provisioning` or `Running`, not time suspended.
 pub struct Engine {
     inner: Arc<Inner>,
@@ -134,10 +156,36 @@ struct Inner {
     models: ModelMap,
     /// Per-run workspaces, when configured with [`Engine::with_workspaces`].
     workspaces: Option<Arc<Workspaces>>,
+    /// Who holds a concurrency slot. Written by the scheduler (acquire) and the run actors
+    /// (release), so it sits behind a lock.
+    slots: Mutex<Slots>,
 }
 
 /// Control channels of the run actors, by run.
 type Actors = HashMap<RunId, mpsc::UnboundedSender<ControlCommand>>;
+
+/// What `run_forever` keeps between ticks.
+#[derive(Default)]
+struct Scheduler {
+    actors: Actors,
+    /// Dropping the set aborts every run actor.
+    tasks: JoinSet<()>,
+    /// Everything waiting for a slot, in arrival order (the front is served first).
+    waiting: VecDeque<Waiter>,
+}
+
+/// A queued run, or a resume command that needs a slot.
+struct Waiter {
+    run: RunId,
+    /// `None` for a `Queued` run to start.
+    resume: Option<ControlCommand>,
+}
+
+impl Waiter {
+    fn is_resume_of(&self, run: RunId) -> bool {
+        self.run == run && self.resume.is_some()
+    }
+}
 
 impl Engine {
     /// `drivers` are in preference order: `SandboxTier::Auto` takes the first one. Model tiers
@@ -174,6 +222,7 @@ impl Engine {
                 drivers,
                 adapters,
                 gateway_url,
+                slots: Mutex::new(Slots::new(limits.max_concurrent_runs)),
                 limits,
                 models,
                 workspaces: None,
@@ -210,14 +259,13 @@ impl Engine {
     /// On shutdown the run actors are dropped without touching their runs; [`Engine::recover`]
     /// picks them up on the next start.
     pub async fn run_forever(&self, shutdown: CancellationToken) -> Result<()> {
-        let mut actors = Actors::new();
-        // Dropping the set on return aborts every run actor.
-        let mut tasks = JoinSet::new();
+        // Dropping the scheduler on return aborts every run actor.
+        let mut scheduler = Scheduler::default();
         let mut tick = self.inner.ticker();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                _ = tick.tick() => self.inner.poll(&mut actors, &mut tasks)?,
+                _ = tick.tick() => self.inner.poll(&mut scheduler)?,
             }
         }
     }
@@ -253,42 +301,162 @@ impl Engine {
 }
 
 impl Inner {
-    /// One scheduler tick: forget finished actors, route control commands, start queued runs.
-    fn poll(self: &Arc<Self>, actors: &mut Actors, tasks: &mut JoinSet<()>) -> Result<()> {
-        while tasks.try_join_next().is_some() {}
-        actors.retain(|_, tx| !tx.is_closed());
+    /// The slot pool. A poisoned lock still holds consistent data, so it is used as is.
+    fn slots(&self) -> MutexGuard<'_, Slots> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
+    /// One scheduler tick: forget finished actors, route control commands, line up the queued
+    /// runs and the commands that need a slot, then hand out the free slots in that order.
+    fn poll(self: &Arc<Self>, s: &mut Scheduler) -> Result<()> {
+        while s.tasks.try_join_next().is_some() {}
+        s.actors.retain(|_, tx| !tx.is_closed());
+
+        let mut resumes = Vec::new();
         for (_, run, cmd) in self.store.take_control()? {
-            let cmd = match actors.get(&run) {
-                Some(tx) => match tx.send(cmd) {
-                    Ok(()) => continue,
-                    // The actor finished since the check above.
-                    Err(mpsc::error::SendError(cmd)) => cmd,
-                },
-                None => cmd,
-            };
-            self.idle_command(run, cmd, actors, tasks)?;
+            self.route(run, cmd, s, &mut resumes)?;
         }
+        self.line_up_queued(s)?;
+        s.waiting.extend(resumes);
+        self.grant(s)
+    }
 
-        let free = self.limits.max_concurrent_runs.saturating_sub(actors.len());
-        if free == 0 {
+    /// Delivers `cmd` now, or, when it resumes a run that holds no slot, adds it to `resumes`.
+    fn route(
+        self: &Arc<Self>,
+        run: RunId,
+        cmd: ControlCommand,
+        s: &mut Scheduler,
+        resumes: &mut Vec<Waiter>,
+    ) -> Result<()> {
+        if matches!(cmd, ControlCommand::Cancel) {
+            s.waiting.retain(|w| !w.is_resume_of(run));
+            resumes.retain(|w| !w.is_resume_of(run));
+        }
+        let needs_slot = matches!(cmd, ControlCommand::Resume | ControlCommand::Approve(_));
+        if needs_slot && !self.slots().holds(run) && self.is_suspended(run)? {
+            if s.waiting
+                .iter()
+                .chain(&*resumes)
+                .any(|w| w.is_resume_of(run))
+            {
+                self.store.append(
+                    run,
+                    EventKind::AgentLog {
+                        line: format!(
+                            "kestrel: a resume already waits for a slot, {cmd:?} ignored"
+                        ),
+                    },
+                )?;
+            } else {
+                resumes.push(Waiter {
+                    run,
+                    resume: Some(cmd),
+                });
+            }
             return Ok(());
         }
+        self.deliver(run, cmd, s)?;
+        Ok(())
+    }
+
+    fn is_suspended(&self, run: RunId) -> Result<bool> {
+        let row = self.store.get_run(run)?;
+        Ok(row.is_some_and(|r| matches!(r.status, RunStatus::Suspended(_))))
+    }
+
+    /// Adds the `Queued` runs not yet waiting to the line, oldest first.
+    fn line_up_queued(&self, s: &mut Scheduler) -> Result<()> {
+        let known: HashSet<RunId> = s
+            .waiting
+            .iter()
+            .filter(|w| w.resume.is_none())
+            .map(|w| w.run)
+            .collect();
         let queued = self.store.list_runs(RunFilter {
             status: Some(RunStatus::Queued),
-            limit: Some(free),
             ..RunFilter::default()
         })?;
-        for run in queued {
-            // A conflict means the run was cancelled meanwhile; it is not ours to start.
-            let claimed =
-                self.store
-                    .transition(run.id, &RunStatus::Queued, RunStatus::Provisioning);
-            if claimed.is_ok() {
-                self.spawn(run.id, RunStatus::Provisioning, run.input, actors, tasks)?;
+        for run in queued.into_iter().filter(|r| !known.contains(&r.id)) {
+            s.waiting.push_back(Waiter {
+                run: run.id,
+                resume: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Gives free slots to the waiters, first come first served. When the head of the line finds
+    /// no slot, nobody behind it can: every waiter needs exactly one.
+    fn grant(self: &Arc<Self>, s: &mut Scheduler) -> Result<()> {
+        while let Some(waiter) = s.waiting.pop_front() {
+            let got = {
+                let mut slots = self.slots();
+                match waiter.resume {
+                    Some(_) => slots.reacquire(waiter.run),
+                    None => slots.try_acquire(waiter.run),
+                }
+            };
+            if !got {
+                s.waiting.push_front(waiter);
+                break;
+            }
+            let started = match &waiter.resume {
+                None => self.start_queued(waiter.run, s)?,
+                Some(cmd) => self.start_resume(waiter.run, cmd.clone(), s)?,
+            };
+            if !started {
+                self.slots().release(waiter.run);
             }
         }
         Ok(())
+    }
+
+    /// Starts a queued run. False when it was cancelled while it waited.
+    fn start_queued(self: &Arc<Self>, run: RunId, s: &mut Scheduler) -> Result<bool> {
+        let claimed = self
+            .store
+            .transition(run, &RunStatus::Queued, RunStatus::Provisioning);
+        if claimed.is_err() {
+            return Ok(false);
+        }
+        let input = self
+            .store
+            .get_run(run)?
+            .map(|r| r.input)
+            .unwrap_or_default();
+        self.spawn(run, RunStatus::Provisioning, input, s)?;
+        Ok(s.actors.contains_key(&run))
+    }
+
+    /// Delivers a resume that got its slot. False when the run is no longer suspended.
+    fn start_resume(
+        self: &Arc<Self>,
+        run: RunId,
+        cmd: ControlCommand,
+        s: &mut Scheduler,
+    ) -> Result<bool> {
+        Ok(self.is_suspended(run)? && self.deliver(run, cmd, s)?)
+    }
+
+    /// Sends `cmd` to the run's actor, or handles it here when there is none. True when an actor
+    /// has the run afterwards.
+    fn deliver(
+        self: &Arc<Self>,
+        run: RunId,
+        cmd: ControlCommand,
+        s: &mut Scheduler,
+    ) -> Result<bool> {
+        let cmd = match s.actors.get(&run) {
+            Some(tx) => match tx.send(cmd) {
+                Ok(()) => return Ok(true),
+                // The actor finished since the last tick (and released its slot).
+                Err(mpsc::error::SendError(cmd)) => cmd,
+            },
+            None => cmd,
+        };
+        self.idle_command(run, cmd, s)?;
+        Ok(s.actors.contains_key(&run))
     }
 
     /// A command for a run that has no actor in this engine.
@@ -296,8 +464,7 @@ impl Inner {
         self: &Arc<Self>,
         run: RunId,
         cmd: ControlCommand,
-        actors: &mut Actors,
-        tasks: &mut JoinSet<()>,
+        s: &mut Scheduler,
     ) -> Result<()> {
         let Some(row) = self.store.get_run(run)? else {
             return Ok(());
@@ -305,8 +472,8 @@ impl Inner {
         match (&row.status, cmd) {
             // Suspended before a restart: an actor takes it over from here.
             (RunStatus::Suspended(_), cmd) => {
-                self.spawn(run, row.status.clone(), row.input, actors, tasks)?;
-                if let Some(tx) = actors.get(&run) {
+                self.spawn(run, row.status.clone(), row.input, s)?;
+                if let Some(tx) = s.actors.get(&run) {
                     // The actor was just created and holds its receiver.
                     let _ = tx.send(cmd);
                 }
@@ -329,20 +496,20 @@ impl Inner {
         run: RunId,
         status: RunStatus,
         input: String,
-        actors: &mut Actors,
-        tasks: &mut JoinSet<()>,
+        s: &mut Scheduler,
     ) -> Result<()> {
         let (Some(spec), Some(token)) = (self.store.run_spec(run)?, self.store.run_token(run)?)
         else {
             let failed =
                 RunStatus::Failed("no agent spec or run token is stored for this run".into());
             self.store.transition(run, &status, failed)?;
+            self.slots().release(run);
             return Ok(());
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = Actor::new(self.clone(), run, spec, input, token, status, rx);
-        tasks.spawn(actor.run());
-        actors.insert(run, tx);
+        s.tasks.spawn(actor.run());
+        s.actors.insert(run, tx);
         Ok(())
     }
 
@@ -486,6 +653,36 @@ impl Actor {
         if let Some(sb) = self.sandbox.take() {
             let _ = self.inner.drivers[sb.driver].destroy(&sb.handle).await;
         }
+        // The run ended; whatever slot it still holds goes back.
+        self.inner.slots().release(self.id);
+    }
+
+    /// Whether the run's sandbox is running or being provisioned, which is what a slot pays for.
+    /// An approval wait after a restart has no sandbox.
+    fn holds_slot(&self) -> bool {
+        let approval = matches!(
+            self.status,
+            RunStatus::Suspended(SuspendReason::Approval(_))
+        );
+        matches!(self.status, RunStatus::Provisioning | RunStatus::Running)
+            || (approval && self.sandbox.is_some())
+    }
+
+    /// Releases the slot if the run's state no longer needs one.
+    fn sync_slot(&self) {
+        if !self.holds_slot() {
+            self.inner.slots().release(self.id);
+        }
+    }
+
+    /// Makes sure the run holds a slot before it starts a sandbox. The scheduler normally took
+    /// one already; this also covers a command that raced with a suspension.
+    fn ensure_slot(&self) -> Result<bool> {
+        if self.inner.slots().reacquire(self.id) {
+            return Ok(true);
+        }
+        self.log("kestrel: no free slot, command ignored; send it again")?;
+        Ok(false)
     }
 
     async fn drive(&mut self) -> Result<()> {
@@ -512,7 +709,12 @@ impl Actor {
         let cmd = recv(&mut self.cmds).await;
         let next = self.on_command(cmd)?;
         // An approval granted after a restart leaves the run `Running` with nothing attached.
-        Ok(matches!(next, Next::Resume) || self.status == RunStatus::Running)
+        let go = matches!(next, Next::Resume) || self.status == RunStatus::Running;
+        if !go {
+            // A resume that was declined, or a cancel: nothing here needs the slot taken for it.
+            self.sync_slot();
+        }
+        Ok(go)
     }
 
     /// Creates the sandbox, applying commands while `create` runs. `None` when the run ended
@@ -689,6 +891,9 @@ impl Actor {
                     self.log("kestrel: not resumed, the run is still over its budget")?;
                     return Ok(Next::Continue);
                 }
+                if !self.ensure_slot()? {
+                    return Ok(Next::Continue);
+                }
                 Ok(Next::Resume)
             }
             C::Approve(id) | C::Reject(id) if pending != Some(id) => {
@@ -697,6 +902,7 @@ impl Actor {
                 ))?;
                 Ok(Next::Continue)
             }
+            C::Approve(_) if !self.ensure_slot()? => Ok(Next::Continue),
             C::Approve(id) => {
                 self.resolve(id, true)?;
                 self.set(RunStatus::Running)?;
@@ -788,6 +994,9 @@ impl Actor {
             _ => self.clock.pause(),
         }
         self.status = next;
+        if matches!(self.status, RunStatus::Suspended(_)) {
+            self.sync_slot();
+        }
         Ok(())
     }
 }

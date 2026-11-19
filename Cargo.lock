@@ -991,6 +991,7 @@ dependencies = [
  "kestrel-sandbox",
  "kestrel-store",
  "kestrel-types",
+ "proptest",
  "rusqlite",
  "tempfile",
  "thiserror",
