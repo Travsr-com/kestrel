@@ -372,6 +372,8 @@ pub trait SandboxDriver: Send + Sync {
     /// `None` when the driver has no run networks (the default): the run then uses
     /// [`NetworkPolicy::GatewayOnly`]. A docker answer that the block is in use is
     /// [`SandboxError::SubnetTaken`]; any other failure removes what was made and names the step.
+    /// A network of the run's own name that is already there (left by a prepare that was cut
+    /// short) is removed and made again, once.
     async fn prepare_network(
         &self,
         run: RunId,
@@ -391,6 +393,13 @@ pub trait SandboxDriver: Send + Sync {
     /// without the label are never touched. The default does nothing.
     async fn sweep_networks(&self) -> Result<()> {
         Ok(())
+    }
+    /// The IPv4 subnets other networks use right now, leaving out the run networks of this
+    /// driver's instance (see [`docker_subnets_except_instance`]). The engine excludes them all
+    /// from its pool after one [`SandboxError::SubnetTaken`], instead of finding them one refused
+    /// block at a time. The default knows of none.
+    async fn taken_subnets(&self) -> Result<Vec<Ipv4Cidr>> {
+        Ok(Vec::new())
     }
 }
 
@@ -687,7 +696,9 @@ impl Cli {
     }
 
     /// See [`SandboxDriver::prepare_network`]. `bridge` is the bridge container name; without
-    /// one, and for Apple `container`, there are no run networks.
+    /// one, and for Apple `container`, there are no run networks. A network of the run's name
+    /// that already exists was left by a prepare that was cut short: it is removed and the create
+    /// runs once more.
     async fn prepare_network(
         &self,
         runner: &dyn CommandRunner,
@@ -735,7 +746,17 @@ impl Cli {
                 },
             }
         };
-        match self.run(runner, &self.argv(&args), None).await {
+        let create = self.argv(&args);
+        let mut created = self.run(runner, &create, None).await;
+        if let Err(SandboxError::CommandFailed { stderr, .. }) = &created
+            && is_left_behind(stderr, &name)
+        {
+            // A prepare cut short (its actor aborted) left this run's network behind, unrecorded.
+            // It is this run's own, so it goes, and the create runs once more.
+            let _ = self.remove_network(runner, Some(bridge), &name).await;
+            created = self.run(runner, &create, None).await;
+        }
+        match created {
             Err(SandboxError::CommandFailed { stderr, .. }) if stderr.contains("Pool overlaps") => {
                 return Err(SandboxError::SubnetTaken {
                     subnet: subnet.cidr(),
@@ -805,6 +826,18 @@ impl Cli {
             .map(drop)
     }
 
+    /// See [`SandboxDriver::taken_subnets`]. Apple `container` has no run networks: nothing.
+    async fn taken_subnets(
+        &self,
+        runner: &dyn CommandRunner,
+        instance: Option<&str>,
+    ) -> Result<Vec<Ipv4Cidr>> {
+        if self.apple {
+            return Ok(Vec::new());
+        }
+        docker_subnets_except_instance(runner, instance).await
+    }
+
     /// See [`SandboxDriver::sweep_networks`]. Without a bridge the networks are only removed.
     async fn sweep_networks(
         &self,
@@ -846,6 +879,13 @@ impl Cli {
 /// Docker's answers for a network, or a connection to one, that is already gone. Shared with the
 /// subnet plan, where a network removed between `ls` and `inspect` is skipped.
 const NETWORK_GONE: [&str; 3] = ["not found", "No such network", "is not connected"];
+
+/// Whether `stderr` is docker's answer that network `name` itself already exists ("network with
+/// name <name> already exists"), not some other object.
+fn is_left_behind(stderr: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    stderr.contains("already exists") && stderr.split(|c: char| !word(c)).any(|w| w == name)
+}
 
 /// What a driver knows about networks: its gateway bridge container and its instance id.
 #[derive(Clone, Copy)]
@@ -1062,6 +1102,10 @@ macro_rules! cli_driver {
             }
             async fn sweep_networks(&self) -> Result<()> {
                 $cli.sweep_networks(self.runner.as_ref(), self.network_context())
+                    .await
+            }
+            async fn taken_subnets(&self) -> Result<Vec<Ipv4Cidr>> {
+                $cli.taken_subnets(self.runner.as_ref(), self.instance.as_deref())
                     .await
             }
         }

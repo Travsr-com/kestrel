@@ -155,6 +155,14 @@ impl PoolState {
             .copied()
     }
 
+    /// Blocks in the excluded ranges.
+    fn excluded_blocks(&self) -> u64 {
+        self.excluded
+            .iter()
+            .map(|(start, end)| u64::from(end - start))
+            .sum()
+    }
+
     fn exclude(&mut self, start: u32, end: u32) {
         self.excluded.push((start, end));
         self.excluded.sort_unstable();
@@ -211,10 +219,11 @@ impl SubnetPool {
 
     /// Never hands out a block that overlaps any of `taken` (docker networks, host routes, a
     /// block docker refused). A block in use stays in use until released, and is not handed out
-    /// again after that.
-    pub fn exclude(&self, taken: &[Ipv4Cidr]) {
+    /// again after that. Returns how many blocks were not excluded before.
+    pub fn exclude(&self, taken: &[Ipv4Cidr]) -> usize {
         let (first, last) = self.pool.range();
         let mut state = self.state();
+        let before = state.excluded_blocks();
         for t in taken {
             let (start, end) = t.range();
             if end < first || start > last {
@@ -227,22 +236,29 @@ impl SubnetPool {
                 state.exclude(from, to);
             }
         }
+        usize::try_from(state.excluded_blocks() - before).unwrap_or(usize::MAX)
     }
 
     /// Blocks that can still be handed out.
     pub fn available(&self) -> usize {
         let state = self.state();
-        let excluded: u64 = state
-            .excluded
-            .iter()
-            .map(|(start, end)| u64::from(end - start))
-            .sum();
         let used = state
             .used
             .iter()
             .filter(|b| state.excluded_range(**b).is_none())
             .count() as u64;
-        usize::try_from(u64::from(self.blocks) - excluded - used).unwrap_or(usize::MAX)
+        usize::try_from(u64::from(self.blocks) - state.excluded_blocks() - used)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Blocks handed out and not excluded: the ones that come back to the pool when released.
+    pub fn in_use(&self) -> usize {
+        let state = self.state();
+        state
+            .used
+            .iter()
+            .filter(|b| state.excluded_range(**b).is_none())
+            .count()
     }
 
     /// Reserves the lowest free block, or `None` when every block is in use or excluded.

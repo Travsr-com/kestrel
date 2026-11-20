@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use common::*;
 use kestrel_core::{Engine, Limits};
 use kestrel_sandbox::{
-    ExitStatus, LaunchSpec, NetworkPolicy, OutputStream, PreparedNetwork, SandboxDriver,
+    ExitStatus, Ipv4Cidr, LaunchSpec, NetworkPolicy, OutputStream, PreparedNetwork, SandboxDriver,
     SandboxError, SandboxHandle, Subnet, SubnetPool,
 };
 use kestrel_store::ControlCommand;
@@ -54,6 +54,10 @@ struct NetState {
     /// Networks that exist, by name. A second `network create` with the same name fails, as in
     /// docker.
     live: Mutex<BTreeSet<String>>,
+    /// What `taken_subnets` answers: networks made outside Kestrel, or an error.
+    outside: Mutex<Option<Result<Vec<Ipv4Cidr>, String>>>,
+    /// `taken_subnets` calls.
+    listings: Mutex<usize>,
 }
 
 /// The shared `FakeDriver` plus run networks that behave like docker's.
@@ -81,6 +85,21 @@ impl NetDriver {
 
     fn released(&self) -> Vec<String> {
         lock(&self.state.released).clone()
+    }
+
+    /// `taken_subnets` reports these networks made outside Kestrel.
+    fn outside(&self, cidrs: &[&str]) {
+        let cidrs = cidrs.iter().map(|c| Ipv4Cidr::parse(c).expect("cidr"));
+        *lock(&self.state.outside) = Some(Ok(cidrs.collect()));
+    }
+
+    /// `taken_subnets` fails.
+    fn listing_fails(&self) {
+        *lock(&self.state.outside) = Some(Err("Cannot connect to the Docker daemon".into()));
+    }
+
+    fn listings(&self) -> usize {
+        *lock(&self.state.listings)
     }
 }
 
@@ -150,6 +169,19 @@ impl SandboxDriver for NetDriver {
         lock(&self.state.released).push(network.name.clone());
         Ok(())
     }
+
+    async fn taken_subnets(&self) -> kestrel_sandbox::Result<Vec<Ipv4Cidr>> {
+        *lock(&self.state.listings) += 1;
+        match lock(&self.state.outside).clone() {
+            None => Ok(Vec::new()),
+            Some(Ok(cidrs)) => Ok(cidrs),
+            Some(Err(stderr)) => Err(SandboxError::CommandFailed {
+                program: "docker".into(),
+                code: 1,
+                stderr,
+            }),
+        }
+    }
 }
 
 fn with(mut h: Harness, pool: &str) -> (Harness, NetDriver, Arc<SubnetPool>) {
@@ -214,6 +246,161 @@ async fn when_every_block_is_taken_the_run_fails_saying_why_and_what_to_set() {
     assert_eq!(net.prepared().len(), 4, "every block was tried once");
     assert_eq!(pool.available(), 0);
     assert_eq!(h.driver.count(&Call::Create), 0);
+}
+
+// 1 (round 2): the message says who holds the rest of the pool ---------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_taken_block_with_the_rest_held_by_our_own_runs_says_to_start_again_later() {
+    let (mut h, net, pool) = harness("10.200.0.0/28");
+    net.taken_next(1);
+    let _sa = h.driver.live();
+    let _sb = h.driver.live();
+    let a = h.submit(spec()).await;
+    let b = h.submit(spec()).await;
+    h.start();
+    until("a settled", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    running(&h, b).await;
+    let msg = h.is_failed(a).expect("a has no block left");
+    assert!(msg.contains("subnet pool 10.200.0.0/28"), "{msg}");
+    assert!(
+        msg.contains("docker reported 1 of its blocks taken"),
+        "{msg}"
+    );
+    assert!(msg.contains("own runs hold the rest"), "{msg}");
+    assert!(msg.contains("once one of them ends"), "{msg}");
+    assert!(!msg.contains("gateway.subnet_pool"), "{msg}");
+    assert_eq!(pool.in_use(), 1, "b holds the other block");
+}
+
+#[tokio::test(start_paused = true)]
+async fn taken_blocks_with_none_held_by_our_runs_say_to_set_the_pool() {
+    let (mut h, net, _pool) = harness("10.200.0.0/28");
+    net.taken_next(2);
+    h.start();
+    let a = h.submit(spec()).await;
+    until("failed", || h.is_failed(a).is_some()).await;
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(msg.contains("subnet pool 10.200.0.0/28"), "{msg}");
+    assert!(
+        msg.contains("docker reported 2 of its blocks taken"),
+        "{msg}"
+    );
+    assert!(msg.contains("outside Kestrel"), "{msg}");
+    assert!(
+        msg.contains("Set gateway.subnet_pool to a free range"),
+        "{msg}"
+    );
+    assert!(!msg.contains("own runs"), "{msg}");
+}
+
+// 3 (round 2): one taken block costs one listing, not one docker call per block ---------------
+
+#[tokio::test(start_paused = true)]
+async fn a_listing_that_covers_the_rest_of_the_pool_fails_the_run_without_trying_each_block() {
+    let (mut h, net, pool) = harness("10.200.0.0/24");
+    net.taken_next(1);
+    // Networks outside Kestrel on everything past the first block.
+    net.outside(&[
+        "10.200.0.8/29",
+        "10.200.0.16/28",
+        "10.200.0.32/27",
+        "10.200.0.64/26",
+        "10.200.0.128/25",
+    ]);
+    h.start();
+    let a = h.submit(spec()).await;
+    until("failed", || h.is_failed(a).is_some()).await;
+    assert_eq!(
+        net.prepared().len(),
+        1,
+        "no attempt per block: {:?}",
+        net.prepared()
+    );
+    assert_eq!(net.listings(), 1);
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(
+        msg.contains("docker reported 32 of its blocks taken"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Set gateway.subnet_pool to a free range"),
+        "{msg}"
+    );
+    assert_eq!(pool.available(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_one_taken_block_exactly_one_more_attempt_is_made_when_one_block_is_left() {
+    let (mut h, net, _pool) = harness("10.200.0.0/24");
+    net.taken_next(2);
+    // Everything but the first two blocks is taken outside Kestrel.
+    net.outside(&[
+        "10.200.0.16/28",
+        "10.200.0.32/27",
+        "10.200.0.64/26",
+        "10.200.0.128/25",
+    ]);
+    h.start();
+    let a = h.submit(spec()).await;
+    until("failed", || h.is_failed(a).is_some()).await;
+    let tried: Vec<String> = net.prepared().into_iter().map(|(_, b, _)| b).collect();
+    assert_eq!(
+        tried,
+        ["10.200.0.0/29", "10.200.0.8/29"],
+        "one more attempt"
+    );
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(
+        msg.contains("docker reported 32 of its blocks taken"),
+        "{msg}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_listing_excludes_only_the_refused_block() {
+    let (mut h, net, pool) = harness("10.200.0.0/28");
+    net.taken_next(1);
+    net.listing_fails();
+    let _sa = h.driver.live();
+    h.start();
+    let a = h.submit(spec()).await;
+    until("running or failed", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    assert!(h.is(a, &Running), "failed: {:?}", h.is_failed(a));
+    let tried: Vec<String> = net.prepared().into_iter().map(|(_, b, _)| b).collect();
+    assert_eq!(tried, ["10.200.0.0/29", "10.200.0.8/29"]);
+    assert_eq!(net.listings(), 1);
+    assert_eq!(pool.available(), 0, "one excluded, one in use");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_listed_block_held_by_another_of_our_runs_is_not_excluded() {
+    let (mut h, net, pool) = harness("10.200.0.0/28");
+    net.taken_next(1);
+    // Docker without an instance filter lists our own run's network too.
+    net.outside(&["10.200.0.8/29"]);
+    let _sa = h.driver.live();
+    let _sb = h.driver.live();
+    let a = h.submit(spec()).await;
+    let b = h.submit(spec()).await;
+    h.start();
+    until("a settled", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    running(&h, b).await;
+    let msg = h.is_failed(a).expect("a has no block left");
+    assert!(msg.contains("own runs hold the rest"), "{msg}");
+    h.control(b, ControlCommand::Cancel);
+    until("b cancelled", || h.is(b, &RunStatus::Cancelled)).await;
+    settle().await;
+    assert_eq!(pool.available(), 1, "b's block came back to the pool");
 }
 
 // 3: a run that has a network keeps it across a run_forever restart ----------------------------
@@ -308,6 +495,17 @@ impl Thief {
             t.join().expect("thief thread");
         }
         lock(&self.stole).clone()
+    }
+}
+
+/// A test that panics before `finish` (in `until`, say) still stops the spinning thread.
+impl Drop for Thief {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            // Already unwinding, or the thread's panic was reported by `finish`: ignore it here.
+            let _ = t.join();
+        }
     }
 }
 
