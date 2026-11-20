@@ -340,8 +340,10 @@ impl SubnetPool {
         None
     }
 
-    /// Gives a block back. One found taken while held is excluded instead. Releasing twice, or a
-    /// block of another pool, changes nothing.
+    /// Gives a block back. One found taken while held is excluded instead. Releasing a block that
+    /// is not in use, or a block of another pool, changes nothing. Release each reserved handle
+    /// exactly once: once a block is reserved again, a stale handle for it would free the new
+    /// holder's reservation.
     pub fn release(&self, subnet: &Subnet) {
         let Some(block) = self.index(subnet) else {
             return;

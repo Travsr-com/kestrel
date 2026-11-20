@@ -155,4 +155,7 @@ async fn a_network_that_cannot_be_removed_keeps_its_block_out_of_the_pool_and_sa
     .await;
     settle().await;
     assert_eq!(pool.available(), 1, "the block may still be in use");
+    // The block does not come back while this process runs, so it must not count as held by
+    // our runs either: a later `NoSubnet` would otherwise tell the user to wait for a run to end.
+    assert_eq!(pool.in_use(), 0, "the retired block is not held by a run");
 }

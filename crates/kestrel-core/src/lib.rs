@@ -688,8 +688,8 @@ impl Inner {
     }
 
     /// Removes `run`'s network, if it has one, then frees its block. A network the driver could
-    /// not remove keeps its block out of the pool, so the block is never handed out while the
-    /// network may still use it.
+    /// not remove retires its block (excluded until the next start), so the block is never handed
+    /// out while the network may still use it, and it no longer counts as held by a run.
     async fn release_network(&self, run: RunId) -> kestrel_sandbox::Result<()> {
         let found = self.live().networks.remove(&run);
         let Some((driver, network)) = found else {
@@ -700,7 +700,10 @@ impl Inner {
         if released.is_ok() {
             self.free_block(run);
         } else {
-            self.live().blocks.remove(&run);
+            let block = self.live().blocks.remove(&run);
+            if let (Some(pool), Some(block)) = (&self.subnets, block) {
+                pool.exclude(&[block.cidr()]);
+            }
         }
         released
     }
@@ -1328,6 +1331,11 @@ impl Actor {
     /// outside Kestrel is excluded once its run gives it back, and a subnet inside one held
     /// block (that run's own network, listed by a driver without an instance id) is ignored.
     /// Returns how many blocks were newly found taken. An error lists nothing.
+    ///
+    /// Known limit, only without an instance id (`serve` always sets one): the listing is read
+    /// before the held blocks. If another run removes its network and frees its block in between,
+    /// that run's /29 is still listed but no longer held, so the block is excluded until the next
+    /// start. Conservative: a block is lost, never handed out twice.
     async fn exclude_listed(&self, pool: &SubnetPool, driver: &dyn SandboxDriver) -> usize {
         let Ok(listed) = driver.taken_subnets().await else {
             return 0;
