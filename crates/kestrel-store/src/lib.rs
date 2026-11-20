@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -61,6 +61,12 @@ pub struct RunRow {
     pub input: String,
     pub status: RunStatus,
     pub created_at: OffsetDateTime,
+    /// The run that spawned this one. `None` for a root.
+    pub parent: Option<RunId>,
+    /// The top of this run's tree. A root is its own root.
+    pub root: RunId,
+    /// Steps up to the root. 0 for a root.
+    pub depth: u32,
 }
 
 /// Filter for [`Store::list_runs`]. `Default` lists every run.
@@ -137,14 +143,55 @@ CREATE TABLE run_tokens (
 );
 ";
 
+/// v4: the run tree. Each run knows its parent, its root and its depth, so a spawned child can be
+/// found from either end. Runs from before v4 become roots: no parent, their own root, depth 0.
+/// `root_run_id` is nullable only because SQLite cannot add a `NOT NULL` column without a default.
+/// The `runs_default_root` trigger gives every row one anyway: an older binary still writing to a
+/// migrated file inserts only the v3 columns, and its run must read back as a root.
+/// `run_caps` holds one capability token per run; nothing writes it yet. `events_run` is keyed
+/// `(run_id, rowid)`, so reading a tree's events after a cursor seeks instead of scanning.
+const SCHEMA_V4: &str = "
+ALTER TABLE runs ADD COLUMN parent_run_id TEXT;
+ALTER TABLE runs ADD COLUMN root_run_id TEXT;
+ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0;
+UPDATE runs SET root_run_id = id;
+CREATE TRIGGER runs_default_root AFTER INSERT ON runs WHEN NEW.root_run_id IS NULL
+BEGIN
+    UPDATE runs SET root_run_id = NEW.id WHERE rowid = NEW.rowid;
+END;
+CREATE TABLE run_caps (
+    run_id TEXT PRIMARY KEY,
+    token  BLOB NOT NULL
+);
+CREATE INDEX runs_parent ON runs (parent_run_id);
+CREATE INDEX runs_root ON runs (root_run_id);
+CREATE INDEX events_run ON events (run_id);
+";
+
 /// RFC 3339 timestamp, stored as JSON text like the rest of the typed columns.
 #[derive(Serialize, Deserialize)]
 struct Ts(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
 
 /// A `runs` row as stored, before the JSON columns are decoded.
-type RawRun = (RunId, String, String, String, String);
+struct RawRun {
+    id: RunId,
+    agent: String,
+    input: String,
+    status: String,
+    created_at: String,
+    parent: Option<RunId>,
+    root: RunId,
+    depth: u32,
+}
 
-const RUN_COLUMNS: &str = "id, agent, input, status, created_at";
+const RUN_COLUMNS: &str = "id, agent, input, status, created_at, parent_run_id, root_run_id, depth";
+
+/// What a new child needs to know about its parent.
+struct Parent {
+    id: RunId,
+    root: RunId,
+    depth: u32,
+}
 
 impl Store {
     /// Opens (creating if needed) a file-backed store, enables WAL and runs migrations.
@@ -177,30 +224,39 @@ impl Store {
 
     // runs
 
-    /// Creates a run in `Queued` and stores its full spec (see [`Store::run_spec`]). Writes no
-    /// event, so the run's first appended event gets seq 1.
+    /// Creates a root run in `Queued` (no parent, its own root, depth 0) and stores its full spec
+    /// (see [`Store::run_spec`]). Writes no event, so the run's first appended event gets seq 1.
     pub fn create_run(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
-        let id = RunId::new();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO runs (id, agent, input, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.to_string(),
-                agent.name,
-                input,
-                serde_json::to_string(&RunStatus::Queued)?,
-                serde_json::to_string(&Ts(OffsetDateTime::now_utc()))?,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO run_specs (run_id, spec) VALUES (?1, ?2)",
-            params![id.to_string(), serde_json::to_string(agent)?],
-        )?;
-        tx.execute(
-            "INSERT INTO run_tokens (token, run_id) VALUES (?1, ?2)",
-            params![new_token()?, id.to_string()],
-        )?;
+        let id = insert_run(&tx, agent, input, None)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Creates a child of `parent` in `Queued`: same root as the parent, depth one more. Stores
+    /// the spec and a fresh token like [`Store::create_run`], and writes no event.
+    /// [`StoreError::NotFound`] (and nothing written) when `parent` does not exist.
+    pub fn create_child_run(&self, parent: RunId, agent: &AgentSpec, input: &str) -> Result<RunId> {
+        let mut conn = self.conn();
+        // The parent is read under the write lock, so it cannot change before the insert.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found = tx
+            .query_row(
+                "SELECT root_run_id, depth FROM runs WHERE id = ?1",
+                [parent.to_string()],
+                |r| Ok((run_id_col(r, 0)?, r.get::<_, u32>(1)?)),
+            )
+            .optional()?;
+        let Some((root, depth)) = found else {
+            return Err(StoreError::NotFound(parent));
+        };
+        let above = Parent {
+            id: parent,
+            root,
+            depth,
+        };
+        let id = insert_run(&tx, agent, input, Some(above))?;
         tx.commit()?;
         Ok(id)
     }
@@ -290,16 +346,63 @@ impl Store {
         let limit = filter
             .limit
             .map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {RUN_COLUMNS} FROM runs
-             WHERE (?1 IS NULL OR agent = ?1) AND (?2 IS NULL OR status = ?2)
-             ORDER BY rowid LIMIT ?3"
-        ))?;
-        let raws = stmt
-            .query_map(params![filter.agent, status, limit], raw_run)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        raws.into_iter().map(decode_run).collect()
+        query_runs(
+            &self.conn(),
+            &format!(
+                "SELECT {RUN_COLUMNS} FROM runs
+                 WHERE (?1 IS NULL OR agent = ?1) AND (?2 IS NULL OR status = ?2)
+                 ORDER BY rowid LIMIT ?3"
+            ),
+            params![filter.agent, status, limit],
+        )
+    }
+
+    // run tree
+
+    /// Direct children of `run`, in creation order. Empty for an unknown run.
+    pub fn children(&self, run: RunId) -> Result<Vec<RunRow>> {
+        query_runs(
+            &self.conn(),
+            &format!("SELECT {RUN_COLUMNS} FROM runs WHERE parent_run_id = ?1 ORDER BY rowid"),
+            [run.to_string()],
+        )
+    }
+
+    /// Every descendant of `run` (not `run` itself), each parent before its children: level by
+    /// level, in creation order within a level. Works for any run, not only a root. Empty for an
+    /// unknown run.
+    pub fn subtree(&self, run: RunId) -> Result<Vec<RunRow>> {
+        // UNION, not UNION ALL: a row is visited once, so the walk always ends.
+        query_runs(
+            &self.conn(),
+            &format!(
+                "WITH RECURSIVE below (run_id) AS (
+                     SELECT id FROM runs WHERE parent_run_id = ?1
+                     UNION
+                     SELECT runs.id FROM runs JOIN below ON runs.parent_run_id = below.run_id
+                 )
+                 SELECT {RUN_COLUMNS} FROM runs WHERE id IN (SELECT run_id FROM below)
+                 ORDER BY depth, rowid"
+            ),
+            [run.to_string()],
+        )
+    }
+
+    /// The chain above `run`: its parent first, the root last. Empty for a root or an unknown run.
+    pub fn ancestors(&self, run: RunId) -> Result<Vec<RunRow>> {
+        query_runs(
+            &self.conn(),
+            &format!(
+                "WITH RECURSIVE above (run_id) AS (
+                     SELECT parent_run_id FROM runs WHERE id = ?1
+                     UNION
+                     SELECT runs.parent_run_id FROM runs JOIN above ON runs.id = above.run_id
+                 )
+                 SELECT {RUN_COLUMNS} FROM runs WHERE id IN (SELECT run_id FROM above)
+                 ORDER BY depth DESC"
+            ),
+            [run.to_string()],
+        )
     }
 
     /// Compare-and-set on the run status. Checks `RunStatus::can_transition_to` and writes a
@@ -371,6 +474,30 @@ impl Store {
         bodies
             .iter()
             .map(|b| serde_json::from_str(b).map_err(StoreError::from))
+            .collect()
+    }
+
+    /// Events of every run whose root is `root` (the root's own included) with a cursor greater
+    /// than `after_cursor`, in commit order. The cursor is the `events` rowid; 0 reads from the
+    /// start. It relies on `events` being append-only: rows are never deleted, so the implicit
+    /// rowid only grows. `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
+    /// id of a run that is not a root, reads nothing.
+    pub fn events_since_global(&self, root: RunId, after_cursor: u64) -> Result<Vec<(u64, Event)>> {
+        let after = i64::try_from(after_cursor).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, body FROM events
+             WHERE rowid > ?2 AND run_id IN (SELECT id FROM runs WHERE root_run_id = ?1)
+             ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![root.to_string(), after], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            // Rowids start at 1, so the u64 view is exact.
+            .map(|(rowid, body)| Ok((rowid.unsigned_abs(), serde_json::from_str(body)?)))
             .collect()
     }
 
@@ -515,6 +642,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if found < 3 {
         tx.execute_batch(SCHEMA_V3)?;
     }
+    if found < 4 {
+        tx.execute_batch(SCHEMA_V4)?;
+    }
     if found < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -527,6 +657,43 @@ fn new_token() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| StoreError::Random(e.to_string()))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Inserts a `Queued` run with its spec and a fresh gateway token. `above` places it under a
+/// parent; `None` makes a root. Callers hold an IMMEDIATE transaction.
+fn insert_run(
+    tx: &Transaction<'_>,
+    agent: &AgentSpec,
+    input: &str,
+    above: Option<Parent>,
+) -> Result<RunId> {
+    let id = RunId::new();
+    let (parent, root, depth) = match above {
+        Some(p) => (Some(p.id), p.root, p.depth.saturating_add(1)),
+        None => (None, id, 0),
+    };
+    tx.execute(
+        &format!("INSERT INTO runs ({RUN_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+        params![
+            id.to_string(),
+            agent.name,
+            input,
+            serde_json::to_string(&RunStatus::Queued)?,
+            serde_json::to_string(&Ts(OffsetDateTime::now_utc()))?,
+            parent.map(|p| p.to_string()),
+            root.to_string(),
+            depth,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO run_specs (run_id, spec) VALUES (?1, ?2)",
+        params![id.to_string(), serde_json::to_string(agent)?],
+    )?;
+    tx.execute(
+        "INSERT INTO run_tokens (token, run_id) VALUES (?1, ?2)",
+        params![new_token()?, id.to_string()],
+    )?;
+    Ok(id)
 }
 
 /// Appends one event with the run's next seq. Callers hold an IMMEDIATE transaction, so no other
@@ -552,30 +719,56 @@ fn insert_event(tx: &Transaction<'_>, run: RunId, kind: EventKind) -> Result<Eve
 }
 
 fn run_id_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunId> {
-    row.get::<_, String>(idx)?
-        .parse()
+    parse_run_id(idx, &row.get::<_, String>(idx)?)
+}
+
+/// Like [`run_id_col`] for a nullable column.
+fn opt_run_id_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<RunId>> {
+    row.get::<_, Option<String>>(idx)?
+        .map(|text| parse_run_id(idx, &text))
+        .transpose()
+}
+
+fn parse_run_id(idx: usize, text: &str) -> rusqlite::Result<RunId> {
+    text.parse()
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, Type::Text, Box::new(e)))
 }
 
+/// Reads one row selected as [`RUN_COLUMNS`].
 fn raw_run(row: &Row<'_>) -> rusqlite::Result<RawRun> {
-    Ok((
-        run_id_col(row, 0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-    ))
+    Ok(RawRun {
+        id: run_id_col(row, 0)?,
+        agent: row.get(1)?,
+        input: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        parent: opt_run_id_col(row, 5)?,
+        root: run_id_col(row, 6)?,
+        depth: row.get(7)?,
+    })
 }
 
-fn decode_run((id, agent, input, status, created_at): RawRun) -> Result<RunRow> {
-    let Ts(created_at) = serde_json::from_str(&created_at)?;
+fn decode_run(raw: RawRun) -> Result<RunRow> {
+    let Ts(created_at) = serde_json::from_str(&raw.created_at)?;
     Ok(RunRow {
-        id,
-        agent,
-        input,
-        status: serde_json::from_str(&status)?,
+        id: raw.id,
+        agent: raw.agent,
+        input: raw.input,
+        status: serde_json::from_str(&raw.status)?,
         created_at,
+        parent: raw.parent,
+        root: raw.root,
+        depth: raw.depth,
     })
+}
+
+/// Runs `sql`, a SELECT of [`RUN_COLUMNS`], and decodes every row.
+fn query_runs(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<RunRow>> {
+    let mut stmt = conn.prepare(sql)?;
+    let raws = stmt
+        .query_map(params, raw_run)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter().map(decode_run).collect()
 }
 
 #[cfg(test)]
@@ -681,7 +874,8 @@ mod tests {
         {
             let conn = store.conn();
             conn.execute(
-                "INSERT INTO runs VALUES ('not-a-uuid', 'a', '', '\"Queued\"', '\"x\"')",
+                "INSERT INTO runs (id, agent, input, status, created_at, root_run_id)
+                 VALUES ('not-a-uuid', 'a', '', '\"Queued\"', '\"x\"', 'not-a-uuid')",
                 [],
             )
             .expect("insert run");

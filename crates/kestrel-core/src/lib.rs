@@ -324,7 +324,13 @@ impl Engine {
     pub async fn submit(&self, spec: AgentSpec, input: String) -> Result<RunId> {
         let store = &self.inner.store;
         let id = store.create_run(&spec, &input)?;
-        store.append(id, EventKind::RunCreated { agent: spec.name })?;
+        store.append(
+            id,
+            EventKind::RunCreated {
+                agent: spec.name,
+                parent: None,
+            },
+        )?;
         Ok(id)
     }
 

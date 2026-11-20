@@ -44,7 +44,8 @@ async fn s1_happy_path_goes_queued_provisioning_running_completed_with_events_in
         h.non_status_events(id),
         vec![
             EventKind::RunCreated {
-                agent: "tester".into()
+                agent: "tester".into(),
+                parent: None,
             },
             EventKind::SandboxProvisioned {
                 driver: "fake".into(),

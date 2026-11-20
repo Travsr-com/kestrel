@@ -373,9 +373,11 @@ uPlot for the cost time series.
 CREATE TABLE agents      (name TEXT, version INTEGER, spec_json TEXT NOT NULL, created_at TEXT,
                           PRIMARY KEY (name, version));
 CREATE TABLE runs        (id TEXT PRIMARY KEY, agent TEXT, agent_version INTEGER,
-                          parent_run_id TEXT, root_run_id TEXT NOT NULL, trigger_id TEXT,
+                          parent_run_id TEXT, root_run_id TEXT NOT NULL,
+                          depth INTEGER NOT NULL DEFAULT 0, trigger_id TEXT,
                           status TEXT NOT NULL, budget_usd REAL, spent_usd REAL DEFAULT 0,
                           sandbox_driver TEXT, created_at TEXT, finished_at TEXT);
+CREATE TABLE run_caps    (run_id TEXT PRIMARY KEY, token BLOB NOT NULL);
 CREATE TABLE events      (run_id TEXT, seq INTEGER, kind TEXT NOT NULL, payload_json TEXT,
                           ts TEXT NOT NULL, PRIMARY KEY (run_id, seq));
 CREATE TABLE model_calls (id TEXT PRIMARY KEY, run_id TEXT, provider TEXT, model TEXT, tier TEXT,
@@ -388,7 +390,9 @@ CREATE TABLE approvals   (id TEXT PRIMARY KEY, run_id TEXT, action_json TEXT, st
                           decided_by TEXT, decided_at TEXT);
 CREATE TABLE triggers    (id TEXT PRIMARY KEY, agent TEXT, kind TEXT, spec_json TEXT,
                           enabled INTEGER, next_fire_at TEXT);
+CREATE INDEX runs_parent ON runs(parent_run_id);
 CREATE INDEX runs_root ON runs(root_run_id);
+CREATE INDEX events_run ON events(run_id);
 CREATE INDEX runs_status ON runs(status);
 ```
 

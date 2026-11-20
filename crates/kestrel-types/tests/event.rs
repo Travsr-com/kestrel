@@ -77,7 +77,8 @@ fn model_call() -> impl Strategy<Value = ModelCallRecord> {
 /// Returns (strategy for a kind, expected snake_case tag) for all 12 variants.
 fn kind_with_tag() -> impl Strategy<Value = (EventKind, &'static str)> {
     prop_oneof![
-        text().prop_map(|agent| (EventKind::RunCreated { agent }, "run_created")),
+        (text(), prop::option::of(run_id()))
+            .prop_map(|(agent, parent)| (EventKind::RunCreated { agent, parent }, "run_created")),
         (status(), status())
             .prop_map(|(from, to)| (EventKind::StatusChanged { from, to }, "status_changed")),
         (text(), text()).prop_map(|(driver, sandbox_id)| (

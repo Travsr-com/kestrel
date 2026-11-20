@@ -31,7 +31,13 @@ pub(crate) fn run(db: Option<PathBuf>, args: RunArgs, out: Output) -> Result<(),
         .ok_or_else(|| Failure::usage("--input is required: the task for the agent"))?;
     let store = open(db)?;
     let id = store.create_run(&spec, &input)?;
-    store.append(id, EventKind::RunCreated { agent: spec.name })?;
+    store.append(
+        id,
+        EventKind::RunCreated {
+            agent: spec.name,
+            parent: None,
+        },
+    )?;
     if out.json {
         say(&json!({ "run_id": id.to_string() }).to_string())?;
     } else {
@@ -93,7 +99,7 @@ fn format_event(event: &Event, out: Output) -> Result<String, Failure> {
 /// One event as a short line of text.
 fn describe(kind: &EventKind) -> String {
     match kind {
-        EventKind::RunCreated { agent } => format!("created run of {agent}"),
+        EventKind::RunCreated { agent, .. } => format!("created run of {agent}"),
         EventKind::StatusChanged { from, to } => {
             format!("status {} -> {}", label(from), label(to))
         }
@@ -282,7 +288,10 @@ mod tests {
         };
         let cases = [
             (
-                EventKind::RunCreated { agent: "a".into() },
+                EventKind::RunCreated {
+                    agent: "a".into(),
+                    parent: None,
+                },
                 "created run of a",
             ),
             (
