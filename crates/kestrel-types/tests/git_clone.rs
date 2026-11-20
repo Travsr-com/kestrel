@@ -121,3 +121,9 @@ fn s1_variant_serializes_as_git_clone() {
         w
     );
 }
+
+#[test]
+fn clone_depth_with_empty_dir_is_rejected_naming_the_field() {
+    let err = parse(", clone_depth: 1", "empty-dir").expect_err("depth needs git-clone");
+    assert!(err.contains("sandbox.clone_depth"), "{err}");
+}

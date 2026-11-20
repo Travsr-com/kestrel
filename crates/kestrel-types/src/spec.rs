@@ -138,10 +138,6 @@ impl FromStr for SandboxTier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceSpec {
-    /// A git worktree of `repo`. From YAML, `repo` is `.` (the project the agent is registered in).
-    GitWorktree {
-        repo: PathBuf,
-    },
     /// A per-run `git clone --local --no-hardlinks` of `repo` (issue #22). `depth` makes the
     /// clone shallow. From YAML, `repo` is `.` and `depth` comes from `sandbox.clone_depth`.
     GitClone {
@@ -259,6 +255,8 @@ struct RawSandbox {
     cpu: String,
     memory: String,
     workspace: String,
+    /// Kept as a raw value so a bad one is reported with the field name.
+    clone_depth: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -295,7 +293,7 @@ impl AgentSpec {
                 image: raw.sandbox.image,
                 cpu_millis: parse_cpu(&raw.sandbox.cpu)?,
                 memory_mb: parse_memory(&raw.sandbox.memory)?,
-                workspace: parse_workspace(&raw.sandbox.workspace)?,
+                workspace: parse_workspace(&raw.sandbox.workspace, raw.sandbox.clone_depth)?,
             },
             budget: Budget {
                 limit: parse_usd(&raw.budget.usd)?,
@@ -417,17 +415,38 @@ fn parse_wall_clock(s: &str) -> Result<Duration, SpecError> {
     }
 }
 
-fn parse_workspace(s: &str) -> Result<WorkspaceSpec, SpecError> {
-    match s {
-        "git-worktree" => Ok(WorkspaceSpec::GitWorktree {
+fn parse_workspace(
+    s: &str,
+    clone_depth: Option<serde_json::Value>,
+) -> Result<WorkspaceSpec, SpecError> {
+    let depth = clone_depth.map(parse_clone_depth).transpose()?;
+    match (s, depth) {
+        ("git-clone", depth) => Ok(WorkspaceSpec::GitClone {
             repo: PathBuf::from("."),
+            depth,
         }),
-        "empty-dir" => Ok(WorkspaceSpec::EmptyDir),
+        ("empty-dir", None) => Ok(WorkspaceSpec::EmptyDir),
+        ("empty-dir", Some(_)) => Err(invalid(
+            "sandbox.clone_depth",
+            "only applies to `workspace: git-clone`",
+        )),
         _ => Err(invalid(
             "sandbox.workspace",
-            format_args!("unknown workspace `{s}` (expected git-worktree or empty-dir)"),
+            format_args!("unknown workspace `{s}` (expected git-clone or empty-dir)"),
         )),
     }
+}
+
+fn parse_clone_depth(v: serde_json::Value) -> Result<u32, SpecError> {
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| {
+            invalid(
+                "sandbox.clone_depth",
+                "must be an integer from 1 to 4294967295",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -506,10 +525,10 @@ mod tests {
     #[test]
     fn workspace_spellings() {
         assert_eq!(
-            parse_workspace("empty-dir").ok(),
+            parse_workspace("empty-dir", None).ok(),
             Some(WorkspaceSpec::EmptyDir)
         );
-        assert!(err(parse_workspace("tmp")).contains("sandbox.workspace"));
+        assert!(err(parse_workspace("tmp", None)).contains("sandbox.workspace"));
     }
 
     #[test]
