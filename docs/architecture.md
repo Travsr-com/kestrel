@@ -392,6 +392,7 @@ CREATE TABLE triggers    (id TEXT PRIMARY KEY, agent TEXT, kind TEXT, spec_json 
                           enabled INTEGER, next_fire_at TEXT);
 CREATE INDEX runs_parent ON runs(parent_run_id);
 CREATE INDEX runs_root ON runs(root_run_id);
+CREATE INDEX events_run ON events(run_id);
 CREATE INDEX runs_status ON runs(status);
 ```
 

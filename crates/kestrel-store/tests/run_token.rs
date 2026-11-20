@@ -93,7 +93,9 @@ fn v2_database_migrates_to_v3_and_old_runs_have_no_token() {
         // Turn the file back into a v2 database: undo v4 (run tree, `run_caps`), then v3.
         let conn = rusqlite::Connection::open(&path).expect("raw open");
         conn.execute_batch(
-            "DROP INDEX runs_parent;
+            "DROP TRIGGER runs_default_root;
+             DROP INDEX events_run;
+             DROP INDEX runs_parent;
              DROP INDEX runs_root;
              ALTER TABLE runs DROP COLUMN parent_run_id;
              ALTER TABLE runs DROP COLUMN root_run_id;

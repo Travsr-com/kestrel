@@ -25,8 +25,8 @@ pub enum EventKind {
     RunCreated {
         agent: String,
         /// The run that spawned this one. `None` for a root, and for events written before the
-        /// field existed.
-        #[serde(default)]
+        /// field existed. Left out of the JSON when `None`, so a root's event reads as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<RunId>,
     },
     StatusChanged {

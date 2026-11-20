@@ -145,19 +145,27 @@ CREATE TABLE run_tokens (
 
 /// v4: the run tree. Each run knows its parent, its root and its depth, so a spawned child can be
 /// found from either end. Runs from before v4 become roots: no parent, their own root, depth 0.
-/// `root_run_id` is nullable only because SQLite cannot add a `NOT NULL` column without a default;
-/// every row has one. `run_caps` holds one capability token per run; nothing writes it yet.
+/// `root_run_id` is nullable only because SQLite cannot add a `NOT NULL` column without a default.
+/// The `runs_default_root` trigger gives every row one anyway: an older binary still writing to a
+/// migrated file inserts only the v3 columns, and its run must read back as a root.
+/// `run_caps` holds one capability token per run; nothing writes it yet. `events_run` is keyed
+/// `(run_id, rowid)`, so reading a tree's events after a cursor seeks instead of scanning.
 const SCHEMA_V4: &str = "
 ALTER TABLE runs ADD COLUMN parent_run_id TEXT;
 ALTER TABLE runs ADD COLUMN root_run_id TEXT;
 ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0;
 UPDATE runs SET root_run_id = id;
+CREATE TRIGGER runs_default_root AFTER INSERT ON runs WHEN NEW.root_run_id IS NULL
+BEGIN
+    UPDATE runs SET root_run_id = NEW.id WHERE rowid = NEW.rowid;
+END;
 CREATE TABLE run_caps (
     run_id TEXT PRIMARY KEY,
     token  BLOB NOT NULL
 );
 CREATE INDEX runs_parent ON runs (parent_run_id);
 CREATE INDEX runs_root ON runs (root_run_id);
+CREATE INDEX events_run ON events (run_id);
 ";
 
 /// RFC 3339 timestamp, stored as JSON text like the rest of the typed columns.
@@ -472,7 +480,8 @@ impl Store {
     /// Events of every run whose root is `root` (the root's own included) with a cursor greater
     /// than `after_cursor`, in commit order. The cursor is the `events` rowid; 0 reads from the
     /// start. It relies on `events` being append-only: rows are never deleted, so the implicit
-    /// rowid only grows. Empty for an unknown root.
+    /// rowid only grows. `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
+    /// id of a run that is not a root, reads nothing.
     pub fn events_since_global(&self, root: RunId, after_cursor: u64) -> Result<Vec<(u64, Event)>> {
         let after = i64::try_from(after_cursor).unwrap_or(i64::MAX);
         let conn = self.conn();

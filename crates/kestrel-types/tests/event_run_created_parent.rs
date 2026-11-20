@@ -81,6 +81,18 @@ fn s9_run_created_with_a_parent_round_trips() {
     assert_eq!(back, event);
 }
 
+// 9. A root's event is written exactly as before the field existed, so `kestrel watch --json`
+//    output and stored logs for root runs do not change.
+#[test]
+fn s9_a_root_run_created_event_is_written_without_a_parent_key() {
+    let kind = EventKind::RunCreated {
+        agent: "x".into(),
+        parent: None,
+    };
+    let json = serde_json::to_string(&kind).expect("serialize");
+    assert_eq!(json, r#"{"kind":"run_created","agent":"x"}"#);
+}
+
 // 9. A root's event (no parent) round-trips too, whichever way `None` is written.
 #[test]
 fn s9_run_created_without_a_parent_round_trips() {
