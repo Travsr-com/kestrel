@@ -111,6 +111,11 @@
 //!
 //! `max_children` is carried and narrowed, but counting a run's children needs the store, so the
 //! engine enforces it, not this module.
+//!
+//! The narrowing of `max_depth` and `max_children` from block to block is enforced only by the
+//! chain check in Rust ([`Capability::check_subset_of`], run by [`attenuate`] and on every read).
+//! The Datalog checks do not encode either number: they only empty `{agents}` when no depth is
+//! left.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;

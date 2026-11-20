@@ -2,12 +2,16 @@
 //! draws a grant that may spawn, so this walks a small grid of spawn grants through parent, child
 //! and grandchild. For every attenuation it checks, for each spawn action:
 //!
-//! * **The rule**: when the child's grant `allows` it, the parent's grant allows it too. This is
-//!   the check that fails on a fault in one layer, such as `check_subset_of` letting the depth or
-//!   the agents grow, because it compares the grants themselves.
-//! * **The tokens**: when `verify` allows it for the child, it allows it for the parent, and the
-//!   child's grant agrees. A child token carries every check of its parent, so this part can only
-//!   fail when the Rust rules and the Datalog checks break together.
+//! * **The rule**: when the child's grant `allows` it, the parent's grant allows it too. This
+//!   catches spawn rights appearing from nothing: agents the parent does not list, or spawn rights
+//!   under a parent at depth 0 or without spawn limits.
+//! * **The limits**: when the child has spawn limits, the parent has them too, with a greater
+//!   depth, at least as many children and every agent the child lists. Written here rather than
+//!   through `check_subset_of`, it catches what `allows` cannot see because every level gives the
+//!   same yes or no: a depth that is not decremented, or `max_children` that grows.
+//! * **The tokens**: when `verify` allows it for the child, it allows it for the parent. A child
+//!   token carries every check of its parent, so this part fails only when the Rust rules and the
+//!   Datalog checks break together.
 //!
 //! It also counts the allowed spawns, so it fails if the grid ever stops reaching an allowed spawn
 //! at the child or the grandchild level.
@@ -23,13 +27,14 @@ use kestrel_core::caps::{self, Action, CapToken, Capability, Decision, RootKey, 
 use kestrel_types::RunId;
 
 /// Every spawn grant in the grid: with or without the spawn tool, crossed with no spawn rights,
-/// depth 0 to 2, and no, one or two spawnable agents.
+/// depth 0 to 2, and no, one or two spawnable agents. Every grid grant may have one child, so a
+/// parent that allows none (see the parents in the test) is a child count that must not grow.
 fn grid() -> Vec<(BTreeSet<String>, Option<SpawnLimits>)> {
     let tools = [set(&["fs.read"]), set(&["fs.read", "kestrel.spawn"])];
     let mut spawns = vec![None];
     for depth in 0..=2 {
         for agents in [&[][..], &["reviewer"][..], &["reviewer", "test-writer"][..]] {
-            spawns.push(Some(limits(2, depth, agents)));
+            spawns.push(Some(limits(1, depth, agents)));
         }
     }
     let mut out = Vec::new();
@@ -72,6 +77,29 @@ type Level<'a> = (&'a CapToken, RunId);
 fn inside(upper: Level<'_>, lower: Level<'_>, pk: &caps::RootPublicKey) -> usize {
     let upper_grant = caps::grant(upper.0, pk).expect("upper token verifies");
     let lower_grant = caps::grant(lower.0, pk).expect("lower token verifies");
+    if let Some(low) = &lower_grant.spawn {
+        let Some(up) = &upper_grant.spawn else {
+            panic!("the lower grant has spawn limits and the grant above has none: {low:?}");
+        };
+        assert!(
+            low.max_depth < up.max_depth,
+            "the lower grant's depth {} is not below the grant above's {}",
+            low.max_depth,
+            up.max_depth
+        );
+        assert!(
+            low.max_children <= up.max_children,
+            "the lower grant may have {} children, more than the grant above's {}",
+            low.max_children,
+            up.max_children
+        );
+        assert!(
+            low.agents.is_subset(&up.agents),
+            "the lower grant lists agents {:?} outside the grant above's {:?}",
+            low.agents,
+            up.agents
+        );
+    }
     let mut allowed = 0;
     for a in spawn_actions() {
         if lower_grant.allows(&a).is_ok() {
@@ -83,11 +111,6 @@ fn inside(upper: Level<'_>, lower: Level<'_>, pk: &caps::RootPublicKey) -> usize
         }
         if check(lower.0, pk, lower.1, a.clone()) == Decision::Allow {
             allowed += 1;
-            assert_eq!(
-                lower_grant.allows(&a),
-                Ok(()),
-                "verify allowed {a:?} that the lower grant does not"
-            );
             assert_eq!(
                 check(upper.0, pk, upper.1, a.clone()),
                 Decision::Allow,
@@ -122,6 +145,10 @@ fn every_allowed_spawn_is_allowed_one_level_up_across_the_grid() {
             Some(limits(2, 3, &["reviewer", "test-writer"])),
         ),
         (spawner.clone(), Some(limits(2, 2, &["reviewer"]))),
+        (
+            spawner.clone(),
+            Some(limits(0, 3, &["reviewer", "test-writer"])),
+        ),
         (spawner, None),
         (
             set(&["fs.read"]),
