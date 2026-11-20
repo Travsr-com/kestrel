@@ -22,7 +22,7 @@ name: test-writer
 runtime: {runtime}
 role: tester
 model_policy: {{ default: tier:mid }}
-sandbox: {{ tier: auto, image: "{image}", cpu: 1, memory: 2Gi, workspace: git-worktree }}
+sandbox: {{ tier: auto, image: "{image}", cpu: 1, memory: 2Gi, workspace: git-clone }}
 budget: {{ usd: 1.00, wall_clock: 10m }}
 "#,
         runtime = runtime.as_str(),

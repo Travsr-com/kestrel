@@ -23,6 +23,9 @@ required-features = ["e2e"]
 
 [dev-dependencies]
 axum.workspace = true
+kestrel-core.workspace = true
+kestrel-sandbox.workspace = true
+kestrel-types.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 time.workspace = true

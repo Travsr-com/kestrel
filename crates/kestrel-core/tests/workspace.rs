@@ -1,8 +1,8 @@
-//! Scenario tests for per-run workspaces (#17).
+//! Scenario tests for per-run workspaces (#17, reworked for per-run git clones in #22).
 //!
 //! Unit tests drive git through `FakeGit`, which records every argv and imitates just enough
-//! of git (`worktree add` creates the directory). One test, `real_git_...`, runs the real
-//! `git` binary against a temp repo.
+//! of git (`clone` creates the directory with a `.git` entry). The real `git` binary runs in
+//! `git_clones.rs`.
 
 // Test helpers fail by panicking.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use kestrel_core::workspace::{WorkspaceError, Workspaces};
 use kestrel_sandbox::{
-    CommandOutput, CommandRunner, GvisorDriver, LaunchSpec, NetworkPolicy, ProcessRunner,
-    SandboxDriver, SandboxError, SpawnedProcess,
+    CommandOutput, CommandRunner, GvisorDriver, LaunchSpec, NetworkPolicy, SandboxDriver,
+    SandboxError, SpawnedProcess,
 };
 use kestrel_types::{RunId, WorkspaceSpec};
 use tempfile::TempDir;
@@ -31,13 +31,16 @@ enum Mode {
     Ok,
     /// Every command fails the way git does outside a repository.
     NotARepo,
-    /// The repo check passes, `worktree add` fails (for example the branch already exists).
-    WorktreeAddFails,
+    /// The repo check passes; `clone` leaves a half-made directory behind, then fails.
+    CloneFails,
+    /// The repo check and `clone` pass; the `checkout -b` inside the clone fails.
+    CheckoutFails,
     /// The runner cannot start git at all (binary missing).
     CannotSpawn,
 }
 
 const NOT_A_REPO: &str = "fatal: not a git repository (or any of the parent directories): .git";
+const CLONE_FAILED: &str = "fatal: could not read from remote repository";
 const BRANCH_EXISTS: &str = "fatal: a branch named 'kestrel/run-123456789abc' already exists";
 
 struct FakeGit {
@@ -60,11 +63,11 @@ impl FakeGit {
             .clone()
     }
 
-    /// Calls that are `git ... worktree add ...`.
-    fn worktree_adds(&self) -> Vec<Vec<String>> {
+    /// Calls that are `git clone ...`.
+    fn clones(&self) -> Vec<Vec<String>> {
         self.calls()
             .into_iter()
-            .filter(|argv| is_worktree_add(argv))
+            .filter(|argv| is_clone(argv))
             .collect()
     }
 
@@ -82,14 +85,13 @@ impl FakeGit {
                 "No such file or directory (os error 2)",
             )),
             Mode::NotARepo => fail(128, NOT_A_REPO),
-            Mode::WorktreeAddFails if is_worktree_add(argv) => fail(255, BRANCH_EXISTS),
-            Mode::Ok if is_worktree_add(argv) => {
-                // `git worktree add -b <branch> <path> <commit>`: the path is the second to last
-                // argument. Imitate git: create it with a `.git` file and a checked-out file.
-                let path = PathBuf::from(&argv[argv.len() - 2]);
-                std::fs::create_dir_all(&path)?;
-                std::fs::write(path.join(".git"), "gitdir: /elsewhere\n")?;
-                std::fs::write(path.join("README.md"), "hello\n")?;
+            Mode::CloneFails if is_clone(argv) => {
+                make_clone_dir(argv)?;
+                fail(128, CLONE_FAILED)
+            }
+            Mode::CheckoutFails if is_checkout(argv) => fail(128, BRANCH_EXISTS),
+            Mode::Ok | Mode::CheckoutFails if is_clone(argv) => {
+                make_clone_dir(argv)?;
                 Ok(CommandOutput::default())
             }
             // Any repo check (`rev-parse` and friends) succeeds.
@@ -102,8 +104,20 @@ impl FakeGit {
     }
 }
 
-fn is_worktree_add(argv: &[String]) -> bool {
-    argv.windows(2).any(|w| w[0] == "worktree" && w[1] == "add")
+fn is_clone(argv: &[String]) -> bool {
+    argv.get(1).is_some_and(|a| a == "clone")
+}
+
+fn is_checkout(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "checkout")
+}
+
+/// `git clone ... <source> <path>`: the path is the last argument. Imitate git: create it with
+/// a `.git` directory and a checked-out file.
+fn make_clone_dir(argv: &[String]) -> std::io::Result<()> {
+    let path = PathBuf::from(argv.last().expect("clone has a target"));
+    std::fs::create_dir_all(path.join(".git"))?;
+    std::fs::write(path.join("README.md"), "hello\n")
 }
 
 #[async_trait]
@@ -148,8 +162,9 @@ fn repo() -> PathBuf {
 }
 
 fn git_spec(repo: &Path) -> WorkspaceSpec {
-    WorkspaceSpec::GitWorktree {
+    WorkspaceSpec::GitClone {
         repo: repo.to_path_buf(),
+        depth: None,
     }
 }
 
@@ -260,11 +275,40 @@ fn s1_branch_name_uses_the_run_id_tail() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scenario 2: git-worktree gives each run its own worktree and branch.
+// Scenario 2: git-clone gives each run its own clone and branch (fake git, exact argv).
 // ---------------------------------------------------------------------------------------------
 
+/// `git clone --local --no-hardlinks <repo> <path>` (plus anything in `extra`, inserted before the
+/// source), then the branch checkout inside the fresh clone with host hooks disabled.
+fn expected_calls(
+    repo: &str,
+    source: &str,
+    extra: &[&str],
+    path: &Path,
+    branch: &str,
+) -> Vec<Vec<String>> {
+    let p = path.to_str().unwrap();
+    let mut clone = s(&["git", "clone", "--local", "--no-hardlinks"]);
+    clone.extend(s(extra));
+    clone.extend(s(&[source, p]));
+    vec![
+        s(&["git", "-C", repo, "rev-parse", "--git-dir"]),
+        clone,
+        s(&[
+            "git",
+            "-C",
+            p,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "-b",
+            branch,
+        ]),
+    ]
+}
+
 #[tokio::test]
-async fn s2_git_worktree_runs_exact_worktree_add() {
+async fn s2_git_clone_runs_rev_parse_then_clone_then_checkout_exactly() {
     let (_tmp, root) = root();
     let git = FakeGit::new(Mode::Ok);
     let ws = Workspaces::new(root.clone(), git.clone());
@@ -273,42 +317,106 @@ async fn s2_git_worktree_runs_exact_worktree_add() {
 
     let expected_path = root.join("0192f0a1-2b3c-7d4e-8f50-123456789abc");
     assert_eq!(path, expected_path);
-    let p = expected_path.to_str().unwrap();
     assert_eq!(
-        git.worktree_adds(),
-        vec![s(&[
-            "git",
-            "-C",
+        git.calls(),
+        expected_calls(
             "/srv/repos/app",
-            "worktree",
-            "add",
-            "-b",
-            "kestrel/run-123456789abc",
-            p,
-            "HEAD",
-        ])]
+            "/srv/repos/app",
+            &[],
+            &expected_path,
+            "kestrel/run-123456789abc"
+        )
     );
     assert!(path.is_dir());
 }
 
 #[tokio::test]
-async fn s2_every_git_call_targets_the_repo_explicitly() {
+async fn s2_clone_never_uses_worktree_shared_or_reference() {
     let (_tmp, root) = root();
     let git = FakeGit::new(Mode::Ok);
     let ws = Workspaces::new(root, git.clone());
 
     ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
 
-    let calls = git.calls();
-    assert!(!calls.is_empty());
-    for argv in calls {
-        assert_eq!(argv[0], "git", "{argv:?}");
-        assert_eq!(argv[1..3], s(&["-C", "/srv/repos/app"]), "{argv:?}");
+    let clones = git.clones();
+    assert_eq!(clones.len(), 1, "{clones:?}");
+    for bad in ["--shared", "--reference", "--dissociate", "worktree"] {
+        assert!(
+            git.calls().iter().flatten().all(|a| !a.starts_with(bad)),
+            "{bad} used: {:?}",
+            git.calls()
+        );
     }
+    assert!(clones[0].contains(&"--no-hardlinks".to_string()));
+    assert!(clones[0].contains(&"--local".to_string()));
 }
 
 #[tokio::test]
-async fn s2_two_runs_get_separate_worktrees_and_branches() {
+async fn s2_the_branch_checkout_runs_before_prepare_returns_with_hooks_disabled() {
+    // The fresh clone is trusted only until an agent can touch it, so the checkout must be done
+    // inside `prepare`, and with the clone's hooks switched off.
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+
+    ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+
+    let checkouts: Vec<Vec<String>> = git.calls().into_iter().filter(|a| is_checkout(a)).collect();
+    assert_eq!(checkouts.len(), 1, "{:?}", git.calls());
+    assert!(
+        checkouts[0]
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "core.hooksPath=/dev/null"),
+        "{:?}",
+        checkouts[0]
+    );
+}
+
+#[tokio::test]
+async fn s2_depth_clones_a_file_url_with_depth_flag() {
+    // git ignores --depth for a plain local path, so a shallow clone must use a file:// source.
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root.clone(), git.clone());
+    let spec = WorkspaceSpec::GitClone {
+        repo: repo(),
+        depth: Some(1),
+    };
+
+    let path = ws.prepare(run_a(), &spec).await.unwrap();
+
+    assert_eq!(
+        git.calls(),
+        expected_calls(
+            "/srv/repos/app",
+            "file:///srv/repos/app",
+            &["--depth", "1"],
+            &path,
+            "kestrel/run-123456789abc"
+        )
+    );
+}
+
+#[tokio::test]
+async fn s2_without_depth_the_source_is_the_plain_path() {
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+
+    ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+
+    let clone = &git.clones()[0];
+    assert!(clone.contains(&"/srv/repos/app".to_string()), "{clone:?}");
+    assert!(
+        clone
+            .iter()
+            .all(|a| !a.starts_with("file://") && a != "--depth"),
+        "{clone:?}"
+    );
+}
+
+#[tokio::test]
+async fn s2_two_runs_get_separate_clones_and_branches() {
     let (_tmp, root) = root();
     let git = FakeGit::new(Mode::Ok);
     let ws = Workspaces::new(root, git.clone());
@@ -317,30 +425,91 @@ async fn s2_two_runs_get_separate_worktrees_and_branches() {
     let b = ws.prepare(run_b(), &git_spec(&repo())).await.unwrap();
 
     assert_ne!(a, b);
-    let adds = git.worktree_adds();
-    assert_eq!(adds.len(), 2, "{adds:?}");
-    let branches: HashSet<&String> = adds.iter().map(|argv| &argv[6]).collect();
-    let paths: HashSet<&String> = adds.iter().map(|argv| &argv[7]).collect();
-    assert_eq!(branches.len(), 2, "branches shared: {adds:?}");
-    assert_eq!(paths.len(), 2, "paths shared: {adds:?}");
+    let clones = git.clones();
+    assert_eq!(clones.len(), 2, "{clones:?}");
+    let targets: HashSet<&String> = clones.iter().filter_map(|argv| argv.last()).collect();
+    assert_eq!(targets.len(), 2, "clone targets shared: {clones:?}");
+    let branches: HashSet<String> = git
+        .calls()
+        .into_iter()
+        .filter(|argv| is_checkout(argv))
+        .filter_map(|argv| argv.last().cloned())
+        .collect();
+    assert_eq!(
+        branches,
+        HashSet::from([
+            "kestrel/run-123456789abc".to_string(),
+            "kestrel/run-fedcba987654".to_string()
+        ])
+    );
 }
 
 #[tokio::test]
-async fn s2_worktree_add_failure_is_a_git_error_with_stderr() {
+async fn s2_clone_failure_is_a_git_error_with_stderr_and_removes_the_half_made_dir() {
     let (_tmp, root) = root();
-    let git = FakeGit::new(Mode::WorktreeAddFails);
+    let git = FakeGit::new(Mode::CloneFails);
+    let ws = Workspaces::new(root, git.clone());
+
+    let err = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap_err();
+
+    match &err {
+        WorkspaceError::Git {
+            argv,
+            status,
+            stderr,
+        } => {
+            assert_eq!(*status, 128);
+            assert!(stderr.contains("could not read"), "{stderr}");
+            assert_eq!(argv[1], "clone", "{argv:?}");
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
+    assert!(err.to_string().contains("could not read"), "{err}");
+    assert!(
+        !ws.path_for(run_a()).exists(),
+        "half-made clone directory left behind"
+    );
+    assert!(
+        git.calls().iter().all(|a| !is_checkout(a)),
+        "no checkout after a failed clone"
+    );
+}
+
+#[tokio::test]
+async fn s2_checkout_failure_is_a_git_error_and_removes_the_directory() {
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::CheckoutFails);
     let ws = Workspaces::new(root, git);
 
     let err = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap_err();
 
     match &err {
-        WorkspaceError::Git { status, stderr, .. } => {
-            assert_eq!(*status, 255);
+        WorkspaceError::Git { argv, stderr, .. } => {
+            assert!(argv.iter().any(|a| a == "checkout"), "{argv:?}");
             assert!(stderr.contains("already exists"), "{stderr}");
         }
         other => panic!("expected Git, got {other:?}"),
     }
-    assert!(err.to_string().contains("already exists"), "{err}");
+    assert!(
+        !ws.path_for(run_a()).exists(),
+        "a clone without its run branch must not be reused later"
+    );
+}
+
+#[tokio::test]
+async fn s2_after_a_failed_prepare_the_next_prepare_clones_again() {
+    let (_tmp, root) = root();
+    let failing = Workspaces::new(root.clone(), FakeGit::new(Mode::CheckoutFails));
+    failing
+        .prepare(run_a(), &git_spec(&repo()))
+        .await
+        .unwrap_err();
+
+    let git = FakeGit::new(Mode::Ok);
+    let ok = Workspaces::new(root, git.clone());
+    ok.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+
+    assert_eq!(git.clones().len(), 1, "{:?}", git.calls());
 }
 
 #[tokio::test]
@@ -353,95 +522,141 @@ async fn s2_git_not_startable_is_an_io_error() {
     assert!(matches!(err, WorkspaceError::Io { .. }), "{err:?}");
 }
 
-/// Real git: two runs, two worktrees on two branches, files do not leak between them, and a
-/// second `prepare` for the same run reuses the worktree.
+#[cfg(unix)]
 #[tokio::test]
-async fn real_git_two_runs_get_isolated_worktrees() {
-    if std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIPPED real_git_two_runs_get_isolated_worktrees: `git` is not on PATH");
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
-                "-c",
-                "user.name=Kestrel Test",
-                "-c",
-                "user.email=test@example.invalid",
-            ])
-            .args([
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    git(&["init", "-q"]);
-    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
-    git(&["add", "README.md"]);
-    git(&["commit", "-q", "-m", "init"]);
+async fn s2_non_utf8_repo_path_gets_its_own_error_and_runs_no_git() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
-    let ws = Workspaces::new(tmp.path().join("workspaces"), Arc::new(ProcessRunner));
-    let spec = git_spec(&repo);
-    let a = ws.prepare(run_a(), &spec).await.unwrap();
-    let b = ws.prepare(run_b(), &spec).await.unwrap();
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+    let bad = PathBuf::from(OsStr::from_bytes(b"/srv/repos/app-\xff"));
 
-    assert_ne!(a, b);
-    assert_eq!(
-        std::fs::read_to_string(a.join("README.md")).unwrap(),
-        "hello\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(b.join("README.md")).unwrap(),
-        "hello\n"
-    );
+    let err = ws.prepare(run_a(), &git_spec(&bad)).await.unwrap_err();
 
-    std::fs::write(a.join("only-in-a.txt"), "a").unwrap();
-    assert!(!b.join("only-in-a.txt").exists(), "file leaked into run b");
     assert!(
-        !repo.join("only-in-a.txt").exists(),
-        "file leaked into the source repo"
+        matches!(&err, WorkspaceError::NonUtf8Repo { repo } if repo == &bad),
+        "{err:?}"
     );
-
-    let branches = git(&[
-        "branch",
-        "--list",
-        "kestrel/run-*",
-        "--format=%(refname:short)",
-    ]);
-    let mut branches: Vec<&str> = branches.lines().collect();
-    branches.sort_unstable();
-    assert_eq!(
-        branches,
-        vec!["kestrel/run-123456789abc", "kestrel/run-fedcba987654"]
+    assert!(err.to_string().contains("UTF-8"), "{err}");
+    assert!(
+        !err.to_string().contains("not a git repository"),
+        "misleading message: {err}"
     );
-
-    // Restart: same run, same worktree, and the file written before is still there.
-    let again = ws.prepare(run_a(), &spec).await.unwrap();
-    assert_eq!(again, a);
-    assert!(a.join("only-in-a.txt").exists());
+    assert!(git.calls().is_empty(), "git ran: {:?}", git.calls());
+    assert!(!ws.path_for(run_a()).exists());
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scenario 3: a repo path that is not a git repo fails clearly, before any worktree exists.
+// fetch_back (fake git): runs only from the source repo, never inside the clone.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root.clone(), git.clone());
+    let path = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+    let before = git.calls().len();
+
+    ws.fetch_back(run_a(), &repo()).await.unwrap();
+
+    let calls = git.calls();
+    assert_eq!(
+        calls[before..],
+        [s(&[
+            "git",
+            "-C",
+            "/srv/repos/app",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "fetch",
+            "--no-tags",
+            path.to_str().unwrap(),
+            "kestrel/run-123456789abc:kestrel/run-123456789abc",
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn fetch_back_after_prepare_the_host_never_runs_git_with_the_clone_as_its_directory() {
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+    let path = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+    let before = git.calls().len();
+
+    ws.fetch_back(run_a(), &repo()).await.unwrap();
+
+    let later: Vec<Vec<String>> = git.calls()[before..].to_vec();
+    assert!(!later.is_empty());
+    for argv in later {
+        assert_eq!(argv[..3], s(&["git", "-C", "/srv/repos/app"]), "{argv:?}");
+        // The clone may appear as the fetch source, but never as the directory git runs in.
+        let in_clone = argv
+            .windows(2)
+            .any(|w| w[0] == "-C" && Path::new(&w[1]).starts_with(&path));
+        assert!(!in_clone, "git ran inside the clone: {argv:?}");
+    }
+}
+
+#[tokio::test]
+async fn fetch_back_failure_is_a_git_error_with_stderr() {
+    let (_tmp, root) = root();
+    let ws = Workspaces::new(root, FakeGit::new(Mode::NotARepo));
+
+    let err = ws
+        .fetch_back(run_a(), Path::new("/srv/repos/app"))
+        .await
+        .unwrap_err();
+
+    match &err {
+        WorkspaceError::Git {
+            argv,
+            status,
+            stderr,
+        } => {
+            assert_eq!(*status, 128);
+            assert!(stderr.contains("not a git repository"), "{stderr}");
+            assert!(argv.iter().any(|a| a == "fetch"), "{argv:?}");
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_back_git_not_startable_is_an_io_error() {
+    let (_tmp, root) = root();
+    let ws = Workspaces::new(root, FakeGit::new(Mode::CannotSpawn));
+
+    let err = ws
+        .fetch_back(run_a(), Path::new("/srv/repos/app"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, WorkspaceError::Io { .. }), "{err:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_back_with_a_non_utf8_repo_path_is_its_own_error() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_tmp, root) = root();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+    let bad = PathBuf::from(OsStr::from_bytes(b"/srv/repos/app-\xff"));
+
+    let err = ws.fetch_back(run_a(), &bad).await.unwrap_err();
+
+    assert!(matches!(err, WorkspaceError::NonUtf8Repo { .. }), "{err:?}");
+    assert!(git.calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scenario 3: a repo path that is not a git repo fails clearly, before any clone exists.
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -482,7 +697,7 @@ async fn s3_not_a_git_repo_leaves_no_workspace_behind() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn s4_git_worktree_prepare_twice_reuses_without_second_worktree_add() {
+async fn s4_git_clone_prepare_twice_reuses_without_any_git() {
     let (_tmp, root) = root();
     let git = FakeGit::new(Mode::Ok);
     let first = Workspaces::new(root.clone(), git.clone());
@@ -496,7 +711,85 @@ async fn s4_git_worktree_prepare_twice_reuses_without_second_worktree_add() {
         .unwrap();
 
     assert_eq!(a1, a2);
-    assert_eq!(git.worktree_adds().len(), 1, "{:?}", git.calls());
+    // Only what the first prepare ran: a reused directory runs no git at all.
+    assert_eq!(git.calls().len(), 3, "{:?}", git.calls());
+    assert_eq!(git.clones().len(), 1, "{:?}", git.calls());
+}
+
+#[tokio::test]
+async fn s4_reusing_a_clone_runs_no_git_at_all() {
+    let (_tmp, root) = root();
+    let path = root.join("0192f0a1-2b3c-7d4e-8f50-123456789abc");
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+
+    let got = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+
+    assert_eq!(got, path);
+    assert!(git.calls().is_empty(), "git ran: {:?}", git.calls());
+}
+
+#[tokio::test]
+async fn s4_a_regular_file_at_the_run_path_is_refused_not_mounted() {
+    for spec in [WorkspaceSpec::EmptyDir, git_spec(&repo())] {
+        let (_tmp, root) = root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("0192f0a1-2b3c-7d4e-8f50-123456789abc");
+        std::fs::write(&path, "i am a file").unwrap();
+        let git = FakeGit::new(Mode::Ok);
+        let ws = Workspaces::new(root, git.clone());
+
+        let err = ws.prepare(run_a(), &spec).await.unwrap_err();
+
+        assert!(
+            matches!(&err, WorkspaceError::BadExisting { path: p, .. } if p == &path),
+            "{spec:?}: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(path.to_str().unwrap()), "{msg}");
+        assert!(msg.contains("not a directory"), "{msg}");
+        assert!(git.calls().is_empty(), "git ran: {:?}", git.calls());
+        assert!(path.is_file(), "the refused path was touched");
+    }
+}
+
+#[tokio::test]
+async fn s4_a_git_clone_directory_without_dot_git_is_refused_not_mounted() {
+    let (_tmp, root) = root();
+    let path = root.join("0192f0a1-2b3c-7d4e-8f50-123456789abc");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("half-made.txt"), "x").unwrap();
+    let git = FakeGit::new(Mode::Ok);
+    let ws = Workspaces::new(root, git.clone());
+
+    let err = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap_err();
+
+    assert!(
+        matches!(&err, WorkspaceError::BadExisting { path: p, .. } if p == &path),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains(path.to_str().unwrap()), "{msg}");
+    assert!(msg.contains(".git"), "{msg}");
+    assert!(git.calls().is_empty(), "git ran: {:?}", git.calls());
+    assert!(
+        path.join("half-made.txt").exists(),
+        "the refused dir was modified"
+    );
+}
+
+#[tokio::test]
+async fn s4_an_empty_dir_workspace_without_dot_git_is_still_reused() {
+    // The `.git` rule is for git clones only.
+    let (_tmp, root) = root();
+    let ws = Workspaces::new(root, FakeGit::new(Mode::Ok));
+    let a = ws.prepare(run_a(), &WorkspaceSpec::EmptyDir).await.unwrap();
+
+    assert_eq!(
+        ws.prepare(run_a(), &WorkspaceSpec::EmptyDir).await.unwrap(),
+        a
+    );
 }
 
 #[tokio::test]
@@ -567,7 +860,7 @@ async fn s5_empty_dir_path_passes_sandbox_validation() {
 }
 
 #[tokio::test]
-async fn s5_git_worktree_path_passes_sandbox_validation() {
+async fn s5_git_clone_path_passes_sandbox_validation() {
     let (_tmp, root) = root();
     let ws = Workspaces::new(root, FakeGit::new(Mode::Ok));
 

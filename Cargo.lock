@@ -1006,6 +1006,9 @@ name = "kestrel-e2e"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "kestrel-core",
+ "kestrel-sandbox",
+ "kestrel-types",
  "serde_json",
  "tempfile",
  "time",

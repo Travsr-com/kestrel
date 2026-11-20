@@ -583,7 +583,7 @@ mod tests {
     use super::*;
 
     const AGENT_YAML: &str = "name: a\nruntime: opencode\nrole: r\nmodel_policy: { default: tier:cheap }\n\
-        sandbox: { tier: auto, cpu: 1, memory: 1Gi, workspace: git-worktree }\n\
+        sandbox: { tier: auto, cpu: 1, memory: 1Gi, workspace: git-clone }\n\
         budget: { usd: 1.00, wall_clock: 10m }\n";
 
     fn agent(name: &str) -> AgentSpec {

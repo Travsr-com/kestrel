@@ -3,8 +3,10 @@
 //! Every run gets its own directory at `<root>/<run id>`:
 //!
 //! * `EmptyDir`: a fresh, empty directory.
-//! * `GitWorktree { repo }`: a new git worktree of `repo` on its own branch
-//!   (`kestrel/run-<short id>`, see [`Workspaces::branch_for`]), checked out from `HEAD`.
+//! * `GitClone { repo, depth }`: a full, self-contained `git clone --local --no-hardlinks` of
+//!   `repo`, on its own branch (`kestrel/run-<short id>`, see [`Workspaces::branch_for`]).
+//!   `depth` makes it shallow. The clone is the agent's to rewrite, so the host never runs git
+//!   inside it; [`Workspaces::fetch_back`] pulls the branch home from the source repo instead.
 //!
 //! `prepare` is idempotent: if the run's directory already exists (for example after an engine
 //! restart), it is reused as is and no git command runs. Workspaces are kept after the run
@@ -21,7 +23,7 @@ use kestrel_types::{RunId, WorkspaceSpec};
 /// Why a workspace could not be prepared.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
-    /// The `git-worktree` repo path is not inside a git repository.
+    /// The `git-clone` repo path is not inside a git repository.
     #[error("`{}` is not a git repository", repo.display())]
     NotAGitRepo { repo: PathBuf },
     /// A git command exited non-zero. `stderr` is git's own error text.
@@ -38,6 +40,13 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+    /// The repo path is not valid UTF-8, so it cannot be passed to git as a text argument.
+    #[error("repo path `{}` is not valid UTF-8", repo.display())]
+    NonUtf8Repo { repo: PathBuf },
+    /// The run's directory already exists but is not a usable workspace: it is a regular file,
+    /// or (for a git clone) it has no `.git` entry. `reason` says which.
+    #[error("existing workspace `{}` is not usable: {reason}", path.display())]
+    BadExisting { path: PathBuf, reason: String },
     /// The workspace path would fail the sandbox's mount validation: it is relative, not
     /// UTF-8, or contains `,` `=` `"` or a newline.
     #[error(
@@ -86,37 +95,129 @@ impl Workspaces {
             })?
             .to_string();
         if tokio::fs::try_exists(&path).await.map_err(io(&path))? {
-            return Ok(path);
+            return Self::check_existing(path, spec).await;
         }
         match spec {
             WorkspaceSpec::EmptyDir => create_dir(&path).await?,
-            WorkspaceSpec::GitWorktree { repo } => {
-                let git = |args: &[&str]| -> Vec<String> {
-                    let repo = repo.to_string_lossy().into_owned();
-                    ["git", "-C", &repo]
-                        .iter()
-                        .chain(args)
-                        .map(|a| (*a).to_string())
-                        .collect()
-                };
-                let check = self.git(&git(&["rev-parse", "--git-dir"]), repo).await?;
+            WorkspaceSpec::GitClone { repo, depth } => {
+                let repo_text = repo
+                    .to_str()
+                    .ok_or_else(|| WorkspaceError::NonUtf8Repo { repo: repo.clone() })?;
+                let check = self
+                    .git(
+                        &argv(&["git", "-C", repo_text, "rev-parse", "--git-dir"]),
+                        repo,
+                    )
+                    .await?;
                 if check.status != 0 {
                     return Err(WorkspaceError::NotAGitRepo { repo: repo.clone() });
                 }
                 create_dir(&self.root).await?;
-                let branch = Self::branch_for(run);
-                let argv = git(&["worktree", "add", "-b", &branch, &text, "HEAD"]);
-                let out = self.git(&argv, repo).await?;
-                if out.status != 0 {
-                    return Err(WorkspaceError::Git {
-                        argv,
-                        status: out.status,
-                        stderr: out.stderr.trim_end().to_string(),
-                    });
+                if let Err(e) = self.clone_repo(run, repo, repo_text, *depth, &text).await {
+                    // Best effort: a half-made clone must not be mistaken for a workspace.
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    return Err(e);
                 }
             }
         }
         Ok(path)
+    }
+
+    /// Clones `repo` to `dest` and checks out the run branch. The checkout runs right after the
+    /// clone only, when the clone's config and hooks are still ours.
+    async fn clone_repo(
+        &self,
+        run: RunId,
+        repo: &Path,
+        repo_text: &str,
+        depth: Option<u32>,
+        dest: &str,
+    ) -> Result<(), WorkspaceError> {
+        let mut clone = argv(&["git", "clone", "--local", "--no-hardlinks"]);
+        let source = match depth {
+            Some(n) => {
+                clone.extend(argv(&["--depth", &n.to_string()]));
+                format!("file://{repo_text}")
+            }
+            None => repo_text.to_string(),
+        };
+        clone.extend([source, dest.to_string()]);
+        let branch = Self::branch_for(run);
+        let checkout = argv(&[
+            "git",
+            "-C",
+            dest,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "-b",
+            &branch,
+        ]);
+        for command in [clone, checkout] {
+            self.run_git(command, repo).await?;
+        }
+        Ok(())
+    }
+
+    /// An existing run directory is reused without running git, if it looks like a workspace.
+    async fn check_existing(
+        path: PathBuf,
+        spec: &WorkspaceSpec,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let bad = |path: PathBuf, reason: &str| WorkspaceError::BadExisting {
+            path,
+            reason: reason.to_string(),
+        };
+        if !tokio::fs::metadata(&path)
+            .await
+            .map_err(io(&path))?
+            .is_dir()
+        {
+            return Err(bad(path, "not a directory"));
+        }
+        let has_git = tokio::fs::try_exists(path.join(".git"))
+            .await
+            .map_err(io(&path))?;
+        if matches!(spec, WorkspaceSpec::GitClone { .. }) && !has_git {
+            return Err(bad(path, "no `.git` entry"));
+        }
+        Ok(path)
+    }
+
+    /// Brings the run's branch home: runs ONLY from the source `repo` (never inside the clone,
+    /// whose config and hooks the agent controls) and creates `kestrel/run-<id tail>` there.
+    pub async fn fetch_back(&self, run: RunId, repo: &Path) -> Result<(), WorkspaceError> {
+        let repo_text = repo.to_str().ok_or_else(|| WorkspaceError::NonUtf8Repo {
+            repo: repo.to_path_buf(),
+        })?;
+        let branch = Self::branch_for(run);
+        let clone = self.path_for(run).to_string_lossy().into_owned();
+        // No `+` on the refspec: a branch that cannot fast-forward is an error on purpose.
+        let command = argv(&[
+            "git",
+            "-C",
+            repo_text,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "fetch",
+            "--no-tags",
+            &clone,
+            &format!("{branch}:{branch}"),
+        ]);
+        self.run_git(command, repo).await
+    }
+
+    /// Runs one git command and turns a non-zero exit into [`WorkspaceError::Git`].
+    async fn run_git(&self, command: Vec<String>, repo: &Path) -> Result<(), WorkspaceError> {
+        let out = self.git(&command, repo).await?;
+        if out.status != 0 {
+            return Err(WorkspaceError::Git {
+                argv: command,
+                status: out.status,
+                stderr: out.stderr.trim_end().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Runs one git command; failing to start git is an `Io` error at `repo`.
@@ -138,4 +239,8 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> WorkspaceError + '_ {
         path: path.to_path_buf(),
         source,
     }
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|p| (*p).to_string()).collect()
 }

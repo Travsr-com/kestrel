@@ -2,7 +2,8 @@
 # Build: docker build -t kestrel-echo-agent:test tests/e2e/echo-agent
 FROM alpine:3.20
 
-RUN apk add --no-cache curl
+# git: scenario 6 has the agent commit inside its clone, like a real coding agent.
+RUN apk add --no-cache curl git
 
 # A fixed uid that is NOT the CI runner's (1001). Kestrel runs the sandbox as the workspace owner
 # (`--user`), so the image must not depend on its own uid for the bind mount to be writable.

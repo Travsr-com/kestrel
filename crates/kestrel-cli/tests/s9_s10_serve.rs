@@ -186,7 +186,7 @@ fn start_serve(f: &Fixture) -> ChildGuard {
     ChildGuard::spawn(cmd)
 }
 
-/// Makes the fixture dir a git repo with one commit, so a `git-worktree` agent submitted from it
+/// Makes the fixture dir a git repo with one commit, so a `git-clone` agent submitted from it
 /// gets its worktree from this throwaway repo instead of the repo the tests run in.
 fn init_fixture_repo(f: &Fixture) {
     let dir = f.dir.path();

@@ -16,7 +16,7 @@ capabilities:
   network: [api.github.com]
   secrets: [github_token]
   spawn: { max_children: 4, max_depth: 2, agents: [test-writer] }
-sandbox: { tier: auto, cpu: 2, memory: 4Gi, workspace: git-worktree }
+sandbox: { tier: auto, cpu: 2, memory: 4Gi, workspace: git-clone }
 budget: { usd: 2.00, wall_clock: 30m }
 approvals: { required_for: [gh.comment, git.push] }
 memory: { scope: project }
@@ -65,7 +65,7 @@ fn s1_parses_architecture_example() {
     assert_eq!(spec.sandbox.image, None);
     assert!(matches!(
         spec.sandbox.workspace,
-        WorkspaceSpec::GitWorktree { .. }
+        WorkspaceSpec::GitClone { .. }
     ));
     assert_eq!(spec.budget.limit, MicroUsd(2_000_000));
     assert_eq!(spec.budget.wall_clock, Duration::from_secs(30 * 60));

@@ -7,7 +7,7 @@ Run fleets of AI agents on your own machine or server: headless, sandboxed, para
 ## What works today (M1)
 
 * **Runs agents headless** inside gVisor sandboxes on Linux, each in its own workspace (an empty
-  folder or a git worktree on its own branch).
+  folder or a git clone on its own branch).
 * **Meters every model call.** All model traffic goes through one gateway that counts tokens and
   cost per run, and your budget suspends a run when it is used up.
 * **Controls from the command line:** `kestrel serve`, `run`, `watch`, `ps`, `pause`, `resume`,

@@ -47,9 +47,9 @@ pub enum EngineError {
     NoDriver,
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
-    /// A `git-worktree` repo path that is relative. The engine does not guess a base dir; the
+    /// A `git-clone` repo path that is relative. The engine does not guess a base dir; the
     /// CLI resolves the path when it submits the run.
-    #[error("git-worktree repo `{}` must be an absolute path", repo.display())]
+    #[error("git-clone repo `{}` must be an absolute path", repo.display())]
     RelativeRepo { repo: PathBuf },
 }
 
@@ -232,14 +232,17 @@ impl Engine {
 
     /// Gives every run a workspace from `workspaces`, mounted at `/workspace` in its sandbox
     /// (`LaunchSpec.workspace`). The workspace is prepared before the sandbox is created; a run
-    /// whose workspace cannot be prepared fails without a sandbox. A `git-worktree` repo path
+    /// whose workspace cannot be prepared fails without a sandbox. A `git-clone` repo path
     /// must be absolute (the CLI resolves it at submit time); a relative one fails the run.
     ///
     /// Without this, runs get no workspace (`LaunchSpec.workspace` is `None`), as before.
-    /// Call it on a new engine, before `start` or `recover`: once the engine has handed out
-    /// its state to running tasks, the workspaces are not applied.
+    /// This cannot silently do nothing: it takes the engine by value, and the only way to share
+    /// its state (`start`, `recover`, `run_forever`) borrows it and keeps no clone alive in the
+    /// returned value, so the state is never shared when this runs.
     pub fn with_workspaces(mut self, workspaces: Workspaces) -> Engine {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
             inner.workspaces = Some(Arc::new(workspaces));
         }
         self
@@ -765,7 +768,7 @@ impl Actor {
             return Ok(None);
         };
         let spec = &self.spec.sandbox.workspace;
-        if let WorkspaceSpec::GitWorktree { repo } = spec
+        if let WorkspaceSpec::GitClone { repo, .. } = spec
             && !repo.is_absolute()
         {
             return Err(EngineError::RelativeRepo { repo: repo.clone() });

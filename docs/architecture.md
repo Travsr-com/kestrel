@@ -104,7 +104,7 @@ capabilities:
   network: [api.github.com]
   secrets: [github_token]         # injected by egress proxy, never visible in sandbox
   spawn: { max_children: 4, max_depth: 2, agents: [test-writer] }
-sandbox: { tier: auto, cpu: 2, memory: 4Gi, workspace: git-worktree }
+sandbox: { tier: auto, cpu: 2, memory: 4Gi, workspace: git-clone }
 budget: { usd: 2.00, wall_clock: 30m }
 approvals: { required_for: [gh.comment, git.push] }
 memory: { scope: project }
@@ -378,7 +378,7 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 | First chat surface | Google Chat via Pub/Sub pull |
 | Meetings | Live meeting bot, Google Meet first, headless-browser approach (Meet Media API is being sunset) |
 | Repo | Separate `Kestrel` repo; Travsr used only over MCP |
-| Workspaces | Per-run git clones (#22), not git worktrees: a worktree's `.git` points outside the sandbox mount, so git fails inside it. The YAML value `git-worktree` stays until #22 renames it |
+| Workspaces | Per-run git clones (#22), not git worktrees: a worktree's `.git` points outside the sandbox mount, so git fails inside it. The YAML value is `git-clone`; the optional `sandbox.clone_depth` makes the clone shallow |
 | Sandbox tool access | `kestrel.*` and Travsr MCP are served under the gateway path (`/r/{token}/mcp`, `/r/{token}/travsr`), because the gateway is a sandbox's only way out |
 | UI coverage | The 95% line rule covers Rust and the Svelte UI (vitest), enforced in CI |
 

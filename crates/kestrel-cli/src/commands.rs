@@ -43,13 +43,13 @@ pub(crate) fn run(db: Option<PathBuf>, args: RunArgs, out: Output) -> Result<(),
     Ok(())
 }
 
-/// Reads and checks an agent file. A git-worktree repo path becomes absolute, resolved against
+/// Reads and checks an agent file. A git-clone repo path becomes absolute, resolved against
 /// the current dir, so the engine (running elsewhere) finds the same repo.
 fn load_spec(path: &PathBuf) -> Result<AgentSpec, Failure> {
     let bad = |e: &dyn std::fmt::Display| Failure::usage(format!("{}: {e}", path.display()));
     let yaml = std::fs::read_to_string(path).map_err(|e| bad(&e))?;
     let mut spec = AgentSpec::from_yaml(&yaml).map_err(|e| bad(&e))?;
-    if let WorkspaceSpec::GitWorktree { repo } = &mut spec.sandbox.workspace {
+    if let WorkspaceSpec::GitClone { repo, .. } = &mut spec.sandbox.workspace {
         *repo = std::path::absolute(&*repo).map_err(|e| bad(&e))?;
     }
     Ok(spec)

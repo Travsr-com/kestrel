@@ -36,7 +36,7 @@ fn spec(runtime: &str) -> AgentSpec {
     AgentSpec::from_yaml(&format!(
         "name: echo\nruntime: {runtime}\nrole: tester\n\
          model_policy: {{ default: tier:cheap }}\n\
-         sandbox: {{ tier: auto, image: my-image:1, cpu: 1, memory: 512Mi, workspace: git-worktree }}\n\
+         sandbox: {{ tier: auto, image: my-image:1, cpu: 1, memory: 512Mi, workspace: git-clone }}\n\
          budget: {{ usd: 1, wall_clock: 10m }}\n"
     ))
     .expect("spec")

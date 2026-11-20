@@ -91,12 +91,13 @@ sandbox:
   image: my-claude-code-image:latest   # your image from "What you need"
   cpu: 2
   memory: 4Gi
-  workspace: git-worktree
+  workspace: git-clone
 budget: { usd: 2.00, wall_clock: 30m }
 ```
 
-`tier:mid` becomes the model you set under `[models]`. `workspace: git-worktree` gives each run its
-own copy of the repo on its own branch (`kestrel/run-...`), so parallel runs never share files.
+`tier:mid` becomes the model you set under `[models]`. `workspace: git-clone` gives each run its
+own full copy of the repo on branch `kestrel/run-<id>`, so parallel runs never share files. A copy
+costs disk space; for a big repo add `clone_depth: 1` under `sandbox` to copy only the latest commit.
 
 ## 4. Start the server
 
