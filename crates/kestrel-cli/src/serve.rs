@@ -62,6 +62,9 @@ struct RawGateway {
 #[serde(deny_unknown_fields)]
 struct RawEngine {
     max_concurrent_runs: Option<usize>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    #[allow(dead_code)]
+    shutdown_grace_secs: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -103,6 +106,9 @@ struct Config {
     /// `gateway.subnet_pool`: where run networks get their `/29` blocks. Default
     /// [`DEFAULT_SUBNET_POOL`].
     subnet_pool: Ipv4Cidr,
+    /// `engine.shutdown_grace_secs`: how long a stop may take, in total. Default 10s.
+    #[allow(dead_code)]
+    shutdown_grace: std::time::Duration,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -184,6 +190,8 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         advertise_url,
         docker_host,
         subnet_pool,
+        // Skeleton (issue #25): the real value is read from `raw.engine.shutdown_grace_secs`.
+        shutdown_grace: std::time::Duration::ZERO,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -1123,6 +1131,56 @@ fn interrupt() -> Result<impl Future<Output = ()>, Failure> {
     })
 }
 
+/// Exit code of a forced stop: a second signal while shutting down (128 + SIGINT).
+#[allow(dead_code)]
+pub(crate) const FORCED_EXIT: u8 = 130;
+
+/// What a signal means while serve runs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalAction {
+    /// The first SIGINT or SIGTERM: start the bounded shutdown.
+    Begin,
+    /// Any later signal: exit at once with [`FORCED_EXIT`], without waiting.
+    Abort,
+}
+
+/// Counts the signals serve has received. SIGINT and SIGTERM are the same signal here.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownPlan {
+    seen: u32,
+}
+
+#[allow(clippy::todo, dead_code)]
+impl ShutdownPlan {
+    pub(crate) fn new() -> ShutdownPlan {
+        ShutdownPlan::default()
+    }
+
+    /// Records one signal and says what to do about it.
+    pub(crate) fn on_signal(&mut self) -> SignalAction {
+        todo!("issue #25")
+    }
+}
+
+/// One paragraph for stderr: how many sandboxes were destroyed, then each failed or timed-out
+/// run with its reason. No newlines.
+#[allow(clippy::todo, dead_code)]
+pub(crate) fn shutdown_summary(report: &kestrel_core::ShutdownReport) -> String {
+    let _ = report;
+    todo!("issue #25")
+}
+
+/// `Ok` when the report is clean (exit 0); otherwise a runtime failure (exit 1) whose message
+/// says which of `failed` and `timed out` happened.
+#[allow(clippy::todo, dead_code)]
+pub(crate) fn shutdown_result(report: &kestrel_core::ShutdownReport) -> Result<(), Failure> {
+    let _ = report;
+    todo!("issue #25")
+}
+
+/// The gateway
 /// The gateway's view of the store: run tokens, budgets and metering.
 struct StoreDeps(Arc<Store>);
 
@@ -1276,6 +1334,121 @@ budget: { usd: 0.000010, wall_clock: 10m }
         store.set_budget(id, MicroUsd(11)).expect("raise");
         assert!(deps.allow(id).await, "a raised budget allows calls again");
         assert!(!deps.allow(RunId::new()).await, "unknown runs are refused");
+    }
+
+    // Issue #25: bounded shutdown (tests first, failing until implemented).
+
+    fn grace(config: &str) -> std::time::Duration {
+        let (_dir, path) = write(config);
+        load_config(&path).expect("config loads").shutdown_grace
+    }
+
+    #[test]
+    fn the_shutdown_grace_defaults_to_10_seconds() {
+        assert_eq!(
+            grace(&format!("{ANTHROPIC}[engine]\nmax_concurrent_runs = 2\n")),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(grace(ANTHROPIC), std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_shutdown_grace_is_read_in_whole_seconds_from_1_to_3600() {
+        for secs in [1u64, 2, 10, 3600] {
+            let cfg = format!("{ANTHROPIC}[engine]\nshutdown_grace_secs = {secs}\n");
+            assert_eq!(grace(&cfg), std::time::Duration::from_secs(secs));
+        }
+    }
+
+    #[test]
+    fn a_bad_shutdown_grace_is_a_usage_error_naming_the_key_and_hiding_the_value() {
+        for bad in [
+            "0",
+            "3601",
+            "-5",
+            "987654321",
+            "\"sekrit-grace\"",
+            "1.5",
+            "true",
+            "[7]",
+        ] {
+            let msg = err(&format!(
+                "{ANTHROPIC}[engine]\nshutdown_grace_secs = {bad}\n"
+            ));
+            assert!(msg.contains("engine.shutdown_grace_secs"), "{bad}: {msg}");
+            for secret in ["987654321", "sekrit-grace", "3601"] {
+                assert!(!msg.contains(secret), "{bad} echoed in: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_grace_secs_is_a_known_config_name_so_toml_errors_can_quote_it() {
+        assert!(CONFIG_NAMES.contains(&"shutdown_grace_secs"));
+    }
+
+    #[test]
+    fn the_first_signal_begins_the_shutdown_and_every_later_one_aborts() {
+        let mut plan = ShutdownPlan::new();
+        assert_eq!(plan.on_signal(), SignalAction::Begin);
+        assert_eq!(plan.on_signal(), SignalAction::Abort);
+        assert_eq!(plan.on_signal(), SignalAction::Abort);
+        assert_eq!(FORCED_EXIT, 130);
+    }
+
+    fn report(
+        destroyed: usize,
+        failed: &[(RunId, &str)],
+        timed_out: &[RunId],
+    ) -> kestrel_core::ShutdownReport {
+        kestrel_core::ShutdownReport {
+            destroyed: (0..destroyed).map(|_| RunId::new()).collect(),
+            failed: failed.iter().map(|(r, e)| (*r, (*e).to_string())).collect(),
+            timed_out: timed_out.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_clean_report_is_exit_0_and_the_summary_counts_the_destroyed() {
+        let r = report(2, &[], &[]);
+        assert!(shutdown_result(&r).is_ok());
+        let text = shutdown_summary(&r);
+        assert!(text.contains("2 destroyed"), "{text}");
+        assert!(!text.contains('\n'), "one paragraph: {text:?}");
+        assert!(shutdown_summary(&report(0, &[], &[])).contains("0 destroyed"));
+    }
+
+    #[test]
+    fn a_failed_destroy_is_exit_1_naming_the_run_and_the_reason() {
+        let run = RunId::new();
+        let r = report(1, &[(run, "docker rm: no such container")], &[]);
+        let e = shutdown_result(&r).expect_err("failed is an error");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("failed"), "{}", e.message);
+        let text = shutdown_summary(&r);
+        assert!(text.contains("1 destroyed"), "{text}");
+        assert!(text.contains(&run.to_string()), "{text}");
+        assert!(text.contains("docker rm: no such container"), "{text}");
+        assert!(!text.contains('\n'), "one paragraph: {text:?}");
+    }
+
+    #[test]
+    fn a_timed_out_run_is_exit_1_saying_timed_out() {
+        let run = RunId::new();
+        let r = report(0, &[], &[run]);
+        let e = shutdown_result(&r).expect_err("timed out is an error");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("timed out"), "{}", e.message);
+        let text = shutdown_summary(&r);
+        assert!(text.contains(&run.to_string()), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn failed_and_timed_out_together_say_both() {
+        let r = report(0, &[(RunId::new(), "boom")], &[RunId::new()]);
+        let e = shutdown_result(&r).expect_err("error");
+        assert!(e.message.contains("failed") && e.message.contains("timed out"));
     }
 
     fn write(config: &str) -> (tempfile::TempDir, PathBuf) {

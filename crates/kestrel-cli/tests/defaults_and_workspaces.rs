@@ -70,6 +70,13 @@ fn serve_gives_an_empty_dir_run_a_workspace_next_to_the_db() {
 fn run_resolves_the_worktree_repo_against_the_current_dir() {
     let f = Fixture::new();
     let agent = f.good_agent();
+    // Issue #25: a git-clone run needs a git repo at submit time.
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(f.dir.path())
+        .status()
+        .expect("run git");
+    assert!(init.success());
     let out = f
         .kestrel()
         .current_dir(f.dir.path())

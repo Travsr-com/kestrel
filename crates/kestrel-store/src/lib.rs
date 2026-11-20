@@ -335,6 +335,14 @@ impl Store {
         Ok(id)
     }
 
+    /// Like [`Store::create_run`], and appends the run's `RunCreated` event (seq 1) in the same
+    /// transaction: either both exist afterwards or neither does.
+    #[allow(clippy::todo)]
+    pub fn create_run_with_event(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
+        let _ = (agent, input);
+        todo!("issue #25")
+    }
+
     /// Creates a child of `parent` in `Queued`: same root as the parent, depth one more. Stores
     /// the spec and a fresh token like [`Store::create_run`], and writes no event.
     /// [`StoreError::NotFound`] (and nothing written) when `parent` does not exist.
