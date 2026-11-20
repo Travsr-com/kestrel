@@ -196,6 +196,7 @@ async fn a_custom_image_is_used_as_is() {
     let runner = happy();
     let spec = BridgeSpec {
         image: "registry.local/socat:9".to_string(),
+        ..BridgeSpec::default()
     };
     GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
         .await
@@ -468,6 +469,7 @@ async fn bad_images_are_rejected_before_any_command() {
         let runner = happy();
         let spec = BridgeSpec {
             image: image.to_string(),
+            ..BridgeSpec::default()
         };
         let err = GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
             .await

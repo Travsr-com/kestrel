@@ -39,12 +39,17 @@ fn is_container_name(name: &str) -> bool {
 pub struct BridgeSpec {
     /// A `socat` image whose entrypoint is `socat`. Defaults to [`DEFAULT_BRIDGE_IMAGE`].
     pub image: String,
+    /// Start the container with `--add-host host.docker.internal:host-gateway`. True (the
+    /// default) when the docker daemon runs on the same machine as Kestrel. False when it runs in
+    /// a VM, which already resolves `host.docker.internal` to the host (issue #53).
+    pub add_host_gateway: bool,
 }
 
 impl Default for BridgeSpec {
     fn default() -> Self {
         Self {
             image: DEFAULT_BRIDGE_IMAGE.to_string(),
+            add_host_gateway: true,
         }
     }
 }
