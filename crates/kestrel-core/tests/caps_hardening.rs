@@ -398,3 +398,80 @@ fn cap_token_debug_prints_only_the_length() {
         assert!(!pretty.replace([' ', '\n'], "").contains(&list), "{pretty}");
     }
 }
+
+// Second review follow-up.
+
+/// `count` tool names long enough that the token passes the 1 MiB limit well before `count`.
+fn many_tools(count: usize) -> std::collections::BTreeSet<String> {
+    (0..count)
+        .map(|i| format!("tool.{i:06}.{}", "x".repeat(40)))
+        .collect()
+}
+
+#[test]
+fn issuing_a_token_over_the_size_limit_fails_up_front() {
+    let key = RootKey::generate();
+    let mut cap = Capability::from_spec(RunId::new(), &root_spec(), expiry());
+    cap.tools = many_tools(20_000);
+    match caps::issue(&key, &cap) {
+        Err(CapError::Token(why)) => assert!(why.contains("MiB"), "{why}"),
+        other => panic!("expected CapError::Token naming the limit, got {other:?}"),
+    }
+}
+
+#[test]
+fn attenuating_to_a_token_over_the_size_limit_fails_up_front() {
+    // Each block carries its grant, so a chain of large grants grows past the limit even though
+    // every single block is fine. The attenuation that would cross it must be refused, rather than
+    // handing back a token that every later call rejects.
+    let key = RootKey::generate();
+    let mut root = Capability::from_spec(RunId::new(), &root_spec(), expiry());
+    root.tools = many_tools(2_500);
+    root.spawn = None;
+    let mut token = caps::issue(&key, &root).expect("a large root still fits");
+    let mut refused = None;
+    for _ in 0..10 {
+        let child = narrowed(&root, |_| {});
+        match caps::attenuate(&token, &key, &child) {
+            Ok(next) => {
+                assert!(
+                    caps::grant(&next, &key.public()).is_ok(),
+                    "an attenuated token that was returned must also verify"
+                );
+                token = next;
+            }
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    match refused {
+        Some(CapError::Token(why)) => assert!(why.contains("MiB"), "{why}"),
+        other => panic!("expected the chain to hit the size limit, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_spawn_tool_with_no_spawnable_agent_is_not_allowed() {
+    // A tool that can never succeed must not be offered (the gateway's `tools/list` filters with
+    // `allows`).
+    let cap = Capability::from_spec(
+        RunId::new(),
+        &spec_from(
+            "{ mcp: [kestrel.spawn], spawn: { max_children: 2, max_depth: 2, agents: [] } }",
+            "1",
+        ),
+        expiry(),
+    );
+    let refused = cap.allows(&tool("kestrel.spawn"));
+    assert!(
+        matches!(&refused, Err(why) if why.contains("agent")),
+        "{refused:?}"
+    );
+    let fx = Fx::issued(RootKey::generate(), cap);
+    assert_deny_naming(
+        &fx.check(&fx.token, fx.cap.run, tool("kestrel.spawn")),
+        "agent",
+    );
+}

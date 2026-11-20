@@ -29,8 +29,12 @@
 //! every run from [`verify`].
 //!
 //! **Run binding is a boundary.** A token is bound to the run of its last block. Since only the
-//! server writes blocks, only the server chooses that run: a holder cannot re-bind a token to
-//! another run. The run check in each block holds only when the block is the last one
+//! server writes blocks, only the server chooses that run: no token can be bound to a run the
+//! server has not attenuated for, and binding never adds rights. (A holder of an ancestor token who
+//! also holds a descendant's token can rebuild a token for that existing descendant run, with
+//! exactly the descendant's rights; the gateway reads each run's token from the store, so a token
+//! presented by a sandbox is never trusted.) The run check in each block holds only when the block
+//! is the last one
 //! (`$last != {index} || ...`), because a block cannot name the run of a child that does not exist
 //! yet. The authorizer supplies `last_block` from the verified token.
 //!
@@ -240,7 +244,7 @@ impl Capability {
     /// with it. It does not look at the run or the expiry, which need a [`Request`].
     ///
     /// * `Tool`: listed in `tools`; [`SPAWN_TOOL`] also needs spawn rights (`spawn` Some with
-    ///   `max_depth >= 1`).
+    ///   `max_depth >= 1`) and at least one spawnable agent, since without one it cannot succeed.
     /// * `Host`, `Secret`: listed.
     /// * `Spawn`: [`SPAWN_TOOL`] listed in `tools`, spawn rights, and the agent in `agents`.
     /// * `Spend`: `0 <= amount <= budget`.
@@ -258,6 +262,11 @@ impl Capability {
                 if name == SPAWN_TOOL && self.spawnable().is_none() {
                     return Err(format!(
                         "tool `{name}` needs spawn rights, and this grant may not spawn"
+                    ));
+                }
+                if name == SPAWN_TOOL && self.spawnable().is_some_and(|s| s.agents.is_empty()) {
+                    return Err(format!(
+                        "tool `{name}` needs a spawnable agent, and the agent list is empty"
                     ));
                 }
                 Ok(())
@@ -411,7 +420,20 @@ pub fn issue(root: &RootKey, cap: &Capability) -> Result<CapToken, CapError> {
         .map_err(token_error)?
         .context(encode(cap)?);
     let biscuit = block.build(&root.0).map_err(token_error)?;
-    biscuit.to_vec().map(CapToken).map_err(token_error)
+    sized(biscuit.to_vec().map_err(token_error)?)
+}
+
+/// `bytes` as a token, or [`CapError::Token`] when they are over [`MAX_TOKEN_BYTES`]. Reading such
+/// a token fails, so it is refused when written instead of being handed back dead on arrival.
+fn sized(bytes: Vec<u8>) -> Result<CapToken, CapError> {
+    if bytes.len() > MAX_TOKEN_BYTES {
+        return Err(CapError::Token(format!(
+            "the token would be {} bytes, more than the {} MiB limit",
+            bytes.len(),
+            MAX_TOKEN_BYTES >> 20
+        )));
+    }
+    Ok(CapToken(bytes))
 }
 
 /// Verifies `parent` against `root`, checks `child.check_subset_of(parent grant)`, and appends one
@@ -457,7 +479,7 @@ fn append_signed(
     let appended = biscuit
         .append_third_party(root.0.public(), signed)
         .map_err(token_error)?;
-    appended.to_vec().map(CapToken).map_err(token_error)
+    sized(appended.to_vec().map_err(token_error)?)
 }
 
 /// The verified effective grant of a token: its last block, after checking that every block
@@ -592,6 +614,10 @@ fn run_limits() -> AuthorizerLimits {
 /// Most blocks a token may hold, the authority block included: a run tree at most 31 levels deep.
 pub const MAX_BLOCKS: usize = 32;
 
+/// Largest serialized token, 1 MiB. Enforced when a token is read, and when [`issue`] or
+/// [`attenuate`] writes one.
+pub const MAX_TOKEN_BYTES: usize = 1 << 20;
+
 /// What a token may contain to be read at all: at most [`MAX_BLOCKS`] blocks and 1 MiB, Ed25519
 /// keys only, never sealed, and every attenuation block a third-party block. That the third party
 /// is the root key is checked in [`effective`].
@@ -601,7 +627,7 @@ fn deserialization_limits() -> DeserializationLimits {
     limits.allow_sealed_tokens = false;
     limits.allow_attenuations_with_external_signatures = true;
     limits.allow_attenuations_without_external_signatures = false;
-    limits.max_token_size = 1 << 20;
+    limits.max_token_size = MAX_TOKEN_BYTES;
     limits.max_blocks = MAX_BLOCKS;
     limits.allowed_internal_signing_algorithms = ed25519();
     limits.allowed_external_signing_algorithms = ed25519();

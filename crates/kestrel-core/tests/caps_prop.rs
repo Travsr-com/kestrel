@@ -4,8 +4,11 @@
 //! Names come from a four-letter alphabet shared by tools, hosts, secrets and agents, so sets
 //! overlap often and a name granted as one kind is regularly asked for as another. Child requests
 //! are mostly clamped into the parent (so `attenuate` succeeds and the actions are exercised) and
-//! sometimes left raw (so escalations are tried). 48 cases: every case signs and verifies
-//! Biscuit tokens, which is not free in a debug build.
+//! sometimes left raw (so escalations are tried). Tool names include `kestrel.spawn`, so the spawn
+//! rules are exercised and spawns are sometimes allowed. Each case also attenuates a grandchild and
+//! asks at random instants up to two hours after `t0`, so requests land on both sides of every
+//! expiry. 48 cases: every case signs and verifies Biscuit tokens, which is not free in a debug
+//! build.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -20,10 +23,17 @@ use proptest::prelude::*;
 use time::Duration;
 
 const NAMES: [&str; 4] = ["a", "b", "c", "d"];
+/// Tool names: the spawn tool, so that spawning can be allowed, plus three plain names.
+const TOOL_NAMES: [&str; 4] = ["a", "b", "c", "kestrel.spawn"];
 const CASES: u32 = 48;
 
 fn names() -> impl Strategy<Value = BTreeSet<String>> {
     proptest::sample::subsequence(NAMES.to_vec(), 0..=NAMES.len())
+        .prop_map(|v| v.into_iter().map(String::from).collect())
+}
+
+fn tool_names() -> impl Strategy<Value = BTreeSet<String>> {
+    proptest::sample::subsequence(TOOL_NAMES.to_vec(), 0..=TOOL_NAMES.len())
         .prop_map(|v| v.into_iter().map(String::from).collect())
 }
 
@@ -51,7 +61,7 @@ struct Parts {
 
 fn parts() -> impl Strategy<Value = Parts> {
     (
-        names(),
+        tool_names(),
         names(),
         names(),
         spawn_limits(),
@@ -103,8 +113,9 @@ fn clamp(child: &Parts, parent: &Parts) -> Parts {
 
 fn action() -> impl Strategy<Value = Action> {
     let name = || proptest::sample::select(NAMES.to_vec()).prop_map(String::from);
+    let tool = || proptest::sample::select(TOOL_NAMES.to_vec()).prop_map(String::from);
     prop_oneof![
-        name().prop_map(Action::Tool),
+        tool().prop_map(Action::Tool),
         name().prop_map(Action::Host),
         name().prop_map(Action::Secret),
         name().prop_map(|agent| Action::Spawn { agent }),
@@ -119,8 +130,9 @@ proptest! {
     fn s11_a_verified_child_allowance_is_a_subset_of_the_parent_allowance(
         parent_parts in parts(),
         child_raw in parts(),
+        grandchild_raw in parts(),
         escalate in proptest::bool::weighted(0.3),
-        actions in proptest::collection::vec(action(), 8),
+        actions in proptest::collection::vec((action(), 0i64..=7_200), 8),
     ) {
         let key = RootKey::generate();
         let pk = key.public();
@@ -147,19 +159,26 @@ proptest! {
         };
         prop_assert_eq!(&caps::grant(&child_token, &pk).expect("child verifies"), &child);
 
-        for a in actions {
-            let by_child = caps::verify(
-                &child_token,
-                &pk,
-                &req_at(child.run, a.clone(), t0()),
-            );
-            if by_child == Decision::Allow {
-                let by_parent = caps::verify(
-                    &parent_token,
-                    &pk,
-                    &req_at(parent.run, a.clone(), t0()),
-                );
-                prop_assert_eq!(by_parent, Decision::Allow, "child allowed {:?}", a);
+        // One more level, always a valid narrowing of the child.
+        let grandchild = cap(RunId::new(), &clamp(&grandchild_raw, &child_parts));
+        let grandchild_token =
+            caps::attenuate(&child_token, &key, &grandchild).expect("clamped grandchild attenuates");
+
+        // Each level's allowance is inside the one above, at every instant.
+        let chain = [
+            (&parent_token, parent.run),
+            (&child_token, child.run),
+            (&grandchild_token, grandchild.run),
+        ];
+        for (a, after) in actions {
+            let now = t0() + Duration::seconds(after);
+            for pair in chain.windows(2) {
+                let (upper, upper_run) = pair[0];
+                let (lower, lower_run) = pair[1];
+                if caps::verify(lower, &pk, &req_at(lower_run, a.clone(), now)) == Decision::Allow {
+                    let by_upper = caps::verify(upper, &pk, &req_at(upper_run, a.clone(), now));
+                    prop_assert_eq!(by_upper, Decision::Allow, "{:?} at +{}s", a, after);
+                }
             }
         }
     }
