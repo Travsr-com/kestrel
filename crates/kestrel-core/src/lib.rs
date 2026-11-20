@@ -62,10 +62,11 @@ pub enum EngineError {
     /// `recover` was called while `run_forever` is active.
     #[error("the engine is already running; wait until run_forever has returned")]
     AlreadyRunning,
-    /// No block of the subnet pool could be used for the run's network: docker reported `taken`
+    /// No block of the subnet pool could be used for the run's network: this run found `taken`
     /// of its blocks taken by networks Kestrel did not know about when it planned the pool, and
-    /// no block is free. `held` blocks are held by this engine's own runs; when there are any,
-    /// the run can be started again once one of them ends.
+    /// no block is free. `held` blocks are held by this engine's own runs and come back to the
+    /// pool when those end (a held block under a network made outside Kestrel is not counted);
+    /// when there are any, the run can be started again once one of them ends.
     #[error("{}", no_subnet(.pool, *.taken, *.held))]
     NoSubnet {
         pool: Ipv4Cidr,
@@ -77,7 +78,7 @@ pub enum EngineError {
 /// The text of [`EngineError::NoSubnet`].
 fn no_subnet(pool: &Ipv4Cidr, taken: usize, held: usize) -> String {
     let head = format!(
-        "no free network block in subnet pool {pool}: docker reported {taken} of its blocks taken by networks made outside Kestrel"
+        "no free network block in subnet pool {pool}: this run found {taken} of the pool's blocks taken by networks made outside Kestrel"
     );
     if held > 0 {
         format!(
@@ -198,7 +199,7 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// network. A block docker says is taken by another network is excluded from the pool, together
 /// with every block the driver's `taken_subnets` lists in use, and another one is tried, until
 /// the pool has no free block left; only then does the run fail. Its failure message says how
-/// many blocks docker reported taken and whether this engine's own runs hold the rest. A run
+/// many blocks the run found taken and whether this engine's own runs hold the rest. A run
 /// that already has a network (its stopped sandbox outlived a `run_forever` that was stopped and
 /// started again) reuses it. A driver without run networks gives the block back at once, and the
 /// run uses the shared network as before. When the run ends, its sandbox is destroyed, then its
@@ -1285,7 +1286,7 @@ impl Actor {
             return Ok(Some(net));
         }
         let driver = &inner.drivers[idx];
-        // Blocks docker reported taken, for the message if none is left.
+        // Blocks this run found taken, for the message if none is left.
         let mut taken_blocks = 0;
         // Every taken block is excluded, so each attempt leaves one block fewer and this ends
         // when the pool has none free. The bound is only a safety net.
@@ -1305,7 +1306,7 @@ impl Actor {
                 Err(SandboxError::SubnetTaken { subnet: taken }) => {
                     // Counted even if another run excluded it meanwhile: docker refused it.
                     taken_blocks += pool.exclude(&[taken]).max(1);
-                    taken_blocks += pool.exclude(&self.others_taken(driver.as_ref()).await);
+                    taken_blocks += self.exclude_listed(pool, driver.as_ref()).await;
                     inner.free_block(self.id);
                 }
                 Err(e) => {
@@ -1321,25 +1322,25 @@ impl Actor {
         })
     }
 
-    /// Best effort: the subnets the driver reports in use (`SandboxDriver::taken_subnets`),
-    /// without those overlapping a block another run of this engine holds. Those are this
-    /// engine's own networks (a driver without an instance id lists them too), or a block that
-    /// run finds taken itself; excluding one would lose it for good. An error is no subnets.
-    async fn others_taken(&self, driver: &dyn SandboxDriver) -> Vec<Ipv4Cidr> {
+    /// Best effort: excludes from `pool` every block the subnets the driver reports in use
+    /// (`SandboxDriver::taken_subnets`) cover, except the blocks other runs of this engine hold
+    /// ([`SubnetPool::exclude_except`]). A held block stays theirs: one under a network made
+    /// outside Kestrel is excluded once its run gives it back, and a subnet inside one held
+    /// block (that run's own network, listed by a driver without an instance id) is ignored.
+    /// Returns how many blocks were newly found taken. An error lists nothing.
+    async fn exclude_listed(&self, pool: &SubnetPool, driver: &dyn SandboxDriver) -> usize {
         let Ok(listed) = driver.taken_subnets().await else {
-            return Vec::new();
+            return 0;
         };
-        let live = self.inner.live();
-        let held: Vec<Ipv4Cidr> = live
+        let held: Vec<Subnet> = self
+            .inner
+            .live()
             .blocks
             .iter()
             .filter(|(run, _)| **run != self.id)
-            .map(|(_, block)| block.cidr())
+            .map(|(_, block)| block.clone())
             .collect();
-        listed
-            .into_iter()
-            .filter(|cidr| !held.iter().any(|b| b.overlaps(cidr)))
-            .collect()
+        pool.exclude_except(&listed, &held)
     }
 
     fn launch_spec(&self, network: Option<&PreparedNetwork>) -> Result<LaunchSpec> {

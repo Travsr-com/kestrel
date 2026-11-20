@@ -2,6 +2,8 @@
 //!
 //! * Taken blocks ("Pool overlaps") are skipped until the pool has none left, not a fixed number
 //!   of times, and only then does the run fail, saying why and what to set.
+//! * A listed network over a block another of our runs holds still excludes every other block it
+//!   covers; the held block is excluded once its run gives it back, and is not counted as held.
 //! * A run that already has a network (for example after `run_forever` was stopped and started
 //!   again without `recover`) reuses it instead of making a second one.
 //! * A command that is not a resume does not give back the block reserved for a pending resume.
@@ -267,7 +269,7 @@ async fn a_taken_block_with_the_rest_held_by_our_own_runs_says_to_start_again_la
     let msg = h.is_failed(a).expect("a has no block left");
     assert!(msg.contains("subnet pool 10.200.0.0/28"), "{msg}");
     assert!(
-        msg.contains("docker reported 1 of its blocks taken"),
+        msg.contains("this run found 1 of the pool's blocks taken"),
         "{msg}"
     );
     assert!(msg.contains("own runs hold the rest"), "{msg}");
@@ -286,7 +288,7 @@ async fn taken_blocks_with_none_held_by_our_runs_say_to_set_the_pool() {
     let msg = h.is_failed(a).unwrap_or_default();
     assert!(msg.contains("subnet pool 10.200.0.0/28"), "{msg}");
     assert!(
-        msg.contains("docker reported 2 of its blocks taken"),
+        msg.contains("this run found 2 of the pool's blocks taken"),
         "{msg}"
     );
     assert!(msg.contains("outside Kestrel"), "{msg}");
@@ -323,7 +325,7 @@ async fn a_listing_that_covers_the_rest_of_the_pool_fails_the_run_without_trying
     assert_eq!(net.listings(), 1);
     let msg = h.is_failed(a).unwrap_or_default();
     assert!(
-        msg.contains("docker reported 32 of its blocks taken"),
+        msg.contains("this run found 32 of the pool's blocks taken"),
         "{msg}"
     );
     assert!(
@@ -355,7 +357,7 @@ async fn after_one_taken_block_exactly_one_more_attempt_is_made_when_one_block_i
     );
     let msg = h.is_failed(a).unwrap_or_default();
     assert!(
-        msg.contains("docker reported 32 of its blocks taken"),
+        msg.contains("this run found 32 of the pool's blocks taken"),
         "{msg}"
     );
 }
@@ -401,6 +403,154 @@ async fn a_listed_block_held_by_another_of_our_runs_is_not_excluded() {
     until("b cancelled", || h.is(b, &RunStatus::Cancelled)).await;
     settle().await;
     assert_eq!(pool.available(), 1, "b's block came back to the pool");
+}
+
+// 1 (round 3): a foreign network over a block another of our runs holds still excludes the rest --
+
+/// The blocks run `run` tried, in order.
+fn tried_by(net: &NetDriver, run: RunId) -> Vec<String> {
+    net.prepared()
+        .into_iter()
+        .filter(|(r, _, _)| *r == run)
+        .map(|(_, b, _)| b)
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_foreign_network_over_the_whole_pool_is_one_listing_even_while_another_run_holds_a_block()
+{
+    let (mut h, net, pool) = harness("10.200.0.0/24");
+    let _sb = h.driver.live();
+    h.start();
+    let b = h.submit(spec()).await;
+    running(&h, b).await;
+    net.outside(&["10.200.0.0/24"]);
+    net.taken_next(31);
+    let a = h.submit(spec()).await;
+    until("a failed", || h.is_failed(a).is_some()).await;
+    assert_eq!(tried_by(&net, a), ["10.200.0.8/29"], "one attempt");
+    assert_eq!(net.listings(), 1);
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(
+        msg.contains("this run found 32 of the pool's blocks taken"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Set gateway.subnet_pool to a free range"),
+        "{msg}"
+    );
+    assert!(!msg.contains("own runs"), "{msg}");
+    assert_eq!(pool.available(), 0);
+    assert!(h.is(b, &Running), "b keeps its block and its network");
+
+    h.control(b, ControlCommand::Cancel);
+    until("b cancelled", || h.is(b, &RunStatus::Cancelled)).await;
+    settle().await;
+    assert_eq!(
+        pool.available(),
+        0,
+        "b's block lies under the foreign network, so it is excluded once b ends"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_foreign_network_over_the_whole_pool_with_no_other_run_is_one_listing() {
+    let (mut h, net, _pool) = harness("10.200.0.0/24");
+    h.start();
+    net.outside(&["10.200.0.0/24"]);
+    net.taken_next(31);
+    let a = h.submit(spec()).await;
+    until("a failed", || h.is_failed(a).is_some()).await;
+    assert_eq!(tried_by(&net, a), ["10.200.0.0/29"], "one attempt");
+    assert_eq!(net.listings(), 1);
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(
+        msg.contains("this run found 32 of the pool's blocks taken"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Set gateway.subnet_pool to a free range"),
+        "{msg}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_foreign_network_over_part_of_the_pool_leaves_a_free_block_outside_it_to_the_run() {
+    // Blocks .0 .8 .16 .24. b holds .0; a foreign network covers .0 and .8.
+    let (mut h, net, pool) = harness("10.200.0.0/27");
+    let _sb = h.driver.live();
+    let _sa = h.driver.live();
+    h.start();
+    let b = h.submit(spec()).await;
+    running(&h, b).await;
+    net.outside(&["10.200.0.0/28"]);
+    net.taken_next(1);
+    let a = h.submit(spec()).await;
+    until("a settled", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    assert!(h.is(a, &Running), "failed: {:?}", h.is_failed(a));
+    assert_eq!(tried_by(&net, a), ["10.200.0.8/29", "10.200.0.16/29"]);
+    assert_eq!(net.listings(), 1);
+    assert_eq!(pool.available(), 1, ".24 is the only free block");
+
+    h.control(b, ControlCommand::Cancel);
+    until("b cancelled", || h.is(b, &RunStatus::Cancelled)).await;
+    settle().await;
+    assert_eq!(
+        pool.available(),
+        1,
+        "b's block lies under the foreign network, so it does not come back"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_foreign_network_over_one_runs_block_counts_only_the_blocks_that_come_back_as_held() {
+    // Blocks .0 .8 .16 .24. b holds .0; .8 is refused, so c holds .16. A foreign network then
+    // covers .16 and .24: only b's block outside it can come back to the pool.
+    let (mut h, net, pool) = harness("10.200.0.0/27");
+    let _sb = h.driver.live();
+    let _sc = h.driver.live();
+    h.start();
+    let b = h.submit(spec()).await;
+    running(&h, b).await;
+    net.taken_next(1);
+    let c = h.submit(spec()).await;
+    running(&h, c).await;
+    assert_eq!(tried_by(&net, c), ["10.200.0.8/29", "10.200.0.16/29"]);
+    net.outside(&["10.200.0.16/28"]);
+    net.taken_next(1);
+    let a = h.submit(spec()).await;
+    until("a failed", || h.is_failed(a).is_some()).await;
+    assert_eq!(tried_by(&net, a), ["10.200.0.24/29"]);
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(
+        msg.contains("this run found 2 of the pool's blocks taken"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("own runs hold the rest (1 in use)"),
+        "only b's block comes back: {msg}"
+    );
+    assert!(!msg.contains("gateway.subnet_pool"), "{msg}");
+
+    h.control(b, ControlCommand::Cancel);
+    until("b cancelled", || h.is(b, &RunStatus::Cancelled)).await;
+    settle().await;
+    assert_eq!(
+        pool.available(),
+        1,
+        "b's block is outside: back in the pool"
+    );
+    h.control(c, ControlCommand::Cancel);
+    until("c cancelled", || h.is(c, &RunStatus::Cancelled)).await;
+    settle().await;
+    assert_eq!(
+        pool.available(),
+        1,
+        "c's block is under the foreign network"
+    );
 }
 
 // 3: a run that has a network keeps it across a run_forever restart ----------------------------

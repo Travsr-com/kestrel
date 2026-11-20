@@ -142,6 +142,9 @@ struct PoolState {
     excluded: Vec<(u32, u32)>,
     /// Block indices handed out and not yet released.
     used: BTreeSet<u32>,
+    /// Blocks in use that were found taken while held ([`SubnetPool::exclude_except`]): each is
+    /// excluded when released instead of coming back.
+    exclude_on_release: BTreeSet<u32>,
 }
 
 impl PoolState {
@@ -221,22 +224,71 @@ impl SubnetPool {
     /// block docker refused). A block in use stays in use until released, and is not handed out
     /// again after that. Returns how many blocks were not excluded before.
     pub fn exclude(&self, taken: &[Ipv4Cidr]) -> usize {
-        let (first, last) = self.pool.range();
+        self.exclude_except(taken, &[])
+    }
+
+    /// Like [`SubnetPool::exclude`], but the blocks of `keep` (blocks this engine's runs hold)
+    /// stay in use. A subnet that lies inside one kept block is ignored: it is that run's own
+    /// network, which docker lists too when it has no instance filter. A larger one excludes
+    /// every other block it covers, and each kept block it covers is excluded when it is
+    /// released instead of coming back, so it is never handed out twice nor lost while held.
+    /// Returns how many blocks were found taken that were not before (excluded, or to be).
+    pub fn exclude_except(&self, taken: &[Ipv4Cidr], keep: &[Subnet]) -> usize {
         let mut state = self.state();
+        // Only a block in use can be kept: a free one is excluded like any other.
+        let keep: BTreeSet<u32> = keep
+            .iter()
+            .filter_map(|s| self.index(s))
+            .filter(|k| state.used.contains(k))
+            .collect();
         let before = state.excluded_blocks();
+        let mut marked = 0;
         for t in taken {
-            let (start, end) = t.range();
-            if end < first || start > last {
+            let Some((from, to)) = self.span(t) else {
+                continue;
+            };
+            if t.prefix >= SUBNET_BLOCK_PREFIX && keep.contains(&from) {
                 continue;
             }
-            let from = (start.max(first) - first) / u64::from(BLOCK_SIZE);
-            let to = (end.min(last) - first) / u64::from(BLOCK_SIZE) + 1;
-            // Both fit: the pool has at most 2^29 blocks.
-            if let (Ok(from), Ok(to)) = (u32::try_from(from), u32::try_from(to)) {
-                state.exclude(from, to);
+            let mut start = from;
+            for &k in keep.range(from..to) {
+                if start < k {
+                    state.exclude(start, k);
+                }
+                if state.excluded_range(k).is_none() && state.exclude_on_release.insert(k) {
+                    marked += 1;
+                }
+                start = k + 1;
+            }
+            if start < to {
+                state.exclude(start, to);
             }
         }
-        usize::try_from(state.excluded_blocks() - before).unwrap_or(usize::MAX)
+        let excluded = usize::try_from(state.excluded_blocks() - before).unwrap_or(usize::MAX);
+        excluded.saturating_add(marked)
+    }
+
+    /// The `[from, to)` block indices `cidr` covers, or `None` when it misses the pool.
+    fn span(&self, cidr: &Ipv4Cidr) -> Option<(u32, u32)> {
+        let (first, last) = self.pool.range();
+        let (start, end) = cidr.range();
+        if end < first || start > last {
+            return None;
+        }
+        let from = (start.max(first) - first) / u64::from(BLOCK_SIZE);
+        let to = (end.min(last) - first) / u64::from(BLOCK_SIZE) + 1;
+        // Both fit: the pool has at most 2^29 blocks.
+        Some((u32::try_from(from).ok()?, u32::try_from(to).ok()?))
+    }
+
+    /// The index of `subnet` in this pool, or `None` for a block of another pool.
+    fn index(&self, subnet: &Subnet) -> Option<u32> {
+        let (start, _) = subnet.block.range();
+        let (first, last) = self.pool.range();
+        if subnet.block.prefix != SUBNET_BLOCK_PREFIX || start < first || start > last {
+            return None;
+        }
+        u32::try_from((start - first) / u64::from(BLOCK_SIZE)).ok()
     }
 
     /// Blocks that can still be handed out.
@@ -251,13 +303,16 @@ impl SubnetPool {
             .unwrap_or(usize::MAX)
     }
 
-    /// Blocks handed out and not excluded: the ones that come back to the pool when released.
+    /// Blocks handed out that come back to the pool when released: not excluded, and not found
+    /// taken while held.
     pub fn in_use(&self) -> usize {
         let state = self.state();
         state
             .used
             .iter()
-            .filter(|b| state.excluded_range(**b).is_none())
+            .filter(|b| {
+                state.excluded_range(**b).is_none() && !state.exclude_on_release.contains(*b)
+            })
             .count()
     }
 
@@ -285,15 +340,15 @@ impl SubnetPool {
         None
     }
 
-    /// Gives a block back. Releasing twice, or a block of another pool, changes nothing.
+    /// Gives a block back. One found taken while held is excluded instead. Releasing twice, or a
+    /// block of another pool, changes nothing.
     pub fn release(&self, subnet: &Subnet) {
-        let (start, _) = subnet.block.range();
-        let (first, last) = self.pool.range();
-        if subnet.block.prefix != SUBNET_BLOCK_PREFIX || start < first || start > last {
+        let Some(block) = self.index(subnet) else {
             return;
-        }
-        if let Ok(block) = u32::try_from((start - first) / u64::from(BLOCK_SIZE)) {
-            self.state().used.remove(&block);
+        };
+        let mut state = self.state();
+        if state.used.remove(&block) && state.exclude_on_release.remove(&block) {
+            state.exclude(block, block + 1);
         }
     }
 }

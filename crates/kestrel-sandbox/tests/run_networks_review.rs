@@ -280,6 +280,90 @@ fn exclude_counts_new_blocks_and_in_use_counts_blocks_that_come_back() {
     assert_eq!(pool.available(), 0);
 }
 
+#[test]
+fn exclude_except_excludes_the_other_blocks_and_excludes_kept_ones_once_released() {
+    // Blocks .0 .8 .16 .24; .0 and .16 are in use.
+    let pool = SubnetPool::parse("10.200.0.0/27").expect("four blocks");
+    let a = pool.reserve().expect(".0");
+    let b = pool.reserve().expect(".8");
+    let c = pool.reserve().expect(".16");
+    pool.release(&b);
+    assert_eq!(pool.in_use(), 2);
+    assert_eq!(pool.available(), 2);
+
+    // A network over the whole pool: .8 and .24 are excluded, .0 and .16 found taken but kept.
+    let keep = [a.clone(), c.clone()];
+    assert_eq!(
+        pool.exclude_except(&[cidr("10.200.0.0/27")], &keep),
+        4,
+        "every block of the pool was found taken"
+    );
+    assert_eq!(pool.available(), 0);
+    assert_eq!(pool.in_use(), 0, "kept blocks under it never come back");
+    assert_eq!(
+        pool.exclude_except(&[cidr("10.200.0.0/27")], &keep),
+        0,
+        "nothing new"
+    );
+    assert!(pool.reserve().is_none(), "kept blocks are not handed out");
+
+    // Released, a kept block under the network is excluded, not returned.
+    pool.release(&a);
+    pool.release(&c);
+    assert_eq!(pool.available(), 0);
+    assert!(pool.reserve().is_none());
+}
+
+#[test]
+fn exclude_except_ignores_a_subnet_inside_one_kept_block_and_returns_the_rest() {
+    let pool = SubnetPool::parse("10.200.0.0/27").expect("four blocks");
+    let a = pool.reserve().expect(".0");
+    let b = pool.reserve().expect(".8");
+    let c = pool.reserve().expect(".16");
+    let keep = [a.clone(), b.clone(), c.clone()];
+    // The kept runs' own networks, as docker lists them without an instance filter.
+    assert_eq!(
+        pool.exclude_except(&[cidr("10.200.0.0/29"), cidr("10.200.0.8/30")], &keep),
+        0
+    );
+    assert_eq!(pool.in_use(), 3, "still held, and they come back");
+    // A network over .16 and .24: .24 is excluded, c's .16 once c releases it.
+    assert_eq!(pool.exclude_except(&[cidr("10.200.0.16/28")], &keep), 2);
+    assert_eq!(pool.in_use(), 2, "a's and b's blocks come back");
+    pool.release(&a);
+    pool.release(&b);
+    pool.release(&c);
+    assert_eq!(pool.available(), 2, ".0 and .8 are free");
+    assert_eq!(pool.reserve(), Some(a), "a's block came back");
+    assert_eq!(pool.reserve(), Some(b), "b's block came back");
+    assert!(pool.reserve().is_none(), ".16 was excluded once released");
+}
+
+#[test]
+fn exclude_except_with_nothing_kept_is_exclude() {
+    let one = SubnetPool::parse("10.200.0.0/26").expect("eight blocks");
+    let two = SubnetPool::parse("10.200.0.0/26").expect("eight blocks");
+    let taken = [
+        cidr("10.200.0.8/29"),
+        cidr("10.200.0.32/28"),
+        cidr("10.200.0.60/30"),
+        cidr("192.168.0.0/16"),
+    ];
+    one.reserve().expect(".0");
+    two.reserve().expect(".0");
+    assert_eq!(one.exclude(&taken), 4);
+    assert_eq!(two.exclude_except(&taken, &[]), 4);
+    assert_eq!(one.available(), two.available());
+    assert_eq!(one.in_use(), two.in_use());
+    // A kept block of another pool keeps nothing here: the block in use at .0 is excluded.
+    let other = SubnetPool::parse("10.201.0.0/29")
+        .expect("pool")
+        .reserve()
+        .expect("block");
+    assert_eq!(two.exclude_except(&[cidr("10.200.0.0/29")], &[other]), 1);
+    assert_eq!(two.in_use(), 0);
+}
+
 // release_network is decided by `docker network rm` ---------------------------------------------
 
 fn prepared() -> PreparedNetwork {
@@ -403,14 +487,39 @@ fn is_create(argv: &[String]) -> bool {
     argv.get(1..3) == Some(&s(&["network", "create"])[..])
 }
 
-/// The first `creates` answers to `network create` say the network exists; everything else
-/// works, and the bridge has `10.200.0.2`.
-fn existing_network(creates: usize, name: &'static str) -> Arc<FakeRunner> {
+/// `docker network ls` for network `NET` of run `RUN`, with the instance filter when given.
+fn ls_this_runs(instance: Option<&str>) -> Vec<String> {
+    let mut argv = s(&[
+        "docker",
+        "network",
+        "ls",
+        "-q",
+        "--filter",
+        &format!("name=^{NET}$"),
+        "--filter",
+        &format!("label=kestrel.run={RUN}"),
+    ]);
+    if let Some(id) = instance {
+        argv.extend(s(&["--filter", &format!("label=kestrel.instance={id}")]));
+    }
+    argv
+}
+
+/// The first `creates` answers to `network create` say the network exists; the listing of this
+/// run's networks answers `listed`; everything else works, and the bridge has `10.200.0.2`.
+fn existing_network_listing(
+    creates: usize,
+    name: &'static str,
+    listed: &'static str,
+) -> Arc<FakeRunner> {
     let seen = std::sync::atomic::AtomicUsize::new(0);
     FakeRunner::with(move |argv| {
         if is_create(argv) {
             let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return if n < creates { exists(name) } else { ok("") };
+        }
+        if argv.get(1..3) == Some(&s(&["network", "ls"])[..]) {
+            return ok(listed);
         }
         if argv.get(1).map(String::as_str) == Some("container") {
             return ok("10.200.0.2\n");
@@ -419,7 +528,12 @@ fn existing_network(creates: usize, name: &'static str) -> Arc<FakeRunner> {
     })
 }
 
-/// The step of each docker call: `create`, `connect`, `disconnect`, `rm` or `inspect`.
+/// Like [`existing_network_listing`], with the left-behind network listed as this run's.
+fn existing_network(creates: usize, name: &'static str) -> Arc<FakeRunner> {
+    existing_network_listing(creates, name, "3f2a9c1d7e6b\n")
+}
+
+/// The step of each docker call: `create`, `ls`, `connect`, `disconnect`, `rm` or `inspect`.
 fn steps(runner: &FakeRunner) -> Vec<String> {
     runner
         .runs()
@@ -444,12 +558,21 @@ async fn a_leftover_network_of_the_same_name_is_removed_and_the_create_runs_agai
     assert_eq!(net.gateway_host.to_string(), "10.200.0.2");
     assert_eq!(
         steps(&runner),
-        ["create", "disconnect", "rm", "create", "connect", "inspect"]
+        [
+            "create",
+            "ls",
+            "disconnect",
+            "rm",
+            "create",
+            "connect",
+            "inspect"
+        ]
     );
     let runs = runner.runs();
-    assert_eq!(runs[1], disconnect());
-    assert_eq!(runs[2], rm());
-    assert_eq!(runs[0], runs[3], "the same create, once more");
+    assert_eq!(runs[1], ls_this_runs(None));
+    assert_eq!(runs[2], disconnect());
+    assert_eq!(runs[3], rm());
+    assert_eq!(runs[0], runs[4], "the same create, once more");
 }
 
 #[tokio::test]
@@ -470,9 +593,95 @@ async fn a_second_already_exists_is_an_error_naming_the_create_step() {
     assert!(err.to_string().contains("already exists"), "{err}");
     assert_eq!(
         steps(&runner),
-        ["create", "disconnect", "rm", "create"],
+        ["create", "ls", "disconnect", "rm", "create"],
         "one retry only"
     );
+}
+
+#[tokio::test]
+async fn a_network_of_the_same_name_that_is_not_this_runs_is_left_alone() {
+    let runner = existing_network_listing(1, NET, "");
+    let run: RunId = RUN.parse().expect("run id");
+    let err = gvisor(&runner)
+        .prepare_network(run, &prepared().subnet)
+        .await
+        .expect_err("not this run's to remove");
+    match &err {
+        SandboxError::RunNetwork {
+            step,
+            network,
+            stderr,
+        } => {
+            assert_eq!(*step, "create");
+            assert_eq!(network, NET);
+            assert!(stderr.contains("already exists"), "{stderr}");
+        }
+        other => panic!("expected RunNetwork, got {other:?}"),
+    }
+    assert_eq!(steps(&runner), ["create", "ls"], "nothing removed");
+    assert_eq!(runner.runs()[1], ls_this_runs(None));
+}
+
+#[tokio::test]
+async fn a_failing_listing_of_this_runs_network_removes_nothing() {
+    let runner = FakeRunner::with(|argv| {
+        if is_create(argv) {
+            return exists(NET);
+        }
+        failed("Cannot connect to the Docker daemon")
+    });
+    let run: RunId = RUN.parse().expect("run id");
+    let err = gvisor(&runner)
+        .prepare_network(run, &prepared().subnet)
+        .await
+        .expect_err("not confirmed");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(steps(&runner), ["create", "ls"]);
+}
+
+#[tokio::test]
+async fn with_an_instance_the_left_behind_network_must_carry_its_label_too() {
+    let runner = existing_network(1, NET);
+    let run: RunId = RUN.parse().expect("run id");
+    gvisor(&runner)
+        .with_instance(INSTANCE)
+        .prepare_network(run, &prepared().subnet)
+        .await
+        .expect("prepared")
+        .expect("a run network");
+    assert_eq!(runner.runs()[1], ls_this_runs(Some(INSTANCE)));
+}
+
+#[tokio::test]
+async fn a_failed_removal_is_kept_in_the_error_when_the_second_create_fails() {
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let runner = FakeRunner::with(move |argv| {
+        if is_create(argv) {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return exists(NET);
+        }
+        if argv == rm().as_slice() {
+            return failed(
+                "Error response from daemon: error while removing network: has active endpoints",
+            );
+        }
+        if argv.get(1..3) == Some(&s(&["network", "ls"])[..]) {
+            return ok("3f2a9c1d7e6b\n");
+        }
+        ok("")
+    });
+    let run: RunId = RUN.parse().expect("run id");
+    let err = gvisor(&runner)
+        .prepare_network(run, &prepared().subnet)
+        .await
+        .expect_err("still there");
+    assert!(
+        matches!(err, SandboxError::RunNetwork { step: "create", .. }),
+        "{err}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("already exists"), "{text}");
+    assert!(text.contains("active endpoints"), "{text}");
 }
 
 #[tokio::test]

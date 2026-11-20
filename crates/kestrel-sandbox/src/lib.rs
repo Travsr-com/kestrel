@@ -697,8 +697,8 @@ impl Cli {
 
     /// See [`SandboxDriver::prepare_network`]. `bridge` is the bridge container name; without
     /// one, and for Apple `container`, there are no run networks. A network of the run's name
-    /// that already exists was left by a prepare that was cut short: it is removed and the create
-    /// runs once more.
+    /// that already exists and carries this run's labels was left by a prepare that was cut
+    /// short: it is removed and the create runs once more. One without them is left alone.
     async fn prepare_network(
         &self,
         runner: &dyn CommandRunner,
@@ -750,11 +750,25 @@ impl Cli {
         let mut created = self.run(runner, &create, None).await;
         if let Err(SandboxError::CommandFailed { stderr, .. }) = &created
             && is_left_behind(stderr, &name)
+            && self
+                .is_this_runs(runner, &name, &run_label, instance_label.as_deref())
+                .await
         {
             // A prepare cut short (its actor aborted) left this run's network behind, unrecorded.
-            // It is this run's own, so it goes, and the create runs once more.
-            let _ = self.remove_network(runner, Some(bridge), &name).await;
+            // Docker confirmed it is this run's own, so it goes, and the create runs once more.
+            let removed = self.remove_network(runner, Some(bridge), &name).await;
             created = self.run(runner, &create, None).await;
+            if let (Err(SandboxError::CommandFailed { stderr, .. }), Err(rm)) =
+                (&mut created, removed)
+            {
+                let rm = match rm {
+                    SandboxError::CommandFailed { stderr, .. } => stderr,
+                    other => other.to_string(),
+                };
+                stderr.push_str(&format!(
+                    "; removing the network left behind failed first: {rm}"
+                ));
+            }
         }
         match created {
             Err(SandboxError::CommandFailed { stderr, .. }) if stderr.contains("Pool overlaps") => {
@@ -796,6 +810,39 @@ impl Cli {
                 let _ = self.remove_network(runner, Some(bridge), &name).await;
                 Err(e)
             }
+        }
+    }
+
+    /// Whether docker lists network `name` with label `run_label` (`kestrel.run=<run id>`) and,
+    /// when given, `instance_label` (`kestrel.instance=<id>`): a network of this run's name that
+    /// is this run's own. A listing that fails confirms nothing.
+    async fn is_this_runs(
+        &self,
+        runner: &dyn CommandRunner,
+        name: &str,
+        run_label: &str,
+        instance_label: Option<&str>,
+    ) -> bool {
+        let name_filter = format!("name=^{name}$");
+        let run_filter = format!("label={run_label}");
+        let instance_filter = instance_label.map(|l| format!("label={l}"));
+        let mut args = vec![
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            &name_filter,
+            "--filter",
+            &run_filter,
+        ];
+        args.extend(
+            instance_filter
+                .iter()
+                .flat_map(|f| ["--filter", f.as_str()]),
+        );
+        match self.run(runner, &self.argv(&args), None).await {
+            Ok(ids) => ids.lines().any(|id| !id.trim().is_empty()),
+            Err(_) => false,
         }
     }
 
