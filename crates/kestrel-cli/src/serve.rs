@@ -11,7 +11,8 @@ use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
-    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect_for,
+    BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
+    ProcessRunner, SandboxDriver, SubnetPool, detect_with, docker_subnets, host_routes,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -52,6 +53,8 @@ struct RawGateway {
     advertise_url: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key and never echoed.
     docker_host: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key.
+    subnet_pool: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -96,6 +99,9 @@ struct Config {
     advertise_url: Option<Url>,
     /// `gateway.docker_host`: where the docker daemon runs. Default `auto`.
     docker_host: DockerHostSetting,
+    /// `gateway.subnet_pool`: where run networks get their `/29` blocks. Default
+    /// [`DEFAULT_SUBNET_POOL`].
+    subnet_pool: Ipv4Cidr,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -169,12 +175,14 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .map(docker_host_setting)
         .transpose()?
         .unwrap_or_default();
+    let subnet_pool = subnet_pool(raw.gateway.subnet_pool)?;
     Ok(Config {
         listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
         port,
         advertise_url,
         docker_host,
+        subnet_pool,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -195,6 +203,61 @@ fn gateway_port(value: toml::Value) -> Result<u16, Failure> {
         .and_then(|n| u16::try_from(n).ok())
         .filter(|port| *port != 0)
         .ok_or_else(|| Failure::usage("gateway.port must be a whole number from 1 to 65535"))
+}
+
+/// `gateway.subnet_pool`: an IPv4 CIDR string of at least one `/29` block, default
+/// [`DEFAULT_SUBNET_POOL`]. Anything else is a usage error naming the key.
+fn subnet_pool(value: Option<toml::Value>) -> Result<Ipv4Cidr, Failure> {
+    let text = match &value {
+        None => DEFAULT_SUBNET_POOL,
+        Some(value) => value.as_str().ok_or_else(|| {
+            Failure::usage("gateway.subnet_pool must be an IPv4 CIDR string like \"10.200.0.0/16\"")
+        })?,
+    };
+    SubnetPool::parse(text)
+        .map(|pool| pool.pool())
+        .map_err(|e| Failure::usage(format!("gateway.subnet_pool: {e}")))
+}
+
+/// The subnet plan for run networks: every `/29` block of `pool` that no docker network uses
+/// and, when docker runs on this host, no host route covers (a VM's routes are not this host's,
+/// so they are not read). Writes one line naming the pool and the free block count to `err`.
+/// No free block is a runtime error that says to set `gateway.subnet_pool` to a free range.
+async fn subnet_plan(
+    pool: Ipv4Cidr,
+    runner: &dyn CommandRunner,
+    host: DockerHost,
+    err: &mut dyn std::io::Write,
+) -> Result<Arc<SubnetPool>, Failure> {
+    let plan =
+        SubnetPool::new(pool).map_err(|e| Failure::usage(format!("gateway.subnet_pool: {e}")))?;
+    let networks = docker_subnets(runner).await.map_err(|e| {
+        Failure::runtime(format!("listing docker networks for the subnet pool: {e}"))
+    })?;
+    plan.exclude(&networks);
+    if host == DockerHost::Native {
+        plan.exclude(&host_routes(runner).await);
+    }
+    let free = plan.available();
+    if free == 0 {
+        return Err(Failure::runtime(format!(
+            "subnet pool {pool} has no free /29 block: docker networks or host routes use all of it. Set gateway.subnet_pool to a free range"
+        )));
+    }
+    // A closed stderr must not stop serve.
+    let _ = writeln!(
+        err,
+        "networks: one per run, from subnet pool {pool} ({free} free /29 blocks)"
+    );
+    Ok(Arc::new(plan))
+}
+
+/// The warning for sandboxes on the one shared network, which is what they get with docker
+/// drivers but no bridge (`gateway.advertise_url` set).
+fn shared_network_warning(docker: bool, advertise: Option<&Url>) -> Option<&'static str> {
+    (docker && advertise.is_some()).then_some(
+        "warning: gateway.advertise_url is set, so there is no gateway bridge and all sandboxes share one network: they can reach each other",
+    )
 }
 
 /// `gateway.docker_host` as written in the config (issue #53).
@@ -325,6 +388,7 @@ const CONFIG_NAMES: &[&str] = &[
     "port",
     "advertise_url",
     "docker_host",
+    "subnet_pool",
     "engine",
     "max_concurrent_runs",
     "providers",
@@ -655,12 +719,19 @@ async fn run(
         Some(d) => d,
         None => {
             let instance = GatewayBridge::instance_id(&db);
-            detect_for(&HostInfo::current().await, false, Some(&instance))
+            // The bridge, when serve starts one, has this name: docker drivers join it to every
+            // run network. Without a bridge (`advertise_url`) there are no run networks.
+            let bridge = GatewayBridge::container_name(&instance);
+            let bridge = config.advertise_url.is_none().then_some(bridge.as_str());
+            detect_with(&HostInfo::current().await, false, Some(&instance), bridge)
                 .map_err(|e| Failure::runtime(e.to_string()))?
         }
     };
     let docker = uses_docker(&drivers);
     let needs_bridge = docker && config.advertise_url.is_none();
+    if let Some(warning) = shared_network_warning(docker, config.advertise_url.as_ref()) {
+        eprintln!("{warning}");
+    }
     let explicit = config.listen_explicit.then_some(config.listen.as_str());
     let (host, listen) = resolve_gateway(
         &ProcessRunner,
@@ -686,6 +757,13 @@ async fn run(
             "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
         );
     }
+    // Before the bridge: a pool with no free block stops serve with nothing to clean up.
+    let subnets = if needs_bridge {
+        let mut err = std::io::stderr();
+        Some(subnet_plan(config.subnet_pool, &ProcessRunner, host, &mut err).await?)
+    } else {
+        None
+    };
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
         host,
@@ -703,6 +781,7 @@ async fn run(
                 addr,
                 gateway_url,
                 shutdown,
+                subnets,
             };
             serve_bound(&db, config, drivers, bound, out).await
         }
@@ -721,6 +800,8 @@ struct Bound {
     addr: SocketAddr,
     gateway_url: Url,
     shutdown: CancellationToken,
+    /// The subnet plan for run networks, when serve runs the bridge.
+    subnets: Option<Arc<SubnetPool>>,
 }
 
 async fn serve_bound(
@@ -735,6 +816,7 @@ async fn serve_bound(
         addr,
         gateway_url,
         shutdown,
+        subnets,
     } = bound;
     let store = Arc::new(open(Some(db.to_path_buf()))?);
     // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
@@ -755,6 +837,10 @@ async fn serve_bound(
     )
     .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
     .with_instance(GatewayBridge::instance_id(db));
+    let engine = match subnets {
+        Some(pool) => engine.with_subnets(pool),
+        None => engine,
+    };
     engine
         .recover()
         .await
@@ -2032,5 +2118,251 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 "{host:?}"
             );
         }
+    }
+
+    // ---- gateway.subnet_pool (issue #34, scenario 9) ----
+    //
+    // The checked value's field name and type in `Config` are left to the implementation, so these
+    // tests read it through `Config`'s `Debug` output, which must show the pool's address.
+
+    fn config_text(config: &str) -> String {
+        let (_dir, path) = write(config);
+        format!("{:?}", load_config(&path).expect("config"))
+    }
+
+    #[test]
+    fn subnet_pool_defaults_to_the_kestrel_pool() {
+        assert_eq!(kestrel_sandbox::DEFAULT_SUBNET_POOL, "10.200.0.0/16");
+        let text = config_text(ANTHROPIC);
+        assert!(text.contains("10.200.0.0"), "{text}");
+    }
+
+    #[test]
+    fn a_custom_subnet_pool_is_read() {
+        for pool in ["10.123.0.0/20", "172.30.8.0/29", "192.168.64.0/18"] {
+            let text = config_text(&format!("[gateway]\nsubnet_pool = \"{pool}\"\n{ANTHROPIC}"));
+            let addr = pool.split('/').next().unwrap_or_default();
+            assert!(text.contains(addr), "{pool}: {text}");
+            assert!(!text.contains("10.200.0.0"), "{pool}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_subnet_pool_is_a_usage_error_naming_the_key() {
+        for bad in [
+            "banana",
+            "10.200.0.0",
+            "10.200.0.1/16",
+            "10.200.0.0/33",
+            "",
+            "fd00::/8",
+        ] {
+            let msg = err(&format!("[gateway]\nsubnet_pool = \"{bad}\"\n{ANTHROPIC}"));
+            assert!(msg.contains("gateway.subnet_pool"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_subnet_pool_smaller_than_one_block_is_a_usage_error_saying_so() {
+        for small in ["10.200.0.0/30", "10.200.0.0/32"] {
+            let msg = err(&format!(
+                "[gateway]\nsubnet_pool = \"{small}\"\n{ANTHROPIC}"
+            ));
+            assert!(msg.contains("gateway.subnet_pool"), "{small}: {msg}");
+            assert!(msg.contains("/29"), "{small}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_subnet_pool_of_the_wrong_type_is_a_usage_error() {
+        for bad in ["42", "true", "[\"10.200.0.0/16\"]", "{ x = 1 }"] {
+            // `err` checks the exit code is the usage one.
+            err(&format!("[gateway]\nsubnet_pool = {bad}\n{ANTHROPIC}"));
+        }
+    }
+
+    #[test]
+    fn subnet_pool_is_a_known_config_name_so_toml_errors_can_quote_it() {
+        assert_eq!(
+            mask_quoted("duplicate key `subnet_pool` in table `gateway`"),
+            "duplicate key `subnet_pool` in table `gateway`"
+        );
+        let msg = err(&format!(
+            "[gateway]\nsubnet_pool = \"10.200.0.0/16\"\nsubnet_pool = \"10.200.0.0/16\"\n{ANTHROPIC}"
+        ));
+        assert!(msg.contains("`subnet_pool`"), "{msg}");
+    }
+
+    #[test]
+    fn a_subnet_pool_error_never_echoes_a_provider_key() {
+        let msg = err(
+            "[gateway]\nsubnet_pool = \"banana\"\n[providers.anthropic]\napi_key = \"sk-ant-SECRET4\"\n",
+        );
+        assert!(!msg.contains("SECRET4"), "{msg}");
+    }
+
+    // ---- the subnet plan at startup (issue #34, scenario 3) ----
+
+    /// Plays docker with networks on `subnets` and a host whose `ip -4 route show` prints
+    /// `routes`. Records every argv.
+    struct Host {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        subnets: &'static str,
+        routes: &'static str,
+        docker_fails: bool,
+    }
+
+    impl Host {
+        fn new(subnets: &'static str, routes: &'static str) -> Host {
+            Host {
+                calls: std::sync::Mutex::new(Vec::new()),
+                subnets,
+                routes,
+                docker_fails: false,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn asked_for_routes(&self) -> bool {
+            self.calls()
+                .iter()
+                .any(|a| a.first().map(String::as_str) == Some("ip"))
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for Host {
+        async fn run(&self, argv: &[String]) -> std::io::Result<kestrel_sandbox::CommandOutput> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(argv.to_vec());
+            let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let stdout = match words.as_slice() {
+                ["ip", ..] => self.routes,
+                ["docker", "network", "ls", ..] => "1a2b3c4d5e6f\n",
+                ["docker", "network", "inspect", ..] => self.subnets,
+                _ => "",
+            };
+            let failed = self.docker_fails && words.first() == Some(&"docker");
+            Ok(kestrel_sandbox::CommandOutput {
+                status: i32::from(failed),
+                stdout: stdout.into(),
+                stderr: if failed {
+                    "Cannot connect".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+        async fn spawn(
+            &self,
+            _argv: &[String],
+        ) -> std::io::Result<kestrel_sandbox::SpawnedProcess> {
+            Err(std::io::Error::other("no spawn"))
+        }
+    }
+
+    fn cidr(text: &str) -> Ipv4Cidr {
+        Ipv4Cidr::parse(text).expect("cidr")
+    }
+
+    async fn plan(
+        pool: &str,
+        host: &Host,
+        mode: DockerHost,
+    ) -> (Result<Arc<SubnetPool>, Failure>, String) {
+        let mut err = Vec::new();
+        let got = subnet_plan(cidr(pool), host, mode, &mut err).await;
+        (got, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_plan_skips_docker_networks_and_says_how_many_blocks_are_free_in_one_line() {
+        let host = Host::new("10.200.0.0/29 fd00::/64\n", "");
+        let (got, line) = plan("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let pool = got.expect("plan");
+        assert_eq!(pool.pool(), cidr("10.200.0.0/16"));
+        assert_eq!(pool.available(), 8191);
+        assert_eq!(
+            pool.reserve().map(|s| s.cidr().to_string()),
+            Some("10.200.0.8/29".to_string())
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.contains("10.200.0.0/16") && line.contains("8191"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_routes_are_read_only_when_docker_runs_on_this_host() {
+        let host = Host::new("", "10.200.0.0/17 dev wg0 scope link\n");
+        let (got, _) = plan("10.200.0.0/16", &host, DockerHost::Native).await;
+        assert!(host.asked_for_routes());
+        assert_eq!(got.expect("plan").available(), 4096);
+
+        let host = Host::new("", "10.200.0.0/17 dev wg0 scope link\n");
+        let (got, _) = plan("10.200.0.0/16", &host, DockerHost::Vm).await;
+        assert!(
+            !host.asked_for_routes(),
+            "a VM's routes are not this host's"
+        );
+        assert_eq!(got.expect("plan").available(), 8192);
+    }
+
+    #[tokio::test]
+    async fn s3_a_route_over_the_whole_pool_stops_serve_naming_the_pool_and_the_setting() {
+        let host = Host::new("", "10.0.0.0/8 dev tun0 scope link\n");
+        let (got, line) = plan("10.200.0.0/16", &host, DockerHost::Native).await;
+        let e = got.expect_err("no free block");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("10.200.0.0/16"), "{}", e.message);
+        assert!(e.message.contains("gateway.subnet_pool"), "{}", e.message);
+        assert!(line.is_empty(), "{line}");
+
+        let host = Host::new("10.200.0.0/16\n", "");
+        let (got, _) = plan("10.200.0.0/16", &host, DockerHost::Vm).await;
+        assert!(got.is_err(), "a docker network over the whole pool too");
+    }
+
+    #[tokio::test]
+    async fn a_docker_that_cannot_list_networks_stops_serve() {
+        let mut host = Host::new("", "");
+        host.docker_fails = true;
+        let (got, _) = plan("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let e = got.expect_err("docker failed");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("Cannot connect"), "{}", e.message);
+    }
+
+    #[test]
+    fn only_docker_without_a_bridge_warns_that_sandboxes_share_a_network() {
+        let advertise = url("http://gw.example.com/");
+        let warning = shared_network_warning(true, Some(&advertise)).expect("warning");
+        assert!(warning.contains("reach each other"), "{warning}");
+        assert!(warning.contains("gateway.advertise_url"), "{warning}");
+        assert!(shared_network_warning(true, None).is_none(), "the bridge");
+        assert!(shared_network_warning(false, Some(&advertise)).is_none());
+        assert!(shared_network_warning(false, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_bridge_names_the_container_drivers_join_to_run_networks() {
+        let db = Path::new("/tmp/k.db");
+        let bridge = start_bridge(recorder(0), DockerHost::Native, true, None, 7070, db)
+            .await
+            .expect("started")
+            .expect("bridge");
+        assert_eq!(
+            bridge.name(),
+            GatewayBridge::container_name(&GatewayBridge::instance_id(db))
+        );
     }
 }

@@ -1,5 +1,6 @@
-//! The gateway bridge: a small `socat` container that lets sandboxes on the `--internal`
-//! `kestrel-gw` network reach the gateway running on the host, and nothing else.
+//! The gateway bridge: a small `socat` container that lets sandboxes on `--internal` networks
+//! reach the gateway running on the host, and nothing else. It sits on the shared `kestrel-gw`
+//! network, and drivers built `with_bridge` also join it to each run's own network.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -28,7 +29,7 @@ const MAX_CHILDREN: u32 = 32;
 const IDLE_TIMEOUT_SECS: u32 = 300;
 
 /// Docker's container name charset: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
-fn is_container_name(name: &str) -> bool {
+pub(crate) fn is_container_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
@@ -276,6 +277,12 @@ impl GatewayBridge {
     #[must_use]
     pub fn url(&self) -> Url {
         self.url.clone()
+    }
+
+    /// The container name, which drivers join to every run network (`with_bridge`).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 

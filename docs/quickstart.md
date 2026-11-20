@@ -176,7 +176,8 @@ A resumed run starts the agent command again in the same workspace.
 * The agent cannot run `git` inside the sandbox yet ([#22](https://github.com/Travsr-com/kestrel/issues/22)).
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
-* All sandboxes share one internal network ([#10](https://github.com/Travsr-com/kestrel/issues/10)).
+* With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
+  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`).
 
 ## If something goes wrong
 
@@ -184,4 +185,7 @@ A resumed run starts the agent command again in the same workspace.
   under runtimes.
 * `providers.anthropic.api_key is missing or empty`: the config has no key. Kestrel never reads keys
   from environment variables.
-* A run stays `Queued`: `kestrel serve` is not running, or it is already at `max_concurrent_runs`.
+* A run stays `Queued`: `kestrel serve` is not running, or it is already at `max_concurrent_runs`. A
+  `subnet pool` line in its log means every network block is in use.
+* `subnet pool ... has no free /29 block`: docker networks or host routes already cover the pool. Set
+  `gateway.subnet_pool` to a free range, for example `subnet_pool = "10.201.0.0/16"`.
