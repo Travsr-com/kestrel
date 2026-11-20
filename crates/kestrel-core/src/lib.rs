@@ -18,16 +18,19 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use kestrel_agent::{ParsedLine, RunContext, RuntimeAdapter};
-use kestrel_sandbox::{LaunchSpec, NetworkPolicy, SandboxDriver, SandboxHandle};
+use kestrel_sandbox::{
+    INSTANCE_LABEL, LaunchSpec, NetworkPolicy, RUN_LABEL, SandboxDriver, SandboxHandle,
+};
 use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
 use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
     SuspendReason, Tier, WorkspaceSpec,
 };
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
-use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tokio::sync::{Notify, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, Interval, MissedTickBehavior, timeout_at};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -52,7 +55,7 @@ pub enum EngineError {
     #[error("git-clone repo `{}` must be an absolute path", repo.display())]
     RelativeRepo { repo: PathBuf },
     /// `recover` was called while `run_forever` is active.
-    #[error("the engine is running; recover must run before run_forever or after shutdown")]
+    #[error("the engine is already running; wait until run_forever has returned")]
     AlreadyRunning,
 }
 
@@ -150,6 +153,28 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// are numbered first (in creation order), then newly claimed resume commands (in control id
 /// order). Slots go to the lowest arrival number first.
 ///
+/// # Stopping and starting again
+///
+/// [`Engine::shutdown`] stops the scheduler, then destroys every sandbox this engine created and
+/// has not destroyed yet. That includes a sandbox whose `create` is still running and one in the
+/// final destroy of a finished run. It changes no run status: a `Running` run stays `Running` in
+/// the store, and [`Engine::recover`] suspends it on the next start.
+///
+/// If the process dies instead, [`Engine::recover`] destroys the sandboxes recorded in the
+/// events, and everything the drivers list as left over: a container with the label
+/// `kestrel.run=<run id>` that no event mentions, for example one whose `create` was cut short.
+/// With [`Engine::with_instance`] every sandbox also carries `kestrel.instance=<id>`, and drivers
+/// built with the same id list only those, so two Kestrel instances on one Docker host leave each
+/// other's sandboxes alone. Without an instance id the sweep covers every `kestrel.run` container
+/// on the host. Apple `container` cannot list by label, so nothing is swept there.
+///
+/// `run_forever` gives every slot back and clears the waiting line when it starts and when it
+/// ends, so the same engine can run again. `recover` and a second `run_forever` are refused while
+/// one is active.
+///
+/// The gateway token of a run is replaced by `[token]` in everything the engine records from the
+/// agent's output, and in the failure text of a run.
+///
 /// Known M1 limitations:
 ///
 /// * Resuming a paused or budget-suspended run starts the stopped sandbox again, which restarts
@@ -173,6 +198,23 @@ struct Inner {
     /// Who holds a concurrency slot. Written by the scheduler (acquire) and the run actors
     /// (release), so it sits behind a lock.
     slots: Mutex<Slots>,
+    /// Instance id for the `kestrel.instance` label, see [`Engine::with_instance`].
+    instance: Option<String>,
+    /// What lives outside the run actors, which are aborted when `run_forever` returns.
+    live: Mutex<Live>,
+    /// Signals a change of `live`.
+    changed: Notify,
+}
+
+/// Sandboxes and scheduler state that must outlive the run actors.
+#[derive(Default)]
+struct Live {
+    /// Stops `run_forever` while it is active.
+    active: Option<CancellationToken>,
+    /// `create` calls in flight, by run.
+    creating: HashSet<RunId>,
+    /// Sandboxes created and not yet destroyed: (driver index, sandbox id) to run.
+    sandboxes: BTreeMap<(usize, String), RunId>,
 }
 
 /// Control channels of the run actors, by run.
@@ -240,6 +282,9 @@ impl Engine {
                 limits,
                 models,
                 workspaces: None,
+                instance: None,
+                live: Mutex::default(),
+                changed: Notify::new(),
             }),
         }
     }
@@ -262,6 +307,18 @@ impl Engine {
         self
     }
 
+    /// Labels every sandbox with `kestrel.instance=<id>`, see the [`Engine`] docs. Use the same
+    /// id for the drivers' `with_instance`. Takes the engine by value, like
+    /// [`Engine::with_workspaces`].
+    pub fn with_instance(mut self, id: impl Into<String>) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.instance = Some(id.into());
+        }
+        self
+    }
+
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
     /// engine on the same database can resume the run.
     pub async fn submit(&self, spec: AgentSpec, input: String) -> Result<RunId> {
@@ -273,24 +330,68 @@ impl Engine {
 
     /// Schedules queued runs, applies control commands and enforces limits until `shutdown`.
     ///
-    /// On shutdown the run actors are dropped without touching their runs; [`Engine::recover`]
-    /// picks them up on the next start.
+    /// When `shutdown` is cancelled (or [`Engine::shutdown`] runs) the run actors are dropped
+    /// without touching their runs; [`Engine::recover`] picks them up on the next start. Their
+    /// sandboxes are left for [`Engine::shutdown`] or the next `recover` to destroy.
+    ///
+    /// A store error that breaks a whole tick ends this with [`EngineError::Store`]. A store
+    /// error on one control command is written to that run's log and scheduling goes on.
     pub async fn run_forever(&self, shutdown: CancellationToken) -> Result<()> {
-        // Dropping the scheduler on return aborts every run actor.
+        let stop = CancellationToken::new();
+        let _active = self.inner.activate(&stop)?;
+        // Dropping the scheduler on return aborts every run actor, before `_active` resets slots.
         let mut scheduler = Scheduler::default();
         let mut tick = self.inner.ticker();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
+                _ = stop.cancelled() => return Ok(()),
                 _ = tick.tick() => self.inner.poll(&mut scheduler)?,
             }
         }
     }
 
-    /// Stops the engine and destroys every sandbox, waiting at most `grace` in total.
-    /// `run_forever` has returned by the time this does.
-    pub async fn shutdown(&self, _grace: Duration) -> ShutdownReport {
-        todo!("graceful shutdown (#19)")
+    /// Stops `run_forever` and destroys every sandbox this engine created and has not destroyed,
+    /// waiting at most `grace` in total. `run_forever` has returned by the time this does,
+    /// unless the grace period ran out first. No run status changes.
+    ///
+    /// The report lists the runs whose sandbox was destroyed, the ones where the driver failed
+    /// (with its error text) and the ones still busy when `grace` ended. A second call, or a call
+    /// with nothing running, returns an empty report.
+    pub async fn shutdown(&self, grace: Duration) -> ShutdownReport {
+        let inner = &self.inner;
+        let deadline = Instant::now() + grace;
+        let stop = inner.live().active.clone();
+        if let Some(stop) = stop {
+            stop.cancel();
+        }
+        // The actors are gone once `run_forever` returned; a `create` may still be running.
+        let mut report = ShutdownReport::default();
+        if timeout_at(deadline, inner.settled()).await.is_err() {
+            report
+                .timed_out
+                .extend(inner.live().creating.iter().copied());
+        }
+        let found: Vec<_> = inner.live().sandboxes.clone().into_iter().collect();
+        let mut left: Vec<RunId> = found.iter().map(|(_, run)| *run).collect();
+        let mut pending: FuturesUnordered<_> = found
+            .into_iter()
+            .map(|((driver, id), run)| async move {
+                (
+                    run,
+                    inner.destroy_tracked(driver, &SandboxHandle { id }).await,
+                )
+            })
+            .collect();
+        while let Ok(Some((run, done))) = timeout_at(deadline, pending.next()).await {
+            left.retain(|r| *r != run);
+            match done {
+                Ok(()) => report.destroyed.push(run),
+                Err(e) => report.failed.push((run, e.to_string())),
+            }
+        }
+        report.timed_out.extend(left);
+        report
     }
 
     /// Call once at startup, before `run_forever`.
@@ -298,8 +399,14 @@ impl Engine {
     /// `Running` runs become `Suspended(Error("engine restarted"))`, `Provisioning` runs fail,
     /// `Suspended` runs stay suspended and `Queued` runs stay queued. Sandboxes left behind by the
     /// previous engine are destroyed; a resumed run gets a fresh one.
+    ///
+    /// Refused with [`EngineError::AlreadyRunning`] while `run_forever` is active.
     pub async fn recover(&self) -> Result<RecoveryReport> {
+        if self.inner.live().active.is_some() {
+            return Err(EngineError::AlreadyRunning);
+        }
         let store = &self.inner.store;
+        self.inner.sweep_leftovers().await;
         let mut report = RecoveryReport::default();
         for run in store.list_runs(RunFilter::default())? {
             if run.status.is_terminal() || run.status == RunStatus::Queued {
@@ -329,6 +436,88 @@ impl Inner {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The sandbox registry and scheduler flag.
+    fn live(&self) -> MutexGuard<'_, Live> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Marks `run_forever` as active, with `stop` to end it, and starts with fresh slots.
+    fn activate(&self, stop: &CancellationToken) -> Result<Active<'_>> {
+        let mut live = self.live();
+        if live.active.is_some() {
+            return Err(EngineError::AlreadyRunning);
+        }
+        live.active = Some(stop.clone());
+        drop(live);
+        self.reset_slots();
+        Ok(Active(self))
+    }
+
+    /// Every slot free again, as the actors that held them are gone.
+    fn reset_slots(&self) {
+        *self.slots() = Slots::new(self.limits.max_concurrent_runs);
+    }
+
+    /// Resolves once `run_forever` is not active and no `create` is in flight.
+    async fn settled(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let live = self.live();
+                if live.active.is_none() && live.creating.is_empty() {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    /// Starts `create` as its own task, so it finishes (and the sandbox is registered) even if
+    /// the run actor is aborted meanwhile.
+    fn start_create(
+        self: &Arc<Self>,
+        run: RunId,
+        driver: usize,
+        launch: LaunchSpec,
+    ) -> JoinHandle<kestrel_sandbox::Result<SandboxHandle>> {
+        self.live().creating.insert(run);
+        let inner = self.clone();
+        tokio::spawn(async move {
+            // Leaves `creating` when the task ends, also if the driver panics.
+            let _creating = Creating { inner: &inner, run };
+            let created = inner.drivers[driver].create(&launch).await;
+            if let Ok(h) = &created {
+                inner.live().sandboxes.insert((driver, h.id.clone()), run);
+            }
+            created
+        })
+    }
+
+    /// Destroys the sandbox and, once that worked, drops it from the registry.
+    async fn destroy_tracked(
+        &self,
+        driver: usize,
+        h: &SandboxHandle,
+    ) -> kestrel_sandbox::Result<()> {
+        self.drivers[driver].destroy(h).await?;
+        self.live().sandboxes.remove(&(driver, h.id.clone()));
+        Ok(())
+    }
+
+    /// Best effort: destroys what the drivers list as left over (see `SandboxDriver::leftovers`).
+    async fn sweep_leftovers(&self) {
+        for (idx, driver) in self.drivers.iter().enumerate() {
+            let Ok(found) = driver.leftovers().await else {
+                continue;
+            };
+            for h in found {
+                let _ = self.destroy_tracked(idx, &h).await;
+            }
+        }
+    }
+
     /// One scheduler tick: forget finished actors, route control commands, line up the queued
     /// runs and the commands that need a slot, then hand out the free slots in that order.
     fn poll(self: &Arc<Self>, s: &mut Scheduler) -> Result<()> {
@@ -337,7 +526,12 @@ impl Inner {
 
         let mut resumes = Vec::new();
         for (_, run, cmd) in self.store.take_control()? {
-            self.route(run, cmd, s, &mut resumes)?;
+            let shown = format!("{cmd:?}");
+            if let Err(e) = self.route(run, cmd, s, &mut resumes) {
+                // One failing command must not stop the scheduler or the rest of the batch.
+                let line = format!("kestrel: command {shown} failed: {e}");
+                let _ = self.store.append(run, EventKind::AgentLog { line });
+            }
         }
         self.line_up_queued(s)?;
         s.waiting.extend(resumes);
@@ -501,6 +695,10 @@ impl Inner {
                     let _ = tx.send(cmd);
                 }
             }
+            (RunStatus::Queued, ControlCommand::SetBudget(limit)) => {
+                // The run starts later and reads its stored spec then.
+                self.store.set_budget(run, limit)?;
+            }
             (RunStatus::Queued, ControlCommand::Cancel) => {
                 self.store
                     .transition(run, &RunStatus::Queued, RunStatus::Cancelled)?;
@@ -584,12 +782,36 @@ impl Inner {
                 _ => None,
             });
         if let Some((name, id)) = old
-            && let Some(driver) = self.drivers.iter().find(|d| d.name() == name)
+            && let Some(idx) = self.drivers.iter().position(|d| d.name() == name)
         {
             // The sandbox may well be gone already.
-            let _ = driver.destroy(&SandboxHandle { id }).await;
+            let _ = self.destroy_tracked(idx, &SandboxHandle { id }).await;
         }
         Ok(())
+    }
+}
+
+/// A `create` in flight for `run`; dropping it ends that.
+struct Creating<'a> {
+    inner: &'a Inner,
+    run: RunId,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        self.inner.live().creating.remove(&self.run);
+        self.inner.changed.notify_waiters();
+    }
+}
+
+/// Marks `run_forever` as active; resets the slots and clears the flag when it ends.
+struct Active<'a>(&'a Inner);
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.0.reset_slots();
+        self.0.live().active = None;
+        self.0.changed.notify_waiters();
     }
 }
 
@@ -671,10 +893,10 @@ impl Actor {
             && !self.status.is_terminal()
         {
             // Nothing more to do if the store refuses this too.
-            let _ = self.set(RunStatus::Failed(e.to_string()));
+            let _ = self.set(RunStatus::Failed(self.scrub(&e.to_string())));
         }
         if let Some(sb) = self.sandbox.take() {
-            let _ = self.inner.drivers[sb.driver].destroy(&sb.handle).await;
+            let _ = self.inner.destroy_tracked(sb.driver, &sb.handle).await;
         }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
@@ -750,11 +972,11 @@ impl Actor {
         let driver = &inner.drivers[idx];
         let mut launch = self.launch_spec()?;
         launch.workspace = self.workspace().await?;
-        let mut create = driver.create(&launch);
+        let mut create = inner.start_create(self.id, idx, launch);
         let created = loop {
             let deadline = self.clock.deadline();
             tokio::select! {
-                res = &mut create => break res,
+                res = &mut create => break res.unwrap_or_else(|e| Err(create_died(&e))),
                 cmd = recv(&mut self.cmds) => {
                     self.on_command(cmd)?;
                 }
@@ -803,6 +1025,10 @@ impl Actor {
             model: self.inner.model(self.spec.model_policy.default),
         };
         let plan = self.adapter.launch_plan(&self.spec, &self.input, &ctx)?;
+        let mut labels = BTreeMap::from([(RUN_LABEL.to_string(), self.id.to_string())]);
+        if let Some(instance) = &self.inner.instance {
+            labels.insert(INSTANCE_LABEL.to_string(), instance.clone());
+        }
         Ok(LaunchSpec {
             image: plan.image,
             argv: plan.argv,
@@ -813,7 +1039,7 @@ impl Actor {
             network: NetworkPolicy::GatewayOnly {
                 gateway: self.inner.gateway_url.clone(),
             },
-            labels: BTreeMap::new(),
+            labels,
         })
     }
 
@@ -856,8 +1082,16 @@ impl Actor {
         Ok(())
     }
 
+    /// `text` without this run's gateway token, which only the gateway may see.
+    fn scrub(&self, text: &str) -> String {
+        match self.token.as_str() {
+            "" => text.to_string(),
+            token => text.replace(token, "[token]"),
+        }
+    }
+
     fn on_line(&mut self, line: &str, finished: &mut Finished) -> Result<Next> {
-        match self.adapter.parse_line(line) {
+        match self.adapter.parse_line(&self.scrub(line)) {
             ParsedLine::Ignore => {}
             ParsedLine::Finished { ok, summary } => *finished = Some((ok, summary)),
             ParsedLine::Events(events) => {
@@ -1022,6 +1256,14 @@ impl Actor {
             self.sync_slot();
         }
         Ok(())
+    }
+}
+
+/// The error for a `create` task that panicked or was cancelled.
+fn create_died(e: &tokio::task::JoinError) -> kestrel_sandbox::SandboxError {
+    kestrel_sandbox::SandboxError::Spawn {
+        program: "sandbox create".into(),
+        source: std::io::Error::other(e.to_string()),
     }
 }
 
