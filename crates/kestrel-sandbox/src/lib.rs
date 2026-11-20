@@ -121,7 +121,18 @@ pub struct LaunchSpec {
     pub cpu_millis: u32,
     pub memory_mb: u64,
     pub network: NetworkPolicy,
+    /// Labels set on the container (`--label key=value`), so a later sweep can find containers
+    /// a crashed engine left behind. The engine sets [`RUN_LABEL`] to the run id.
+    pub labels: BTreeMap<String, String>,
 }
+
+/// Label key every sandbox of a run carries; the value is the run id.
+pub const RUN_LABEL: &str = "kestrel.run";
+
+/// Label key that names the Kestrel instance a sandbox belongs to, when the engine has an
+/// instance id. A driver with the same instance id lists only those sandboxes, so two instances
+/// on one Docker host do not remove each other's.
+pub const INSTANCE_LABEL: &str = "kestrel.instance";
 
 /// A created sandbox. `id` is the container id printed by the CLI on create.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +273,13 @@ pub trait SandboxDriver: Send + Sync {
     async fn stop(&self, h: &SandboxHandle) -> Result<()>;
     /// Idempotent.
     async fn destroy(&self, h: &SandboxHandle) -> Result<()>;
+    /// Sandboxes carrying the [`RUN_LABEL`] label, running or not, whether or not this process
+    /// created them. A driver given an instance id (`with_instance`) lists only the sandboxes
+    /// labelled with [`INSTANCE_LABEL`] set to that id. Drivers that cannot list by label return
+    /// nothing (the default).
+    async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.
@@ -396,9 +414,44 @@ impl Cli {
         for (k, v) in env.into_iter().chain(gateway) {
             argv.extend(["--env".to_string(), format!("{k}={v}")]);
         }
+        for (key, value) in &spec.labels {
+            argv.extend(["--label".to_string(), format!("{key}={value}")]);
+        }
         argv.push(spec.image.clone());
         argv.extend(spec.argv.iter().cloned());
         argv
+    }
+
+    /// Ids of the containers labelled [`RUN_LABEL`] (and [`INSTANCE_LABEL`] when `instance` is
+    /// given). Ids that are not safe to pass to the CLI again are dropped. Apple `container` has
+    /// no label filter, so it lists nothing and runs no process.
+    async fn leftovers(
+        &self,
+        runner: &dyn CommandRunner,
+        instance: Option<&str>,
+    ) -> Result<Vec<SandboxHandle>> {
+        if self.apple {
+            return Ok(Vec::new());
+        }
+        let run_filter = format!("label={RUN_LABEL}");
+        let mut args = vec!["ps", "-a", "--filter", run_filter.as_str()];
+        let instance_filter = match instance {
+            Some(id) => Some(format!("label={INSTANCE_LABEL}={}", check_id(id)?)),
+            None => None,
+        };
+        args.extend(
+            instance_filter
+                .iter()
+                .flat_map(|f| ["--filter", f.as_str()]),
+        );
+        args.extend(["--format", "{{.ID}}"]);
+        let stdout = self.run(runner, &self.argv(&args), None).await?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|id| check_id(id).is_ok())
+            .map(|id| SandboxHandle { id: id.to_string() })
+            .collect())
     }
 
     async fn create(
@@ -602,6 +655,21 @@ macro_rules! cli_driver {
                     runner,
                     exits: Exits::default(),
                     owner: default_owner(),
+                    instance: None,
+                }
+            }
+
+            /// Limits [`SandboxDriver::leftovers`] to sandboxes labelled with this instance id
+            /// ([`INSTANCE_LABEL`]). The id must be `[A-Za-z0-9_.-]`, else `leftovers` fails.
+            pub fn with_instance(mut self, id: impl Into<String>) -> Self {
+                self.instance = Some(id.into());
+                self
+            }
+
+            fn tag(self, instance: Option<&str>) -> Self {
+                match instance {
+                    Some(id) => self.with_instance(id),
+                    None => self,
                 }
             }
 
@@ -638,6 +706,10 @@ macro_rules! cli_driver {
             async fn destroy(&self, h: &SandboxHandle) -> Result<()> {
                 $cli.destroy(self.runner.as_ref(), &self.exits, h).await
             }
+            async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
+                $cli.leftovers(self.runner.as_ref(), self.instance.as_deref())
+                    .await
+            }
         }
     };
 }
@@ -647,6 +719,7 @@ pub struct GvisorDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
     owner: OwnerLookup,
+    instance: Option<String>,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
@@ -658,6 +731,7 @@ pub struct AppleContainerDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
     owner: OwnerLookup,
+    instance: Option<String>,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
@@ -665,6 +739,7 @@ pub struct DockerRuncDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
     owner: OwnerLookup,
+    instance: Option<String>,
 }
 
 cli_driver!(GvisorDriver, GVISOR);
@@ -763,20 +838,32 @@ runtimes only, allow docker-runc.";
 
 /// Usable drivers for `host`, strongest first. Drivers run real processes via [`ProcessRunner`].
 pub fn detect(host: &HostInfo, allow_weak: bool) -> Result<Vec<Box<dyn SandboxDriver>>> {
+    detect_for(host, allow_weak, None)
+}
+
+/// Like [`detect`], with every driver limited to the sandboxes of `instance` when listing
+/// leftovers (see [`SandboxDriver::leftovers`]).
+pub fn detect_for(
+    host: &HostInfo,
+    allow_weak: bool,
+    instance: Option<&str>,
+) -> Result<Vec<Box<dyn SandboxDriver>>> {
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessRunner);
     let has_docker_runtime = |name: &str| host.docker_runtimes.iter().any(|r| r == name);
     let mut drivers: Vec<Box<dyn SandboxDriver>> = Vec::new();
     if host.os == Os::Linux && has_docker_runtime("runsc") {
-        drivers.push(Box::new(GvisorDriver::new(runner.clone())));
+        drivers.push(Box::new(GvisorDriver::new(runner.clone()).tag(instance)));
     }
     if matches!(host.os, Os::MacOs { major } if major >= 26)
         && host.arch == Arch::Aarch64
         && host.apple_container
     {
-        drivers.push(Box::new(AppleContainerDriver::new(runner.clone())));
+        drivers.push(Box::new(
+            AppleContainerDriver::new(runner.clone()).tag(instance),
+        ));
     }
     if allow_weak && has_docker_runtime("runc") {
-        drivers.push(Box::new(DockerRuncDriver::new(runner)));
+        drivers.push(Box::new(DockerRuncDriver::new(runner).tag(instance)));
     }
     if drivers.is_empty() {
         return Err(SandboxError::NoSecureSandbox {

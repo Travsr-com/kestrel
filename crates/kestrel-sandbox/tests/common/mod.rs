@@ -134,6 +134,7 @@ pub fn spec() -> LaunchSpec {
         cpu_millis: 1500,
         memory_mb: 512,
         network: NetworkPolicy::None,
+        labels: BTreeMap::new(),
     }
 }
 

@@ -20,6 +20,7 @@ fn alpine(argv: &[&str]) -> LaunchSpec {
         cpu_millis: 1000,
         memory_mb: 256,
         network: NetworkPolicy::None,
+        labels: BTreeMap::new(),
     }
 }
 

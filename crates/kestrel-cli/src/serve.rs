@@ -11,7 +11,7 @@ use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
-    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect,
+    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect_for,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -653,8 +653,11 @@ async fn run(
 
     let drivers = match drivers {
         Some(d) => d,
-        None => detect(&HostInfo::current().await, false)
-            .map_err(|e| Failure::runtime(e.to_string()))?,
+        None => {
+            let instance = GatewayBridge::instance_id(&db);
+            detect_for(&HostInfo::current().await, false, Some(&instance))
+                .map_err(|e| Failure::runtime(e.to_string()))?
+        }
     };
     let docker = uses_docker(&drivers);
     let needs_bridge = docker && config.advertise_url.is_none();
@@ -750,7 +753,8 @@ async fn serve_bound(
         config.limits,
         config.models,
     )
-    .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)));
+    .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
+    .with_instance(GatewayBridge::instance_id(db));
     engine
         .recover()
         .await
