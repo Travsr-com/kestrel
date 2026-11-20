@@ -143,6 +143,43 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 
 WASM (`wasmtime`) is kept only for small, user-authored policy and watchdog plugins, not for agents.
 
+### 3.4.1 High-density server sandbox pools
+
+Kestrel server mode will use its own high-density sandbox-pool design for long-lived, mostly-idle
+Runs. The design takes inspiration from systems such as Google Agent Substrate: keep a small pool
+of warm workers, suspend an idle sandbox, and restore its memory and filesystem state when work
+arrives. Kestrel owns the interface, lifecycle semantics and deployment choices.
+
+Kestrel keeps ownership of the product-facing state:
+
+* **Kestrel:** Agent versions, Runs and spawn trees, capability attenuation, approvals, budgets,
+  event log, model policy, routing and cost records.
+* **Kestrel worker-pool driver:** worker placement, per-Run sandbox lifecycle, snapshots, and
+  kernel and network isolation.
+
+`WorkerPoolDriver` is added only in server mode, after the local gVisor and Apple `container`
+drivers are proven. A long-lived Run or session maps to one Kestrel sandbox session. Short,
+one-shot jobs continue to use the local drivers. Kestrel maps its runtime image, CPU, memory,
+filesystem and network policy to a selected worker pool.
+
+```text
+Kestrel Run ── WorkerPoolDriver ── Kestrel sandbox session on a warm worker
+                                               │
+                                   Kestrel egress policy and workload identity
+                                               │
+                                               ▼
+                                      Kestrel Gateway
+```
+
+The sandbox session has no provider credential and no direct provider egress. Its egress policy permits only
+the Kestrel Gateway. A Kestrel-issued workload identity is exchanged over mTLS and bound to the
+Run, so the Gateway can apply its capability, budget and model policy. Provider keys remain in the
+Gateway. Snapshots may preserve a workspace and runtime memory, but never provider credentials or
+Kestrel control-plane authority.
+
+This keeps local mode a one-binary product while providing a path to active-only compute economics
+when a self-hosted team needs Kubernetes-scale, long-lived agent sessions.
+
 ### 3.5 Kestrel Gateway (the "cheaper" engine)
 
 Cost levers, in build order (biggest return for least effort first):
@@ -159,6 +196,82 @@ Cost levers, in build order (biggest return for least effort first):
 7. **Batch pricing** for scheduled, non-interactive single-shot jobs (nightly summaries, digests).
 
 Every model call records: run, agent, role, provider, model, input/output/cached tokens, cost, latency, route reason.
+
+#### 3.5.1 Stateful, cache-aware model routing
+
+Routing is a decision over an agent session, not an independent choice for each request. A cheap
+model can be the right choice for a bounded step yet be the wrong choice when switching loses a
+warm context or makes recovery more likely. The Gateway therefore makes a durable `RouteDecision`
+before a provider call:
+
+1. **Admission policy:** enforce data residency, provider allow-list, required capabilities
+   (tools, schema, vision and context), remaining budget and maximum in-flight cost.
+2. **Cache affinity:** prefer the healthy model profile and provider cohort that already holds the
+   Run's compatible prefix cache.
+3. **Deterministic rules:** classify known low-risk work such as extraction, summarisation, log
+   tagging and bounded tool-result interpretation.
+4. **Escalation:** move up a tier only for an explicit signal: invalid structured output, repeated
+   tool failure, failing tests, critic rejection, or a turn-limit or confidence threshold.
+5. **Fallback:** retry only on a compatible healthy deployment. Record the reason and preserve the
+   selected profile for the next call unless an escalation signal requires a change.
+
+A `ModelProfile` replaces a bare `tier -> model name` map in server configuration. It describes a
+provider and model plus capabilities, allowed data classes and roles, pricing for input, output and
+cache reads/writes, latency and health limits, and the cache cohort it belongs to. `cheap`, `mid`
+and `frontier` remain the portable policy interface in an Agent definition.
+
+The Gateway reserves the configured maximum completion cost before starting a call and reconciles
+the reservation against provider-reported usage. This prevents concurrent calls from spending more
+than a Run or root-tree budget merely because they were admitted before their predecessors finished.
+
+#### 3.5.2 SLMs as bounded workers
+
+Small language models are useful where the input, output and success condition are narrow. Kestrel
+uses a locally served SLM, when host capability and an evaluation gate allow it, for:
+
+* route classification and task-difficulty scoring;
+* structured extraction, normalisation and validation;
+* log, diff and test-output summarisation;
+* tool-result tagging and context compression;
+* offline clustering of failed runs and proposed routing-rule improvements.
+
+An SLM does not grant a capability, approve a side effect, act as the sole secret or PII detector,
+or replace a coding agent for open-ended planning, novel debugging, multi-file changes or recovery.
+Every SLM route is evaluated against a frozen task set and is promoted only when successful-task
+cost, latency and quality improve without a regression.
+
+#### 3.5.3 Cache contract
+
+Kestrel distinguishes three cache layers:
+
+| Layer | Purpose | Safety boundary |
+| :--- | :--- | :--- |
+| Provider prefix cache | Reuse a stable prompt prefix at Anthropic or OpenAI | Same org, provider, model and compatible rendered prefix |
+| Local-model KV cache | Reuse local inference prefill, for example with vLLM automatic prefix caching | Same model weights, adapter and cache cohort; cache storage is sensitive |
+| Semantic or tool-result cache | Reuse a pure read-only result | Exact tool arguments, input revision, capability and retention policy |
+
+The Gateway does not treat an agent response or arbitrary mutable tool result as a semantic cache
+entry. A result is cacheable only when the tool declares it pure and read-only, and its key includes
+the source revision and policy version.
+
+Every cacheable model request follows this immutable layout:
+
+```text
+policy version + agent version + role instructions + stable tool schemas
+→ deterministically ordered repository/context bundle
+→ append-only conversation history
+→ current task + latest tool results + volatile state
+```
+
+The stable prefix is content-addressed as a `ContextBundle`. Sibling agents with the same Agent
+version and bundle are scheduled close together and normally remain on the same model profile while
+the prefix is warm. Dynamic content stays at the end. Provider-specific controls are used only when
+the adapter's API contract supports them: Anthropic cache breakpoints, OpenAI cache keys or
+breakpoints, and automatic prefix caching for a local vLLM server.
+
+The Gateway reports `cache_profile`, `context_bundle_hash`, cache read/write tokens, hit ratio,
+cache-write cost, time to first token and miss reason. These are the signals used to decide whether
+a cache policy is helping rather than simply increasing cache-write spend.
 
 ### 3.6 Privacy perimeter
 
@@ -266,8 +379,11 @@ CREATE TABLE runs        (id TEXT PRIMARY KEY, agent TEXT, agent_version INTEGER
 CREATE TABLE events      (run_id TEXT, seq INTEGER, kind TEXT NOT NULL, payload_json TEXT,
                           ts TEXT NOT NULL, PRIMARY KEY (run_id, seq));
 CREATE TABLE model_calls (id TEXT PRIMARY KEY, run_id TEXT, provider TEXT, model TEXT, tier TEXT,
-                          route_reason TEXT, tokens_in INTEGER, tokens_out INTEGER,
-                          tokens_cached INTEGER, cost_usd REAL, latency_ms INTEGER, ts TEXT);
+                          model_profile TEXT, route_reason TEXT, cache_profile TEXT,
+                          context_bundle_hash TEXT, cache_miss_reason TEXT,
+                          tokens_in INTEGER, tokens_out INTEGER, tokens_cache_read INTEGER,
+                          tokens_cache_write INTEGER, reserved_cost_usd REAL, cost_usd REAL,
+                          latency_ms INTEGER, ttft_ms INTEGER, ts TEXT);
 CREATE TABLE approvals   (id TEXT PRIMARY KEY, run_id TEXT, action_json TEXT, status TEXT,
                           decided_by TEXT, decided_at TEXT);
 CREATE TABLE triggers    (id TEXT PRIMARY KEY, agent TEXT, kind TEXT, spec_json TEXT,
@@ -342,9 +458,14 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
   shows the whole tree live.
 
 **M3. Cheaper**
-* Role tiers, prompt-cache shaping, hard budgets, rule routing, secret masking, Costs view.
+* Model profiles, role tiers, cache-aware prompt shaping, context bundles, reserved hard budgets,
+  deterministic sticky routing, secret masking and the Costs view.
+* Local SLM helpers for bounded routing, extraction and summarisation only after a frozen-eval gate.
+  An SLM cannot authorize a tool or make a security decision on its own.
 * Benchmark suite: a fixed task set run (a) directly with the agent and (b) through Kestrel.
-* Accept: lower cost per successful task than baseline with equal or better success rate, published as a report.
+* Accept: lower cost per successful task than baseline with equal or better success rate, published as a
+  report. The report includes p50/p95 time to first token and completion time, cache-read and
+  cache-write rates, escalation rate, routing overhead and budget-reservation accuracy.
 
 **M4. Triggers and agent catalog**
 * Cron, webhooks, event watchers; Agents builder and Triggers views.
@@ -363,7 +484,9 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
   no regression.
 
 **M6. Team scale**
-* Postgres backend and multiple workers, SSO and RBAC, audit log export, Firecracker tier, Redis only if measured need.
+* Postgres backend and multiple workers, SSO and RBAC, audit log export, Firecracker tier, and a
+  Kestrel-native high-density worker-pool driver for Kubernetes-scale deployments. Redis is added
+  only if measured need.
 * Meeting bot stage 3 (speaking via TTS); Zoom and Teams connectors; Slack channel.
 
 ## 8. Decisions log
@@ -388,3 +511,16 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 2. Should the meeting bot speak (TTS) in the first release, or is listen + chat reply enough until M6?
 3. Who owns the Google Cloud project for the Chat app in self-hosted installs: Kestrel docs walk each org through
    creating their own (recommended), or a shared Kestrel-published app?
+
+## 10. Design references
+
+* [Google Agent Substrate on GKE](https://cloud.google.com/blog/products/containers-kubernetes/agent-substrate-available-on-gke)
+  informs the warm-worker, snapshot and egress design. Kestrel does not depend on or embed it.
+* [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) documents stable
+  prefixes, cache keys, retention and cache-aware routing behavior.
+* [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) documents
+  explicit breakpoints, TTLs and cache usage accounting.
+* [vLLM automatic prefix caching](https://docs.vllm.ai/en/v0.10.1/features/automatic_prefix_caching.html)
+  documents KV reuse for compatible local-model prefixes.
+* [Context-guided routing for stateful agents](https://arxiv.org/abs/2610.19292) motivates session-aware,
+  cache-aware routing rather than independent per-call decisions.
