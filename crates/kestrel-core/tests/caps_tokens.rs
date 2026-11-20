@@ -17,10 +17,11 @@ use kestrel_core::caps::{self, Action, CapToken, Decision, RootKey};
 use kestrel_types::{MicroUsd, RunId};
 use time::Duration;
 
-/// A child of [`Fx::new`] narrowed to one tool, one host, one secret, $1 and depth 1.
+/// A child of [`Fx::new`] narrowed to one tool (plus `kestrel.spawn`, which spawning needs), one
+/// host, one secret, $1 and depth 1.
 fn narrow_child(fx: &Fx) -> (kestrel_core::caps::Capability, CapToken) {
     fx.child(|c| {
-        c.tools = set(&["fs.read"]);
+        c.tools = set(&["fs.read", "kestrel.spawn"]);
         c.hosts = set(&["crates.io"]);
         c.secrets = set(&["npm_token"]);
         c.spawn = Some(limits(2, 1, &["reviewer"]));
@@ -88,7 +89,7 @@ fn s7_one_changed_byte_anywhere_is_denied() {
             assert_deny(&fx.check(&tampered, fx.cap.run, tool("fs.write")), &what);
             assert_invalid_token(caps::grant(&tampered, &fx.pk), &what);
             let grandchild = narrowed(&child, |g| g.tools.clear());
-            assert_invalid_token(caps::attenuate(&tampered, &fx.pk, &grandchild), &what);
+            assert_invalid_token(caps::attenuate(&tampered, &fx.key, &grandchild), &what);
         }
     }
 }
@@ -139,7 +140,7 @@ fn s7_a_token_signed_by_another_key_is_rejected() {
     }
     assert_invalid_token(caps::grant(&forged, &fx.pk), "grant");
     let child = fx.child_cap(|c| c.tools = set(&["fs.read"]));
-    assert_invalid_token(caps::attenuate(&forged, &fx.pk, &child), "attenuate");
+    assert_invalid_token(caps::attenuate(&forged, &fx.key, &child), "attenuate");
     // Still a good token for its own key.
     assert_allow(
         &check(&forged, &other.public(), fx.cap.run, tool("fs.read")),
@@ -192,7 +193,7 @@ fn s8_a_child_token_with_its_block_stripped_fails_for_everyone() {
     }
     assert_invalid_token(caps::grant(&stripped, &fx.pk), "grant");
     let again = fx.child_cap(|c| c.tools = set(&["fs.write"]));
-    assert_invalid_token(caps::attenuate(&stripped, &fx.pk, &again), "attenuate");
+    assert_invalid_token(caps::attenuate(&stripped, &fx.key, &again), "attenuate");
 }
 
 #[test]
@@ -213,7 +214,7 @@ fn s8_removing_any_block_of_a_grandchild_token_fails() {
     let fx = Fx::new();
     let (child, child_token) = narrow_child(&fx);
     let g = narrowed(&child, |g| g.tools.clear());
-    let g_token = caps::attenuate(&child_token, &fx.pk, &g).expect("grandchild");
+    let g_token = caps::attenuate(&child_token, &fx.key, &g).expect("grandchild");
     assert_eq!(attenuation_blocks(g_token.as_bytes()), 2);
     for index in [0, 1] {
         let t = CapToken::from_bytes(remove_block(&g_token, index));
@@ -229,7 +230,6 @@ fn s8_removing_any_block_of_a_grandchild_token_fails() {
 fn s8_the_parent_token_keeps_the_parent_rights_for_the_parent_run() {
     let fx = Fx::new();
     let (child, token) = narrow_child(&fx);
-    let _stripped = strip_last_block(&token);
     for a in parent_only_actions().into_iter().chain(child_actions()) {
         assert_allow(
             &fx.check(&fx.token, fx.cap.run, a.clone()),
@@ -250,63 +250,50 @@ fn s8_the_parent_token_keeps_the_parent_rights_for_the_parent_run() {
 }
 
 // Not a numbered scenario, but the reason scenarios 4 and 8 hold: anyone can append a block with
-// the raw Biscuit API, so such a block must never widen what the token grants.
+// the raw Biscuit API. Only the root key may attenuate, so such a block makes the token invalid:
+// it is denied for every run and grants nothing, so it can neither widen nor re-bind the token.
+
+/// `forged` is dead: `grant` fails and every action is denied for the child, the parent and an
+/// unrelated run.
+#[track_caller]
+fn assert_dead(fx: &Fx, child: &kestrel_core::caps::Capability, forged: &CapToken) {
+    assert_invalid_token(caps::grant(forged, &fx.pk), "grant");
+    for run in [child.run, fx.cap.run, RunId::new()] {
+        for a in parent_only_actions().into_iter().chain(child_actions()) {
+            assert_deny(
+                &fx.check(forged, run, a.clone()),
+                &format!("{a:?} as {run}"),
+            );
+        }
+    }
+}
 
 #[test]
-fn s4_a_raw_empty_block_appended_by_the_holder_does_not_widen() {
+fn s4_a_raw_empty_block_appended_by_the_holder_makes_the_token_invalid() {
     let fx = Fx::new();
     let (child, token) = narrow_child(&fx);
     let forged = append_raw_block(&token, BlockBuilder::new());
-    for a in parent_only_actions() {
-        assert_deny(&fx.check(&forged, child.run, a.clone()), &format!("{a:?}"));
-        assert_deny(
-            &fx.check(&forged, fx.cap.run, a.clone()),
-            &format!("parent run {a:?}"),
-        );
-    }
-    if let Ok(g) = caps::grant(&forged, &fx.pk) {
-        assert_no_wider(&g, &child);
-    }
+    assert_dead(&fx, &child, &forged);
 }
 
 #[test]
-fn s4_a_raw_block_replaying_the_root_block_does_not_widen() {
+fn s4_a_raw_block_replaying_the_root_block_makes_the_token_invalid() {
     let fx = Fx::new();
     let (child, token) = narrow_child(&fx);
+    // The replayed block names the parent's run; it must not re-bind the token to it.
     let forged = append_raw_block(&token, replay_block(&token, 0));
-    for a in parent_only_actions() {
-        assert_deny(&fx.check(&forged, child.run, a.clone()), &format!("{a:?}"));
-        assert_deny(
-            &fx.check(&forged, fx.cap.run, a.clone()),
-            &format!("parent run {a:?}"),
-        );
-    }
-    // Which run the forged token is bound to is not asserted: the replayed block may name the
-    // parent's run, and "run = run of the last block" lets any holder re-bind a token to another
-    // run with no more rights than it already had. Only the rights are pinned here.
-    if let Ok(g) = caps::grant(&forged, &fx.pk) {
-        assert_no_wider(&g, &child);
-    }
+    assert_dead(&fx, &child, &forged);
 }
 
 #[test]
-fn s4_a_raw_block_with_a_junk_context_does_not_widen() {
+fn s4_a_raw_block_with_a_junk_context_makes_the_token_invalid() {
     let fx = Fx::new();
     let (child, token) = narrow_child(&fx);
     let forged = append_raw_block(
         &token,
         BlockBuilder::new().context("{\"tools\":[\"fs.write\"]} not json".to_string()),
     );
-    for a in parent_only_actions() {
-        assert_deny(&fx.check(&forged, child.run, a.clone()), &format!("{a:?}"));
-        assert_deny(
-            &fx.check(&forged, fx.cap.run, a.clone()),
-            &format!("parent run {a:?}"),
-        );
-    }
-    if let Ok(g) = caps::grant(&forged, &fx.pk) {
-        assert_no_wider(&g, &child);
-    }
+    assert_dead(&fx, &child, &forged);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -424,7 +411,7 @@ fn s10_a_grandchild_token_works_for_the_grandchild_run_only() {
     let fx = Fx::new();
     let (child, child_token) = narrow_child(&fx);
     let g = narrowed(&child, |_| {});
-    let g_token = caps::attenuate(&child_token, &fx.pk, &g).expect("grandchild");
+    let g_token = caps::attenuate(&child_token, &fx.key, &g).expect("grandchild");
     assert_allow(
         &fx.check(&g_token, g.run, tool("fs.read")),
         "grandchild run",

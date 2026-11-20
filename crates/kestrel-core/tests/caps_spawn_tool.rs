@@ -40,11 +40,19 @@ fn listed_spawn_tool_with_spawn_limits_is_allowed() {
 
 #[test]
 fn unlisted_spawn_tool_with_spawn_limits_is_denied() {
-    let fx = Fx::new();
+    let fx = Fx::from_spec(&spec_from(
+        "{ mcp: [fs.read], spawn: { max_children: 1, max_depth: 1, agents: [reviewer] } }",
+        "1",
+    ));
     assert!(fx.cap.spawn.is_some());
     assert!(!fx.cap.tools.contains("kestrel.spawn"));
     assert_deny_naming(
         &fx.check(&fx.token, fx.cap.run, tool("kestrel.spawn")),
+        "kestrel.spawn",
+    );
+    // Without the tool, spawning itself is refused too.
+    assert_deny_naming(
+        &fx.check(&fx.token, fx.cap.run, spawn("reviewer")),
         "kestrel.spawn",
     );
 }
@@ -85,7 +93,7 @@ fn a_child_without_spawn_loses_the_spawn_tool_but_its_parent_keeps_it() {
     );
     // Its own child (depth 0) may not.
     let grandchild = narrowed(&deep, |_| {});
-    let g_token = caps::attenuate(&deep_token, &fx.pk, &grandchild).expect("grandchild");
+    let g_token = caps::attenuate(&deep_token, &fx.key, &grandchild).expect("grandchild");
     assert_deny_naming(
         &fx.check(&g_token, grandchild.run, tool("kestrel.spawn")),
         "spawn",

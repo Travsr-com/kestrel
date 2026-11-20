@@ -266,7 +266,7 @@ fn s4_child_cannot_gain_a_tool() {
     let fx = Fx::from_spec(&spec_from("{ mcp: [fs.read] }", "1"));
     let child = fx.child_cap(|c| c.tools = set(&["fs.read", "fs.write"]));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "fs.write");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "fs.write");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "fs.write");
 }
 
 #[test]
@@ -275,7 +275,7 @@ fn s4_child_cannot_gain_a_host() {
     let child = fx.child_cap(|c| c.hosts = set(&["crates.io", "evil.example.com"]));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "evil.example.com");
     assert_escalation_naming(
-        caps::attenuate(&fx.token, &fx.pk, &child),
+        caps::attenuate(&fx.token, &fx.key, &child),
         "evil.example.com",
     );
 }
@@ -285,14 +285,14 @@ fn s4_child_cannot_gain_a_secret() {
     let fx = Fx::from_spec(&spec_from("{ secrets: [npm_token] }", "1"));
     let child = fx.child_cap(|c| c.secrets = set(&["npm_token", "aws_root_key"]));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "aws_root_key");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "aws_root_key");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "aws_root_key");
 }
 
 #[test]
 fn s4_escalation_error_text_says_escalation() {
     let fx = Fx::from_spec(&spec_from("{ mcp: [fs.read] }", "1"));
     let child = fx.child_cap(|c| c.tools = set(&["fs.write"]));
-    let text = escalation(caps::attenuate(&fx.token, &fx.pk, &child));
+    let text = escalation(caps::attenuate(&fx.token, &fx.key, &child));
     assert!(
         text.starts_with("capability escalation: "),
         "unexpected text {text:?}"
@@ -306,7 +306,7 @@ fn s4_a_tool_dropped_by_the_child_cannot_come_back_in_the_grandchild() {
     let grandchild = narrowed(&child, |g| g.tools = set(&TOOLS));
     assert_escalation_naming(grandchild.check_subset_of(&child), "fs.write");
     assert_escalation_naming(
-        caps::attenuate(&child_token, &fx.pk, &grandchild),
+        caps::attenuate(&child_token, &fx.key, &grandchild),
         "fs.write",
     );
 }
@@ -342,7 +342,7 @@ fn s4_subset_check_accepts_equal_and_smaller_and_ignores_the_run() {
     });
     assert!(empty.check_subset_of(&fx.cap).is_ok(), "no rights at all");
     assert!(
-        caps::attenuate(&fx.token, &fx.pk, &empty).is_ok(),
+        caps::attenuate(&fx.token, &fx.key, &empty).is_ok(),
         "attenuate to nothing"
     );
 }
@@ -365,14 +365,14 @@ fn s5_child_budget_above_the_parent_fails() {
     assert_eq!(fx.cap.budget, usd(2));
     let child = fx.child_cap(|c| c.budget = usd(3));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "budget");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "budget");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "budget");
 }
 
 #[test]
 fn s5_child_budget_one_micro_dollar_above_the_parent_fails() {
     let fx = Fx::new();
     let child = fx.child_cap(|c| c.budget = MicroUsd(usd(2).0 + 1));
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "budget");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "budget");
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn s5_child_budget_below_or_equal_to_the_parent_works() {
         let child = fx.child_cap(|c| c.budget = b);
         assert!(child.check_subset_of(&fx.cap).is_ok(), "budget {b:?}");
         assert!(
-            caps::attenuate(&fx.token, &fx.pk, &child).is_ok(),
+            caps::attenuate(&fx.token, &fx.key, &child).is_ok(),
             "budget {b:?}"
         );
     }
@@ -419,11 +419,11 @@ fn s6_child_gets_at_most_parent_depth_minus_one() {
     assert_eq!(fx.cap.spawn.as_ref().map(|s| s.max_depth), Some(2));
     let too_deep = fx.child_cap(|c| c.spawn = Some(limits(4, 2, &AGENTS)));
     assert_escalation_naming(too_deep.check_subset_of(&fx.cap), "depth");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &too_deep), "depth");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &too_deep), "depth");
     for depth in [1, 0] {
         let ok = fx.child_cap(|c| c.spawn = Some(limits(4, depth, &AGENTS)));
         assert!(
-            caps::attenuate(&fx.token, &fx.pk, &ok).is_ok(),
+            caps::attenuate(&fx.token, &fx.key, &ok).is_ok(),
             "child max_depth {depth}"
         );
     }
@@ -436,12 +436,12 @@ fn s6_grandchild_cannot_ask_for_depth_two_or_one() {
     for depth in [1, 2, 3] {
         let g = narrowed(&child, |g| g.spawn = Some(limits(4, depth, &AGENTS)));
         assert_escalation_naming(g.check_subset_of(&child), "depth");
-        assert_escalation_naming(caps::attenuate(&child_token, &fx.pk, &g), "depth");
+        assert_escalation_naming(caps::attenuate(&child_token, &fx.key, &g), "depth");
     }
     let g = narrowed(&child, |g| g.spawn = Some(limits(4, 0, &AGENTS)));
-    let g_token = caps::attenuate(&child_token, &fx.pk, &g).expect("grandchild at depth 0");
+    let g_token = caps::attenuate(&child_token, &fx.key, &g).expect("grandchild at depth 0");
     let none = narrowed(&child, |g| g.spawn = None);
-    assert!(caps::attenuate(&child_token, &fx.pk, &none).is_ok());
+    assert!(caps::attenuate(&child_token, &fx.key, &none).is_ok());
 
     // The child (depth 1) may spawn; the grandchild (depth 0) may not.
     assert_allow(
@@ -460,7 +460,7 @@ fn s6_a_parent_that_cannot_spawn_cannot_give_a_child_spawn() {
     assert_eq!(fx.cap.spawn, None);
     let child = fx.child_cap(|c| c.spawn = Some(limits(1, 0, &[])));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "spawn");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "spawn");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "spawn");
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn s6_child_agents_must_be_a_subset() {
     let fx = Fx::new();
     let child = fx.child_cap(|c| c.spawn = Some(limits(4, 1, &["reviewer", "deployer"])));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "deployer");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "deployer");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "deployer");
     let (narrow, token) = fx.child(|c| c.spawn = Some(limits(4, 1, &["reviewer"])));
     assert_allow(
         &fx.check(&token, narrow.run, spawn("reviewer")),
@@ -504,11 +504,11 @@ fn s6_max_children_cannot_grow() {
     let fx = Fx::new();
     let child = fx.child_cap(|c| c.spawn = Some(limits(5, 1, &AGENTS)));
     assert_escalation_naming(child.check_subset_of(&fx.cap), "children");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &child), "children");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &child), "children");
     for n in [4, 1, 0] {
         let ok = fx.child_cap(|c| c.spawn = Some(limits(n, 1, &AGENTS)));
         assert!(
-            caps::attenuate(&fx.token, &fx.pk, &ok).is_ok(),
+            caps::attenuate(&fx.token, &fx.key, &ok).is_ok(),
             "max_children {n}"
         );
     }
@@ -519,11 +519,11 @@ fn s6_expiry_cannot_be_later_than_the_parent() {
     let fx = Fx::new();
     let later = fx.child_cap(|c| c.expires_at = expiry() + Duration::seconds(1));
     assert_escalation_naming(later.check_subset_of(&fx.cap), "expire");
-    assert_escalation_naming(caps::attenuate(&fx.token, &fx.pk, &later), "expire");
+    assert_escalation_naming(caps::attenuate(&fx.token, &fx.key, &later), "expire");
     for at in [expiry(), expiry() - Duration::minutes(30)] {
         let ok = fx.child_cap(|c| c.expires_at = at);
         assert!(
-            caps::attenuate(&fx.token, &fx.pk, &ok).is_ok(),
+            caps::attenuate(&fx.token, &fx.key, &ok).is_ok(),
             "expiry {at}"
         );
     }
@@ -562,33 +562,45 @@ fn s12_spawn_of_an_agent_not_listed_is_denied_naming_it() {
 #[test]
 fn s12_spawn_at_max_depth_zero_is_denied() {
     let fx = Fx::from_spec(&spec_from(
-        "{ spawn: { max_children: 3, max_depth: 0, agents: [reviewer] } }",
+        "{ mcp: [kestrel.spawn], spawn: { max_children: 3, max_depth: 0, agents: [reviewer] } }",
         "1",
     ));
     assert_eq!(fx.cap.spawn, Some(limits(3, 0, &["reviewer"])));
-    assert_deny(
+    assert_deny_naming(
         &fx.check(&fx.token, fx.cap.run, spawn("reviewer")),
-        "spawn at depth 0",
+        "max_depth 0",
     );
 }
 
 #[test]
 fn s12_spawn_with_an_empty_agent_list_is_denied() {
     let fx = Fx::from_spec(&spec_from(
-        "{ spawn: { max_children: 3, max_depth: 2 } }",
+        "{ mcp: [kestrel.spawn], spawn: { max_children: 3, max_depth: 2 } }",
         "1",
     ));
     assert_eq!(fx.cap.spawn, Some(limits(3, 2, &[])));
-    assert_deny(
+    assert_deny_naming(
         &fx.check(&fx.token, fx.cap.run, spawn("reviewer")),
-        "fail closed on no agents",
+        "reviewer",
     );
 }
 
+/// Issue #36 scenario 9: a parent whose capability lacks `kestrel.spawn` is refused a spawn, even
+/// with spawn limits that list the agent.
 #[test]
-fn s12_spawn_of_a_listed_agent_with_depth_left_is_allowed() {
+fn s12_spawn_without_the_spawn_tool_is_denied_naming_it() {
     let fx = Fx::from_spec(&spec_from(
         "{ spawn: { max_children: 1, max_depth: 1, agents: [reviewer] } }",
+        "1",
+    ));
+    let d = fx.check(&fx.token, fx.cap.run, spawn("reviewer"));
+    assert_deny_naming(&d, "kestrel.spawn");
+}
+
+#[test]
+fn s12_spawn_of_a_listed_agent_with_depth_left_and_the_spawn_tool_is_allowed() {
+    let fx = Fx::from_spec(&spec_from(
+        "{ mcp: [kestrel.spawn], spawn: { max_children: 1, max_depth: 1, agents: [reviewer] } }",
         "1",
     ));
     assert_allow(
@@ -686,7 +698,7 @@ fn grant_of_an_attenuated_token_is_the_child_capability() {
         g.spawn = None;
         g.budget = MicroUsd(1);
     });
-    let g_token = caps::attenuate(&token, &fx.pk, &grandchild).expect("grandchild");
+    let g_token = caps::attenuate(&token, &fx.key, &grandchild).expect("grandchild");
     assert_eq!(caps::grant(&g_token, &fx.pk).expect("verifies"), grandchild);
 }
 

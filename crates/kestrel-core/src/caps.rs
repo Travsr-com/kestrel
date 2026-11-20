@@ -4,9 +4,35 @@
 //! may spawn, its budget ceiling and its expiry. A child's grant is always a subset of its parent's.
 //!
 //! Grants travel as Biscuit tokens ([`CapToken`]). The server signs a root token with its
-//! [`RootKey`]; [`attenuate`] narrows a token for a child by appending one block; [`verify`]
-//! answers allow or deny for one [`Request`]. This module is pure logic: no store, no network, no
-//! clock (the caller passes `now`).
+//! [`RootKey`]; [`attenuate`] narrows a token for a child by appending one block, also signed with
+//! the root key; [`verify`] answers allow or deny for one [`Request`]. This module is pure logic:
+//! no store, no network, no clock (the caller passes `now`).
+//!
+//! # Who can attenuate
+//!
+//! Only the holder of the root key, which is the server. [`attenuate`] takes the [`RootKey`] and
+//! appends the child's block as a Biscuit *third-party block* signed by it
+//! (`Biscuit::third_party_request`, `ThirdPartyRequest::create_block`,
+//! `Biscuit::append_third_party`). The external signature covers the block and the signature of
+//! the block before it, so a signed block cannot be moved to another token.
+//!
+//! A token holder can still append a block with the plain Biscuit API, since a token carries the
+//! private key for its next block. Such a token is refused:
+//!
+//! * At parse time, `DeserializationLimits::allow_attenuations_without_external_signatures` is
+//!   false, so any attenuation block without an external signature fails to deserialize.
+//! * In [`grant`] and [`verify`], every attenuation block's external key must be the root public
+//!   key (a third-party block signed by any other key is refused), and its grant must pass
+//!   `check_subset_of` against the grant before it. A signed but widening chain fails closed.
+//!
+//! Every refusal is [`CapError::InvalidToken`] from [`grant`] and [`attenuate`], and a Deny for
+//! every run from [`verify`].
+//!
+//! **Run binding is a boundary.** A token is bound to the run of its last block. Since only the
+//! server writes blocks, only the server chooses that run: a holder cannot re-bind a token to
+//! another run. The run check in each block holds only when the block is the last one
+//! (`$last != {index} || ...`), because a block cannot name the run of a child that does not exist
+//! yet. The authorizer supplies `last_block` from the verified token.
 //!
 //! # Token encoding
 //!
@@ -23,12 +49,12 @@
 //!   check if action($kind, $name, $amount), $kind != "host"   || {hosts}.contains($name);
 //!   check if action($kind, $name, $amount), $kind != "secret" || {secrets}.contains($name);
 //!   check if action($kind, $name, $amount), $kind != "spawn"  || {agents}.contains($name);
-//!   check if action($kind, $name, $amount), $kind != "spend"  || $amount <= {budget};
+//!   check if action($kind, $name, $amount), $kind != "spend"
+//!       || ($amount >= 0 && $amount <= {budget});
 //!   ```
 //!
 //!   Every `{...}` is a Biscuit parameter (a `Term`), never text pasted into the source, so a name
-//!   such as `a") or true` stays one string. `{agents}` is empty when the grant may not spawn, and
-//!   `{tools}` leaves out `kestrel.spawn` then too (see [`SPAWN_TOOL`]).
+//!   such as `a") or true` stays one string. The sets come from [`Capability::allows`].
 //! * **Context**: canonical JSON of the block's [`Capability`] (version, run, sets, spawn limits,
 //!   budget, expiry to the nanosecond). It is signed with the block, and [`grant`] reads it back.
 //!
@@ -41,12 +67,15 @@
 //! ```
 //!
 //! Kestrel's blocks hold checks only, no facts or rules. Biscuit's default scope lets a check (or
-//! the policy) read only its own block, the authority block and the authorizer, so facts that a
-//! holder puts in an appended block never satisfy anyone else's check.
+//! the policy) read only its own block, the authority block and the authorizer, so facts in an
+//! appended block never satisfy anyone else's check.
 //!
-//! **Run binding.** A token is bound to the run of its last block. A block cannot name the run of a
-//! child that does not exist yet, so the run check holds only when the block is the last one
-//! (`$last != {index} || ...`). The authorizer supplies `last_block` from the verified token.
+//! **Spawning needs [`SPAWN_TOOL`].** `Action::Spawn` is allowed only when `kestrel.spawn` is in
+//! `tools`, `spawn` is Some with `max_depth >= 1`, and the agent is in `agents`. The tool itself
+//! also needs spawn rights, even when listed. In Datalog, `{tools}` leaves out `kestrel.spawn`
+//! and `{agents}` is empty whenever the tool is not allowed.
+//!
+//! **Spending** is allowed for `0 <= amount <= budget`; a negative amount is denied.
 //!
 //! **Expiry.** Biscuit dates are whole seconds. The check compares floor(now) with
 //! floor(expires_at) and denies when they are equal, so it can only deny early within the expiry
@@ -58,18 +87,27 @@
 //! and the proof no longer matches the new last block, so the token fails to verify for everyone.
 //! Resealing does not help either: sealed tokens are refused.
 //!
+//! # Limits
+//!
+//! * Parsing: at most [`MAX_BLOCKS`] blocks (authority included) and 1 MiB, Ed25519 keys only
+//!   (`allowed_internal_signing_algorithms` and `allowed_external_signing_algorithms`), no sealed
+//!   tokens, every attenuation block third-party. [`attenuate`] refuses to add a block past the
+//!   limit.
+//! * Authorizing: at most 10 000 facts, 100 iterations and 100 000 steps, which bound the work
+//!   deterministically. The 1 s wall clock limit is only a backstop.
+//!
 //! # Verification
 //!
 //! [`grant`] and [`verify`] check every signature against the root public key, then decode the
-//! context of every block and take the narrowest of them (a block with missing or malformed data
-//! makes the whole token invalid). [`verify`] then checks the request in Rust to build a precise
-//! deny reason, and only allows when Biscuit's authorizer also allows. The Rust check never allows
-//! what the authorizer denies.
+//! context of every block and check the chain as above (a block with missing or malformed data
+//! makes the whole token invalid). The grant is the last block's. [`verify`] then checks the
+//! request in Rust with [`Capability::allows`] to build a precise deny reason, and only allows
+//! when Biscuit's authorizer also allows. The Rust check never allows what the authorizer denies.
 //!
 //! `max_children` is carried and narrowed, but counting a run's children needs the store, so the
 //! engine enforces it, not this module.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::Duration as StdDuration;
 
@@ -83,7 +121,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 /// The MCP tool that spawns a child run. It is denied whenever the grant may not spawn, even when
-/// the spec lists it.
+/// the spec lists it, and [`Action::Spawn`] is denied unless it is listed.
 pub const SPAWN_TOOL: &str = "kestrel.spawn";
 
 /// What a run may do.
@@ -196,62 +234,58 @@ impl Capability {
         self.spawn.as_ref().filter(|s| s.max_depth >= 1)
     }
 
-    /// Why `tool` is denied, or `None` when it is allowed. The only place the [`SPAWN_TOOL`] rule
-    /// lives: both the Rust check and the Datalog tool set come from here.
-    fn tool_denial(&self, tool: &str) -> Option<String> {
-        if !self.tools.contains(tool) {
-            return Some(format!("tool `{tool}` is not granted"));
-        }
-        if tool == SPAWN_TOOL && self.spawnable().is_none() {
-            return Some(format!(
-                "tool `{tool}` needs spawn rights, and this grant may not spawn"
-            ));
-        }
-        None
-    }
-
-    /// Why `req.action` is denied, or `None` when this grant allows it.
-    fn action_denial(&self, action: &Action) -> Option<String> {
-        let missing = |kind: &str, set: &BTreeSet<String>, name: &str| {
-            (!set.contains(name)).then(|| format!("{kind} `{name}` is not granted"))
+    /// Ok when this grant allows `action`, or a reason a human can read that names what was asked
+    /// for. The one rule set: [`verify`] uses it for the Rust half of its check, the Datalog sets
+    /// of every block are built from it, and callers such as the gateway's `tools/list` can filter
+    /// with it. It does not look at the run or the expiry, which need a [`Request`].
+    ///
+    /// * `Tool`: listed in `tools`; [`SPAWN_TOOL`] also needs spawn rights (`spawn` Some with
+    ///   `max_depth >= 1`).
+    /// * `Host`, `Secret`: listed.
+    /// * `Spawn`: [`SPAWN_TOOL`] listed in `tools`, spawn rights, and the agent in `agents`.
+    /// * `Spend`: `0 <= amount <= budget`.
+    pub fn allows(&self, action: &Action) -> Result<(), String> {
+        let listed = |kind: &str, set: &BTreeSet<String>, name: &str| {
+            if set.contains(name) {
+                Ok(())
+            } else {
+                Err(format!("{kind} `{name}` is not granted"))
+            }
         };
         match action {
-            Action::Tool(name) => self.tool_denial(name),
-            Action::Host(name) => missing("host", &self.hosts, name),
-            Action::Secret(name) => missing("secret", &self.secrets, name),
-            Action::Spawn { agent } => match (&self.spawn, self.spawnable()) {
-                (None, _) => Some(format!(
-                    "spawn of agent `{agent}`: this grant may not spawn"
-                )),
-                (Some(_), None) => Some(format!(
-                    "spawn of agent `{agent}`: no spawn depth left (max_depth 0)"
-                )),
-                (Some(_), Some(limits)) => missing("spawnable agent", &limits.agents, agent),
-            },
-            Action::Spend(amount) => (*amount > self.budget)
-                .then(|| format!("spending {amount} is more than the budget {}", self.budget)),
-        }
-    }
-
-    /// The narrowest of `self` and `later`, bound to the run of `later`.
-    fn meet(&self, later: &Capability) -> Capability {
-        let both =
-            |a: &BTreeSet<String>, b: &BTreeSet<String>| a.intersection(b).cloned().collect();
-        Capability {
-            run: later.run,
-            tools: both(&self.tools, &later.tools),
-            hosts: both(&self.hosts, &later.hosts),
-            secrets: both(&self.secrets, &later.secrets),
-            spawn: match (&self.spawn, &later.spawn) {
-                (Some(a), Some(b)) => Some(SpawnLimits {
-                    max_children: a.max_children.min(b.max_children),
-                    max_depth: a.max_depth.min(b.max_depth),
-                    agents: both(&a.agents, &b.agents),
-                }),
-                _ => None,
-            },
-            budget: self.budget.min(later.budget),
-            expires_at: self.expires_at.min(later.expires_at),
+            Action::Tool(name) => {
+                listed("tool", &self.tools, name)?;
+                if name == SPAWN_TOOL && self.spawnable().is_none() {
+                    return Err(format!(
+                        "tool `{name}` needs spawn rights, and this grant may not spawn"
+                    ));
+                }
+                Ok(())
+            }
+            Action::Host(name) => listed("host", &self.hosts, name),
+            Action::Secret(name) => listed("secret", &self.secrets, name),
+            Action::Spawn { agent } => {
+                if !self.tools.contains(SPAWN_TOOL) {
+                    return Err(format!(
+                        "spawn of agent `{agent}`: tool `{SPAWN_TOOL}` is not granted"
+                    ));
+                }
+                match (&self.spawn, self.spawnable()) {
+                    (None, _) => Err(format!(
+                        "spawn of agent `{agent}`: this grant may not spawn"
+                    )),
+                    (Some(_), None) => Err(format!(
+                        "spawn of agent `{agent}`: no spawn depth left (max_depth 0)"
+                    )),
+                    (Some(_), Some(limits)) => listed("spawnable agent", &limits.agents, agent),
+                }
+            }
+            Action::Spend(amount) if amount.0 < 0 => Err(format!("spending {amount} is negative")),
+            Action::Spend(amount) if *amount > self.budget => Err(format!(
+                "spending {amount} is more than the budget {}",
+                self.budget
+            )),
+            Action::Spend(_) => Ok(()),
         }
     }
 }
@@ -265,9 +299,10 @@ pub enum Action {
     Host(String),
     /// Read a secret.
     Secret(String),
-    /// `kestrel.spawn` of the given agent: needs spawn Some, max_depth >= 1, agent in agents.
+    /// `kestrel.spawn` of the given agent: needs [`SPAWN_TOOL`] in tools, spawn Some,
+    /// max_depth >= 1, agent in agents.
     Spawn { agent: String },
-    /// Spending this much in total: allowed while amount <= budget.
+    /// Spending this much in total: allowed while 0 <= amount <= budget.
     Spend(MicroUsd),
 }
 
@@ -345,8 +380,17 @@ impl fmt::Debug for RootKey {
 pub struct RootPublicKey(PublicKey);
 
 /// A serialized token. `from_bytes` does not verify anything; `grant`, `verify`, `attenuate` do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` prints only the length: the bytes are a bearer credential.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CapToken(Vec<u8>);
+
+impl fmt::Debug for CapToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapToken")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 impl CapToken {
     /// Wraps bytes as they are.
@@ -370,15 +414,24 @@ pub fn issue(root: &RootKey, cap: &Capability) -> Result<CapToken, CapError> {
     biscuit.to_vec().map(CapToken).map_err(token_error)
 }
 
-/// Verifies `parent` against `key`, checks `child.check_subset_of(parent grant)`, and appends one
-/// block. The new token is issued to `child.run`.
+/// Verifies `parent` against `root`, checks `child.check_subset_of(parent grant)`, and appends one
+/// third-party block signed by `root`. The new token is issued to `child.run`. Only the server,
+/// which holds the root key, can attenuate.
+///
+/// Fails with [`CapError::Token`] when the parent already holds [`MAX_BLOCKS`] blocks.
 pub fn attenuate(
     parent: &CapToken,
-    key: &RootPublicKey,
+    root: &RootKey,
     child: &Capability,
 ) -> Result<CapToken, CapError> {
-    let biscuit = parse(parent, key)?;
-    child.check_subset_of(&effective(&biscuit)?)?;
+    let public = root.public();
+    let biscuit = parse(parent, &public)?;
+    child.check_subset_of(&effective(&biscuit, &public)?)?;
+    if biscuit.block_count() >= MAX_BLOCKS {
+        return Err(CapError::Token(format!(
+            "a token holds at most {MAX_BLOCKS} blocks, and this one is full"
+        )));
+    }
     let block = BlockBuilder::new()
         .code_with_params(
             BLOCK_CHECKS,
@@ -387,14 +440,30 @@ pub fn attenuate(
         )
         .map_err(token_error)?
         .context(encode(child)?);
-    let appended = biscuit.append(block).map_err(token_error)?;
+    append_signed(&biscuit, root, block)
+}
+
+/// `biscuit` plus `block` as a third-party block signed by `root`. The signature covers the
+/// block and the signature of the block before it, so it cannot be moved to another token.
+fn append_signed(
+    biscuit: &Biscuit,
+    root: &RootKey,
+    block: BlockBuilder,
+) -> Result<CapToken, CapError> {
+    let signed = biscuit
+        .third_party_request()
+        .and_then(|request| request.create_block(&root.0, block))
+        .map_err(token_error)?;
+    let appended = biscuit
+        .append_third_party(root.0.public(), signed)
+        .map_err(token_error)?;
     appended.to_vec().map(CapToken).map_err(token_error)
 }
 
-/// The verified effective grant of a token: the narrowest of every block, with `run` = the run of
-/// the last block.
+/// The verified effective grant of a token: its last block, after checking that every block
+/// narrows the one before it.
 pub fn grant(token: &CapToken, key: &RootPublicKey) -> Result<Capability, CapError> {
-    effective(&parse(token, key)?)
+    effective(&parse(token, key)?, key)
 }
 
 /// Allow or deny `req`. Any token problem (bad signature, wrong key, stripped block) is a Deny with
@@ -409,7 +478,7 @@ pub fn verify(token: &CapToken, key: &RootPublicKey, req: &Request) -> Decision 
 
 fn check_request(token: &CapToken, key: &RootPublicKey, req: &Request) -> Result<(), String> {
     let biscuit = parse(token, key).map_err(|e| e.to_string())?;
-    let cap = effective(&biscuit).map_err(|e| e.to_string())?;
+    let cap = effective(&biscuit, key).map_err(|e| e.to_string())?;
     if req.run != cap.run {
         return Err(format!(
             "token is bound to run {}, not to run {}",
@@ -419,9 +488,7 @@ fn check_request(token: &CapToken, key: &RootPublicKey, req: &Request) -> Result
     if req.now >= cap.expires_at {
         return Err(format!("token expired at {}", cap.expires_at));
     }
-    if let Some(reason) = cap.action_denial(&req.action) {
-        return Err(reason);
-    }
+    cap.allows(&req.action)?;
     authorize(&biscuit, req).map_err(|e| format!("denied by the token's checks: {e}"))
 }
 
@@ -458,7 +525,7 @@ check if action($kind, $name, $amount), $kind != "tool" || {tools}.contains($nam
 check if action($kind, $name, $amount), $kind != "host" || {hosts}.contains($name);
 check if action($kind, $name, $amount), $kind != "secret" || {secrets}.contains($name);
 check if action($kind, $name, $amount), $kind != "spawn" || {agents}.contains($name);
-check if action($kind, $name, $amount), $kind != "spend" || $amount <= {budget};
+check if action($kind, $name, $amount), $kind != "spend" || ($amount >= 0 && $amount <= {budget});
 "#;
 
 /// The request facts and the one allow policy.
@@ -470,9 +537,18 @@ action({kind}, {name}, {amount});
 allow if action($kind, $name, $amount);
 "#;
 
+/// The Datalog sets come from [`Capability::allows`]: a tool is in `{tools}` only when it is
+/// allowed, and `{agents}` is empty unless [`SPAWN_TOOL`] is allowed (listed, with spawn rights).
 fn block_params(cap: &Capability, index: usize) -> HashMap<String, Term> {
-    let tools = strings(cap.tools.iter().filter(|t| cap.tool_denial(t).is_none()));
-    let agents = strings(cap.spawnable().into_iter().flat_map(|s| s.agents.iter()));
+    let allowed_tool = |t: &&String| cap.allows(&Action::Tool((*t).clone())).is_ok();
+    let tools = strings(cap.tools.iter().filter(allowed_tool));
+    let may_spawn = cap.allows(&Action::Tool(SPAWN_TOOL.to_string())).is_ok();
+    let agents = strings(
+        cap.spawnable()
+            .filter(|_| may_spawn)
+            .into_iter()
+            .flat_map(|s| s.agents.iter()),
+    );
     HashMap::from([
         ("index".to_string(), integer(index)),
         ("run".to_string(), Term::Str(cap.run.to_string())),
@@ -500,25 +576,35 @@ fn integer(n: usize) -> Term {
     Term::Integer(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
-/// Runtime limits for the authorizer. The default allows 1 ms of wall clock, which a debug or
-/// coverage build can exceed for a few blocks and then wrongly denies. The step and fact counts
-/// are the deterministic bound; the time limit is only a backstop.
+/// Runtime limits for the authorizer. The step, iteration and fact counts are the real bound: they
+/// are deterministic and cap the work of [`MAX_BLOCKS`] blocks of fixed checks with room to
+/// spare. The wall clock limit is only a backstop. Biscuit's default of 1 ms is too tight for a
+/// debug or coverage build, which would then wrongly deny, so it is 1 s.
 fn run_limits() -> AuthorizerLimits {
     AuthorizerLimits {
         max_facts: 10_000,
         max_iterations: 100,
-        max_time: StdDuration::from_secs(5),
+        max_time: StdDuration::from_secs(1),
         max_steps: 100_000,
     }
 }
 
-/// What a token may contain to be read at all. Kestrel never seals tokens or uses third-party
-/// blocks, so both are refused; the size cap keeps parsing cheap.
+/// Most blocks a token may hold, the authority block included: a run tree at most 31 levels deep.
+pub const MAX_BLOCKS: usize = 32;
+
+/// What a token may contain to be read at all: at most [`MAX_BLOCKS`] blocks and 1 MiB, Ed25519
+/// keys only, never sealed, and every attenuation block a third-party block. That the third party
+/// is the root key is checked in [`effective`].
 fn deserialization_limits() -> DeserializationLimits {
+    let ed25519 = || Some(HashSet::from([Algorithm::Ed25519]));
     let mut limits = DeserializationLimits::allow_everything();
     limits.allow_sealed_tokens = false;
-    limits.allow_attenuations_with_external_signatures = false;
+    limits.allow_attenuations_with_external_signatures = true;
+    limits.allow_attenuations_without_external_signatures = false;
     limits.max_token_size = 1 << 20;
+    limits.max_blocks = MAX_BLOCKS;
+    limits.allowed_internal_signing_algorithms = ed25519();
+    limits.allowed_external_signing_algorithms = ed25519();
     limits
 }
 
@@ -528,15 +614,31 @@ fn parse(token: &CapToken, key: &RootPublicKey) -> Result<Biscuit, CapError> {
         .map_err(|e| CapError::InvalidToken(e.to_string()))
 }
 
-/// The narrowest grant of every block, bound to the run of the last block.
-fn effective(biscuit: &Biscuit) -> Result<Capability, CapError> {
+/// The grant of the last block, after checking the chain: every attenuation block is signed by
+/// `root` (as a third-party block) and narrows the grant before it. So the last block is the
+/// narrowest, and the run it names was chosen by the server.
+fn effective(biscuit: &Biscuit, root: &RootPublicKey) -> Result<Capability, CapError> {
+    let signers = biscuit.external_public_keys();
+    let contexts = biscuit.context();
+    // Both lists have one entry per block. `zip` would silently skip blocks if they ever did not.
+    if contexts.len() != signers.len() {
+        return Err(CapError::InvalidToken(
+            "the token's blocks and signers do not match".to_string(),
+        ));
+    }
     let mut grant: Option<Capability> = None;
-    for (index, context) in biscuit.context().into_iter().enumerate() {
+    for (index, (context, signer)) in contexts.into_iter().zip(signers).enumerate() {
         let block = decode(index, context.as_deref())?;
-        grant = Some(match grant {
-            Some(earlier) => earlier.meet(&block),
-            None => block,
-        });
+        if let Some(previous) = &grant {
+            let invalid = |why: String| CapError::InvalidToken(format!("block {index}: {why}"));
+            if signer.as_ref() != Some(&root.0) {
+                return Err(invalid("not signed by the root key".to_string()));
+            }
+            block
+                .check_subset_of(previous)
+                .map_err(|e| invalid(format!("does not narrow the block before it: {e}")))?;
+        }
+        grant = Some(block);
     }
     grant.ok_or_else(|| CapError::InvalidToken("the token has no blocks".to_string()))
 }
@@ -753,6 +855,33 @@ mod tests {
     }
 
     #[test]
+    fn datalog_alone_denies_spawning_without_the_spawn_tool() {
+        let key = RootKey::generate();
+        let pk = key.public();
+        let mut c = cap(spawn(1));
+        c.tools.remove(SPAWN_TOOL);
+        let token = issue(&key, &c).expect("issues");
+        let now = at(1_800_000_000);
+        assert!(!datalog(&token, &pk, &req(c.run, agent("reviewer"), now)));
+        assert!(datalog(&token, &pk, &req(c.run, tool("fs.read"), now)));
+    }
+
+    #[test]
+    fn datalog_alone_denies_a_negative_spend() {
+        let key = RootKey::generate();
+        let pk = key.public();
+        let c = cap(None);
+        let token = issue(&key, &c).expect("issues");
+        let now = at(1_800_000_000);
+        for amount in [-1, i64::MIN] {
+            let spend = Action::Spend(MicroUsd(amount));
+            assert!(!datalog(&token, &pk, &req(c.run, spend, now)), "{amount}");
+        }
+        let zero = Action::Spend(MicroUsd(0));
+        assert!(datalog(&token, &pk, &req(c.run, zero, now)));
+    }
+
+    #[test]
     fn datalog_alone_enforces_the_child_block_and_its_run() {
         let key = RootKey::generate();
         let pk = key.public();
@@ -765,7 +894,7 @@ mod tests {
             budget: MicroUsd(10),
             ..parent.clone()
         };
-        let token = attenuate(&root, &pk, &child).expect("attenuates");
+        let token = attenuate(&root, &key, &child).expect("attenuates");
         let now = at(1_800_000_000);
         assert!(datalog(&token, &pk, &req(child.run, tool("fs.read"), now)));
         assert!(!datalog(
@@ -837,8 +966,7 @@ mod tests {
             .code("check if false;")
             .expect("parses")
             .context(encode(&c).expect("encodes"));
-        let appended = parsed.append(block).expect("appends");
-        let forged = CapToken(appended.to_vec().expect("serializes"));
+        let forged = append_signed(&parsed, &key, block).expect("appends");
         assert_eq!(grant(&forged, &pk).expect("verifies"), c);
         let d = verify(
             &forged,

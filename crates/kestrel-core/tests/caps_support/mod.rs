@@ -17,7 +17,8 @@ use kestrel_types::{AgentSpec, MicroUsd, RunId};
 use time::{Duration, OffsetDateTime};
 
 /// The tools, hosts, secrets and spawnable agents of [`root_spec`].
-pub const TOOLS: [&str; 2] = ["fs.read", "fs.write"];
+/// `kestrel.spawn` is listed because spawning needs it (issue #36 scenario 9).
+pub const TOOLS: [&str; 3] = ["fs.read", "fs.write", "kestrel.spawn"];
 pub const HOSTS: [&str; 2] = ["api.github.com", "crates.io"];
 pub const SECRETS: [&str; 2] = ["github_token", "npm_token"];
 pub const AGENTS: [&str; 2] = ["reviewer", "test-writer"];
@@ -44,10 +45,11 @@ pub fn spec_from(capabilities: &str, usd: &str) -> AgentSpec {
     AgentSpec::from_yaml(&yaml).expect("fixture spec parses")
 }
 
-/// Two tools, two hosts, two secrets, may spawn 4 children 2 levels deep, $2 budget.
+/// Two tools plus `kestrel.spawn`, two hosts, two secrets, may spawn 4 children 2 levels deep, $2
+/// budget.
 pub fn root_spec() -> AgentSpec {
     spec_from(
-        "{ mcp: [fs.read, fs.write], network: [api.github.com, crates.io], \
+        "{ mcp: [fs.read, fs.write, kestrel.spawn], network: [api.github.com, crates.io], \
            secrets: [github_token, npm_token], \
            spawn: { max_children: 4, max_depth: 2, agents: [test-writer, reviewer] } }",
         "2.00",
@@ -188,7 +190,7 @@ impl Fx {
     /// Attenuates the root token to `child_cap(edit)`, failing the test if that is refused.
     pub fn child(&self, edit: impl FnOnce(&mut Capability)) -> (Capability, CapToken) {
         let child = self.child_cap(edit);
-        let token = caps::attenuate(&self.token, &self.pk, &child).expect("child attenuates");
+        let token = caps::attenuate(&self.token, &self.key, &child).expect("child attenuates");
         (child, token)
     }
 

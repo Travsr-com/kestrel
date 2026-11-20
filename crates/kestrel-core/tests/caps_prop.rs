@@ -134,7 +134,7 @@ proptest! {
             prop_assert!(subset.is_ok(), "clamped child refused: {:?}", subset);
         }
 
-        let attenuated = caps::attenuate(&parent_token, &pk, &child);
+        let attenuated = caps::attenuate(&parent_token, &key, &child);
         prop_assert_eq!(
             subset.is_ok(),
             attenuated.is_ok(),

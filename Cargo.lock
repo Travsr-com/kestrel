@@ -229,7 +229,6 @@ checksum = "2c3bf746be6281ff67063f156d431e4e4285e997f1c482adc06ee48dbba66ad1"
 dependencies = [
  "base64 0.22.1",
  "biscuit-parser",
- "biscuit-quote",
  "ed25519-dalek",
  "hex",
  "nom",
@@ -256,19 +255,6 @@ dependencies = [
  "quote",
  "thiserror",
  "time",
-]
-
-[[package]]
-name = "biscuit-quote"
-version = "0.4.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "306287f96a32d02842a544b220e43253083e7d7fdc9ed82a71466f5ffdb890ac"
-dependencies = [
- "biscuit-parser",
- "manyhow",
- "proc-macro2",
- "quote",
- "syn 3.0.10",
 ]
 
 [[package]]
@@ -618,7 +604,6 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
- "pkcs8",
  "signature",
 ]
 
@@ -631,7 +616,6 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "rand_core",
- "serde",
  "sha2",
  "signature",
  "subtle",
@@ -1449,29 +1433,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
-name = "manyhow"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1704b073316272a6785b70599f91f73b49022c2e290b065591ee6b9109ed8c7"
-dependencies = [
- "manyhow-macros",
- "proc-macro2",
- "quote",
- "syn 3.0.10",
-]
-
-[[package]]
-name = "manyhow-macros"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31601db71f1f5fb6f831a18aa3052d13a62528ee4f2cba7e8c9a5e258d953725"
-dependencies = [
- "proc-macro-utils",
- "proc-macro2",
- "quote",
-]
-
-[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1711,17 +1672,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
  "toml_edit 0.25.19+spec-1.1.0",
-]
-
-[[package]]
-name = "proc-macro-utils"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeaf08a13de400bc215877b5bdc088f241b12eb42f0a548d3390dc1c56bb7071"
-dependencies = [
- "proc-macro2",
- "quote",
- "smallvec",
 ]
 
 [[package]]

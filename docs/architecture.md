@@ -404,9 +404,9 @@ Traces for future training are a view over `events` + `model_calls` + `approvals
 kestrel/
 ├── Cargo.toml                 # MSRV 1.89 (rusqlite 0.41)
 ├── crates/
-│   ├── kestrel-types/         # Agent spec, Run, Event, Capability, errors
+│   ├── kestrel-types/         # Agent spec, Run, Event, errors
 │   ├── kestrel-store/         # EventLog + state: SQLite (local), Postgres (server)
-│   ├── kestrel-core/          # scheduler, run state machine, policy, budgets, triggers
+│   ├── kestrel-core/          # scheduler, run state machine, policy, Capability, budgets, triggers
 │   ├── kestrel-sandbox/       # SandboxDriver: gvisor, firecracker, apple, docker-runc; egress proxy
 │   ├── kestrel-gateway/       # LLM proxy: masking, routing, caching, metering
 │   ├── kestrel-agent/         # native agent loop + adapters (claude-code, opencode, codex)
