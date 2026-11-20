@@ -67,9 +67,27 @@ cache_write_per_mtok = "3.75"
 > bridge network, so the default bind may not work. Set `listen` and `gateway.advertise_url`
 > yourself there.
 
-> **Docker Desktop (macOS and Windows) does not work with the default bind.** The docker bridge
-> address lives inside a VM there, so set `gateway.advertise_url` or `gateway.listen` yourself.
-> (Kestrel's gVisor driver is Linux only today anyway.)
+> **Docker in a VM (Rancher Desktop, Docker Desktop, Colima).** Set `gateway.docker_host` to tell
+> Kestrel where the Docker daemon runs:
+>
+> ```toml
+> [gateway]
+> docker_host = "auto"   # or "native", or "vm"
+> ```
+>
+> * `auto` (the default) tries to bind the Docker bridge IP on your machine. If it works, Docker
+>   runs on this host (`native`). If the address is not one of yours, Docker runs in a VM (`vm`).
+>   Kestrel prints which one it chose when it starts.
+> * Set `native` or `vm` yourself if `auto` guesses wrong.
+> * In `vm` mode the gateway binds `127.0.0.1` by default, because the VM reaches your machine
+>   through loopback. `gateway.listen` still wins if you set it.
+>
+> Rancher Desktop was tested. Docker Desktop and Colima are expected to work but are not
+> verified. On Rancher Desktop, keep the workspace folder (the folder of the database) under your
+> home directory, because only the home directory is shared into the VM.
+>
+> **Known limit:** on Rancher Desktop's shared mount, agents that run git inside the sandbox can
+> fail (issue #54). Use native Docker for coding agents until that is fixed.
 >
 > **If `docker network inspect bridge` lists an IPv6 range first,** Kestrel cannot read the bridge
 > IP. Set `gateway.listen` explicitly.

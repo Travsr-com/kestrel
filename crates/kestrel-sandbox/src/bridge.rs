@@ -163,7 +163,7 @@ impl GatewayBridge {
 
         let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={MAX_CHILDREN}");
         let target = format!("TCP:host.docker.internal:{host_port}");
-        let run = argv(&[
+        let mut run = argv(&[
             "docker",
             "run",
             "--detach",
@@ -175,8 +175,11 @@ impl GatewayBridge {
             &db_label,
             "--network",
             "bridge",
-            "--add-host",
-            "host.docker.internal:host-gateway",
+        ]);
+        if spec.add_host_gateway {
+            run.extend(argv(&["--add-host", "host.docker.internal:host-gateway"]));
+        }
+        run.extend(argv(&[
             "--restart",
             "no",
             "--cap-drop",
@@ -195,7 +198,7 @@ impl GatewayBridge {
             &IDLE_TIMEOUT_SECS.to_string(),
             &listen,
             &target,
-        ]);
+        ]));
         let connect = argv(&["docker", "network", "connect", NETWORK, &name]);
         // The name is not used by sandboxes: Docker's DNS does not answer inside gVisor, so they
         // reach the bridge by its IP on the internal network.
