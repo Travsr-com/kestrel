@@ -839,6 +839,7 @@ async fn sandbox_accepts(workspace: PathBuf) {
         cpu_millis: 1000,
         memory_mb: 256,
         network: NetworkPolicy::None,
+        labels: BTreeMap::new(),
     };
     match GvisorDriver::new(Arc::new(FakeDocker)).create(&spec).await {
         Err(e @ SandboxError::InvalidWorkspace { .. }) => panic!("sandbox rejected: {e}"),

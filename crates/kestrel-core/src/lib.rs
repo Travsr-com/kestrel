@@ -12,7 +12,7 @@ mod slots;
 pub mod workspace;
 pub use workspace::{WorkspaceError, Workspaces};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -51,6 +51,9 @@ pub enum EngineError {
     /// CLI resolves the path when it submits the run.
     #[error("git-clone repo `{}` must be an absolute path", repo.display())]
     RelativeRepo { repo: PathBuf },
+    /// `recover` was called while `run_forever` is active.
+    #[error("the engine is running; recover must run before run_forever or after shutdown")]
+    AlreadyRunning,
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -107,6 +110,17 @@ pub struct RecoveryReport {
     /// Runs that were `Running` when the previous engine stopped. Their sandbox is gone, so they
     /// are now `Suspended(Error("engine restarted"))`.
     pub interrupted: Vec<RunId>,
+}
+
+/// What [`Engine::shutdown`] could and could not clean up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Runs whose sandbox was destroyed.
+    pub destroyed: Vec<RunId>,
+    /// Runs whose sandbox could not be destroyed, with the driver's error text.
+    pub failed: Vec<(RunId, String)>,
+    /// Runs whose sandbox was still being destroyed (or created) when the grace period ended.
+    pub timed_out: Vec<RunId>,
 }
 
 /// Status message of a run that was `Running` when the previous engine stopped.
@@ -271,6 +285,12 @@ impl Engine {
                 _ = tick.tick() => self.inner.poll(&mut scheduler)?,
             }
         }
+    }
+
+    /// Stops the engine and destroys every sandbox, waiting at most `grace` in total.
+    /// `run_forever` has returned by the time this does.
+    pub async fn shutdown(&self, _grace: Duration) -> ShutdownReport {
+        todo!("graceful shutdown (#19)")
     }
 
     /// Call once at startup, before `run_forever`.
@@ -793,6 +813,7 @@ impl Actor {
             network: NetworkPolicy::GatewayOnly {
                 gateway: self.inner.gateway_url.clone(),
             },
+            labels: BTreeMap::new(),
         })
     }
 

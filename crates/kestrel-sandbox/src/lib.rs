@@ -121,7 +121,13 @@ pub struct LaunchSpec {
     pub cpu_millis: u32,
     pub memory_mb: u64,
     pub network: NetworkPolicy,
+    /// Labels set on the container (`--label key=value`), so a later sweep can find containers
+    /// a crashed engine left behind. The engine sets [`RUN_LABEL`] to the run id.
+    pub labels: BTreeMap<String, String>,
 }
+
+/// Label key every sandbox of a run carries; the value is the run id.
+pub const RUN_LABEL: &str = "kestrel.run";
 
 /// A created sandbox. `id` is the container id printed by the CLI on create.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +268,11 @@ pub trait SandboxDriver: Send + Sync {
     async fn stop(&self, h: &SandboxHandle) -> Result<()>;
     /// Idempotent.
     async fn destroy(&self, h: &SandboxHandle) -> Result<()>;
+    /// Sandboxes carrying the [`RUN_LABEL`] label, running or not, whether or not this process
+    /// created them. Drivers that cannot list by label return nothing (the default).
+    async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.

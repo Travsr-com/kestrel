@@ -61,6 +61,7 @@ fn launch_spec(runtime: Runtime, name: &str) -> LaunchSpec {
         network: NetworkPolicy::GatewayOnly {
             gateway: Url::parse("http://172.18.0.2:7070/").expect("url"),
         },
+        labels: Default::default(),
     }
 }
 
