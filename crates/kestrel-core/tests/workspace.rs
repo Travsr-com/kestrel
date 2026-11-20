@@ -278,8 +278,7 @@ fn s1_branch_name_uses_the_run_id_tail() {
 // Scenario 2: git-clone gives each run its own clone and branch (fake git, exact argv).
 // ---------------------------------------------------------------------------------------------
 
-/// `git clone --local --no-hardlinks <repo> <path>` (plus anything in `extra`, inserted before the
-/// source), then the branch checkout inside the fresh clone with host hooks disabled.
+/// `git clone --local --no-hardlinks <extra> -- <repo> <path>` (`extra` goes before the `--`), then the branch checkout inside the fresh clone with host hooks disabled.
 fn expected_calls(
     repo: &str,
     source: &str,
@@ -290,7 +289,7 @@ fn expected_calls(
     let p = path.to_str().unwrap();
     let mut clone = s(&["git", "clone", "--local", "--no-hardlinks"]);
     clone.extend(s(extra));
-    clone.extend(s(&[source, p]));
+    clone.extend(s(&["--", source, p]));
     vec![
         s(&["git", "-C", repo, "rev-parse", "--git-dir"]),
         clone,
@@ -571,8 +570,13 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
             "/srv/repos/app",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "transfer.fsckObjects=true",
+            "-c",
+            "protocol.ext.allow=never",
             "fetch",
             "--no-tags",
+            "--",
             path.to_str().unwrap(),
             "kestrel/run-123456789abc:kestrel/run-123456789abc",
         ])]

@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kestrel_sandbox::{CommandRunner, validate_workspace_path};
+use kestrel_sandbox::{CommandRunner, EnvScrub, validate_workspace_path};
 use kestrel_types::{RunId, WorkspaceSpec};
 
 /// Why a workspace could not be prepared.
@@ -53,6 +53,51 @@ pub enum WorkspaceError {
         "invalid workspace path `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
     )]
     InvalidPath { path: String },
+    /// `prepare` was given a relative `git-clone` repo path; it is refused before any git call.
+    #[error("git-clone repo `{}` must be an absolute path", repo.display())]
+    RelativeRepo { repo: PathBuf },
+    /// `<clone>/.git` is missing, a file (gitfile) or a symlink, so `fetch_back` refuses to
+    /// fetch from the clone. `clone` is the clone directory.
+    #[error("`.git` in `{}` is not a real directory; refusing to fetch from it", clone.display())]
+    GitDirNotADirectory { clone: PathBuf },
+    /// The clone has an `objects/info/alternates` or `http-alternates` entry, which could make
+    /// the fetch read objects from another repository, so `fetch_back` refuses.
+    #[error("clone `{}` has object alternates; refusing to fetch from it", clone.display())]
+    AlternatesPresent { clone: PathBuf },
+}
+
+/// The environment every host git call runs with: removes `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_CONFIG_*`, `GIT_SSH*` and `GIT_EXEC_PATH`; sets `GIT_CONFIG_NOSYSTEM=1` and
+/// `GIT_TERMINAL_PROMPT=0`.
+pub fn git_env_scrub() -> EnvScrub {
+    let names = |list: &[&str]| list.iter().map(|n| (*n).to_string()).collect();
+    EnvScrub {
+        remove: names(&[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_*",
+            "GIT_SSH*",
+            "GIT_EXEC_PATH",
+            "GIT_TRACE*",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_PROTOCOL_FROM_USER",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PAGER",
+        ]),
+        set: vec![
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ],
+    }
 }
 
 /// Creates and finds per-run workspaces under one root directory.
@@ -88,6 +133,11 @@ impl Workspaces {
         run: RunId,
         spec: &WorkspaceSpec,
     ) -> Result<PathBuf, WorkspaceError> {
+        if let WorkspaceSpec::GitClone { repo, .. } = spec
+            && repo.is_relative()
+        {
+            return Err(WorkspaceError::RelativeRepo { repo: repo.clone() });
+        }
         let path = self.path_for(run);
         let text = validate_workspace_path(&path)
             .map_err(|_| WorkspaceError::InvalidPath {
@@ -141,7 +191,7 @@ impl Workspaces {
             }
             None => repo_text.to_string(),
         };
-        clone.extend([source, dest.to_string()]);
+        clone.extend(["--".to_string(), source, dest.to_string()]);
         let branch = Self::branch_for(run);
         let checkout = argv(&[
             "git",
@@ -191,7 +241,25 @@ impl Workspaces {
             repo: repo.to_path_buf(),
         })?;
         let branch = Self::branch_for(run);
-        let clone = self.path_for(run).to_string_lossy().into_owned();
+        let clone_dir = self.path_for(run);
+        // The clone is the agent's: refuse anything that could point git at another repo.
+        // A clone directory that does not exist at all is left for git to report.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&clone_dir).await {
+            let objects_info = clone_dir.join(".git/objects/info");
+            let git_dir = tokio::fs::symlink_metadata(clone_dir.join(".git")).await;
+            if !meta.is_dir() || !git_dir.is_ok_and(|m| m.is_dir()) {
+                return Err(WorkspaceError::GitDirNotADirectory { clone: clone_dir });
+            }
+            for name in ["alternates", "http-alternates"] {
+                if tokio::fs::symlink_metadata(objects_info.join(name))
+                    .await
+                    .is_ok()
+                {
+                    return Err(WorkspaceError::AlternatesPresent { clone: clone_dir });
+                }
+            }
+        }
+        let clone = clone_dir.to_string_lossy().into_owned();
         // No `+` on the refspec: a branch that cannot fast-forward is an error on purpose.
         let command = argv(&[
             "git",
@@ -199,8 +267,13 @@ impl Workspaces {
             repo_text,
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "transfer.fsckObjects=true",
+            "-c",
+            "protocol.ext.allow=never",
             "fetch",
             "--no-tags",
+            "--",
             &clone,
             &format!("{branch}:{branch}"),
         ]);
@@ -226,7 +299,10 @@ impl Workspaces {
         argv: &[String],
         repo: &Path,
     ) -> Result<kestrel_sandbox::CommandOutput, WorkspaceError> {
-        self.runner.run(argv).await.map_err(io(repo))
+        self.runner
+            .run_with_env(argv, &git_env_scrub())
+            .await
+            .map_err(io(repo))
     }
 }
 
