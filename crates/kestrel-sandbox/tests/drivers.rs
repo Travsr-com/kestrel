@@ -367,3 +367,28 @@ async fn process_runner_spawn_tags_lines_by_stream() {
     assert!(lines.contains(&line(StdStream::Stderr, "err")), "{lines:?}");
     assert_eq!(lines.len(), 2);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_runner_run_with_env_removes_exact_names_and_prefixes_then_sets() {
+    use kestrel_sandbox::EnvScrub;
+
+    // `PATH` is removed by name, `HOM*` removes `HOME` by prefix, and `set` wins last.
+    let scrub = EnvScrub {
+        remove: s(&["PATH", "HOM*"]),
+        set: vec![("KESTREL_SCRUB_TEST".to_string(), "1".to_string())],
+    };
+    let out = ProcessRunner
+        .run_with_env(&s(&["/usr/bin/env"]), &scrub)
+        .await
+        .expect("env");
+    assert_eq!(out.status, 0, "{}", out.stderr);
+    let names: Vec<&str> = out
+        .stdout
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        .collect();
+    assert!(names.contains(&"KESTREL_SCRUB_TEST"), "{names:?}");
+    assert!(!names.contains(&"PATH"), "{names:?}");
+    assert!(!names.contains(&"HOME"), "{names:?}");
+}

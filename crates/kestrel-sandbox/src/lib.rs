@@ -224,13 +224,17 @@ pub struct ProcessRunner;
 #[async_trait]
 impl CommandRunner for ProcessRunner {
     async fn run(&self, argv: &[String]) -> std::io::Result<CommandOutput> {
-        let out = command(argv)?.output().await?;
-        Ok(CommandOutput {
-            // A process killed by a signal has no code.
-            status: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        output_of(command(argv)?).await
+    }
+
+    async fn run_with_env(
+        &self,
+        argv: &[String],
+        env: &EnvScrub,
+    ) -> std::io::Result<CommandOutput> {
+        let mut cmd = command(argv)?;
+        env.apply(&mut cmd);
+        output_of(cmd).await
     }
 
     async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess> {
@@ -256,6 +260,38 @@ impl CommandRunner for ProcessRunner {
             exit: Box::pin(async move { rx.await.map_err(std::io::Error::other)? }),
         })
     }
+}
+
+impl EnvScrub {
+    /// Applies `remove` (exact names, or prefixes ending in `*`), then `set`, to `cmd`.
+    fn apply(&self, cmd: &mut tokio::process::Command) {
+        for pattern in &self.remove {
+            match pattern.strip_suffix('*') {
+                Some(prefix) => {
+                    for (name, _) in std::env::vars_os() {
+                        if name.to_string_lossy().starts_with(prefix) {
+                            cmd.env_remove(name);
+                        }
+                    }
+                }
+                None => {
+                    cmd.env_remove(pattern);
+                }
+            }
+        }
+        cmd.envs(self.set.iter().map(|(k, v)| (k, v)));
+    }
+}
+
+/// Runs `cmd` to completion and captures its output.
+async fn output_of(mut cmd: tokio::process::Command) -> std::io::Result<CommandOutput> {
+    let out = cmd.output().await?;
+    Ok(CommandOutput {
+        // A process killed by a signal has no code.
+        status: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 /// `argv[0]` with `argv[1..]` as separate arguments. No shell is involved.
