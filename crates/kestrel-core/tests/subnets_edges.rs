@@ -125,7 +125,7 @@ async fn when_docker_refuses_every_block_left_the_run_fails_naming_the_pool() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_engine_gives_up_after_a_few_taken_blocks() {
+async fn the_engine_tries_every_free_block_once_before_it_gives_up() {
     let (mut h, driver, pool) = harness(Mode::AlwaysTaken, "10.200.0.0/25");
     h.start();
     let a = h.submit(spec()).await;
@@ -135,8 +135,8 @@ async fn the_engine_gives_up_after_a_few_taken_blocks() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .len();
-    assert_eq!(tried, 8);
-    assert_eq!(pool.available(), 16 - 8);
+    assert_eq!(tried, 16);
+    assert_eq!(pool.available(), 0);
 }
 
 #[tokio::test(start_paused = true)]

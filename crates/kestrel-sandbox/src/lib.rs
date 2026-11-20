@@ -24,7 +24,7 @@ use bridge::is_container_name;
 pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
 pub use subnet::{
     DEFAULT_SUBNET_POOL, Ipv4Cidr, SUBNET_BLOCK_PREFIX, Subnet, SubnetError, SubnetPool,
-    docker_subnets, host_routes,
+    docker_subnets, docker_subnets_except_instance, host_routes,
 };
 
 /// Errors from sandbox drivers and host detection.
@@ -749,7 +749,8 @@ impl Cli {
                 .await
                 .map_err(step("connect"))?;
             let format = format!("{{{{(index .NetworkSettings.Networks \"{name}\").IPAddress}}}}");
-            let inspect = self.argv(&["inspect", "--format", &format, bridge]);
+            // `container inspect`: a network or image named like the bridge cannot match.
+            let inspect = self.argv(&["container", "inspect", "--format", &format, bridge]);
             let answer = self
                 .run(runner, &inspect, None)
                 .await
@@ -778,8 +779,9 @@ impl Cli {
     }
 
     /// Disconnects `bridge` (when given) from network `name`, then removes the network. A
-    /// network or connection that is already gone is fine. Both steps always run; the first
-    /// failure is returned.
+    /// network or connection that is already gone is fine. Both steps always run. The result is
+    /// the `network rm` one: once the network is gone its block is free, whatever the disconnect
+    /// said (for example that the bridge container is gone); if `rm` fails, that is the error.
     async fn remove_network(
         &self,
         runner: &dyn CommandRunner,
@@ -790,20 +792,17 @@ impl Cli {
             return Ok(());
         }
         check_network_name(name)?;
-        let mut first = Ok(());
         if let Some(bridge) = bridge {
             let disconnect = self.argv(&["network", "disconnect", "--force", name, bridge]);
-            first = self
+            // A disconnect that failed for a reason that matters also makes `rm` fail.
+            let _ = self
                 .run_tolerating(runner, &disconnect, &NETWORK_GONE)
-                .await
-                .map(drop);
+                .await;
         }
         let rm = self.argv(&["network", "rm", name]);
-        let removed = self
-            .run_tolerating(runner, &rm, &NETWORK_GONE)
+        self.run_tolerating(runner, &rm, &NETWORK_GONE)
             .await
-            .map(drop);
-        first.and(removed)
+            .map(drop)
     }
 
     /// See [`SandboxDriver::sweep_networks`]. Without a bridge the networks are only removed.
@@ -844,7 +843,8 @@ impl Cli {
     }
 }
 
-/// Docker's answers for a network, or a connection to one, that is already gone.
+/// Docker's answers for a network, or a connection to one, that is already gone. Shared with the
+/// subnet plan, where a network removed between `ls` and `inspect` is skipped.
 const NETWORK_GONE: [&str; 3] = ["not found", "No such network", "is not connected"];
 
 /// What a driver knows about networks: its gateway bridge container and its instance id.

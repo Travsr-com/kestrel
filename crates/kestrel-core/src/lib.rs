@@ -62,9 +62,11 @@ pub enum EngineError {
     /// `recover` was called while `run_forever` is active.
     #[error("the engine is already running; wait until run_forever has returned")]
     AlreadyRunning,
-    /// No block of the subnet pool could be used for the run's network: none is free, or docker
-    /// refused every one tried as taken by another network.
-    #[error("no usable network block left in subnet pool {pool}")]
+    /// No block of the subnet pool could be used for the run's network: docker refused every
+    /// free one as taken by a network Kestrel did not know about when it planned the pool.
+    #[error(
+        "no usable network block left in subnet pool {pool}: docker networks made outside Kestrel took the remaining blocks. Set gateway.subnet_pool to a free range"
+    )]
     NoSubnet { pool: Ipv4Cidr },
 }
 
@@ -176,8 +178,10 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// The run actor turns the block into the run's network with `SandboxDriver::prepare_network`
 /// before it builds the launch plan, and the gateway URL of the run points at the bridge on that
 /// network. A block docker says is taken by another network is excluded from the pool and
-/// another one is tried, a few times. A driver without run networks gives the block back at
-/// once, and the run uses the shared network as before. When the run ends, its sandbox is
+/// another one is tried, until the pool has no free block left; only then does the run fail. A
+/// run that already has a network (its stopped sandbox outlived a `run_forever` that was stopped
+/// and started again) reuses it. A driver without run networks gives the block back at once, and
+/// the run uses the shared network as before. When the run ends, its sandbox is
 /// destroyed, then its network removed, then its block freed. A suspended run keeps its network
 /// and block while its stopped sandbox exists. [`Engine::shutdown`] removes the networks of the
 /// sandboxes it destroys, and [`Engine::recover`] removes every leftover labelled run network.
@@ -1024,9 +1028,6 @@ fn run_gateway(gateway: &Url, token: &str) -> Url {
     url
 }
 
-/// How often the actor tries another block when docker says the one it tried is taken.
-const PREPARE_ATTEMPTS: usize = 8;
-
 /// An `AgentLog` noting that `cmd` does not apply to a run in `status`.
 fn ignored(cmd: &ControlCommand, status: &RunStatus) -> EventKind {
     EventKind::AgentLog {
@@ -1168,12 +1169,16 @@ impl Actor {
     /// While suspended: applies one command. True when the run should run again.
     async fn wait_for_resume(&mut self) -> Result<bool> {
         let cmd = recv(&mut self.cmds).await;
+        // Only these may have been given a slot (and a block) by the scheduler. Any other command
+        // leaves both alone: a resume it arrived with may be right behind it, and its slot and
+        // block must still be there when it is read.
+        let resumes = matches!(cmd, ControlCommand::Resume | ControlCommand::Approve(_));
         let next = self.on_command(cmd)?;
         // An approval granted after a restart leaves the run `Running` with nothing attached.
         let go = matches!(next, Next::Resume) || self.status == RunStatus::Running;
-        if !go {
-            // A resume that was declined, or a cancel: nothing here needs the slot (or a block)
-            // taken for it.
+        if !go && resumes {
+            // A resume that was declined: nothing here needs the slot (or a block) taken for it.
+            // A cancel or a reject ends the run, which gives both back.
             self.sync_slot();
             self.inner.free_unused_block(self.id);
         }
@@ -1240,16 +1245,26 @@ impl Actor {
 
     /// The run's own network on a block of the engine's pool, when the engine has one and the
     /// driver makes run networks. Registered with the engine so it is removed when the run ends
-    /// (or by `shutdown`). A block docker says is taken is excluded from the pool and another one
-    /// is tried, at most [`PREPARE_ATTEMPTS`] times; any other failure frees the block and fails
-    /// the run.
+    /// (or by `shutdown`). A run that already has a network reuses it. A block docker says is
+    /// taken is excluded from the pool and another one is tried, until the pool has no free
+    /// block left ([`EngineError::NoSubnet`]); any other failure frees the block and fails the
+    /// run.
     async fn prepare_network(&mut self, idx: usize) -> Result<Option<PreparedNetwork>> {
         let inner = self.inner.clone();
         let Some(pool) = &inner.subnets else {
             return Ok(None);
         };
+        // A run that has a network keeps it: its stopped sandbox outlived the actor that made
+        // it (`run_forever` stopped and started again without `recover`). The run's spec picks
+        // the same driver, and docker would refuse a second network of that name.
+        let existing = inner.live().networks.get(&self.id).cloned();
+        if let Some((_, net)) = existing {
+            return Ok(Some(net));
+        }
         let driver = &inner.drivers[idx];
-        for _ in 0..PREPARE_ATTEMPTS {
+        // Every taken block is excluded, so each attempt leaves one block fewer and this ends
+        // when the pool has none free. The bound is only a safety net.
+        for _ in 0..pool.capacity() {
             let Some(subnet) = inner.block_for(self.id) else {
                 break;
             };

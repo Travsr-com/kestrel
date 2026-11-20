@@ -67,6 +67,7 @@ fn connect() -> Vec<String> {
 fn inspect() -> Vec<String> {
     s(&[
         "docker",
+        "container",
         "inspect",
         "--format",
         &format!("{{{{(index .NetworkSettings.Networks \"{NET}\").IPAddress}}}}"),

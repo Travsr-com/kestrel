@@ -1,0 +1,357 @@
+//! Review fixes for run networks on the engine side (PR #62):
+//!
+//! * Taken blocks ("Pool overlaps") are skipped until the pool has none left, not a fixed number
+//!   of times, and only then does the run fail, saying why and what to set.
+//! * A run that already has a network (for example after `run_forever` was stopped and started
+//!   again without `recover`) reuses it instead of making a second one.
+//! * A command that is not a resume does not give back the block reserved for a pending resume.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod common;
+
+use std::collections::{BTreeSet, VecDeque};
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use common::*;
+use kestrel_core::{Engine, Limits};
+use kestrel_sandbox::{
+    ExitStatus, LaunchSpec, NetworkPolicy, OutputStream, PreparedNetwork, SandboxDriver,
+    SandboxError, SandboxHandle, Subnet, SubnetPool,
+};
+use kestrel_store::ControlCommand;
+use kestrel_types::{MicroUsd, RunId, RunStatus, SuspendReason};
+use url::Url;
+
+use RunStatus::{Running, Suspended};
+
+const MANUAL: RunStatus = Suspended(SuspendReason::Manual);
+const GRACE: Duration = Duration::from_secs(30);
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `kestrel-gw-<last 12 hex chars of the run id>`.
+fn network_name(run: RunId) -> String {
+    let id = run.to_string();
+    format!("kestrel-gw-{}", &id[id.len() - 12..])
+}
+
+/// One `prepare_network` call: the run, the block, and whether it made a network.
+type Prepared = (RunId, String, bool);
+
+#[derive(Default)]
+struct NetState {
+    /// Consumed one per `prepare_network`: `true` answers that the block is taken.
+    taken: Mutex<VecDeque<bool>>,
+    prepared: Mutex<Vec<Prepared>>,
+    released: Mutex<Vec<String>>,
+    /// Networks that exist, by name. A second `network create` with the same name fails, as in
+    /// docker.
+    live: Mutex<BTreeSet<String>>,
+}
+
+/// The shared `FakeDriver` plus run networks that behave like docker's.
+#[derive(Clone)]
+struct NetDriver {
+    inner: FakeDriver,
+    state: Arc<NetState>,
+}
+
+impl NetDriver {
+    fn new(inner: FakeDriver) -> NetDriver {
+        NetDriver {
+            inner,
+            state: Arc::default(),
+        }
+    }
+
+    fn taken_next(&self, n: usize) {
+        lock(&self.state.taken).extend(std::iter::repeat_n(true, n));
+    }
+
+    fn prepared(&self) -> Vec<Prepared> {
+        lock(&self.state.prepared).clone()
+    }
+
+    fn released(&self) -> Vec<String> {
+        lock(&self.state.released).clone()
+    }
+}
+
+#[async_trait]
+impl SandboxDriver for NetDriver {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn is_strong(&self) -> bool {
+        true
+    }
+
+    async fn create(&self, spec: &LaunchSpec) -> kestrel_sandbox::Result<SandboxHandle> {
+        self.inner.create(spec).await
+    }
+
+    async fn start(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<OutputStream> {
+        self.inner.start(h).await
+    }
+
+    async fn wait(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<ExitStatus> {
+        self.inner.wait(h).await
+    }
+
+    async fn stop(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<()> {
+        self.inner.stop(h).await
+    }
+
+    async fn destroy(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<()> {
+        self.inner.destroy(h).await
+    }
+
+    async fn prepare_network(
+        &self,
+        run: RunId,
+        subnet: &Subnet,
+    ) -> kestrel_sandbox::Result<Option<PreparedNetwork>> {
+        let cidr = subnet.cidr().to_string();
+        if lock(&self.state.taken).pop_front().unwrap_or(false) {
+            lock(&self.state.prepared).push((run, cidr, false));
+            return Err(SandboxError::SubnetTaken {
+                subnet: subnet.cidr(),
+            });
+        }
+        let name = network_name(run);
+        let made = lock(&self.state.live).insert(name.clone());
+        lock(&self.state.prepared).push((run, cidr, made));
+        if !made {
+            return Err(SandboxError::RunNetwork {
+                step: "create",
+                network: name.clone(),
+                stderr: format!(
+                    "Error response from daemon: network with name {name} already exists"
+                ),
+            });
+        }
+        Ok(Some(PreparedNetwork {
+            name,
+            gateway_host: Ipv4Addr::from(u32::from(subnet.cidr().addr()) + 2),
+            subnet: subnet.clone(),
+        }))
+    }
+
+    async fn release_network(&self, network: &PreparedNetwork) -> kestrel_sandbox::Result<()> {
+        lock(&self.state.live).remove(&network.name);
+        lock(&self.state.released).push(network.name.clone());
+        Ok(())
+    }
+}
+
+fn with(mut h: Harness, pool: &str) -> (Harness, NetDriver, Arc<SubnetPool>) {
+    let net = NetDriver::new(h.driver.clone());
+    let pool = Arc::new(SubnetPool::parse(pool).expect("pool"));
+    let engine = Engine::new(
+        h.store.clone(),
+        vec![Box::new(net.clone())],
+        adapter_factory(h.adapters.clone()),
+        Url::parse(GATEWAY).expect("gateway url"),
+        Limits {
+            max_concurrent_runs: 4,
+            poll_interval: POLL,
+        },
+    )
+    .with_subnets(pool.clone());
+    h.engine = Arc::new(engine);
+    (h, net, pool)
+}
+
+fn harness(pool: &str) -> (Harness, NetDriver, Arc<SubnetPool>) {
+    with(Harness::new(4), pool)
+}
+
+async fn running(h: &Harness, id: RunId) {
+    until("running", || h.is(id, &Running)).await;
+}
+
+// 2: taken blocks are skipped while the pool has free ones ------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn eight_taken_blocks_in_a_row_do_not_fail_a_run_while_blocks_remain() {
+    let (mut h, net, pool) = harness("10.200.0.0/24");
+    net.taken_next(8);
+    let _sa = h.driver.live();
+    h.start();
+    let a = h.submit(spec()).await;
+    until("running or failed", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    assert!(h.is(a, &Running), "failed: {:?}", h.is_failed(a));
+    let tried: Vec<String> = net.prepared().into_iter().map(|(_, b, _)| b).collect();
+    assert_eq!(tried.len(), 9, "{tried:?}");
+    assert_eq!(tried[8], "10.200.0.64/29", "the 9th block");
+    assert_eq!(pool.available(), 32 - 9, "8 excluded, 1 in use");
+    let plans = h.adapters.plans();
+    assert_eq!(plans[0][0].gateway_url.host_str(), Some("10.200.0.66"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_every_block_is_taken_the_run_fails_saying_why_and_what_to_set() {
+    let (mut h, net, pool) = harness("10.200.0.0/27");
+    net.taken_next(4);
+    h.start();
+    let a = h.submit(spec()).await;
+    until("failed", || h.is_failed(a).is_some()).await;
+    let msg = h.is_failed(a).unwrap_or_default();
+    assert!(msg.contains("subnet pool 10.200.0.0/27"), "{msg}");
+    assert!(msg.contains("outside Kestrel"), "{msg}");
+    assert!(msg.contains("gateway.subnet_pool"), "{msg}");
+    assert_eq!(net.prepared().len(), 4, "every block was tried once");
+    assert_eq!(pool.available(), 0);
+    assert_eq!(h.driver.count(&Call::Create), 0);
+}
+
+// 3: a run that has a network keeps it across a run_forever restart ----------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_after_run_forever_restarts_without_recover_reuses_the_runs_network() {
+    let (mut h, net, pool) = harness("10.200.0.0/28");
+    let _first = h.driver.live();
+    let _again = h.driver.live();
+    h.start();
+    let a = h.submit(spec()).await;
+    running(&h, a).await;
+    h.control(a, ControlCommand::Pause);
+    until("paused", || h.is(a, &MANUAL)).await;
+    settle().await;
+    assert_eq!(pool.available(), 1);
+
+    // Stop run_forever through its token and start it again, without `recover`.
+    h.shutdown.cancel();
+    let task = h.task.take().expect("started");
+    task.await.expect("join").expect("run_forever ok");
+    assert_eq!(pool.available(), 1, "the paused run keeps its block");
+    h.shutdown = tokio_util::sync::CancellationToken::new();
+    h.start();
+
+    h.control(a, ControlCommand::Resume);
+    until("running or failed", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    assert!(h.is(a, &Running), "failed: {:?}", h.is_failed(a));
+    assert_eq!(
+        net.prepared().len(),
+        1,
+        "one network for the run, made once"
+    );
+    assert!(net.released().is_empty(), "the network was never removed");
+    assert_eq!(pool.available(), 1, "the block was never freed");
+    let specs = h.driver.specs();
+    assert_eq!(specs.len(), 2, "a fresh sandbox for the new actor");
+    for s in &specs {
+        match &s.network {
+            NetworkPolicy::RunNetwork { network, gateway } => {
+                assert_eq!(network, &network_name(a));
+                assert_eq!(gateway.host_str(), Some("10.200.0.2"));
+            }
+            other => panic!("expected RunNetwork, got {other:?}"),
+        }
+    }
+}
+
+// 5: a command that is not a resume keeps the block reserved for a pending resume --------------
+
+/// Takes the pool's block the moment it is free, once the pool was seen exhausted. Plays a run
+/// that the scheduler would hand a freed block to on another thread.
+struct Thief {
+    stop: Arc<AtomicBool>,
+    stole: Arc<Mutex<Option<Subnet>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Thief {
+    fn new(pool: Arc<SubnetPool>) -> Thief {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stole = Arc::new(Mutex::new(None));
+        let (s, got) = (stop.clone(), stole.clone());
+        let thread = std::thread::spawn(move || {
+            while pool.available() != 0 {
+                if s.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+            while !s.load(Ordering::Relaxed) {
+                if let Some(block) = pool.reserve() {
+                    *lock(&got) = Some(block);
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        });
+        Thief {
+            stop,
+            stole,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) -> Option<Subnet> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.join().expect("thief thread");
+        }
+        lock(&self.stole).clone()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn set_budget_and_resume_in_one_tick_after_a_restart_keep_the_reserved_block() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = dir.path().join("kestrel.db");
+
+    // First engine: `a` runs, then the engine stops.
+    let (mut first, _net, _pool) = with(Harness::on(&db, 4), "10.200.0.0/29");
+    let _s1 = first.driver.live();
+    first.start();
+    let a = first.submit(spec()).await;
+    running(&first, a).await;
+    first.engine.shutdown(GRACE).await;
+    drop(first);
+
+    // Second engine, one block: the resume of `a` reserves it.
+    let (mut h, _net, pool) = with(Harness::on(&db, 4), "10.200.0.0/29");
+    h.engine.recover().await.expect("recover");
+    let restarted = Suspended(SuspendReason::Error("engine restarted".into()));
+    assert!(h.is(a, &restarted));
+    let _sa = h.driver.live();
+    let thief = Thief::new(pool.clone());
+    h.start();
+    h.control(a, ControlCommand::SetBudget(MicroUsd(2_000_000)));
+    h.control(a, ControlCommand::Resume);
+    until("running or failed", || {
+        h.is(a, &Running) || h.is_failed(a).is_some()
+    })
+    .await;
+    let stolen = thief.finish();
+    assert!(h.is(a, &Running), "failed: {:?}", h.is_failed(a));
+    assert!(
+        stolen.is_none(),
+        "the reserved block was given back: {stolen:?}"
+    );
+    assert_eq!(
+        h.store
+            .run_spec(a)
+            .expect("spec")
+            .expect("stored")
+            .budget
+            .limit,
+        MicroUsd(2_000_000)
+    );
+}

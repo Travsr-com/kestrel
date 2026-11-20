@@ -4,11 +4,14 @@
 //! never depends on docker's default address pools. Blocks that overlap an existing docker
 //! network or a host route are excluded before any is handed out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::{CommandRunner, SandboxError};
+use crate::{
+    CommandRunner, INSTANCE_LABEL, NETWORK_GONE, RUN_LABEL, SandboxError, check_id,
+    is_container_name,
+};
 
 /// The pool used when `gateway.subnet_pool` is not set.
 pub const DEFAULT_SUBNET_POOL: &str = "10.200.0.0/16";
@@ -197,6 +200,11 @@ impl SubnetPool {
         self.pool
     }
 
+    /// Blocks in the pool, free or not.
+    pub fn capacity(&self) -> usize {
+        usize::try_from(self.blocks).unwrap_or(usize::MAX)
+    }
+
     fn state(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -274,61 +282,69 @@ impl SubnetPool {
     }
 }
 
-/// Text in docker's answer for a network that is gone (removed meanwhile).
-const NETWORK_GONE: [&str; 2] = ["No such network", "not found"];
-
 /// The IPv4 subnets docker networks already use: `docker network ls -q`, then one
 /// `docker network inspect` for their IPAM subnets. IPv6 subnets are ignored. A network removed
 /// between the two calls is skipped.
 pub async fn docker_subnets(runner: &dyn CommandRunner) -> Result<Vec<Ipv4Cidr>, SandboxError> {
-    let argv = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
-    let ids = run_docker(runner, &argv(&["docker", "network", "ls", "-q"]), &[]).await?;
-    let mut inspect = argv(&[
-        "docker",
+    docker_subnets_except_instance(runner, None).await
+}
+
+/// Like [`docker_subnets`], but leaves out the run networks of Kestrel instance `instance`: the
+/// ones labelled [`RUN_LABEL`] and [`INSTANCE_LABEL`]`=<instance>`. Those are this instance's
+/// own leftovers (a crash or Ctrl-C), which `Engine::recover` removes before any block is
+/// reserved, so they must not shrink the plan. Networks of other instances and of users still
+/// count. An `instance` docker could read as an option is refused before any command runs.
+pub async fn docker_subnets_except_instance(
+    runner: &dyn CommandRunner,
+    instance: Option<&str>,
+) -> Result<Vec<Ipv4Cidr>, SandboxError> {
+    let instance = instance.map(check_id).transpose()?;
+    let ids = docker(runner, &["network", "ls", "-q"], &[]).await?;
+    let ours: HashSet<String> = match instance {
+        Some(id) => {
+            let run = format!("label={RUN_LABEL}");
+            let mine = format!("label={INSTANCE_LABEL}={id}");
+            let args = ["network", "ls", "-q", "--filter", &run, "--filter", &mine];
+            docker(runner, &args, &[])
+                .await?
+                .lines()
+                .map(|id| id.trim().to_string())
+                .collect()
+        }
+        None => HashSet::new(),
+    };
+    let mut inspect = vec![
         "network",
         "inspect",
         "--format",
         "{{range .IPAM.Config}}{{.Subnet}} {{end}}",
-    ]);
+    ];
     let before = inspect.len();
     inspect.extend(
         ids.lines()
             .map(str::trim)
-            .filter(|id| crate::is_container_name(id))
-            .map(String::from),
+            .filter(|id| is_container_name(id) && !ours.contains(*id)),
     );
     if inspect.len() == before {
         return Ok(Vec::new());
     }
-    let subnets = run_docker(runner, &inspect, &NETWORK_GONE).await?;
+    let subnets = docker(runner, &inspect, &NETWORK_GONE).await?;
     Ok(subnets
         .split_whitespace()
         .filter_map(Ipv4Cidr::parse_lenient)
         .collect())
 }
 
-/// Runs a docker command and returns its stdout. A failure whose stderr holds one of
-/// `tolerated` still returns the stdout.
-async fn run_docker(
+/// Runs `docker <args>` and returns its stdout. A failure whose stderr holds one of `tolerated`
+/// still returns the stdout.
+async fn docker(
     runner: &dyn CommandRunner,
-    argv: &[String],
+    args: &[&str],
     tolerated: &[&str],
 ) -> Result<String, SandboxError> {
-    let out = runner
-        .run(argv)
-        .await
-        .map_err(|source| SandboxError::Spawn {
-            program: "docker".into(),
-            source,
-        })?;
-    if out.status == 0 || tolerated.iter().any(|t| out.stderr.contains(t)) {
-        return Ok(out.stdout);
-    }
-    Err(SandboxError::CommandFailed {
-        program: "docker".into(),
-        code: out.status,
-        stderr: out.stderr.trim_end().to_string(),
-    })
+    // Any docker CLI does: only its program name is used here.
+    let cli = &crate::DOCKER_RUNC;
+    cli.run_tolerating(runner, &cli.argv(args), tolerated).await
 }
 
 /// Route types `ip route` may print before the destination.

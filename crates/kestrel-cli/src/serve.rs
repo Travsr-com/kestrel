@@ -12,7 +12,8 @@ use kestrel_gateway::{
 };
 use kestrel_sandbox::{
     BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
-    ProcessRunner, SandboxDriver, SubnetPool, detect_with, docker_subnets, host_routes,
+    ProcessRunner, SandboxDriver, SubnetPool, detect_with, docker_subnets_except_instance,
+    host_routes,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -221,19 +222,24 @@ fn subnet_pool(value: Option<toml::Value>) -> Result<Ipv4Cidr, Failure> {
 
 /// The subnet plan for run networks: every `/29` block of `pool` that no docker network uses
 /// and, when docker runs on this host, no host route covers (a VM's routes are not this host's,
-/// so they are not read). Writes one line naming the pool and the free block count to `err`.
-/// No free block is a runtime error that says to set `gateway.subnet_pool` to a free range.
+/// so they are not read). The leftover run networks of `instance` do not count: `recover` removes
+/// them before any block is reserved. Writes one line naming the pool and the free block count
+/// to `err`. No free block is a runtime error that says to set `gateway.subnet_pool` to a free
+/// range.
 async fn subnet_plan(
     pool: Ipv4Cidr,
     runner: &dyn CommandRunner,
     host: DockerHost,
+    instance: Option<&str>,
     err: &mut dyn std::io::Write,
 ) -> Result<Arc<SubnetPool>, Failure> {
     let plan =
         SubnetPool::new(pool).map_err(|e| Failure::usage(format!("gateway.subnet_pool: {e}")))?;
-    let networks = docker_subnets(runner).await.map_err(|e| {
-        Failure::runtime(format!("listing docker networks for the subnet pool: {e}"))
-    })?;
+    let networks = docker_subnets_except_instance(runner, instance)
+        .await
+        .map_err(|e| {
+            Failure::runtime(format!("listing docker networks for the subnet pool: {e}"))
+        })?;
     plan.exclude(&networks);
     if host == DockerHost::Native {
         plan.exclude(&host_routes(runner).await);
@@ -760,7 +766,17 @@ async fn run(
     // Before the bridge: a pool with no free block stops serve with nothing to clean up.
     let subnets = if needs_bridge {
         let mut err = std::io::stderr();
-        Some(subnet_plan(config.subnet_pool, &ProcessRunner, host, &mut err).await?)
+        // This instance's leftover run networks do not count: `recover` removes them before
+        // any block is reserved.
+        let instance = GatewayBridge::instance_id(&db);
+        let plan = subnet_plan(
+            config.subnet_pool,
+            &ProcessRunner,
+            host,
+            Some(&instance),
+            &mut err,
+        );
+        Some(plan.await?)
     } else {
         None
     };
@@ -2210,6 +2226,8 @@ budget: { usd: 0.000010, wall_clock: 10m }
         subnets: &'static str,
         routes: &'static str,
         docker_fails: bool,
+        /// What `docker network ls -q` prints when filtered to this instance's run networks.
+        ours: &'static str,
     }
 
     impl Host {
@@ -2219,6 +2237,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 subnets,
                 routes,
                 docker_fails: false,
+                ours: "",
             }
         }
 
@@ -2246,6 +2265,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let words: Vec<&str> = argv.iter().map(String::as_str).collect();
             let stdout = match words.as_slice() {
                 ["ip", ..] => self.routes,
+                ["docker", "network", "ls", "-q", "--filter", ..] => self.ours,
                 ["docker", "network", "ls", ..] => "1a2b3c4d5e6f\n",
                 ["docker", "network", "inspect", ..] => self.subnets,
                 _ => "",
@@ -2279,8 +2299,54 @@ budget: { usd: 0.000010, wall_clock: 10m }
         mode: DockerHost,
     ) -> (Result<Arc<SubnetPool>, Failure>, String) {
         let mut err = Vec::new();
-        let got = subnet_plan(cidr(pool), host, mode, &mut err).await;
+        let got = subnet_plan(cidr(pool), host, mode, None, &mut err).await;
         (got, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// The plan of instance `k1` for a `/29` pool on a docker whose only network, on that block,
+    /// prints `ours` when listed as k1's run networks.
+    async fn plan_of_k1(ours: &'static str) -> (Result<Arc<SubnetPool>, Failure>, Host) {
+        let mut host = Host::new("10.200.0.0/29\n", "");
+        host.ours = ours;
+        let mut err = Vec::new();
+        let pool = cidr("10.200.0.0/29");
+        let got = subnet_plan(pool, &host, DockerHost::Vm, Some("k1"), &mut err).await;
+        (got, host)
+    }
+
+    #[tokio::test]
+    async fn our_own_leftover_run_network_does_not_shrink_the_plan() {
+        // `recover` removes it before any block is reserved, so its block stays in the plan.
+        let (got, host) = plan_of_k1("1a2b3c4d5e6f\n").await;
+        assert_eq!(got.expect("plan").available(), 1);
+        let ours: Vec<String> = [
+            "docker",
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            "label=kestrel.run",
+            "--filter",
+            "label=kestrel.instance=k1",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(host.calls().contains(&ours), "{:?}", host.calls());
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|a| a.get(2).map(String::as_str) == Some("inspect")),
+            "our leftover is not inspected: {:?}",
+            host.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_network_of_another_instance_or_a_user_still_shrinks_the_plan() {
+        let (got, _host) = plan_of_k1("").await;
+        let e = got.expect_err("the only block is taken");
+        assert!(e.message.contains("gateway.subnet_pool"), "{}", e.message);
     }
 
     #[tokio::test]
