@@ -55,8 +55,9 @@ cache_read_per_mtok = "0.30"
 cache_write_per_mtok = "3.75"
 ```
 
-> **The gateway cannot listen on loopback.** Sandboxes reach it through a container, which a
-> loopback address refuses, so `kestrel serve` exits with an error if you set one. Without a
+> **With Docker on this machine, the gateway cannot listen on loopback.** Sandboxes reach it
+> through a container, which a loopback address refuses, so `kestrel serve` exits with an error
+> if you set one. (Docker in a VM is different, see below.) Without a
 > `listen` setting, Kestrel binds the Docker bridge IP, so the gateway is not exposed to your LAN.
 > If you set `listen = "0.0.0.0:7070"`, Kestrel warns you: the gateway is then reachable from
 > your LAN, and only the per-run token protects it.
@@ -67,12 +68,38 @@ cache_write_per_mtok = "3.75"
 > bridge network, so the default bind may not work. Set `listen` and `gateway.advertise_url`
 > yourself there.
 
-> **Docker Desktop (macOS and Windows) does not work with the default bind.** The docker bridge
-> address lives inside a VM there, so set `gateway.advertise_url` or `gateway.listen` yourself.
-> (Kestrel's gVisor driver is Linux only today anyway.)
+> **Docker in a VM (Rancher Desktop, Docker Desktop, Colima).** Set `gateway.docker_host` to tell
+> Kestrel where the Docker daemon runs:
+>
+> ```toml
+> [gateway]
+> docker_host = "auto"   # or "native", or "vm"
+> ```
+>
+> * `auto` (the default) tries to bind the Docker bridge IP on your machine. If it works, Docker
+>   runs on this host (`native`). If the address is not one of yours, Docker runs in a VM (`vm`).
+>   Kestrel prints which one it chose when it starts.
+> * Set `native` or `vm` yourself if `auto` guesses wrong.
+> * In `vm` mode the gateway binds `127.0.0.1` by default, because the VM reaches your machine
+>   through loopback. `gateway.listen` still wins if you set it.
+> * In `vm` mode, any container in the VM can reach the gateway port (and any other loopback
+>   service on your machine) through `host.docker.internal`. The per-run token is what protects
+>   the gateway. This comes with running Docker in a VM.
+> * `auto` can guess wrong. If a second, native Docker owns `172.17.0.1` while your active
+>   context is a VM, it picks `native`: set `docker_host = "vm"`. Rootless Docker and Podman may
+>   be taken for `vm`: set `docker_host = "native"`, or set `gateway.listen` and
+>   `gateway.advertise_url`.
+>
+> Rancher Desktop was tested. Docker Desktop and Colima are expected to work but are not
+> verified. On Rancher Desktop, keep the workspace folder (the folder of the database) under your
+> home directory, because only the home directory is shared into the VM.
+>
+> **Known limit:** on Rancher Desktop's shared mount, agents that run git inside the sandbox can
+> fail (issue #54). Use native Docker for coding agents until that is fixed.
 >
 > **If `docker network inspect bridge` lists an IPv6 range first,** Kestrel cannot read the bridge
-> IP. Set `gateway.listen` explicitly.
+> IP. Set `gateway.listen` explicitly (this skips the lookup), or set `gateway.docker_host` to `vm`
+> if Docker runs in a VM.
 
 > **Add a price for every model you use.** A call to a model with no price entry is not counted
 > against the run's budget.

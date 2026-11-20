@@ -50,6 +50,8 @@ struct RawGateway {
     port: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key, not as a TOML error.
     advertise_url: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    docker_host: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -92,6 +94,8 @@ struct Config {
     port: Option<u16>,
     /// Where sandboxes reach the gateway, when the operator sets it.
     advertise_url: Option<Url>,
+    /// `gateway.docker_host`: where the docker daemon runs. Default `auto`.
+    docker_host: DockerHostSetting,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -159,11 +163,18 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     }
     let advertise_url = raw.gateway.advertise_url.map(advertise_url).transpose()?;
     let port = raw.gateway.port.map(gateway_port).transpose()?;
+    let docker_host = raw
+        .gateway
+        .docker_host
+        .map(docker_host_setting)
+        .transpose()?
+        .unwrap_or_default();
     Ok(Config {
         listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
         port,
         advertise_url,
+        docker_host,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -186,6 +197,126 @@ fn gateway_port(value: toml::Value) -> Result<u16, Failure> {
         .ok_or_else(|| Failure::usage("gateway.port must be a whole number from 1 to 65535"))
 }
 
+/// `gateway.docker_host` as written in the config (issue #53).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DockerHostSetting {
+    /// Decide by trying to bind the docker bridge IP locally.
+    #[default]
+    Auto,
+    /// The docker daemon runs on this machine.
+    Native,
+    /// The docker daemon runs in a VM (Rancher Desktop, Docker Desktop, Colima).
+    Vm,
+}
+
+/// Where the docker daemon runs, once `auto` is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerHost {
+    Native,
+    Vm,
+}
+
+/// `gateway.docker_host`: the string `auto`, `native` or `vm`. Anything else is a usage error
+/// that names `gateway.docker_host` and never echoes the value.
+fn docker_host_setting(value: toml::Value) -> Result<DockerHostSetting, Failure> {
+    match value.as_str() {
+        Some("auto") => Ok(DockerHostSetting::Auto),
+        Some("native") => Ok(DockerHostSetting::Native),
+        Some("vm") => Ok(DockerHostSetting::Vm),
+        _ => Err(Failure::usage(
+            "gateway.docker_host must be \"auto\", \"native\" or \"vm\"",
+        )),
+    }
+}
+
+/// Which mode serve runs in. `bind` is the result of trying to bind `<docker bridge IP>:0`
+/// locally. Explicit `native` and `vm` win and ignore it. `auto`: Ok means native,
+/// `AddrNotAvailable` means vm, any other error is a runtime failure naming `gateway.listen`.
+fn choose_docker_host(
+    setting: DockerHostSetting,
+    bind: &std::io::Result<()>,
+) -> Result<DockerHost, Failure> {
+    match (setting, bind) {
+        (DockerHostSetting::Native, _) | (DockerHostSetting::Auto, Ok(())) => {
+            Ok(DockerHost::Native)
+        }
+        (DockerHostSetting::Vm, _) => Ok(DockerHost::Vm),
+        (DockerHostSetting::Auto, Err(e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            Ok(DockerHost::Vm)
+        }
+        (DockerHostSetting::Auto, Err(e)) => Err(Failure::runtime(format!(
+            "gateway.listen: cannot tell where docker runs, binding the docker bridge IP failed ({e}). Set gateway.listen, or set gateway.docker_host to \"vm\" if docker runs in a VM"
+        ))),
+    }
+}
+
+/// Like [`check_bridge_listen`] but mode aware. `Native` is exactly `check_bridge_listen`. `Vm`
+/// accepts a loopback address (no error, no warning) because the VM reaches the host through
+/// loopback; `0.0.0.0` and `::` still get the LAN warning.
+fn check_host_listen(
+    host: DockerHost,
+    bridge: bool,
+    addr: SocketAddr,
+) -> Result<Option<String>, Failure> {
+    if host == DockerHost::Vm && addr.ip().is_loopback() {
+        return Ok(None);
+    }
+    check_bridge_listen(bridge, addr)
+}
+
+/// `auto`: asks docker for the bridge IP, then tries to bind it locally.
+async fn detect_docker_host(runner: &dyn CommandRunner) -> Result<(DockerHost, Ipv4Addr), Failure> {
+    let ip = discover_bridge_ip(runner).await?;
+    let probe = TcpListener::bind((ip, 0)).await.map(drop);
+    Ok((choose_docker_host(DockerHostSetting::Auto, &probe)?, ip))
+}
+
+/// Picks the mode and the gateway bind string, and writes one line to `err` saying which mode
+/// was chosen, only when `needs_bridge` is true (`gateway: docker daemon on this host` or
+/// `gateway: docker daemon in a VM, binding loopback`).
+///
+/// * `needs_bridge` false: `Native`, the plain loopback default, no docker call, no line.
+/// * `native`: as `resolve_listen` (docker asked once, only without an explicit `listen`).
+/// * `vm`: docker never asked; bind is `listen`, else `127.0.0.1:<port or 7070>`.
+/// * `auto`: docker asked once for the bridge IP (even with an explicit `listen`), then
+///   `choose_docker_host` on the result of binding `<ip>:0`. With an explicit `listen`, any
+///   failure of that detection means `Native` and that `listen`, as before #53.
+async fn resolve_gateway(
+    runner: &dyn CommandRunner,
+    setting: DockerHostSetting,
+    listen: Option<&str>,
+    port: Option<u16>,
+    needs_bridge: bool,
+    err: &mut dyn std::io::Write,
+) -> Result<(DockerHost, String), Failure> {
+    if !needs_bridge {
+        return Ok((DockerHost::Native, gateway_bind(listen, port, None)));
+    }
+    let (host, bind) = match setting {
+        DockerHostSetting::Vm => (DockerHost::Vm, gateway_bind(listen, port, None)),
+        DockerHostSetting::Native => (
+            DockerHost::Native,
+            resolve_listen(runner, listen, port, true).await?,
+        ),
+        DockerHostSetting::Auto => match detect_docker_host(runner).await {
+            Ok((DockerHost::Native, ip)) => {
+                (DockerHost::Native, gateway_bind(listen, port, Some(ip)))
+            }
+            Ok((DockerHost::Vm, _)) => (DockerHost::Vm, gateway_bind(listen, port, None)),
+            // An explicit listen never needed the lookup before, so a failed one is not fatal.
+            Err(_) if listen.is_some() => (DockerHost::Native, gateway_bind(listen, port, None)),
+            Err(e) => return Err(e),
+        },
+    };
+    let line = match host {
+        DockerHost::Native => "gateway: docker daemon on this host",
+        DockerHost::Vm => "gateway: docker daemon in a VM, binding loopback",
+    };
+    // A closed stderr must not stop serve.
+    let _ = writeln!(err, "{line}");
+    Ok((host, bind))
+}
+
 /// Names that may appear in a config error. Anything else quoted in an error came from the
 /// user and may be an API key, so it is masked.
 const CONFIG_NAMES: &[&str] = &[
@@ -193,6 +324,7 @@ const CONFIG_NAMES: &[&str] = &[
     "listen",
     "port",
     "advertise_url",
+    "docker_host",
     "engine",
     "max_concurrent_runs",
     "providers",
@@ -356,8 +488,7 @@ fn gateway_bind(listen: Option<&str>, port: Option<u16>, bridge_ip: Option<Ipv4A
 }
 
 /// What to do when the docker bridge IP cannot be found.
-const BRIDGE_HINT: &str =
-    "set gateway.listen (for example to your docker bridge IP and a port) to skip the lookup";
+const BRIDGE_HINT: &str = "set gateway.listen (for example to your docker bridge IP and a port) to skip the lookup, or set gateway.docker_host to \"vm\" if docker runs in a VM";
 
 /// The one IPv4 address `docker network inspect bridge --format {{(index .IPAM.Config 0).Gateway}}`
 /// prints (surrounding whitespace allowed). Anything else is a runtime failure.
@@ -448,6 +579,7 @@ fn acquire_serve_lock(db: &Path) -> Result<ServeLock, Failure> {
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
 async fn start_bridge(
     runner: Arc<dyn CommandRunner>,
+    host: DockerHost,
     docker: bool,
     advertise: Option<&Url>,
     port: u16,
@@ -456,7 +588,11 @@ async fn start_bridge(
     if !docker || advertise.is_some() {
         return Ok(None);
     }
-    GatewayBridge::start(runner, port, BridgeSpec::default(), db)
+    let spec = BridgeSpec {
+        add_host_gateway: host == DockerHost::Native,
+        ..BridgeSpec::default()
+    };
+    GatewayBridge::start(runner, port, spec, db)
         .await
         .map(Some)
         .map_err(|e| Failure::runtime(e.to_string()))
@@ -523,7 +659,15 @@ async fn run(
     let docker = uses_docker(&drivers);
     let needs_bridge = docker && config.advertise_url.is_none();
     let explicit = config.listen_explicit.then_some(config.listen.as_str());
-    let listen = resolve_listen(&ProcessRunner, explicit, config.port, needs_bridge).await?;
+    let (host, listen) = resolve_gateway(
+        &ProcessRunner,
+        config.docker_host,
+        explicit,
+        config.port,
+        needs_bridge,
+        &mut std::io::stderr(),
+    )
+    .await?;
     let listener = TcpListener::bind(&listen)
         .await
         .map_err(|e| Failure::runtime(format!("gateway.listen: cannot listen there: {e}")))?;
@@ -532,7 +676,7 @@ async fn run(
         .map_err(|e| Failure::runtime(e.to_string()))?;
     // The discovered docker bridge IP is the expected bind, so it is not worth a warning.
     let discovered = needs_bridge && explicit.is_none();
-    if let Some(warning) = check_bridge_listen(needs_bridge, addr)? {
+    if let Some(warning) = check_host_listen(host, needs_bridge, addr)? {
         eprintln!("{warning}");
     } else if !discovered && !addr.ip().is_loopback() {
         eprintln!(
@@ -541,6 +685,7 @@ async fn run(
     }
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
+        host,
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
@@ -1112,16 +1257,30 @@ budget: { usd: 0.000010, wall_clock: 10m }
             (false, Some(&advertise)),
         ] {
             let r = recorder(0);
-            let bridge =
-                start_bridge(r.clone(), docker, advertise, 7070, Path::new("/tmp/k.db")).await;
+            let bridge = start_bridge(
+                r.clone(),
+                DockerHost::Native,
+                docker,
+                advertise,
+                7070,
+                Path::new("/tmp/k.db"),
+            )
+            .await;
             assert!(bridge.expect("ok").is_none());
             assert_eq!(call_count(&r), 0);
         }
         let r = recorder(0);
-        let bridge = start_bridge(r.clone(), true, None, 7070, Path::new("/tmp/k.db"))
-            .await
-            .expect("started")
-            .expect("bridge");
+        let bridge = start_bridge(
+            r.clone(),
+            DockerHost::Native,
+            true,
+            None,
+            7070,
+            Path::new("/tmp/k.db"),
+        )
+        .await
+        .expect("started")
+        .expect("bridge");
         assert_eq!(bridge.url().as_str(), "http://172.18.0.2:7070/");
         assert_eq!(call_count(&r), 5);
         bridge.stop().await;
@@ -1130,9 +1289,16 @@ budget: { usd: 0.000010, wall_clock: 10m }
 
     #[tokio::test]
     async fn a_failing_bridge_is_a_runtime_error() {
-        let e = start_bridge(recorder(1), true, None, 7070, Path::new("/tmp/k.db"))
-            .await
-            .expect_err("fails");
+        let e = start_bridge(
+            recorder(1),
+            DockerHost::Native,
+            true,
+            None,
+            7070,
+            Path::new("/tmp/k.db"),
+        )
+        .await
+        .expect_err("fails");
         assert!(e.message.contains("boom"), "{}", e.message);
     }
 
@@ -1522,5 +1688,345 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let expected: Vec<u64> = (seqs[0]..seqs[0] + 10).collect();
         assert_eq!(seqs, expected, "no gaps, no duplicates");
         assert_eq!(model_calls(&gateway_side, run).len(), 5);
+    }
+
+    // ---- gateway.docker_host (issue #53) ----
+
+    const SECRET: &str = "secret-mode-9f3a";
+
+    fn host_of(config: &str) -> DockerHostSetting {
+        let (_dir, path) = write(config);
+        load_config(&path).expect("config").docker_host
+    }
+
+    #[test]
+    fn docker_host_defaults_to_auto_and_reads_the_three_values() {
+        assert_eq!(host_of(ANTHROPIC), DockerHostSetting::Auto);
+        for (text, want) in [
+            ("auto", DockerHostSetting::Auto),
+            ("native", DockerHostSetting::Native),
+            ("vm", DockerHostSetting::Vm),
+        ] {
+            let config = format!("[gateway]\ndocker_host = \"{text}\"\n{ANTHROPIC}");
+            assert_eq!(host_of(&config), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn any_other_docker_host_is_a_usage_error_naming_the_key_and_hiding_the_value() {
+        let bad = [
+            format!("\"{SECRET}\""),
+            "\"VM\"".to_string(),
+            "\"Auto\"".to_string(),
+            "\"\"".to_string(),
+            "\" vm\"".to_string(),
+            "42".to_string(),
+            "true".to_string(),
+            "[\"vm\"]".to_string(),
+            format!("{{ x = \"{SECRET}\" }}"),
+        ];
+        for value in bad {
+            let msg = err(&format!("[gateway]\ndocker_host = {value}\n{ANTHROPIC}"));
+            assert!(msg.contains("gateway.docker_host"), "{value}: {msg}");
+            assert!(!msg.contains(SECRET), "{value}: {msg}");
+        }
+    }
+
+    #[test]
+    fn docker_host_is_a_known_config_name_so_toml_errors_can_quote_it() {
+        assert_eq!(
+            mask_quoted("duplicate key `docker_host` in table `gateway`"),
+            "duplicate key `docker_host` in table `gateway`"
+        );
+        let msg = err(&format!(
+            "[gateway]\ndocker_host = \"vm\"\ndocker_host = \"vm\"\n{ANTHROPIC}"
+        ));
+        assert!(msg.contains("`docker_host`"), "{msg}");
+    }
+
+    fn io_err(kind: std::io::ErrorKind) -> std::io::Result<()> {
+        Err(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn explicit_native_and_vm_win_whatever_the_bind_said() {
+        use std::io::ErrorKind::{AddrInUse, AddrNotAvailable, PermissionDenied};
+        for (setting, want) in [
+            (DockerHostSetting::Native, DockerHost::Native),
+            (DockerHostSetting::Vm, DockerHost::Vm),
+        ] {
+            for bind in [
+                Ok(()),
+                io_err(AddrNotAvailable),
+                io_err(PermissionDenied),
+                io_err(AddrInUse),
+            ] {
+                assert_eq!(choose_docker_host(setting, &bind).expect("mode"), want);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_is_native_when_the_bridge_ip_binds_and_vm_when_it_is_not_local() {
+        assert_eq!(
+            choose_docker_host(DockerHostSetting::Auto, &Ok(())).expect("mode"),
+            DockerHost::Native
+        );
+        assert_eq!(
+            choose_docker_host(
+                DockerHostSetting::Auto,
+                &io_err(std::io::ErrorKind::AddrNotAvailable)
+            )
+            .expect("mode"),
+            DockerHost::Vm
+        );
+    }
+
+    #[test]
+    fn auto_with_any_other_bind_error_is_a_runtime_error_naming_gateway_listen() {
+        use std::io::ErrorKind::{AddrInUse, PermissionDenied};
+        for kind in [PermissionDenied, AddrInUse, std::io::ErrorKind::Other] {
+            let e = choose_docker_host(DockerHostSetting::Auto, &io_err(kind)).expect_err("fails");
+            assert_eq!(e.code, crate::EXIT_RUNTIME, "{kind:?}");
+            assert!(e.message.contains("gateway.listen"), "{}", e.message);
+        }
+    }
+
+    const NATIVE_LINE: &str = "gateway: docker daemon on this host\n";
+    const VM_LINE: &str = "gateway: docker daemon in a VM, binding loopback\n";
+
+    /// 127.0.0.1 is always a local address; 203.0.113.5 (TEST-NET-3) never is.
+    const LOCAL: &str = "127.0.0.1\n";
+    const NOT_LOCAL: &str = "203.0.113.5\n";
+
+    async fn gateway(
+        r: &Scripted,
+        setting: DockerHostSetting,
+        listen: Option<&str>,
+        port: Option<u16>,
+        needs_bridge: bool,
+    ) -> (Result<(DockerHost, String), Failure>, String) {
+        let mut line = Vec::new();
+        let got = resolve_gateway(r, setting, listen, port, needs_bridge, &mut line).await;
+        (got, String::from_utf8(line).expect("utf8"))
+    }
+
+    #[tokio::test]
+    async fn auto_with_a_local_bridge_ip_is_native_and_binds_that_ip() {
+        let r = Scripted::new(0, LOCAL, "");
+        let (got, line) = gateway(&r, DockerHostSetting::Auto, None, Some(9000), true).await;
+        assert_eq!(
+            got.expect("ok"),
+            (DockerHost::Native, "127.0.0.1:9000".into())
+        );
+        assert_eq!(line, NATIVE_LINE);
+        assert_eq!(r.calls(), vec![inspect_argv()]);
+    }
+
+    #[tokio::test]
+    async fn auto_with_a_bridge_ip_that_is_not_local_is_vm_and_binds_loopback() {
+        let r = Scripted::new(0, NOT_LOCAL, "");
+        let (got, line) = gateway(&r, DockerHostSetting::Auto, None, None, true).await;
+        assert_eq!(got.expect("ok"), (DockerHost::Vm, "127.0.0.1:7070".into()));
+        assert_eq!(line, VM_LINE);
+        let (got, _) = gateway(&r, DockerHostSetting::Auto, None, Some(9000), true).await;
+        assert_eq!(got.expect("ok").1, "127.0.0.1:9000");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_listen_wins_in_every_mode_and_the_mode_is_still_chosen() {
+        let r = Scripted::new(0, NOT_LOCAL, "");
+        let (got, line) = gateway(
+            &r,
+            DockerHostSetting::Auto,
+            Some("0.0.0.0:8123"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(got.expect("ok"), (DockerHost::Vm, "0.0.0.0:8123".into()));
+        assert_eq!(line, VM_LINE);
+        for (setting, host, text) in [
+            (DockerHostSetting::Native, DockerHost::Native, NATIVE_LINE),
+            (DockerHostSetting::Vm, DockerHost::Vm, VM_LINE),
+        ] {
+            let (got, line) = gateway(&r, setting, Some("10.1.2.3:80"), Some(1), true).await;
+            assert_eq!(got.expect("ok"), (host, "10.1.2.3:80".into()));
+            assert_eq!(line, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_with_an_explicit_listen_degrades_to_native_when_discovery_fails() {
+        for r in [
+            Scripted::new(1, "", "Cannot connect to the Docker daemon"),
+            Scripted::new(0, "fd00::1\n", ""),
+            Scripted::new(0, "not an address\n", ""),
+        ] {
+            let (got, line) = gateway(
+                &r,
+                DockerHostSetting::Auto,
+                Some("10.1.2.3:8123"),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(
+                got.expect("ok"),
+                (DockerHost::Native, "10.1.2.3:8123".into())
+            );
+            assert_eq!(line, NATIVE_LINE);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_without_an_explicit_listen_still_fails_on_a_non_ipv4_answer() {
+        let r = Scripted::new(0, "fd00::1\n", "");
+        let (got, line) = gateway(&r, DockerHostSetting::Auto, None, None, true).await;
+        assert_eq!(got.expect_err("fails").code, crate::EXIT_RUNTIME);
+        assert_eq!(line, "");
+    }
+
+    #[tokio::test]
+    async fn explicit_native_binds_the_bridge_ip_as_today() {
+        let r = Scripted::new(0, "172.17.0.1\n", "");
+        let (got, line) = gateway(&r, DockerHostSetting::Native, None, None, true).await;
+        assert_eq!(
+            got.expect("ok"),
+            (DockerHost::Native, "172.17.0.1:7070".into())
+        );
+        assert_eq!(line, NATIVE_LINE);
+        assert_eq!(r.calls(), vec![inspect_argv()]);
+    }
+
+    #[tokio::test]
+    async fn explicit_vm_never_asks_docker_and_binds_loopback() {
+        let r = Scripted::new(1, "", "daemon down");
+        let (got, line) = gateway(&r, DockerHostSetting::Vm, None, None, true).await;
+        assert_eq!(got.expect("ok"), (DockerHost::Vm, "127.0.0.1:7070".into()));
+        assert_eq!(line, VM_LINE);
+        let (got, _) = gateway(&r, DockerHostSetting::Vm, None, Some(9000), true).await;
+        assert_eq!(got.expect("ok").1, "127.0.0.1:9000");
+        assert!(r.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_bridge_nothing_is_asked_or_printed() {
+        let r = Scripted::new(0, NOT_LOCAL, "");
+        for setting in [
+            DockerHostSetting::Auto,
+            DockerHostSetting::Native,
+            DockerHostSetting::Vm,
+        ] {
+            let (got, line) = gateway(&r, setting, None, None, false).await;
+            assert_eq!(got.expect("ok").1, DEFAULT_LISTEN, "{setting:?}");
+            assert_eq!(line, "", "{setting:?}");
+        }
+        assert!(r.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_cannot_decide_when_docker_does_not_answer() {
+        let r = Scripted::new(1, "", "Cannot connect to the Docker daemon");
+        let (got, line) = gateway(&r, DockerHostSetting::Auto, None, None, true).await;
+        let e = got.expect_err("fails");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(
+            e.message.contains("docker network inspect bridge"),
+            "{}",
+            e.message
+        );
+        assert_eq!(line, "", "no mode line when no mode was chosen");
+    }
+
+    fn sock(text: &str) -> SocketAddr {
+        text.parse().expect("addr")
+    }
+
+    #[test]
+    fn vm_accepts_loopback_with_a_bridge_silently() {
+        for text in ["127.0.0.1:7070", "127.0.0.1:0", "[::1]:7070"] {
+            assert_eq!(
+                check_host_listen(DockerHost::Vm, true, sock(text)).expect("accepted"),
+                None,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_still_warns_about_the_lan_for_an_all_interfaces_bind() {
+        for text in ["0.0.0.0:7070", "[::]:7070"] {
+            let warning = check_host_listen(DockerHost::Vm, true, sock(text))
+                .expect("a warning is not an error")
+                .expect("a warning");
+            assert!(
+                warning.contains(text) && warning.contains("LAN"),
+                "{warning}"
+            );
+        }
+        for text in ["192.168.1.5:9000", "10.0.0.2:7070"] {
+            assert_eq!(
+                check_host_listen(DockerHost::Vm, true, sock(text)).expect("ok"),
+                None
+            );
+        }
+        assert_eq!(
+            check_host_listen(DockerHost::Vm, false, sock("0.0.0.0:7070")).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn native_checks_are_exactly_the_existing_ones() {
+        for text in [
+            "127.0.0.1:7070",
+            "[::1]:7070",
+            "0.0.0.0:7070",
+            "[::]:7070",
+            "172.17.0.1:7070",
+        ] {
+            for bridge in [true, false] {
+                let a = check_host_listen(DockerHost::Native, bridge, sock(text));
+                let b = check_bridge_listen(bridge, sock(text));
+                match (a, b) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b, "{text} {bridge}"),
+                    (Err(a), Err(b)) => assert_eq!(a.message, b.message, "{text} {bridge}"),
+                    (a, b) => panic!("{text} {bridge}: {a:?} vs {b:?}"),
+                }
+            }
+        }
+        let e = check_host_listen(DockerHost::Native, true, sock("127.0.0.1:7070"))
+            .expect_err("native loopback with a bridge");
+        assert_eq!(e.code, crate::EXIT_USAGE);
+    }
+
+    fn run_call(r: &Recorder) -> Vec<String> {
+        r.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|a| a.get(1).map(String::as_str) == Some("run"))
+            .expect("a docker run call")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn the_bridge_run_has_add_host_for_native_and_none_for_vm() {
+        for (host, has) in [(DockerHost::Native, true), (DockerHost::Vm, false)] {
+            let r = recorder(0);
+            start_bridge(r.clone(), host, true, None, 7070, Path::new("/tmp/k.db"))
+                .await
+                .expect("started")
+                .expect("bridge");
+            let argv = run_call(&r);
+            assert_eq!(argv.iter().any(|a| a == "--add-host"), has, "{host:?}");
+            assert_eq!(
+                argv.iter()
+                    .any(|a| a == "host.docker.internal:host-gateway"),
+                has,
+                "{host:?}"
+            );
+        }
     }
 }
