@@ -245,7 +245,7 @@ fn choose_docker_host(
             Ok(DockerHost::Vm)
         }
         (DockerHostSetting::Auto, Err(e)) => Err(Failure::runtime(format!(
-            "gateway.listen: cannot tell where docker runs, binding the docker bridge IP failed ({e}). Set gateway.listen, or set gateway.docker_host to \"native\" or \"vm\""
+            "gateway.listen: cannot tell where docker runs, binding the docker bridge IP failed ({e}). Set gateway.listen, or set gateway.docker_host to \"vm\" if docker runs in a VM"
         ))),
     }
 }
@@ -264,6 +264,13 @@ fn check_host_listen(
     check_bridge_listen(bridge, addr)
 }
 
+/// `auto`: asks docker for the bridge IP, then tries to bind it locally.
+async fn detect_docker_host(runner: &dyn CommandRunner) -> Result<(DockerHost, Ipv4Addr), Failure> {
+    let ip = discover_bridge_ip(runner).await?;
+    let probe = TcpListener::bind((ip, 0)).await.map(drop);
+    Ok((choose_docker_host(DockerHostSetting::Auto, &probe)?, ip))
+}
+
 /// Picks the mode and the gateway bind string, and writes one line to `err` saying which mode
 /// was chosen, only when `needs_bridge` is true (`gateway: docker daemon on this host` or
 /// `gateway: docker daemon in a VM, binding loopback`).
@@ -272,7 +279,8 @@ fn check_host_listen(
 /// * `native`: as `resolve_listen` (docker asked once, only without an explicit `listen`).
 /// * `vm`: docker never asked; bind is `listen`, else `127.0.0.1:<port or 7070>`.
 /// * `auto`: docker asked once for the bridge IP (even with an explicit `listen`), then
-///   `choose_docker_host` on the result of binding `<ip>:0`.
+///   `choose_docker_host` on the result of binding `<ip>:0`. With an explicit `listen`, any
+///   failure of that detection means `Native` and that `listen`, as before #53.
 async fn resolve_gateway(
     runner: &dyn CommandRunner,
     setting: DockerHostSetting,
@@ -290,14 +298,15 @@ async fn resolve_gateway(
             DockerHost::Native,
             resolve_listen(runner, listen, port, true).await?,
         ),
-        DockerHostSetting::Auto => {
-            let ip = discover_bridge_ip(runner).await?;
-            let probe = TcpListener::bind((ip, 0)).await.map(drop);
-            match choose_docker_host(setting, &probe)? {
-                DockerHost::Native => (DockerHost::Native, gateway_bind(listen, port, Some(ip))),
-                DockerHost::Vm => (DockerHost::Vm, gateway_bind(listen, port, None)),
+        DockerHostSetting::Auto => match detect_docker_host(runner).await {
+            Ok((DockerHost::Native, ip)) => {
+                (DockerHost::Native, gateway_bind(listen, port, Some(ip)))
             }
-        }
+            Ok((DockerHost::Vm, _)) => (DockerHost::Vm, gateway_bind(listen, port, None)),
+            // An explicit listen never needed the lookup before, so a failed one is not fatal.
+            Err(_) if listen.is_some() => (DockerHost::Native, gateway_bind(listen, port, None)),
+            Err(e) => return Err(e),
+        },
     };
     let line = match host {
         DockerHost::Native => "gateway: docker daemon on this host",
@@ -479,8 +488,7 @@ fn gateway_bind(listen: Option<&str>, port: Option<u16>, bridge_ip: Option<Ipv4A
 }
 
 /// What to do when the docker bridge IP cannot be found.
-const BRIDGE_HINT: &str =
-    "set gateway.listen (for example to your docker bridge IP and a port) to skip the lookup";
+const BRIDGE_HINT: &str = "set gateway.listen (for example to your docker bridge IP and a port) to skip the lookup, or set gateway.docker_host to \"vm\" if docker runs in a VM";
 
 /// The one IPv4 address `docker network inspect bridge --format {{(index .IPAM.Config 0).Gateway}}`
 /// prints (surrounding whitespace allowed). Anything else is a runtime failure.
