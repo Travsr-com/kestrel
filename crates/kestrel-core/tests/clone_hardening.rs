@@ -337,7 +337,7 @@ fn removes(env: &EnvScrub, name: &str) -> bool {
     })
 }
 
-const HOSTILE_NAMES: [&str; 8] = [
+const HOSTILE_NAMES: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_CONFIG_COUNT",
@@ -346,10 +346,26 @@ const HOSTILE_NAMES: [&str; 8] = [
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_EXEC_PATH",
+    // Added by the second review round: tracing, object redirects and helper programs.
+    "GIT_TRACE",
+    "GIT_TRACE_PACKET",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROTOCOL_FROM_USER",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
 ];
 
 fn assert_scrubs_everything(env: &EnvScrub) {
-    for name in HOSTILE_NAMES {
+    for &name in HOSTILE_NAMES {
         assert!(removes(env, name), "{name} not removed: {env:?}");
     }
     let has = |k: &str, v: &str| env.set.iter().any(|(a, b)| a == k && b == v);
@@ -442,6 +458,8 @@ fn run_child(step: &str, f: &Fixture, decoy: &Path, traps: &Traps) {
         .env("GIT_SSH_COMMAND", traps.dir.join("ssh"))
         .env("GIT_SSH", traps.dir.join("ssh"))
         .env("GIT_EXEC_PATH", traps.dir.join("exec"))
+        .env("GIT_TRACE", traps.dir.join("trace.log"))
+        .env("GIT_OBJECT_DIRECTORY", traps.dir.join("redirected-objects"))
         .output()
         .expect("child spawns");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -488,6 +506,14 @@ fn s2_hostile_git_variables_in_kestrels_environment_change_nothing() {
         "decoy untouched"
     );
     assert_eq!(traps.fired(), Vec::<String>::new(), "a marker command ran");
+    assert!(
+        !traps.dir.join("trace.log").exists(),
+        "GIT_TRACE took effect"
+    );
+    assert!(
+        !traps.dir.join("redirected-objects").exists(),
+        "GIT_OBJECT_DIRECTORY took effect"
+    );
 }
 
 /// Child half of the test above. Ignored so a normal run skips it; the parent runs it with
@@ -733,4 +759,105 @@ async fn s5_a_relative_repo_with_a_depth_is_refused_the_same_way() {
         "{err:?}"
     );
     assert!(fake.calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 2: object alternates, a symlinked clone directory.
+// ---------------------------------------------------------------------------------------------
+
+/// A host repo with a commit that the source repo does not have. Returns (repo, commit id).
+fn secret_repo(f: &Fixture) -> (PathBuf, String) {
+    let secret = f.repo.parent().unwrap().join("secret");
+    std::fs::create_dir(&secret).unwrap();
+    git(&secret, &["init", "-q"]);
+    commit_file(&secret, "secret.txt", "private\n");
+    let id = git(&secret, &["rev-parse", "HEAD"]);
+    (secret, id)
+}
+
+async fn assert_alternates_refused(f: &Fixture, setup: impl FnOnce(&Path, &Path, &str)) {
+    let (secret, id) = secret_repo(f);
+    let (ws, rec, clone) = prepared(f).await;
+    setup(&clone, &secret, &id);
+    let calls_before = rec.argvs().len();
+
+    let err = ws.fetch_back(run_a(), &f.repo).await.unwrap_err();
+
+    match &err {
+        WorkspaceError::AlternatesPresent { clone: c } => assert_eq!(c, &clone),
+        other => panic!("expected AlternatesPresent, got {other:?}"),
+    }
+    assert!(err.to_string().contains("alternates"), "{err}");
+    assert_eq!(rec.argvs().len(), calls_before, "no git call was made");
+    assert_eq!(kestrel_refs(&f.repo), "", "source got no ref");
+    assert!(
+        !git_raw(&f.repo, &["cat-file", "-e", &id]).status.success(),
+        "the secret commit reached the source repo"
+    );
+}
+
+#[tokio::test]
+async fn alternates_pointing_at_another_repo_make_fetch_back_refuse() {
+    need_git!();
+    let f = fixture();
+    assert_alternates_refused(&f, |clone, secret, id| {
+        let info = clone.join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", secret.join(".git/objects").display()),
+        )
+        .unwrap();
+        git(
+            clone,
+            &["update-ref", &format!("refs/heads/{BRANCH_A}"), id],
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dangling_alternates_symlink_also_makes_fetch_back_refuse() {
+    need_git!();
+    let f = fixture();
+    assert_alternates_refused(&f, |clone, _secret, _id| {
+        let info = clone.join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/alternates", info.join("alternates")).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_http_alternates_file_makes_fetch_back_refuse() {
+    need_git!();
+    let f = fixture();
+    assert_alternates_refused(&f, |clone, _secret, _id| {
+        let info = clone.join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("http-alternates"), "http://example.invalid/\n").unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_symlinked_clone_directory_is_refused_before_any_git_call() {
+    need_git!();
+    let f = fixture();
+    let decoy = decoy_with_branch(&f);
+    let (ws, rec, clone) = prepared(&f).await;
+    std::fs::remove_dir_all(&clone).unwrap();
+    std::os::unix::fs::symlink(&decoy, &clone).unwrap();
+    let decoy_before = git(&decoy, &["for-each-ref"]);
+    let calls_before = rec.argvs().len();
+
+    let err = ws.fetch_back(run_a(), &f.repo).await.unwrap_err();
+
+    match &err {
+        WorkspaceError::GitDirNotADirectory { clone: c } => assert_eq!(c, &clone),
+        other => panic!("expected GitDirNotADirectory, got {other:?}"),
+    }
+    assert_eq!(rec.argvs().len(), calls_before, "no git call was made");
+    assert_eq!(kestrel_refs(&f.repo), "", "source repo untouched");
+    assert_eq!(git(&decoy, &["for-each-ref"]), decoy_before);
 }

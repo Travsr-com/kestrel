@@ -60,6 +60,10 @@ pub enum WorkspaceError {
     /// fetch from the clone. `clone` is the clone directory.
     #[error("`.git` in `{}` is not a real directory; refusing to fetch from it", clone.display())]
     GitDirNotADirectory { clone: PathBuf },
+    /// The clone has an `objects/info/alternates` or `http-alternates` entry, which could make
+    /// the fetch read objects from another repository, so `fetch_back` refuses.
+    #[error("clone `{}` has object alternates; refusing to fetch from it", clone.display())]
+    AlternatesPresent { clone: PathBuf },
 }
 
 /// The environment every host git call runs with: removes `GIT_DIR`, `GIT_WORK_TREE`,
