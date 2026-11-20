@@ -147,7 +147,7 @@ WASM (`wasmtime`) is kept only for small, user-authored policy and watchdog plug
 
 * One gateway bridge container serves every run. It joins each run network with `docker network connect`. One bridge per run would double the containers and slow every start.
 * The network's host side gets no address, so the bridge is the only way out of it.
-* When every block is in use, new runs wait `Queued` (one event says why) and start when a run ends.
+* When every block is in use, new runs wait `Queued` (one event says why) and start when a run ends. When no block can come back (all are taken by networks outside Kestrel, or held by networks that could not be removed), a queued run fails at once and says to change `gateway.subnet_pool` or restart.
 * Networks carry `kestrel.run` and `kestrel.instance` labels. `kestrel serve` removes leftover ones at startup.
 * With `gateway.advertise_url` there is no bridge: all sandboxes share the old `kestrel-gw` network and can reach each other. Serve prints a warning.
 

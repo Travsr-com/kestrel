@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use common::*;
 use kestrel_core::{Engine, Limits};
 use kestrel_sandbox::{
-    CommandOutput, CommandRunner, ExitStatus, GvisorDriver, LaunchSpec, NetworkPolicy,
+    CommandOutput, CommandRunner, ExitStatus, GvisorDriver, Ipv4Cidr, LaunchSpec, NetworkPolicy,
     OutputStream, PreparedNetwork, SandboxDriver, SandboxError, SandboxHandle, SpawnedProcess,
     Subnet, SubnetPool,
 };
@@ -723,4 +723,46 @@ async fn a_resume_after_a_restart_waits_for_a_block_and_then_gets_a_new_network(
     running(&h, a).await;
     assert_eq!(net.blocks_of(a), vec!["10.200.0.0/29"]);
     assert_eq!(h.count_events(a, waits_for("10.200.0.0/29")), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_from_a_dead_pool_is_dropped_with_a_note_and_the_run_stays_suspended() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = dir.path().join("kestrel.db");
+
+    // First engine: `a` runs, then the engine stops.
+    let (mut first, _net, _pool) = with(Harness::on(&db, 4), 4, "10.200.0.0/29");
+    let _s1 = first.driver.live();
+    first.start();
+    let a = first.submit(spec()).await;
+    running(&first, a).await;
+    first.engine.shutdown(GRACE).await;
+    drop(first);
+
+    // Second engine: a network outside Kestrel covers the only block, so no block is free and
+    // none will come back. The resume of `a` cannot get a network.
+    let (mut h, net, pool) = with(Harness::on(&db, 4), 4, "10.200.0.0/29");
+    h.engine.recover().await.expect("recover");
+    let restarted = Suspended(SuspendReason::Error("engine restarted".into()));
+    assert!(h.is(a, &restarted));
+    pool.exclude(&[Ipv4Cidr::parse("10.200.0.0/29").expect("cidr")]);
+    h.start();
+
+    h.control(a, ControlCommand::Resume);
+    until("a is told the resume is not possible", || {
+        h.has_event(a, |e| {
+            matches!(e, EventKind::AgentLog { line }
+                if line.contains("resume not possible") && line.contains("gateway.subnet_pool"))
+        })
+    })
+    .await;
+    settle().await;
+    assert!(h.is(a, &restarted), "the run stays suspended, not failed");
+    assert!(net.blocks_of(a).is_empty());
+    assert_eq!(
+        h.count_events(a, |e| matches!(e, EventKind::AgentLog { line }
+            if line.contains("waiting for a network block"))),
+        0,
+        "no wait note: the resume is not waiting"
+    );
 }

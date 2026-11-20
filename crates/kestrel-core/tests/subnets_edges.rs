@@ -159,3 +159,37 @@ async fn a_network_that_cannot_be_removed_keeps_its_block_out_of_the_pool_and_sa
     // our runs either: a later `NoSubnet` would otherwise tell the user to wait for a run to end.
     assert_eq!(pool.in_use(), 0, "the retired block is not held by a run");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_run_fails_instead_of_waiting_when_no_block_can_ever_come_back() {
+    // A /29 pool has one block. Run a ends, its network cannot be removed, so the block is
+    // retired until the next start: nothing is free and no run holds a block. Run b must not wait
+    // for a block that never comes back.
+    let (mut h, _driver, pool) = harness(Mode::ReleaseFails, "10.200.0.0/29");
+    h.driver.script(&["ok:done"], 0);
+    h.start();
+    let a = h.submit(spec()).await;
+    until("a completed", || h.is(a, &RunStatus::Completed)).await;
+    settle().await;
+    assert_eq!(
+        (pool.available(), pool.in_use()),
+        (0, 0),
+        "the block is retired"
+    );
+
+    let b = h.submit(spec()).await;
+    until("b failed", || matches!(h.status(b), RunStatus::Failed(_))).await;
+    let RunStatus::Failed(why) = h.status(b) else {
+        unreachable!("checked above")
+    };
+    assert!(why.contains("10.200.0.0/29"), "{why}");
+    assert!(why.contains("gateway.subnet_pool"), "{why}");
+    assert!(why.contains("restart"), "{why}");
+    assert!(
+        !h.has_event(b, |e| matches!(
+            e,
+            EventKind::AgentLog { line } if line.contains("waiting for a network block")
+        )),
+        "b is not told to wait"
+    );
+}

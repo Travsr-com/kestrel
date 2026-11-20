@@ -708,6 +708,37 @@ impl Inner {
         released
     }
 
+    /// True when the subnet pool has no free block and no block held by a run that will come
+    /// back: every block is excluded (taken by networks outside Kestrel, or retired because a
+    /// network could not be removed) until the next start.
+    fn pool_is_dead(&self) -> bool {
+        self.subnets
+            .as_ref()
+            .is_some_and(|p| p.available() == 0 && p.in_use() == 0)
+    }
+
+    /// Ends the wait of `run` for a block from a dead pool ([`Inner::pool_is_dead`]). A queued run
+    /// fails; for a resume, the command is dropped with a log line and the run stays suspended.
+    fn give_up_on_pool(&self, run: RunId, resume: bool) -> Result<()> {
+        let pool = self.subnets.as_ref().map(|p| p.pool().to_string());
+        let why = format!(
+            "no block of subnet pool {} can be used until kestrel serve restarts: every block is \
+             taken by networks outside Kestrel or by run networks that could not be removed. Set \
+             gateway.subnet_pool to a free range, or restart",
+            pool.unwrap_or_default()
+        );
+        if resume {
+            let line = format!("kestrel: resume not possible: {why}");
+            self.store.append(run, EventKind::AgentLog { line })?;
+        } else {
+            // The run may have been cancelled meanwhile; then there is nothing to fail.
+            let _ = self
+                .store
+                .transition(run, &RunStatus::Queued, RunStatus::Failed(why));
+        }
+        Ok(())
+    }
+
     /// The line a run waiting for a block gets, once per wait.
     fn pool_note(&self) -> String {
         let pool = self.subnets.as_ref().map(|p| p.pool().to_string());
@@ -833,6 +864,14 @@ impl Inner {
             }
             if needs_block && self.block_for(run).is_none() {
                 self.slots().release(run);
+                if self.pool_is_dead() {
+                    // Nothing is free and no run holds a block that will come back: waiting would
+                    // never end. A queued run fails; a resume is dropped and the run stays
+                    // suspended.
+                    s.waiting.remove(i);
+                    self.give_up_on_pool(run, resume)?;
+                    continue;
+                }
                 starved = true;
                 if !waiter.told {
                     waiter.told = true;
