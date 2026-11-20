@@ -78,6 +78,20 @@ pub fn git_env_scrub() -> EnvScrub {
             "GIT_CONFIG_*",
             "GIT_SSH*",
             "GIT_EXEC_PATH",
+            "GIT_TRACE*",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_PROTOCOL_FROM_USER",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PAGER",
         ]),
         set: vec![
             ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
@@ -228,12 +242,21 @@ impl Workspaces {
         })?;
         let branch = Self::branch_for(run);
         let clone_dir = self.path_for(run);
-        // `.git` must be a real directory: a gitfile or symlink could point git at another repo.
+        // The clone is the agent's: refuse anything that could point git at another repo.
         // A clone directory that does not exist at all is left for git to report.
-        if clone_dir.exists() {
+        if let Ok(meta) = tokio::fs::symlink_metadata(&clone_dir).await {
+            let objects_info = clone_dir.join(".git/objects/info");
             let git_dir = tokio::fs::symlink_metadata(clone_dir.join(".git")).await;
-            if !git_dir.is_ok_and(|m| m.is_dir()) {
+            if !meta.is_dir() || !git_dir.is_ok_and(|m| m.is_dir()) {
                 return Err(WorkspaceError::GitDirNotADirectory { clone: clone_dir });
+            }
+            for name in ["alternates", "http-alternates"] {
+                if tokio::fs::symlink_metadata(objects_info.join(name))
+                    .await
+                    .is_ok()
+                {
+                    return Err(WorkspaceError::AlternatesPresent { clone: clone_dir });
+                }
             }
         }
         let clone = clone_dir.to_string_lossy().into_owned();
