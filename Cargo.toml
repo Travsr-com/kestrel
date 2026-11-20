@@ -56,6 +56,10 @@ tower        = { version = "0.5", features = ["util"] }
 assert_cmd   = "2"
 predicates   = "3"
 toml         = "0.8"
+# Capability tokens (#33). Pinned exactly: 6.0.0 fails `cargo deny` (RUSTSEC-2026-0387 via
+# crypto-bigint 0.5.5), and 7.0.0 is still a pre-release, so no other version may slip in.
+# No default features: Kestrel uses no Datalog macros, PEM keys or Unicode regex classes.
+biscuit-auth = { version = "=7.0.0-alpha.4", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

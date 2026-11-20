@@ -7,7 +7,10 @@
 //!
 //! Each active run has its own task (a run actor). It is the only writer of that run's status, so
 //! control commands are applied while the run is busy, for example while `create` is still blocked.
+//!
+//! [`caps`] holds the capability grant a run carries and the signed tokens that narrow it per child.
 
+pub mod caps;
 mod slots;
 pub mod workspace;
 pub use workspace::{WorkspaceError, Workspaces};
