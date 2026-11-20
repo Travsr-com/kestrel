@@ -118,7 +118,8 @@ fn s3_run_writes_run_created_like_engine_submit() {
     assert_eq!(
         events[0].kind,
         EventKind::RunCreated {
-            agent: "cli-tester".into()
+            agent: "cli-tester".into(),
+            parent: None,
         }
     );
 }

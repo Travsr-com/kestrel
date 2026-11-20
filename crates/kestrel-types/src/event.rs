@@ -24,6 +24,10 @@ pub struct ModelCallRecord {
 pub enum EventKind {
     RunCreated {
         agent: String,
+        /// The run that spawned this one. `None` for a root, and for events written before the
+        /// field existed.
+        #[serde(default)]
+        parent: Option<RunId>,
     },
     StatusChanged {
         from: RunStatus,
