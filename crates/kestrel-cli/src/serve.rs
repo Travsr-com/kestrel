@@ -1849,6 +1849,37 @@ budget: { usd: 0.000010, wall_clock: 10m }
     }
 
     #[tokio::test]
+    async fn auto_with_an_explicit_listen_degrades_to_native_when_discovery_fails() {
+        for r in [
+            Scripted::new(1, "", "Cannot connect to the Docker daemon"),
+            Scripted::new(0, "fd00::1\n", ""),
+            Scripted::new(0, "not an address\n", ""),
+        ] {
+            let (got, line) = gateway(
+                &r,
+                DockerHostSetting::Auto,
+                Some("10.1.2.3:8123"),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(
+                got.expect("ok"),
+                (DockerHost::Native, "10.1.2.3:8123".into())
+            );
+            assert_eq!(line, NATIVE_LINE);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_without_an_explicit_listen_still_fails_on_a_non_ipv4_answer() {
+        let r = Scripted::new(0, "fd00::1\n", "");
+        let (got, line) = gateway(&r, DockerHostSetting::Auto, None, None, true).await;
+        assert_eq!(got.expect_err("fails").code, crate::EXIT_RUNTIME);
+        assert_eq!(line, "");
+    }
+
+    #[tokio::test]
     async fn explicit_native_binds_the_bridge_ip_as_today() {
         let r = Scripted::new(0, "172.17.0.1\n", "");
         let (got, line) = gateway(&r, DockerHostSetting::Native, None, None, true).await;
