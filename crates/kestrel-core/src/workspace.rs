@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kestrel_sandbox::{CommandRunner, validate_workspace_path};
+use kestrel_sandbox::{CommandRunner, EnvScrub, validate_workspace_path};
 use kestrel_types::{RunId, WorkspaceSpec};
 
 /// Why a workspace could not be prepared.
@@ -53,6 +53,20 @@ pub enum WorkspaceError {
         "invalid workspace path `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
     )]
     InvalidPath { path: String },
+    /// `prepare` was given a relative `git-clone` repo path; it is refused before any git call.
+    #[error("git-clone repo `{}` must be an absolute path", repo.display())]
+    RelativeRepo { repo: PathBuf },
+    /// `<clone>/.git` is missing, a file (gitfile) or a symlink, so `fetch_back` refuses to
+    /// fetch from the clone. `clone` is the clone directory.
+    #[error("`.git` in `{}` is not a real directory; refusing to fetch from it", clone.display())]
+    GitDirNotADirectory { clone: PathBuf },
+}
+
+/// The environment every host git call runs with: removes `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_CONFIG_*`, `GIT_SSH*` and `GIT_EXEC_PATH`; sets `GIT_CONFIG_NOSYSTEM=1` and
+/// `GIT_TERMINAL_PROMPT=0`.
+pub fn git_env_scrub() -> EnvScrub {
+    todo!("#52: scrubbed git environment")
 }
 
 /// Creates and finds per-run workspaces under one root directory.

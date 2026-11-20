@@ -188,11 +188,30 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+/// Environment changes for one process, applied on top of the inherited environment.
+/// A `remove` entry ending in `*` is a prefix (`GIT_SSH*` removes `GIT_SSH` and `GIT_SSH_COMMAND`).
+/// `remove` is applied first, then `set`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EnvScrub {
+    pub remove: Vec<String>,
+    pub set: Vec<(String, String)>,
+}
+
 /// All process spawning goes through this. `argv[0]` is the program; nothing is run via a shell.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run to completion and capture output.
     async fn run(&self, argv: &[String]) -> std::io::Result<CommandOutput>;
+    /// Like [`run`](Self::run), with `env` applied to the child's environment. The default
+    /// ignores `env` so existing implementors (fakes) keep working; `ProcessRunner` must override it.
+    async fn run_with_env(
+        &self,
+        argv: &[String],
+        env: &EnvScrub,
+    ) -> std::io::Result<CommandOutput> {
+        let _ = env;
+        self.run(argv).await
+    }
     /// Start, stream stdout and stderr lines as they arrive, and report the exit code.
     async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess>;
 }
