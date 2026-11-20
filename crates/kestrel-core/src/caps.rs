@@ -96,7 +96,8 @@
 //! * Parsing: at most [`MAX_BLOCKS`] blocks (authority included) and 1 MiB, Ed25519 keys only
 //!   (`allowed_internal_signing_algorithms` and `allowed_external_signing_algorithms`), no sealed
 //!   tokens, every attenuation block third-party. [`attenuate`] refuses to add a block past the
-//!   limit.
+//!   block limit, and [`issue`] and [`attenuate`] refuse to write a token over
+//!   [`MAX_TOKEN_BYTES`] ([`CapError::Token`]), so no token is handed out that cannot be read.
 //! * Authorizing: at most 10 000 facts, 100 iterations and 100 000 steps, which bound the work
 //!   deterministically. The 1 s wall clock limit is only a backstop.
 //!
@@ -414,6 +415,9 @@ impl CapToken {
 }
 
 /// A root token for `cap`, signed by `root`.
+///
+/// Fails with [`CapError::Token`] when the token would be over [`MAX_TOKEN_BYTES`] (a grant with
+/// very many names).
 pub fn issue(root: &RootKey, cap: &Capability) -> Result<CapToken, CapError> {
     let block = BiscuitBuilder::new()
         .code_with_params(BLOCK_CHECKS, block_params(cap, 0), HashMap::new())
@@ -440,7 +444,8 @@ fn sized(bytes: Vec<u8>) -> Result<CapToken, CapError> {
 /// third-party block signed by `root`. The new token is issued to `child.run`. Only the server,
 /// which holds the root key, can attenuate.
 ///
-/// Fails with [`CapError::Token`] when the parent already holds [`MAX_BLOCKS`] blocks.
+/// Fails with [`CapError::Token`] when the parent already holds [`MAX_BLOCKS`] blocks, or when the
+/// new token would be over [`MAX_TOKEN_BYTES`].
 pub fn attenuate(
     parent: &CapToken,
     root: &RootKey,
