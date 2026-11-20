@@ -1040,6 +1040,7 @@ impl Actor {
                 gateway: self.inner.gateway_url.clone(),
             },
             labels,
+            prepared_network: None,
         })
     }
 

@@ -71,6 +71,7 @@ mod tests {
             memory_mb: 512,
             network: NetworkPolicy::None,
             labels: Default::default(),
+            prepared_network: None,
         };
         let a = d.create(&spec).await.expect("create");
         let b = d.create(&spec).await.expect("create");

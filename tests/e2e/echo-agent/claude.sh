@@ -12,6 +12,12 @@
 #   git.txt      only when the input contains `git=1` (scenario 6): the agent commits inside its
 #                git clone and records `branch=`, `status_rc=`, `add_rc=`, `commit_rc=` and `log=`
 #
+#   peer.txt    only when the input contains `peer=<ip>` (scenario 7): `blocked <curl exit code>`
+#                or `reachable`, from trying http://<ip>:9999/ with a 3 second limit
+#
+# If the input contains `listen=1`, it starts `nc -lk -p 9999 &` before the model call, so a
+# second sandbox has something to try to reach.
+#
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
 set -u
@@ -34,6 +40,21 @@ result_line() { # $1 = is_error (true/false), $2 = result text without quotes
 }
 
 env > /workspace/env.txt
+
+case "$input" in
+  *listen=1*) nc -lk -p 9999 > /dev/null 2>&1 & ;;
+esac
+
+peer=$(printf '%s' "$input" | sed -n 's/.*peer=\([0-9.][0-9.]*\).*/\1/p')
+if [ -n "$peer" ]; then
+  curl -s -o /dev/null --max-time 3 "http://$peer:9999/"
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    echo "reachable" > /workspace/peer.txt
+  else
+    echo "blocked $code" > /workspace/peer.txt
+  fi
+fi
 
 : > /workspace/egress.txt
 for url in https://example.com https://1.1.1.1; do

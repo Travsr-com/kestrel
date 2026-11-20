@@ -21,6 +21,7 @@ fn alpine(argv: &[&str]) -> LaunchSpec {
         memory_mb: 256,
         network: NetworkPolicy::None,
         labels: BTreeMap::new(),
+        ..Default::default()
     }
 }
 

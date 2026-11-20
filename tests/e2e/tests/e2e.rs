@@ -762,3 +762,62 @@ fn s6_agent_can_commit_in_its_clone() {
         "fetch_back must not move the user's checkout"
     );
 }
+
+/// Scenario 7 (issue #10): two sandboxes running at once are on separate networks, so one cannot
+/// connect to the other, while the model call through the gateway still works.
+///
+/// Run B listens on port 9999 and sleeps. Run A tries B's address and records the result.
+#[test]
+fn s7_sandboxes_cannot_reach_each_other() {
+    let env = Env::new();
+    let _serve = env.serve();
+    let b = env.submit("5", "listen=1 sleep=40");
+    env.wait_status(&b, "Running");
+    // B has made its model call once it is about to sleep.
+    let start = Instant::now();
+    while env.mock.keys_seen().is_empty() {
+        assert!(
+            start.elapsed() < RUN_DEADLINE,
+            "run B never called the gateway"
+        );
+        std::thread::sleep(POLL);
+    }
+    let container = env
+        .events(&b)
+        .iter()
+        .find(|e| e["kind"]["kind"] == "sandbox_provisioned")
+        .and_then(|e| e["kind"]["sandbox_id"].as_str().map(String::from))
+        .expect("sandbox_provisioned event of run B");
+    let inspect = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            &container,
+        ])
+        .output()
+        .expect("docker inspect");
+    assert!(inspect.status.success(), "docker inspect failed");
+    let ips = String::from_utf8(inspect.stdout).expect("utf-8");
+    let ip = ips.split_whitespace().next().expect("B has an address");
+
+    let a = env.submit("5", &format!("probe peer={ip}"));
+    env.wait_status(&a, "Completed");
+
+    let peer = std::fs::read_to_string(env.workspace(&a).join("peer.txt")).expect("peer.txt");
+    assert!(
+        peer.trim().starts_with("blocked"),
+        "run A reached run B at {ip}: {peer:?}"
+    );
+    // A still made its metered model call through the gateway.
+    assert_eq!(
+        env.mock.keys_seen().len(),
+        2,
+        "both runs called the gateway"
+    );
+    let events = env.events(&a);
+    assert!(
+        events.iter().any(|e| e["kind"]["kind"] == "model_call"),
+        "run A has no metered model call"
+    );
+}

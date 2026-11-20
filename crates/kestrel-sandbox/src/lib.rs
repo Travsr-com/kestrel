@@ -13,7 +13,7 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, Stream};
-use kestrel_types::GATEWAY_KEY_PLACEHOLDER;
+use kestrel_types::{GATEWAY_KEY_PLACEHOLDER, RunId};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
 
@@ -64,6 +64,13 @@ pub enum SandboxError {
     #[error("gateway bridge step `{step}` failed: {stderr}")]
     Bridge { step: &'static str, stderr: String },
     /// The bridge port is 0.
+    #[error("network step `{step}` failed: {stderr}")]
+    Network { step: &'static str, stderr: String },
+    /// Docker has no address pool left for another per-run network (issue #34 lifts the limit).
+    #[error(
+        "docker has no free address pool for another run network: {stderr}. Docker's default pools hold about 30 networks, so fewer runs can be active at once (see issue #34)"
+    )]
+    NetworkPoolExhausted { stderr: String },
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
     /// The workspace directory could not be inspected (missing, no permission, ...), so the
@@ -79,9 +86,10 @@ pub enum SandboxError {
 pub type Result<T> = std::result::Result<T, SandboxError>;
 
 /// Network access for a sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NetworkPolicy {
     /// No network at all.
+    #[default]
     None,
     /// Only the Kestrel gateway is reachable.
     GatewayOnly { gateway: Url },
@@ -110,7 +118,7 @@ fn default_owner() -> OwnerLookup {
 }
 
 /// What to run and with which limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LaunchSpec {
     pub image: String,
     /// Passed as separate arguments, never through a shell.
@@ -124,6 +132,26 @@ pub struct LaunchSpec {
     /// Labels set on the container (`--label key=value`), so a later sweep can find containers
     /// a crashed engine left behind. The engine sets [`RUN_LABEL`] to the run id.
     pub labels: BTreeMap<String, String>,
+    /// The per-run network from [`SandboxDriver::prepare_network`]. With it, a `GatewayOnly`
+    /// sandbox is attached to this network only. Without it, the shared `kestrel-gw` network.
+    pub prepared_network: Option<String>,
+}
+
+/// A per-run network that [`SandboxDriver::prepare_network`] created, with the shared bridge
+/// joined to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedNetwork {
+    /// The network name, for example `kestrel-gw-1a2b3c4d5e6f`.
+    pub network: String,
+    /// The bridge's IPv4 address on that network: the host a sandbox uses to reach the gateway.
+    pub gateway_host: std::net::IpAddr,
+}
+
+/// The one-line warning printed when sandboxes share a network (no gateway bridge), or `None`
+/// when each run has its own.
+pub fn shared_network_warning(has_bridge: bool) -> Option<String> {
+    let _ = has_bridge;
+    todo!("issue #10")
 }
 
 /// Label key every sandbox of a run carries; the value is the run id.
@@ -335,6 +363,25 @@ pub trait SandboxDriver: Send + Sync {
     async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
         Ok(Vec::new())
     }
+
+    /// Creates this run's own internal network and joins the gateway bridge to it. `None` (the
+    /// default) means the driver uses the shared network, as before.
+    async fn prepare_network(&self, run: RunId) -> Result<Option<PreparedNetwork>> {
+        let _ = run;
+        Ok(None)
+    }
+
+    /// Disconnects the bridge from `network` and removes it. Idempotent. Default: nothing.
+    async fn remove_network(&self, network: &str) -> Result<()> {
+        let _ = network;
+        Ok(())
+    }
+
+    /// Names of per-run networks left behind (label `kestrel.run`, and this instance's label
+    /// when the driver has an instance id). Default: none.
+    async fn leftover_networks(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.
@@ -507,6 +554,39 @@ impl Cli {
             .filter(|id| check_id(id).is_ok())
             .map(|id| SandboxHandle { id: id.to_string() })
             .collect())
+    }
+
+    async fn prepare_network(
+        &self,
+        runner: &dyn CommandRunner,
+        bridge: Option<&str>,
+        instance: Option<&str>,
+        run: RunId,
+    ) -> Result<Option<PreparedNetwork>> {
+        let _ = (runner, instance, run);
+        if self.apple || bridge.is_none() {
+            return Ok(None);
+        }
+        todo!("issue #10")
+    }
+
+    async fn remove_network(
+        &self,
+        runner: &dyn CommandRunner,
+        bridge: Option<&str>,
+        network: &str,
+    ) -> Result<()> {
+        let _ = (runner, bridge, network);
+        todo!("issue #10")
+    }
+
+    async fn leftover_networks(
+        &self,
+        runner: &dyn CommandRunner,
+        instance: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let _ = (runner, instance);
+        todo!("issue #10")
     }
 
     async fn create(
@@ -711,7 +791,15 @@ macro_rules! cli_driver {
                     exits: Exits::default(),
                     owner: default_owner(),
                     instance: None,
+                    bridge: None,
                 }
+            }
+
+            /// Names the shared gateway bridge container. With it, `prepare_network` gives each
+            /// run its own internal network with the bridge joined to it.
+            pub fn with_bridge(mut self, container: impl Into<String>) -> Self {
+                self.bridge = Some(container.into());
+                self
             }
 
             /// Limits [`SandboxDriver::leftovers`] to sandboxes labelled with this instance id
@@ -719,6 +807,13 @@ macro_rules! cli_driver {
             pub fn with_instance(mut self, id: impl Into<String>) -> Self {
                 self.instance = Some(id.into());
                 self
+            }
+
+            fn tag_bridge(self, bridge: Option<&str>) -> Self {
+                match bridge {
+                    Some(name) => self.with_bridge(name),
+                    None => self,
+                }
             }
 
             fn tag(self, instance: Option<&str>) -> Self {
@@ -765,6 +860,23 @@ macro_rules! cli_driver {
                 $cli.leftovers(self.runner.as_ref(), self.instance.as_deref())
                     .await
             }
+            async fn prepare_network(&self, run: RunId) -> Result<Option<PreparedNetwork>> {
+                $cli.prepare_network(
+                    self.runner.as_ref(),
+                    self.bridge.as_deref(),
+                    self.instance.as_deref(),
+                    run,
+                )
+                .await
+            }
+            async fn remove_network(&self, network: &str) -> Result<()> {
+                $cli.remove_network(self.runner.as_ref(), self.bridge.as_deref(), network)
+                    .await
+            }
+            async fn leftover_networks(&self) -> Result<Vec<String>> {
+                $cli.leftover_networks(self.runner.as_ref(), self.instance.as_deref())
+                    .await
+            }
         }
     };
 }
@@ -775,6 +887,7 @@ pub struct GvisorDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
@@ -787,6 +900,7 @@ pub struct AppleContainerDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
@@ -795,6 +909,7 @@ pub struct DockerRuncDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 cli_driver!(GvisorDriver, GVISOR);
@@ -903,22 +1018,43 @@ pub fn detect_for(
     allow_weak: bool,
     instance: Option<&str>,
 ) -> Result<Vec<Box<dyn SandboxDriver>>> {
+    detect_with_bridge(host, allow_weak, instance, None)
+}
+
+/// Like [`detect_for`], and every driver gets `.with_bridge(name)` when `bridge` is `Some`, so
+/// each run has its own network.
+pub fn detect_with_bridge(
+    host: &HostInfo,
+    allow_weak: bool,
+    instance: Option<&str>,
+    bridge: Option<&str>,
+) -> Result<Vec<Box<dyn SandboxDriver>>> {
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessRunner);
     let has_docker_runtime = |name: &str| host.docker_runtimes.iter().any(|r| r == name);
     let mut drivers: Vec<Box<dyn SandboxDriver>> = Vec::new();
     if host.os == Os::Linux && has_docker_runtime("runsc") {
-        drivers.push(Box::new(GvisorDriver::new(runner.clone()).tag(instance)));
+        drivers.push(Box::new(
+            GvisorDriver::new(runner.clone())
+                .tag(instance)
+                .tag_bridge(bridge),
+        ));
     }
     if matches!(host.os, Os::MacOs { major } if major >= 26)
         && host.arch == Arch::Aarch64
         && host.apple_container
     {
         drivers.push(Box::new(
-            AppleContainerDriver::new(runner.clone()).tag(instance),
+            AppleContainerDriver::new(runner.clone())
+                .tag(instance)
+                .tag_bridge(bridge),
         ));
     }
     if allow_weak && has_docker_runtime("runc") {
-        drivers.push(Box::new(DockerRuncDriver::new(runner).tag(instance)));
+        drivers.push(Box::new(
+            DockerRuncDriver::new(runner)
+                .tag(instance)
+                .tag_bridge(bridge),
+        ));
     }
     if drivers.is_empty() {
         return Err(SandboxError::NoSecureSandbox {

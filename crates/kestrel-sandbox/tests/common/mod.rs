@@ -135,6 +135,7 @@ pub fn spec() -> LaunchSpec {
         memory_mb: 512,
         network: NetworkPolicy::None,
         labels: BTreeMap::new(),
+        ..Default::default()
     }
 }
 
