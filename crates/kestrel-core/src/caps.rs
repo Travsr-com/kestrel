@@ -419,6 +419,76 @@ impl CapToken {
     }
 }
 
+/// What a child's spec asked for that its parent could not grant, as [`narrow`] found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub tools: Vec<String>,
+    pub hosts: Vec<String>,
+    pub secrets: Vec<String>,
+    /// Spawnable agents.
+    pub agents: Vec<String>,
+}
+
+impl Dropped {
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+            && self.hosts.is_empty()
+            && self.secrets.is_empty()
+            && self.agents.is_empty()
+    }
+}
+
+/// The grant a child gets: what `wanted` (from the child's spec) asks for, cut down to what
+/// `parent` holds, and what was cut. The result always passes `check_subset_of(parent)`, so it
+/// can be handed to [`attenuate`].
+///
+/// Tools, hosts, secrets and spawnable agents are intersected. Budget and expiry take the
+/// smaller value. The child may spawn only when the parent may (`max_depth >= 1`): then its
+/// `max_depth` is at most the parent's minus one and its `max_children` at most the parent's.
+/// `run` is `wanted.run`.
+pub fn narrow(parent: &Capability, wanted: &Capability) -> (Capability, Dropped) {
+    fn split(
+        wanted: &BTreeSet<String>,
+        held: &BTreeSet<String>,
+    ) -> (BTreeSet<String>, Vec<String>) {
+        let kept = wanted.intersection(held).cloned().collect();
+        let cut = wanted.difference(held).cloned().collect();
+        (kept, cut)
+    }
+    let (tools, cut_tools) = split(&wanted.tools, &parent.tools);
+    let (hosts, cut_hosts) = split(&wanted.hosts, &parent.hosts);
+    let (secrets, cut_secrets) = split(&wanted.secrets, &parent.secrets);
+    let (spawn, cut_agents) = match (&wanted.spawn, parent.spawnable()) {
+        (None, _) => (None, Vec::new()),
+        (Some(w), None) => (None, w.agents.iter().cloned().collect()),
+        (Some(w), Some(p)) => {
+            let (agents, cut) = split(&w.agents, &p.agents);
+            let limits = SpawnLimits {
+                max_children: w.max_children.min(p.max_children),
+                max_depth: w.max_depth.min(p.max_depth.saturating_sub(1)),
+                agents,
+            };
+            (Some(limits), cut)
+        }
+    };
+    let child = Capability {
+        run: wanted.run,
+        tools,
+        hosts,
+        secrets,
+        spawn,
+        budget: wanted.budget.min(parent.budget),
+        expires_at: wanted.expires_at.min(parent.expires_at),
+    };
+    let dropped = Dropped {
+        tools: cut_tools,
+        hosts: cut_hosts,
+        secrets: cut_secrets,
+        agents: cut_agents,
+    };
+    (child, dropped)
+}
+
 /// A root token for `cap`, signed by `root`.
 ///
 /// Fails with [`CapError::Token`] when the token would be over [`MAX_TOKEN_BYTES`] (a grant with

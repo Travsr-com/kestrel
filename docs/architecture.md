@@ -132,6 +132,17 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * `wait=true` blocks and returns the child's result; `wait=false` returns a handle for fan-in via `kestrel.join`.
 * Concurrency is capped per host (a semaphore sized to CPU/RAM), so a runaway fan-out queues instead of thrashing.
 
+**How the engine spawns** (`Engine::spawn_child`):
+
+* **Who may spawn.** Only a `Running` run. Its capability token needs `kestrel.spawn`, spawn rights with depth left (`max_depth`), and the child agent in its `agents` list. A root run's token is made from its spec on its first spawn.
+* **The child's token.** What the child's spec asks for, cut down to what the parent holds. Anything cut is recorded on the child as a `CapabilitiesDropped` event.
+* **Budget.** Each run may spend up to its own limit. A spawn moves the child's budget out of the parent's limit, in the same store transaction that creates the child, so the limits of a tree always add up to the root budget. When a child ends, it keeps what it spent and the rest goes back to its parent (or further up, if the parent has ended too).
+* **Default budget.** With no `budget_usd`, the child gets the smaller of its spec's budget and half of what the parent has left.
+* **Limits.** The parent's `max_children` counts live and finished children. One tree holds at most 256 runs (`Engine::with_tree_limit`).
+* **Model tier.** A child spec without `model_policy` runs one tier below its parent (lever 1 in section 3.5).
+* **Workspace.** Each child gets its own clone. A `git-clone` child whose `repo` is relative clones its parent's repo.
+* Because a parent's limit shrinks when it spawns, `kestrel ps` shows the budget the parent kept, not the one it started with.
+
 ### 3.4 Sandbox drivers
 
 | Host | Default driver | Strong tier | Notes |
