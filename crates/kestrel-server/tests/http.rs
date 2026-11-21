@@ -438,6 +438,66 @@ async fn s12_unknown_approval_is_404_and_a_resolved_one_409() {
 }
 
 #[tokio::test]
+async fn an_unknown_approval_action_is_404_before_anything_else() {
+    let store = store();
+    let (id, aid) = waiting(&store);
+    store
+        .append(
+            id,
+            EventKind::ApprovalResolved {
+                id: aid,
+                approved: true,
+                payload: None,
+            },
+        )
+        .unwrap();
+    let app = app(store);
+    let (status, _) = json(
+        &app,
+        req("POST", &format!("/api/approvals/{aid}/bogus"), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_field_that_does_not_match_the_action_is_400() {
+    let store = store();
+    let (_, aid) = waiting(&store);
+    let app = app(store.clone());
+    for (action, body) in [
+        ("reject", r#"{"payload":"x"}"#),
+        ("approve", r#"{"reason":"x"}"#),
+        ("approve", r#"{"payload":"x","extra":1}"#),
+        ("approve", "not json"),
+    ] {
+        let (status, _) = json(
+            &app,
+            req(
+                "POST",
+                &format!("/api/approvals/{aid}/{action}"),
+                Some(body),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action} {body}");
+    }
+    assert!(store.take_control().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_socket_paths_are_a_json_404_not_the_ui() {
+    let app = app(store());
+    let (status, body) = json(&app, get("/ws/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+    assert_eq!(
+        send(&app, bare("/ws/nope")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn approving_for_a_run_no_longer_waiting_is_409() {
     let store = store();
     let (id, aid) = waiting(&store);

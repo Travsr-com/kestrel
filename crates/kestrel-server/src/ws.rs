@@ -86,9 +86,14 @@ pub(crate) async fn tree_socket(
 
 fn upgrade(ws: WebSocketUpgrade, s: AppState, source: Source, cursor: u64) -> Response {
     // Echoes `kestrel.v1` when the client offers it; the token subprotocol is never echoed.
+    // Tracked, so `serve` lets the socket send its close frame before the server goes.
+    let sockets = s.config.sockets.clone();
     ws.protocols([WS_PROTOCOL])
-        .on_upgrade(move |socket| follow(socket, s, source, cursor))
+        .on_upgrade(move |socket| sockets.track_future(follow(socket, s, source, cursor)))
 }
+
+/// Events read from the store per step, so a socket never holds a whole history at once.
+const PAGE: usize = 256;
 
 /// Events after `cursor`, each with its cursor.
 fn read(
@@ -98,11 +103,11 @@ fn read(
 ) -> Result<Vec<(u64, kestrel_types::Event)>, StoreError> {
     match source {
         Source::Run(run) => Ok(store
-            .events_since(run, cursor)?
+            .events_page(run, cursor, PAGE)?
             .into_iter()
             .map(|e| (e.seq, e))
             .collect()),
-        Source::Tree(root) => store.events_since_global(root, cursor),
+        Source::Tree(root) => store.events_since_global_page(root, cursor, PAGE),
     }
 }
 
@@ -138,16 +143,22 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
             Ok(End::Shutdown) => Some((close_code::AWAY, "kestrel is stopping")),
             Ok(End::TooSlow) => Some((close_code::POLICY, "the client is not reading")),
             Ok(End::Error) => Some((close_code::ERROR, "store error")),
+            // The client closed. The socket queued its answer when it read the client's close
+            // frame; closing the sink below flushes it, so the client sees a clean handshake.
             Ok(End::Client) | Err(_) => None,
         };
-        if let Some((code, reason)) = close {
-            let frame = Message::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            }));
-            // A client that does not read may never take it: give up after a moment.
-            let _ = timeout(Duration::from_secs(1), sink.send(frame)).await;
-        }
+        // A client that does not read may never take it: give up after a moment.
+        let _ = timeout(Duration::from_secs(1), async {
+            if let Some((code, reason)) = close {
+                let frame = CloseFrame {
+                    code,
+                    reason: reason.into(),
+                };
+                sink.send(Message::Close(Some(frame))).await?;
+            }
+            sink.close().await
+        })
+        .await;
     });
 
     let end = pump(&s, source, &mut cursor, &tx, &mut incoming).await;
@@ -187,11 +198,16 @@ async fn pump(
                     Ok(events) => events,
                     Err(_) => return End::Error,
                 };
+                let full = events.len() == PAGE;
                 for (at, event) in events {
                     if let Some(end) = push(s, tx, &WsFrame::Event { cursor: at, event }).await {
                         return end;
                     }
                     *cursor = at;
+                }
+                // A full page means more is waiting: read the next one without waiting a tick.
+                if full {
+                    poll.reset_immediately();
                 }
             }
         }

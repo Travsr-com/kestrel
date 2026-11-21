@@ -770,6 +770,30 @@ fn open_browser(url: &str) {
     }
 }
 
+/// An error of the API server, so `supervise` names it rather than the gateway.
+#[derive(Debug)]
+struct ApiServerError(std::io::Error);
+
+impl std::fmt::Display for ApiServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ApiServerError {}
+
+/// The message for a server that failed: the API server's errors say so, any other is the
+/// gateway's.
+fn server_error(e: &std::io::Error) -> String {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ApiServerError>())
+    {
+        Some(api) => format!("API server: {api}"),
+        None => format!("gateway: {e}"),
+    }
+}
+
 /// The API server, bound and ready to serve.
 struct Api {
     addr: SocketAddr,
@@ -795,19 +819,26 @@ async fn bind_api(
         .local_addr()
         .map_err(|e| Failure::runtime(e.to_string()))?;
     let path = token_path(db);
-    let token = kestrel_server::load_or_create_token(&path)
-        .map_err(|e| Failure::runtime(format!("{}: {e}", path.display())))?;
+    let token =
+        kestrel_server::load_or_create_token(&path).map_err(|e| Failure::runtime(e.to_string()))?;
+    let config = kestrel_server::Config::new(token.clone(), addr);
+    let sockets = config.sockets.clone();
     let app = kestrel_server::router(
         store,
-        kestrel_server::Config::new(token.clone(), addr),
+        config,
         Arc::new(kestrel_server::EmbeddedUi),
         shutdown.clone(),
     );
+    let serve = kestrel_server::serve(listener, app, shutdown, sockets);
     Ok(Api {
         addr,
         url: ui_url(addr, &token),
         open: options.open,
-        serve: Box::pin(kestrel_server::serve(listener, app, shutdown)),
+        serve: Box::pin(async move {
+            serve
+                .await
+                .map_err(|e| std::io::Error::other(ApiServerError(e)))
+        }),
     })
 }
 
@@ -1049,7 +1080,7 @@ async fn supervise<E: std::fmt::Display>(
     let gateway = |r: Result<std::io::Result<()>, tokio::task::JoinError>, expected: bool| match r {
         Ok(Ok(())) if expected => Ok(()),
         Ok(Ok(())) => Err(Failure::runtime("gateway stopped unexpectedly")),
-        Ok(Err(e)) => Err(Failure::runtime(format!("gateway: {e}"))),
+        Ok(Err(e)) => Err(Failure::runtime(server_error(&e))),
         Err(e) => Err(Failure::runtime(format!("gateway: {e}"))),
     };
     tokio::pin!(engine);
@@ -1395,6 +1426,18 @@ budget: { usd: 0.000010, wall_clock: 10m }
             .await
             .expect_err("panic");
         assert!(e.message.starts_with("gateway:"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn a_dead_api_server_is_named_in_the_error() {
+        let engine = std::future::pending::<Result<(), String>>();
+        let failed = server(Err(std::io::Error::other(ApiServerError(
+            std::io::Error::other("accept failed"),
+        ))));
+        let e = supervise(engine, failed, CancellationToken::new())
+            .await
+            .expect_err("api server error");
+        assert_eq!(e.message, "API server: accept failed");
     }
 
     #[tokio::test]

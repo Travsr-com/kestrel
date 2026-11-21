@@ -95,7 +95,7 @@ fn up_serves_the_api_with_the_printed_token_and_stops_on_sigint() {
 #[test]
 fn up_reuses_the_token_across_starts() {
     let f = Fixture::new();
-    std::fs::write(f.db.with_file_name("server.token"), "feedface").unwrap();
+    std::fs::write(f.db.with_file_name("server.token"), "feedface".repeat(8)).unwrap();
     let config = f.write("config.toml", CONFIG);
     let mut cmd = f.kestrel_std();
     cmd.args([
@@ -112,7 +112,10 @@ fn up_reuses_the_token_across_starts() {
     let mut up = ChildGuard::spawn(cmd);
     let ready = common::json_line(&up.stdout_lines().next_line("up ready line"));
     assert!(
-        ready["url"].as_str().unwrap().ends_with("?token=feedface"),
+        ready["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("?token={}", "feedface".repeat(8))),
         "{ready}"
     );
     up.interrupt();

@@ -33,21 +33,36 @@ pub(crate) async fn origin(State(state): State<AppState>, req: Request, next: Ne
     next.run(req).await
 }
 
-/// `host:port` names `bind` when the port matches and the name is: `localhost` or a loopback IP
-/// for a loopback bind; the bound IP for a specific bind; any IP literal for an unspecified bind
-/// (0.0.0.0 or ::). Never a DNS name other than `localhost`, so rebinding cannot pass.
+/// The name and port of a `Host` value. Browsers leave out the port for 80.
+fn split_host(host: &str) -> Option<(&str, u16)> {
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => {
+            let (inside, after) = rest.split_once(']')?;
+            (inside, after.strip_prefix(':'))
+        }
+        None => match host.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (host, None),
+        },
+    };
+    let port = match port {
+        Some(p) => p.parse().ok()?,
+        None => 80,
+    };
+    Some((name, port))
+}
+
+/// `host[:port]` names `bind` when the port matches and the name is: `localhost` or a loopback
+/// IP for a loopback bind; the bound IP for a specific bind; any IP literal for an unspecified
+/// bind (0.0.0.0 or ::). Never a DNS name other than `localhost`, so rebinding cannot pass.
 fn allowed_host(host: &str, bind: SocketAddr) -> bool {
-    let Some((name, port)) = host.rsplit_once(':') else {
+    let Some((name, port)) = split_host(host) else {
         return false;
     };
-    if port.parse::<u16>().ok() != Some(bind.port()) {
+    if port != bind.port() {
         return false;
     }
-    let ip = name
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .ok();
+    let ip = name.parse::<IpAddr>().ok();
     let ip_bind = bind.ip();
     if ip_bind.is_loopback() {
         name == "localhost" || ip.is_some_and(|ip| ip.is_loopback())
@@ -124,6 +139,18 @@ mod tests {
         assert!(!allowed_host("10.0.0.5:7171", bind));
         assert!(!allowed_host("localhost", bind));
         assert!(!allowed_host("localhost:port", bind));
+    }
+
+    // Browsers leave the port out of Host and Origin for port 80.
+    #[test]
+    fn a_host_without_a_port_means_port_80() {
+        let bind = addr("127.0.0.1:80");
+        assert!(allowed_host("localhost", bind));
+        assert!(allowed_host("127.0.0.1", bind));
+        assert!(allowed_host("localhost:80", bind));
+        assert!(!allowed_host("localhost", addr("127.0.0.1:7171")));
+        assert!(!allowed_host("[::1]", addr("127.0.0.1:7171")));
+        assert!(allowed_host("[::1]", bind));
     }
 
     #[test]

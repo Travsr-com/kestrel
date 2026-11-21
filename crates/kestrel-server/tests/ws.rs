@@ -37,8 +37,9 @@ async fn start(store: Arc<Store>, tune: impl FnOnce(&mut Config)) -> Server {
     config.poll = Duration::from_millis(10);
     tune(&mut config);
     let shutdown = CancellationToken::new();
+    let sockets = config.sockets.clone();
     let app = router(store, config, Arc::new(MemUi::build()), shutdown.clone());
-    let task = tokio::spawn(serve(listener, app, shutdown.clone()));
+    let task = tokio::spawn(serve(listener, app, shutdown.clone(), sockets));
     Server {
         addr,
         shutdown,
@@ -282,7 +283,19 @@ async fn a_client_close_ends_the_socket_on_the_server() {
     let server = start(store, |_| {}).await;
     let mut socket = open(&server, &format!("/ws/runs/{id}")).await;
     socket.send(Message::Close(None)).await.unwrap();
-    // The server answers the close, and shutting down after that does not hang.
+    // The server answers the close: a clean close handshake, not a dropped connection.
+    let answer = timeout(Duration::from_secs(10), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(answer, "the server did not answer the close");
     server.shutdown.cancel();
     timeout(Duration::from_secs(10), server.task)
         .await

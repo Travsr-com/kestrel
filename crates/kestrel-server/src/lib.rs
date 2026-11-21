@@ -23,6 +23,7 @@ use axum::routing::{any, get, post};
 use kestrel_store::Store;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub use ui::{Asset, Assets, EmbeddedUi, PLACEHOLDER};
 
@@ -41,6 +42,9 @@ pub struct Config {
     pub ws_queue: usize,
     /// How long a full queue may stay full before the client is dropped. 10 s by default.
     pub ws_stall: Duration,
+    /// The open event sockets. [`serve`] waits for them after it stops accepting, so each one
+    /// gets to send its close frame.
+    pub sockets: TaskTracker,
 }
 
 impl Config {
@@ -52,6 +56,7 @@ impl Config {
             poll: Duration::from_millis(200),
             ws_queue: 256,
             ws_stall: Duration::from_secs(10),
+            sockets: TaskTracker::new(),
         }
     }
 }
@@ -90,6 +95,7 @@ pub fn router(
         .route("/api/{*rest}", any(api::not_found))
         .route("/ws/runs/{id}", get(ws::run_socket))
         .route("/ws/tree/{id}", get(ws::tree_socket))
+        .route("/ws/{*rest}", any(api::not_found))
         .route_layer(middleware::from_fn_with_state(state.clone(), guard::auth));
     Router::new()
         .merge(protected)
@@ -98,35 +104,72 @@ pub fn router(
         .with_state(state)
 }
 
-/// Serves `app` on `listener` until `shutdown` is cancelled, then waits for open connections
-/// (event sockets close themselves on the same token) and releases the port.
+/// How long [`serve`] waits for event sockets to send their close frames after it stops.
+const SOCKET_GRACE: Duration = Duration::from_secs(3);
+
+/// Serves `app` on `listener` until `shutdown` is cancelled. Then it waits for HTTP requests in
+/// flight, and (up to a few seconds) for the event sockets in `sockets` (`Config::sockets` of the
+/// router) to send their close frames, and releases the port.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
     shutdown: CancellationToken,
+    sockets: TaskTracker,
 ) -> io::Result<()> {
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
+        .await;
+    sockets.close();
+    let _ = tokio::time::timeout(SOCKET_GRACE, sockets.wait()).await;
+    served
 }
 
+/// Shortest token accepted from the token file.
+const MIN_TOKEN_LEN: usize = 32;
+
 /// The API token stored at `path`, made on first use: 32 random bytes as 64 hex characters, in a
-/// file only its owner can read (mode 0600 on Unix). Hex fits in a WebSocket subprotocol.
+/// file only its owner can read (mode 0600 on Unix). A token found there must be at least 32
+/// characters of letters, digits, `-` and `_`, which fit in a WebSocket subprotocol; on Unix
+/// the file is set to 0600 if others could read it.
 pub fn load_or_create_token(path: &Path) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let token = text.trim();
-            if token.is_empty() {
+            let usable = token.len() >= MIN_TOKEN_LEN
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            if !usable {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{} is empty; delete it to make a new token", path.display()),
+                    format!(
+                        "{}: the token must be at least {MIN_TOKEN_LEN} letters, digits, - or _; delete the file to make a new one",
+                        path.display()
+                    ),
                 ));
             }
+            tighten(path)?;
             Ok(token.to_string())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => create_token(path),
         Err(e) => Err(e),
     }
+}
+
+/// Makes the token file readable by its owner only, if others could read it.
+#[cfg(unix)]
+fn tighten(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn create_token(path: &Path) -> io::Result<String> {

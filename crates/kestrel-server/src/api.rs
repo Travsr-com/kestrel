@@ -314,9 +314,25 @@ pub(crate) async fn approvals(State(s): State<AppState>, Query(q): Params) -> Re
 }
 
 #[derive(Deserialize, Default)]
-struct ResolveBody {
+#[serde(deny_unknown_fields)]
+struct ApproveBody {
     payload: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RejectBody {
     reason: Option<String>,
+}
+
+/// The body of an approve or reject: empty, or the one field that action takes. Any other field
+/// is a 400, so a `reason` sent to approve is not silently dropped.
+fn resolve_body<T: Default + serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Reject> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| Box::new(error(StatusCode::BAD_REQUEST, format!("bad body: {e}"))))
 }
 
 /// `POST /api/approvals/{id}/{approve|reject}`, optionally with `{"payload": ...}` (approve) or
@@ -328,6 +344,9 @@ pub(crate) async fn resolve(
     body: Bytes,
 ) -> Response {
     let missing = || error(StatusCode::NOT_FOUND, format!("no approval {id}"));
+    if action != "approve" && action != "reject" {
+        return error(StatusCode::NOT_FOUND, format!("no command `{action}`"));
+    }
     let Ok(aid) = ApprovalId::from_str(&id) else {
         return missing();
     };
@@ -353,32 +372,22 @@ pub(crate) async fn resolve(
         }
         Err(e) => return internal(e),
     }
-    let text = if body.is_empty() {
-        ResolveBody::default()
-    } else {
-        match serde_json::from_slice::<ResolveBody>(&body) {
-            Ok(b) => b,
-            Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad body: {e}")),
-        }
-    };
-    let cmd = match (action.as_str(), text) {
-        (
-            "approve",
-            ResolveBody {
+    let cmd = if action == "approve" {
+        match resolve_body::<ApproveBody>(&body) {
+            Ok(ApproveBody {
                 payload: Some(payload),
-                ..
-            },
-        ) => ControlCommand::ApproveWith { id: aid, payload },
-        ("approve", _) => ControlCommand::Approve(aid),
-        (
-            "reject",
-            ResolveBody {
+            }) => ControlCommand::ApproveWith { id: aid, payload },
+            Ok(ApproveBody { payload: None }) => ControlCommand::Approve(aid),
+            Err(res) => return *res,
+        }
+    } else {
+        match resolve_body::<RejectBody>(&body) {
+            Ok(RejectBody {
                 reason: Some(reason),
-                ..
-            },
-        ) => ControlCommand::RejectWith { id: aid, reason },
-        ("reject", _) => ControlCommand::Reject(aid),
-        (other, _) => return error(StatusCode::NOT_FOUND, format!("no command `{other}`")),
+            }) => ControlCommand::RejectWith { id: aid, reason },
+            Ok(RejectBody { reason: None }) => ControlCommand::Reject(aid),
+            Err(res) => return *res,
+        }
     };
     match s.store.push_control(record.run_id, cmd) {
         Ok(_) => accepted(),
