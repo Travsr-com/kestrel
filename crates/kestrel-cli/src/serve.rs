@@ -1926,12 +1926,15 @@ budget: { usd: 0.000010, wall_clock: 10m }
 
     #[test]
     fn every_travsr_setting_is_read() {
+        // Absolute on every platform (on Windows `/opt/...` has no drive, so it is not).
+        let command = std::env::temp_dir().join("opt").join("travsr");
         let (_dir, path) = write(&format!(
-            "{ANTHROPIC}[travsr]\ncommand = \"/opt/travsr/bin/travsr\"\n\
-             index_timeout = 600\ncall_timeout = 5\nmax_indexing = 4\n"
+            "{ANTHROPIC}[travsr]\ncommand = '{}'\n\
+             index_timeout = 600\ncall_timeout = 5\nmax_indexing = 4\n",
+            command.display()
         ));
         let t = load_config(&path).expect("config").travsr.expect("on");
-        assert_eq!(t.command, PathBuf::from("/opt/travsr/bin/travsr"));
+        assert_eq!(t.command, command);
         assert_eq!(t.index_timeout, Duration::from_secs(600));
         assert_eq!(t.call_timeout, Duration::from_secs(5));
         assert_eq!(t.max_indexing, 4);

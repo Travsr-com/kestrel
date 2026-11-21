@@ -7,12 +7,15 @@
 //! * [`TravsrProcesses`] keeps a private copy of each indexed run's code at
 //!   `<data dir>/travsr/<run id>/repo`: a clone of the run's source repo at the commit its
 //!   workspace was cloned at (`kestrel_core::workspace::clone_at`). The `travsr` directory and
-//!   each run's directory are owner-only (0700), and no sandbox ever mounts them.
+//!   each run's directory are owner-only (0700), and no sandbox ever mounts them. A link the
+//!   commit holds is a plain file in the copy, so nothing Travsr writes there (`.gitignore`,
+//!   `.travsrignore`, its index) can go through one to the host.
 //! * It indexes that copy with `travsr init --no-connect`, with `CI=1` (no background daemon),
 //!   `TRAVSR_SKIP_DOWNLOAD=1` (no tool or model download) and `TRAVSR_DISABLE_REGISTRY=1` (no
 //!   entry in Travsr's global registry), and records the commit, so a resumed run reuses or
-//!   remakes the same copy. A `.travsr` the commit holds is deleted first, or refused when it is
-//!   a link. On Unix `init` runs in its own process group, killed whole when Kestrel gives up.
+//!   remakes the same copy. A `.travsr` the commit holds is deleted first (one that is a link is
+//!   refused, as defence in depth). On Unix `init` runs in its own process group, killed whole
+//!   when Kestrel gives up.
 //! * Each run that calls a tool gets its own `travsr mcp --stdio --db <copy>/.travsr/graph.db`,
 //!   started on its first call in the copy, once the database is checked to be a regular file
 //!   inside the run's directory.
@@ -136,12 +139,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether `command` may be the travsr command: a path from the root, or a bare name (one plain
+/// Whether `command` may be the travsr command: an absolute path, or a bare name (one plain
 /// component) to look up on `PATH`. A relative path such as `./travsr` or `bin/travsr` is not:
-/// Travsr runs with the run's copy as its working directory, where it would resolve.
+/// Travsr runs with the run's copy as its working directory, where it would resolve. Nor, on
+/// Windows, is `\travsr`, which has a root but no drive.
 pub(crate) fn acceptable_command(command: &Path) -> bool {
     use std::path::Component;
-    if command.has_root() {
+    if command.is_absolute() {
         return true;
     }
     let mut parts = command.components();
@@ -151,12 +155,12 @@ pub(crate) fn acceptable_command(command: &Path) -> bool {
     )
 }
 
-/// The travsr command to run, from the root: `command` itself when it is a path from the root,
-/// else the first runnable file of that name in an absolute entry of `path` (Kestrel's `PATH`).
-/// A relative entry is skipped, as the copy would resolve it. Done once, when `serve` starts.
+/// The travsr command to run, as an absolute path: `command` itself when it is one, else the
+/// first runnable file of that name in an absolute entry of `path` (Kestrel's `PATH`). A
+/// relative entry is skipped, as the copy would resolve it. Done once, when `serve` starts.
 /// The `Err` names neither the command nor `PATH`.
 pub(crate) fn resolve_command(command: &Path, path: Option<&OsStr>) -> Result<PathBuf, String> {
-    if command.has_root() {
+    if command.is_absolute() {
         return Ok(command.to_path_buf());
     }
     if !acceptable_command(command) {
@@ -196,46 +200,78 @@ fn runnable(path: &Path) -> bool {
     }
 }
 
-/// The process group of a command started as the leader of its own group (on Unix): when this
-/// is dropped (the command ended, or Kestrel gave up on it), the whole group is killed, so
-/// helpers the command started go with it. Elsewhere it holds nothing and does nothing.
+/// The process group of a command started as the leader of its own group (on Unix). Dropped
+/// while armed (Kestrel gave up on the command, or could not wait for it), it kills the whole
+/// group, so helpers the command started go with it. Elsewhere it holds nothing and does
+/// nothing.
 ///
-/// The group is killed by the `kill` command (`kill -s KILL -- -<group>`), so no `unsafe`
-/// signal call is needed. Right after the leader ends its id is not reused while any process is
-/// still in its group.
+/// A group's id is a process id, so it may be reused once the leader is reaped and no process
+/// is left in the group. While Kestrel waits, the leader is not reaped, so killing the group
+/// then cannot hit another one. Once the leader ended by itself (and was reaped) and its output
+/// reached its end, the group is disarmed and left alone. What remains:
+/// * a helper that let go of the output and kept running is not killed after a clean exit;
+/// * if the leader was reaped but its output did not reach its end (a read error, or Kestrel
+///   gave up while a helper held it), the group is still killed: a helper holding the output
+///   keeps the id in use, but after a read error the group may be empty and its id reused.
 struct Group(Option<u32>);
 
 impl Group {
     fn of(child: &Child) -> Group {
         Group(if cfg!(unix) { child.id() } else { None })
     }
+
+    /// The command ended by itself and its output reached its end: its group is left alone.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
-        if let Some(group) = self.0 {
-            // Nothing left in the group is fine; so is a missing `kill`.
-            let _ = std::process::Command::new("kill")
-                .args(["-s", "KILL", "--", &format!("-{group}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if let Some(group) = self.0.take() {
+            kill_group(group);
         }
     }
 }
 
+/// Sends `SIGKILL` to process group `group`. A group with nothing left in it is fine; any other
+/// failure is logged. Groups 0 and 1 are never a command's, and `-1` would signal every process,
+/// so they are never signalled.
+#[cfg(unix)]
+fn kill_group(group: u32) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    let Some(pid) = i32::try_from(group)
+        .ok()
+        .filter(|g| *g > 1)
+        .and_then(Pid::from_raw)
+    else {
+        return;
+    };
+    if let Err(e) = kill_process_group(pid, Signal::KILL)
+        && e != rustix::io::Errno::SRCH
+    {
+        eprintln!("kestrel: could not kill the process group {group} of `travsr init`: {e}");
+    }
+}
+
+/// Process groups are Unix only; [`Group::of`] holds none elsewhere.
+#[cfg(not(unix))]
+fn kill_group(_: u32) {}
+
 /// Reads `reader` to its end and returns the last [`KEPT_OUTPUT`] bytes it gave, never holding
-/// much more. A read error ends it early.
-async fn tail_of<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>) -> Vec<u8> {
+/// much more, and whether it reached the end. A read error ends it early. No reader has ended.
+async fn tail_of<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>) -> (Vec<u8>, bool) {
     let mut tail = Vec::new();
     let Some(mut reader) = reader else {
-        return tail;
+        return (tail, true);
     };
     let mut buf = [0u8; 8192];
-    while let Ok(read) = reader.read(&mut buf).await {
+    loop {
+        let Ok(read) = reader.read(&mut buf).await else {
+            return (tail, false);
+        };
         if read == 0 {
-            break;
+            return (tail, true);
         }
         tail.extend_from_slice(&buf[..read]);
         if tail.len() > KEPT_OUTPUT {
@@ -243,7 +279,6 @@ async fn tail_of<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>) -> Vec<u8> 
             tail.drain(..over);
         }
     }
-    tail
 }
 
 /// The last [`TAIL`] bytes of `said`, trimmed, on a character boundary.
@@ -258,8 +293,11 @@ fn last_words(said: &[u8]) -> String {
 }
 
 /// Deletes the `.travsr` the copy's commit holds, if any, before `init` runs: Travsr writes its
-/// index to `<repo>/.travsr/graph.db` and would use a committed one as it is. A `.travsr` that is
-/// a link could send those writes anywhere, so it is refused instead.
+/// index to `<repo>/.travsr/graph.db` and would use a committed one as it is.
+///
+/// A `.travsr` that is a link could send those writes anywhere, so it is refused. The copy never
+/// holds one (`clone_at` checks out a committed link as a plain file, which is deleted here), so
+/// this refusal is defence in depth, kept in case the copy is ever made another way.
 fn clear_committed_index(copy: &Path) -> Result<(), String> {
     let index = copy.join(".travsr");
     let cleared = match std::fs::symlink_metadata(&index) {
@@ -380,8 +418,8 @@ pub(crate) struct TravsrProcesses {
 }
 
 impl TravsrProcesses {
-    /// `command` is run only when it is a path from the root (see [`resolve_command`]); any
-    /// other makes every index fail, saying so.
+    /// `command` is run only when it is an absolute path (see [`resolve_command`]); any other
+    /// makes every index fail, saying so.
     pub(crate) fn new(
         command: PathBuf,
         root: PathBuf,
@@ -409,12 +447,12 @@ impl TravsrProcesses {
     }
 
     /// The travsr command with `args`, a clean environment and no stdin. Killed when dropped.
-    /// Refused unless the command is a path from the root.
+    /// Refused unless the command is an absolute path.
     fn command<S: AsRef<OsStr>>(
         &self,
         args: impl IntoIterator<Item = S>,
     ) -> Result<Command, String> {
-        if !self.command.has_root() {
+        if !self.command.is_absolute() {
             return Err(
                 "travsr.command was not found on PATH when `kestrel serve` started".to_string(),
             );
@@ -430,7 +468,8 @@ impl TravsrProcesses {
     }
 
     /// Runs `travsr init --no-connect` in `copy` to the end. On Unix it leads a process group of
-    /// its own, killed whole however this ends, a drop included. Only the latest output is held
+    /// its own, killed whole when Kestrel gives up on it (a drop included) or cannot wait for
+    /// it, and left alone when it ends by itself (see [`Group`]). Only the latest output is held
     /// in memory; `Err` ends with the tail of it.
     async fn init(&self, copy: &Path) -> Result<(), String> {
         let mut cmd = self.command(["init", "--no-connect"])?;
@@ -442,10 +481,15 @@ impl TravsrProcesses {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("could not start {}: {e}", self.command.display()))?;
-        let _group = Group::of(&child);
+        // Declared after `child`, so dropped first: the group is killed before the leader is.
+        let mut group = Group::of(&child);
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let (out, err, status) = tokio::join!(tail_of(stdout), tail_of(stderr), child.wait());
+        let ((out, out_ended), (err, err_ended), status) =
+            tokio::join!(tail_of(stdout), tail_of(stderr), child.wait());
         let status = status.map_err(|e| format!("`travsr init` could not be waited for: {e}"))?;
+        if out_ended && err_ended {
+            group.disarm();
+        }
         if status.success() {
             return Ok(());
         }
@@ -906,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_not_from_the_root_is_never_run() {
+    async fn a_command_that_is_not_absolute_is_never_run() {
         let dir = tempfile::tempdir().unwrap();
         let p = TravsrProcesses::new(
             PathBuf::from("travsr"),
@@ -946,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_path_from_the_root_or_a_bare_name_is_a_command() {
+    fn only_an_absolute_path_or_a_bare_name_is_a_command() {
         let rooted = std::env::temp_dir().join("travsr");
         for ok in [
             Path::new("travsr"),
@@ -958,31 +1002,75 @@ mod tests {
         for bad in ["", "./travsr", "bin/travsr", "../travsr", "a/../travsr"] {
             assert!(!acceptable_command(Path::new(bad)), "{bad}");
         }
+        // On Windows `\travsr` has a root but no drive: it is relative to the current drive.
+        #[cfg(windows)]
+        {
+            let no_drive = Path::new(r"\travsr");
+            assert!(!acceptable_command(no_drive));
+            assert!(resolve_command(no_drive, None).is_err());
+            let p = TravsrProcesses::new(
+                no_drive.to_path_buf(),
+                std::env::temp_dir(),
+                Arc::new(FakeGit),
+                Duration::from_secs(1),
+            );
+            assert!(p.command(["init"]).is_err());
+        }
+    }
+
+    /// `target` as a path relative to the current directory (`..` up to the deepest common
+    /// ancestor, then down), `None` when they share no root (another drive, on Windows).
+    fn relative_to_current_dir(target: &Path) -> Option<PathBuf> {
+        let here = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
+        let target = std::fs::canonicalize(target).ok()?;
+        let common = here
+            .components()
+            .zip(target.components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common == 0 {
+            return None;
+        }
+        let mut relative = PathBuf::new();
+        for _ in common..here.components().count() {
+            relative.push("..");
+        }
+        relative.extend(target.components().skip(common));
+        Some(relative)
     }
 
     #[test]
     fn a_bare_command_is_found_in_an_absolute_path_entry_only() {
         let name = "kestrel-test-travsr";
-        // A directory reached by a relative entry (it is under the current directory) and the
-        // same directory by its absolute path.
-        let here = tempfile::Builder::new()
+        let found = tempfile::Builder::new()
             .prefix("resolve")
-            .tempdir_in(".")
+            .tempdir()
             .unwrap();
-        let relative = Path::new(".").join(here.path().file_name().unwrap());
-        std::fs::write(relative.join(name), "").unwrap();
+        let absolute = std::fs::canonicalize(found.path()).unwrap();
+        std::fs::write(absolute.join(name), "").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(relative.join(name), mode).unwrap();
+            std::fs::set_permissions(absolute.join(name), mode).unwrap();
         }
-        let absolute = std::fs::canonicalize(&relative).unwrap();
         let empty = tempfile::tempdir().unwrap();
-        let only_relative = std::env::join_paths([&relative]).unwrap();
-        assert!(resolve_command(Path::new(name), Some(&only_relative)).is_err());
-        let path = std::env::join_paths([relative.clone(), empty.path().into(), absolute.clone()])
-            .unwrap();
+        // The same directory by a relative entry, which does reach the file from here, is
+        // passed over.
+        if let Some(relative) = relative_to_current_dir(&absolute) {
+            assert!(relative.is_relative() && runnable(&relative.join(name)));
+            let only_relative = std::env::join_paths([&relative]).unwrap();
+            assert!(resolve_command(Path::new(name), Some(&only_relative)).is_err());
+            let path =
+                std::env::join_paths([relative, empty.path().into(), absolute.clone()]).unwrap();
+            assert_eq!(
+                resolve_command(Path::new(name), Some(&path)).unwrap(),
+                absolute.join(name)
+            );
+        } else {
+            eprintln!("SKIPPED the relative entry: the temp dir is on another drive");
+        }
+        let path = std::env::join_paths([empty.path(), absolute.as_path()]).unwrap();
         assert_eq!(
             resolve_command(Path::new(name), Some(&path)).unwrap(),
             absolute.join(name)
@@ -999,7 +1087,7 @@ mod tests {
         // A relative path is never looked up.
         let err = resolve_command(Path::new("./kestrel-test-travsr"), Some(&path)).unwrap_err();
         assert!(err.contains("bare command name"), "{err}");
-        // A path from the root is used as it is.
+        // An absolute path is used as it is.
         let rooted = empty.path().join("anything");
         assert_eq!(resolve_command(&rooted, None).unwrap(), rooted);
         // On Unix a file that cannot be run is passed over.
@@ -1011,14 +1099,41 @@ mod tests {
         }
     }
 
+    /// Gives `data`, then fails.
+    struct Failing(&'static [u8]);
+
+    impl tokio::io::AsyncRead for Failing {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.0.is_empty() {
+                return std::task::Poll::Ready(Err(io::Error::other("broken pipe")));
+            }
+            buf.put_slice(self.0);
+            self.0 = &[];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn only_the_latest_output_is_kept() {
         let long: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
-        let kept = tail_of(Some(&long[..])).await;
+        let (kept, ended) = tail_of(Some(&long[..])).await;
+        assert!(ended);
         assert_eq!(kept.len(), KEPT_OUTPUT);
         assert_eq!(kept, &long[long.len() - KEPT_OUTPUT..]);
-        assert!(tail_of::<&[u8]>(None).await.is_empty());
-        assert_eq!(tail_of(Some(&b"short"[..])).await, b"short");
+        assert_eq!(tail_of::<&[u8]>(None).await, (Vec::new(), true));
+        assert_eq!(
+            tail_of(Some(&b"short"[..])).await,
+            (b"short".to_vec(), true)
+        );
+        // A read error ends it early, not at the end of the output.
+        assert_eq!(
+            tail_of(Some(Failing(b"partial"))).await,
+            (b"partial".to_vec(), false)
+        );
         // The reason keeps the last words, whole characters only.
         let said = format!("{}\n", "é".repeat(400));
         let words = last_words(said.as_bytes());
@@ -1203,14 +1318,18 @@ mod tests {
         ///   daemon (a line in `<dir>/daemons`); without `TRAVSR_SKIP_DOWNLOAD` downloads (a line
         ///   in `<dir>/downloads`); without `TRAVSR_DISABLE_REGISTRY=1` registers the repo (a
         ///   line in `<dir>/registry`). It writes its index to `.travsr/graph.db` as it finds it,
-        ///   so through a `.travsr` link too, and keeps what a `.travsr` directory holds.
+        ///   so through a `.travsr` link too, and keeps what a `.travsr` directory holds. It adds
+        ///   a line to `.gitignore` and writes `.travsrignore` when none exists, both through a
+        ///   link too (a link to nothing counts as none).
         /// * `mcp` starts a daemon without `CI`, then answers `tools/list`, echoes every
         ///   `tools/call` as its text, and for tools named `die`, `quit`, `hang` and `bad` dies,
         ///   answers then quits, never answers, or answers with an error.
         ///
         /// Flag files in `<dir>`: `init_fails`; `init_sleeps`, with which `init` first starts a
         /// helper in the background that writes `helper_done` after 2 s, then writes
-        /// `init_started`, sleeps 2 s and writes `init_done` (both only if not killed first).
+        /// `init_started`, sleeps 2 s and writes `init_done` (both only if not killed first);
+        /// `init_detaches`, with which `init` starts a helper that lets go of its output and
+        /// writes `detached_done` after 1 s, then ends at once.
         const SCRIPT: &str = r#"#!/bin/sh
 d='@DIR@'
 echo "argv $*" >> "$d/log"
@@ -1228,10 +1347,15 @@ case "$1" in
       sleep 2
       : > "$d/init_done"
     fi
+    if [ -f "$d/init_detaches" ]; then
+      (sleep 1; : > "$d/detached_done") < /dev/null > /dev/null 2>&1 &
+    fi
     [ -n "$TRAVSR_SKIP_DOWNLOAD" ] || echo "download in $(pwd -P)" >> "$d/downloads"
     [ "$TRAVSR_DISABLE_REGISTRY" = 1 ] || echo "$(pwd -P)" >> "$d/registry"
     mkdir -p .travsr .git/hooks && : > .travsr/graph.db
     echo 'travsr hook-run' > .git/hooks/post-commit
+    echo '.travsr/' >> .gitignore
+    [ -e .travsrignore ] || echo '# travsr' > .travsrignore
     case " $* " in
       *" --no-connect "*) ;;
       *) echo '{}' > .mcp.json; echo travsr > CLAUDE.md; echo travsr > AGENTS.md ;;
@@ -1529,11 +1653,20 @@ exit 0
                 .output()
                 .unwrap();
             assert!(!out.status.success());
-            // A `.travsr` link in the repo is written through.
+            // A `.travsr` link in the repo is written through, and so are a `.gitignore` link
+            // and a `.travsrignore` link to nothing.
             let elsewhere = s.fake().join("elsewhere");
             std::fs::create_dir_all(&elsewhere).unwrap();
             std::fs::remove_dir_all(s.workspace.join(".travsr")).unwrap();
             std::os::unix::fs::symlink(&elsewhere, s.workspace.join(".travsr")).unwrap();
+            let host_ignore = s.fake().join("host-gitignore");
+            std::fs::write(&host_ignore, "host\n").unwrap();
+            let dangling = s.fake().join("host-travsrignore");
+            for name in [".gitignore", ".travsrignore"] {
+                std::fs::remove_file(s.workspace.join(name)).unwrap();
+            }
+            std::os::unix::fs::symlink(&host_ignore, s.workspace.join(".gitignore")).unwrap();
+            std::os::unix::fs::symlink(&dangling, s.workspace.join(".travsrignore")).unwrap();
             let out = Std::new(&s.p.command)
                 .arg("init")
                 .current_dir(&s.workspace)
@@ -1541,6 +1674,8 @@ exit 0
                 .unwrap();
             assert!(out.status.success());
             assert!(elsewhere.join("graph.db").exists());
+            assert_ne!(std::fs::read_to_string(&host_ignore).unwrap(), "host\n");
+            assert!(dangling.exists());
         }
 
         #[tokio::test]
@@ -1618,20 +1753,68 @@ exit 0
         }
 
         #[tokio::test]
-        async fn a_committed_travsr_link_is_refused_and_nothing_is_written_through_it() {
+        async fn a_committed_travsr_link_is_a_plain_file_in_the_copy_and_nothing_goes_through_it() {
             let s = setup();
             let elsewhere = s.fake().join("elsewhere");
             std::fs::create_dir_all(&elsewhere).unwrap();
             std::os::unix::fs::symlink(&elsewhere, s.repo.join(".travsr")).unwrap();
             let linked = commit_all(&s.repo);
             let run = RunId::new();
-            let err =
-                s.p.index(run, &at(&s.repo, Some(&linked)))
-                    .await
-                    .unwrap_err();
-            assert!(err.contains("`.travsr` that is a link"), "{err}");
-            assert!(calls_of(s.fake(), "init").is_empty());
+            s.p.index(run, &at(&s.repo, Some(&linked))).await.unwrap();
+            // The copy held a plain file, deleted before `init` made its own index.
+            let index = s.p.copy(run).join(".travsr");
+            assert!(std::fs::symlink_metadata(&index).unwrap().is_dir());
+            assert!(index.join("graph.db").is_file());
             assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        }
+
+        /// `travsr init` rewrites `.gitignore` and writes `.travsrignore` when there is none,
+        /// through a link too. Committed links are plain files in the copy, so the host files
+        /// they point at are never written.
+        #[tokio::test]
+        async fn committed_ignore_file_links_are_plain_files_so_init_writes_nothing_through_them() {
+            let s = setup();
+            let host = s.fake().join("host");
+            std::fs::create_dir_all(&host).unwrap();
+            let gitignore = host.join("gitignore");
+            std::fs::write(&gitignore, "host\n").unwrap();
+            let dangling = host.join("travsrignore");
+            std::os::unix::fs::symlink(&gitignore, s.repo.join(".gitignore")).unwrap();
+            std::os::unix::fs::symlink(&dangling, s.repo.join(".travsrignore")).unwrap();
+            let linked = commit_all(&s.repo);
+            let run = RunId::new();
+            s.p.index(run, &at(&s.repo, Some(&linked))).await.unwrap();
+            assert_eq!(calls_of(s.fake(), "init").len(), 1);
+            assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "host\n");
+            assert!(!dangling.exists());
+            let copy = s.p.copy(run);
+            for name in [".gitignore", ".travsrignore"] {
+                let meta = std::fs::symlink_metadata(copy.join(name)).unwrap();
+                assert!(meta.is_file(), "{name}");
+            }
+            // `init` wrote the copy's own `.gitignore`.
+            let written = std::fs::read_to_string(copy.join(".gitignore")).unwrap();
+            assert!(written.ends_with(".travsr/\n"), "{written}");
+        }
+
+        /// A command that ends by itself, its output read to the end, has its group left
+        /// alone: the group's id may belong to someone else by then. A helper that let go of
+        /// the output keeps running.
+        #[tokio::test]
+        async fn a_clean_init_exit_does_not_kill_its_group() {
+            let s = setup();
+            std::fs::write(s.fake().join("init_detaches"), "").unwrap();
+            let run = RunId::new();
+            s.p.index(run, &at(&s.repo, Some(&s.first))).await.unwrap();
+            let done = s.fake().join("detached_done");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the helper was killed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         #[tokio::test]
@@ -2024,15 +2207,26 @@ exit 0
 
         /// Scenario 12, reworked: the index answers from the run's private copy, and an edit the
         /// agent makes in its workspace never reaches the host's index. Against a real Travsr:
-        /// `TRAVSR_BIN`, else `travsr` on `PATH`; skipped, saying so, when neither runs.
-        /// `cargo test -p kestrel-cli --features integration`.
+        /// `TRAVSR_BIN` (an absolute path or a bare name), else `travsr`, resolved as `serve`
+        /// resolves `travsr.command`; skipped, saying so, when it is not found or does not run.
+        /// A relative `TRAVSR_BIN` fails the test. `cargo test -p kestrel-cli --features
+        /// integration`.
         #[cfg(feature = "integration")]
         #[tokio::test]
         async fn s12_the_index_answers_from_the_private_copy_and_never_sees_the_workspace() {
-            let bin = std::env::var_os("TRAVSR_BIN")
+            let wanted = std::env::var_os("TRAVSR_BIN")
                 .map_or_else(|| PathBuf::from("travsr"), PathBuf::from);
+            assert!(
+                acceptable_command(&wanted),
+                "TRAVSR_BIN must be an absolute path or a bare command name, not {}",
+                wanted.display()
+            );
+            let Ok(bin) = resolve_command(&wanted, std::env::var_os("PATH").as_deref()) else {
+                eprintln!("SKIPPED: no travsr binary in an absolute PATH entry (set TRAVSR_BIN)");
+                return;
+            };
             if Std::new(&bin).arg("--version").output().is_err() {
-                eprintln!("SKIPPED: no travsr binary (set TRAVSR_BIN)");
+                eprintln!("SKIPPED: {} does not run (set TRAVSR_BIN)", bin.display());
                 return;
             }
             let dir = tempfile::tempdir().unwrap();

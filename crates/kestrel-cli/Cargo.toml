@@ -39,6 +39,9 @@ tokio-util.workspace = true
 toml.workspace = true
 url.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [features]
 # Tests against a real Travsr (`travsr` on PATH, or TRAVSR_BIN). Run with `--features integration`.
 integration = []
