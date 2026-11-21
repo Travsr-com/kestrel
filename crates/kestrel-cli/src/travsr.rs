@@ -1190,7 +1190,7 @@ exit 0
             let at = s.real(&s.workspace);
             assert_eq!(lines(s.fake(), "daemons"), [format!("daemon in {at}")]);
             assert_eq!(lines(s.fake(), "downloads"), [format!("download in {at}")]);
-            assert_eq!(lines(s.fake(), "registry"), [at.clone()]);
+            assert_eq!(lines(s.fake(), "registry"), [at.as_str()]);
             // Outside a git repo, init fails; an unknown repo is no error to remove.
             let out = Std::new(&s.p.command)
                 .arg("init")
