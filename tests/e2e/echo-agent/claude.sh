@@ -40,7 +40,8 @@
 #   spend=N      make model calls until N were made or the gateway refuses one (spend.out); after a
 #                refusal it waits, so the engine suspends it while it runs.
 #   hosts=1      also try api.github.com and evil.example (egress.txt).
-#   tools=1      the `--allowedTools`, a tools/list and a call of kestrel.ask_human (tools.out).
+#   tools=1      the `--allowedTools`, a tools/list, a call of kestrel.ask_human and a call of
+#                kestrel.join with no children (tools.out).
 #   ask=1        asks a person with kestrel.ask_human (ask.out) and writes the answer (answer.out).
 #   escalate=1   spawns with a budget above its own, then a grandchild with escalate=2 and wait
 #                (escalate.out); escalate=2 lists its tools and tries to spawn (escalate.out).
@@ -240,6 +241,9 @@ if marker tools > /dev/null; then
     echo
     echo "== kestrel.ask_human"
     mcp_call '{"jsonrpc":"2.0","id":"ask","method":"tools/call","params":{"name":"kestrel.ask_human","arguments":{"question":"may I?"}}}' 30
+    echo
+    echo "== kestrel.join"
+    mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 30
     echo
   } > /workspace/tools.out 2>&1
 fi

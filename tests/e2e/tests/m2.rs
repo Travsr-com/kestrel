@@ -345,7 +345,8 @@ fn strings(v: &Value) -> Vec<String> {
 }
 
 /// Scenario 3: a child asking for tools its parent lacks does not get them. `tools/list` does not
-/// show them, and a direct call is refused with `not permitted` and recorded.
+/// show them, and a direct call is refused with `not permitted` and recorded. A call of a tool it
+/// holds (`kestrel.join`) on the same route succeeds.
 ///
 /// The gateway serves only the `kestrel.*` tools until the Travsr route lands (#44), so the
 /// direct call is made to `kestrel.ask_human`; `travsr.get_callers` is checked in the grant.
@@ -384,6 +385,12 @@ fn m2_s03_child_cannot_use_a_tool_its_parent_lacks() {
     let call = section(&report, "kestrel.ask_human");
     assert!(call.contains("not permitted"), "{report}");
     assert!(call.contains(r#""isError":true"#), "{report}");
+    // The control: the same child, the same route, a tool it holds. It has no children, so the
+    // join answers at once with none.
+    let call = section(&report, "kestrel.join");
+    assert!(call.contains(r#""isError":false"#), "{report}");
+    assert!(!call.contains(r#""isError":true"#), "{report}");
+    assert!(call.contains(r#""children":[]"#), "{report}");
 
     let events = env.events(&child);
     assert!(
