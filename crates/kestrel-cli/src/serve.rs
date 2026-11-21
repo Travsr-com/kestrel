@@ -285,12 +285,16 @@ fn travsr_settings(raw: RawTravsr) -> Result<TravsrSettings, Failure> {
     };
     let command = match raw.command {
         None => defaults.command,
+        // A relative path would resolve in the run's copy, Travsr's working directory.
         Some(value) => value
             .as_str()
-            .filter(|c| !c.is_empty())
             .map(PathBuf::from)
+            .filter(|c| crate::travsr::acceptable_command(c))
             .ok_or_else(|| {
-                Failure::usage("travsr.command must be a non-empty path or command name")
+                Failure::usage(
+                    "travsr.command must be an absolute path or a bare command name looked up \
+                     on PATH",
+                )
             })?,
     };
     let index_timeout = whole(
@@ -1288,10 +1292,19 @@ async fn start_engine(
     // Travsr, when configured: one process client keeps private copies of runs' code under
     // `<data dir>/travsr`, indexes them and answers the gateway. Never a run's workspace.
     let travsr = config.travsr.map(|t| {
+        // Looked up once, now, in absolute PATH entries only. Not found: every run starts
+        // without Travsr, saying why.
+        let path = std::env::var_os("PATH");
+        let command =
+            crate::travsr::resolve_command(&t.command, path.as_deref()).unwrap_or_else(|why| {
+                eprintln!("kestrel: {why}; runs start without Travsr");
+                t.command.clone()
+            });
         let processes = TravsrProcesses::new(
-            t.command.clone(),
+            command,
             data_dir.join("travsr"),
-            Arc::new(ProcessRunner),
+            // A copy whose indexing is given up on stops being written: its git is killed.
+            Arc::new(kestrel_sandbox::KillOnDropRunner),
             t.call_timeout,
         );
         (Arc::new(processes), t)
@@ -1929,6 +1942,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
         for (line, key) in [
             ("command = \"\"", "travsr.command"),
             ("command = 7", "travsr.command"),
+            ("command = \"./travsr\"", "travsr.command"),
+            ("command = \"bin/travsr\"", "travsr.command"),
+            ("command = \"../travsr\"", "travsr.command"),
             ("index_timeout = 0", "travsr.index_timeout"),
             ("index_timeout = \"5m\"", "travsr.index_timeout"),
             ("index_timeout = 86401", "travsr.index_timeout"),

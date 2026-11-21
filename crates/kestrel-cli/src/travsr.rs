@@ -11,17 +11,19 @@
 //! * It indexes that copy with `travsr init --no-connect`, with `CI=1` (no background daemon),
 //!   `TRAVSR_SKIP_DOWNLOAD=1` (no tool or model download) and `TRAVSR_DISABLE_REGISTRY=1` (no
 //!   entry in Travsr's global registry), and records the commit, so a resumed run reuses or
-//!   remakes the same copy.
+//!   remakes the same copy. A `.travsr` the commit holds is deleted first, or refused when it is
+//!   a link. On Unix `init` runs in its own process group, killed whole when Kestrel gives up.
 //! * Each run that calls a tool gets its own `travsr mcp --stdio --db <copy>/.travsr/graph.db`,
 //!   started on its first call in the copy, once the database is checked to be a regular file
 //!   inside the run's directory.
-//! * Forgetting a run stops its server, runs `travsr repos --remove <copy>` and deletes the run's
-//!   directory, each bounded in time.
+//! * Forgetting a run stops its server and deletes the run's directory. No Travsr command runs:
+//!   nothing was registered.
 //! * [`EngineTravsr`] is what the gateway asks: which tools a run may call (from the engine) and
 //!   the calls themselves, always to the run's own server.
 //!
 //! Travsr gets a short list of environment variables (see [`PASSED_ENV`] and [`SET_ENV`]), never
-//! the run token or a provider key.
+//! the run token or a provider key. The command is an absolute path (see [`resolve_command`]),
+//! so nothing in the copy, which is Travsr's working directory, can stand in for it.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -43,7 +45,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// The `[travsr]` settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TravsrSettings {
-    /// The travsr command: a path, or a name looked up on `PATH`.
+    /// The travsr command: an absolute path, or a bare name looked up on `PATH` once, when
+    /// `serve` starts (see [`resolve_command`]).
     pub(crate) command: PathBuf,
     /// The longest indexing of one run may take.
     pub(crate) index_timeout: Duration,
@@ -94,7 +97,10 @@ const PASSED_ENV: &[&str] = &[
 /// * `CI`: `travsr init` and `travsr mcp` start no background daemon (and an interrupted init
 ///   hands nothing to one).
 /// * `TRAVSR_SKIP_DOWNLOAD`: `travsr init` downloads no language tool and no ranking model.
-/// * `TRAVSR_DISABLE_REGISTRY`: the copy is not added to Travsr's global registry.
+/// * `TRAVSR_DISABLE_REGISTRY`: the copy is not added to Travsr's global registry. Travsr checks
+///   it at both places `init` writes the registry (`travsr_store::registry::register` and
+///   `mark_indexed`, in `crates/travsr-daemon/src/lib.rs` of the travsr repo), so forgetting a
+///   run has nothing to unregister and runs no Travsr command.
 const SET_ENV: &[(&str, &str)] = &[
     ("CI", "1"),
     ("TRAVSR_SKIP_DOWNLOAD", "1"),
@@ -103,10 +109,16 @@ const SET_ENV: &[(&str, &str)] = &[
 
 /// Most bytes of a failed command's output kept for its error.
 const TAIL: usize = 500;
+/// Most bytes of each of `init`'s output streams held in memory while it runs: the latest ones.
+const KEPT_OUTPUT: usize = 4096;
 /// Longest line read from a Travsr server; a longer answer is an error.
 const MAX_LINE: u64 = 16 * 1024 * 1024;
-/// The longest `travsr repos --remove`, or a wait for a call to give a run's server up, may take.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a wait for a call to give a run's server up may take.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// What the agent is told when its run's server cannot be started. The details (host paths
+/// among them) go to Kestrel's log only.
+const NOT_STARTED: &str =
+    "Travsr's server for this run could not be started; Kestrel's log on the host says why";
 
 /// Whether Kestrel's variable `name` is passed to Travsr. Windows names are not case sensitive
 /// (`SystemRoot` may be `SYSTEMROOT`), Unix ones are.
@@ -122,6 +134,147 @@ fn passed(name: &str) -> bool {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether `command` may be the travsr command: a path from the root, or a bare name (one plain
+/// component) to look up on `PATH`. A relative path such as `./travsr` or `bin/travsr` is not:
+/// Travsr runs with the run's copy as its working directory, where it would resolve.
+pub(crate) fn acceptable_command(command: &Path) -> bool {
+    use std::path::Component;
+    if command.has_root() {
+        return true;
+    }
+    let mut parts = command.components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
+/// The travsr command to run, from the root: `command` itself when it is a path from the root,
+/// else the first runnable file of that name in an absolute entry of `path` (Kestrel's `PATH`).
+/// A relative entry is skipped, as the copy would resolve it. Done once, when `serve` starts.
+/// The `Err` names neither the command nor `PATH`.
+pub(crate) fn resolve_command(command: &Path, path: Option<&OsStr>) -> Result<PathBuf, String> {
+    if command.has_root() {
+        return Ok(command.to_path_buf());
+    }
+    if !acceptable_command(command) {
+        return Err("travsr.command is neither an absolute path nor a bare command name".into());
+    }
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| candidates(&dir, command))
+        .find(|candidate| runnable(candidate))
+        .ok_or_else(|| "travsr.command was not found in any absolute PATH entry".to_string())
+}
+
+/// The files `name` may be in `dir`: on Windows `name.exe` first, when `name` has no extension.
+fn candidates(dir: &Path, name: &Path) -> Vec<PathBuf> {
+    let plain = dir.join(name);
+    if cfg!(windows) && name.extension().is_none() {
+        vec![plain.with_extension("exe"), plain]
+    } else {
+        vec![plain]
+    }
+}
+
+/// Whether `path` is a file that can be run (on Unix, with an execute bit).
+fn runnable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// The process group of a command started as the leader of its own group (on Unix): when this
+/// is dropped (the command ended, or Kestrel gave up on it), the whole group is killed, so
+/// helpers the command started go with it. Elsewhere it holds nothing and does nothing.
+///
+/// The group is killed by the `kill` command (`kill -s KILL -- -<group>`), so no `unsafe`
+/// signal call is needed. Right after the leader ends its id is not reused while any process is
+/// still in its group.
+struct Group(Option<u32>);
+
+impl Group {
+    fn of(child: &Child) -> Group {
+        Group(if cfg!(unix) { child.id() } else { None })
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            // Nothing left in the group is fine; so is a missing `kill`.
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", "--", &format!("-{group}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Reads `reader` to its end and returns the last [`KEPT_OUTPUT`] bytes it gave, never holding
+/// much more. A read error ends it early.
+async fn tail_of<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let Some(mut reader) = reader else {
+        return tail;
+    };
+    let mut buf = [0u8; 8192];
+    while let Ok(read) = reader.read(&mut buf).await {
+        if read == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..read]);
+        if tail.len() > KEPT_OUTPUT {
+            let over = tail.len() - KEPT_OUTPUT;
+            tail.drain(..over);
+        }
+    }
+    tail
+}
+
+/// The last [`TAIL`] bytes of `said`, trimmed, on a character boundary.
+fn last_words(said: &[u8]) -> String {
+    let text = String::from_utf8_lossy(said);
+    let text = text.trim();
+    let mut start = text.len().saturating_sub(TAIL);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+/// Deletes the `.travsr` the copy's commit holds, if any, before `init` runs: Travsr writes its
+/// index to `<repo>/.travsr/graph.db` and would use a committed one as it is. A `.travsr` that is
+/// a link could send those writes anywhere, so it is refused instead.
+fn clear_committed_index(copy: &Path) -> Result<(), String> {
+    let index = copy.join(".travsr");
+    let cleared = match std::fs::symlink_metadata(&index) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(
+                "the run's commit holds a `.travsr` that is a link, so Kestrel does not index it"
+                    .into(),
+            );
+        }
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&index),
+        Ok(_) => std::fs::remove_file(&index),
+    };
+    cleared.map_err(|e| format!("could not delete the `.travsr` the run's commit holds: {e}"))
 }
 
 /// One run's Travsr server, `travsr mcp --stdio`, speaking newline-delimited JSON-RPC.
@@ -221,12 +374,14 @@ pub(crate) struct TravsrProcesses {
     git: Arc<dyn CommandRunner>,
     /// The longest one call to a server may take.
     call_timeout: Duration,
-    /// The longest `repos --remove`, or a wait for a call to give a server up, may take.
-    command_timeout: Duration,
+    /// The longest a wait for a call to give a server up may take.
+    stop_timeout: Duration,
     served: Mutex<Served>,
 }
 
 impl TravsrProcesses {
+    /// `command` is run only when it is a path from the root (see [`resolve_command`]); any
+    /// other makes every index fail, saying so.
     pub(crate) fn new(
         command: PathBuf,
         root: PathBuf,
@@ -238,7 +393,7 @@ impl TravsrProcesses {
             root,
             git,
             call_timeout,
-            command_timeout: COMMAND_TIMEOUT,
+            stop_timeout: STOP_TIMEOUT,
             served: Mutex::default(),
         }
     }
@@ -254,7 +409,16 @@ impl TravsrProcesses {
     }
 
     /// The travsr command with `args`, a clean environment and no stdin. Killed when dropped.
-    fn command<S: AsRef<OsStr>>(&self, args: impl IntoIterator<Item = S>) -> Command {
+    /// Refused unless the command is a path from the root.
+    fn command<S: AsRef<OsStr>>(
+        &self,
+        args: impl IntoIterator<Item = S>,
+    ) -> Result<Command, String> {
+        if !self.command.has_root() {
+            return Err(
+                "travsr.command was not found on PATH when `kestrel serve` started".to_string(),
+            );
+        }
         let mut cmd = Command::new(&self.command);
         cmd.args(args)
             .env_clear()
@@ -262,49 +426,40 @@ impl TravsrProcesses {
             .envs(SET_ENV.iter().copied())
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        cmd
+        Ok(cmd)
     }
 
-    /// Runs `cmd` to the end, at most `limit` when there is one. `Err` names `what` and ends with
-    /// the tail of its output.
-    async fn run(
-        &self,
-        mut cmd: Command,
-        what: &str,
-        limit: Option<Duration>,
-    ) -> Result<(), String> {
-        let output = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output();
-        let out = match limit {
-            Some(limit) => tokio::time::timeout(limit, output).await.map_err(|_| {
-                format!(
-                    "`travsr {what}` did not finish within {} s",
-                    limit.as_secs()
-                )
-            })?,
-            None => output.await,
-        }
-        .map_err(|e| format!("could not start {}: {e}", self.command.display()))?;
-        if out.status.success() {
+    /// Runs `travsr init --no-connect` in `copy` to the end. On Unix it leads a process group of
+    /// its own, killed whole however this ends, a drop included. Only the latest output is held
+    /// in memory; `Err` ends with the tail of it.
+    async fn init(&self, copy: &Path) -> Result<(), String> {
+        let mut cmd = self.command(["init", "--no-connect"])?;
+        cmd.current_dir(copy)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("could not start {}: {e}", self.command.display()))?;
+        let _group = Group::of(&child);
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let (out, err, status) = tokio::join!(tail_of(stdout), tail_of(stderr), child.wait());
+        let status = status.map_err(|e| format!("`travsr init` could not be waited for: {e}"))?;
+        if status.success() {
             return Ok(());
         }
-        let said = if out.stderr.iter().all(u8::is_ascii_whitespace) {
-            &out.stdout
+        let said = if err.iter().all(u8::is_ascii_whitespace) {
+            &out
         } else {
-            &out.stderr
+            &err
         };
-        let text = String::from_utf8_lossy(said);
-        let text = text.trim();
-        let mut start = text.len().saturating_sub(TAIL);
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        let code = out
-            .status
+        let code = status
             .code()
             .map_or_else(|| "a signal".to_string(), |c| format!("code {c}"));
         Err(format!(
-            "`travsr {what}` exited with {code}: {}",
-            &text[start..]
+            "`travsr init` exited with {code}: {}",
+            last_words(said)
         ))
     }
 
@@ -318,8 +473,8 @@ impl TravsrProcesses {
     }
 
     /// Stops serving `run`: no new call reaches it, and its server is stopped. A call under way
-    /// keeps the server at most `command_timeout`; past that, the server goes when that call
-    /// ends (at most its own timeout later).
+    /// keeps the server at most `stop_timeout`; past that, the server goes when that call ends
+    /// (at most its own timeout later).
     async fn stop(&self, run: RunId) {
         let slot = {
             let mut served = lock(&self.served);
@@ -327,7 +482,7 @@ impl TravsrProcesses {
             served.servers.remove(&run)
         };
         if let Some(slot) = slot
-            && let Ok(mut held) = tokio::time::timeout(self.command_timeout, slot.lock()).await
+            && let Ok(mut held) = tokio::time::timeout(self.stop_timeout, slot.lock()).await
         {
             held.closed = true;
             held.server.take();
@@ -336,7 +491,8 @@ impl TravsrProcesses {
 
     /// Asks `run`'s server, starting it if needed, at most `call_timeout`. A server that died,
     /// that a dropped call left halfway, or that did not answer in time, is started again on the
-    /// next call.
+    /// next call. A server that cannot be started is logged on the host with the reason (which
+    /// may name host paths), and the `Err` the agent gets says only that.
     pub(crate) async fn request(
         &self,
         run: RunId,
@@ -354,7 +510,13 @@ impl TravsrProcesses {
         }
         let server = match held.server.as_mut() {
             Some(server) => server,
-            None => held.server.insert(self.start(run)?),
+            None => match self.start(run) {
+                Ok(server) => held.server.insert(server),
+                Err(why) => {
+                    eprintln!("kestrel: Travsr's server for run {run} could not be started: {why}");
+                    return Err(NOT_STARTED.into());
+                }
+            },
         };
         let limit = self.call_timeout;
         match tokio::time::timeout(limit, server.ask(method, params)).await {
@@ -377,7 +539,7 @@ impl TravsrProcesses {
     fn start(&self, run: RunId) -> Result<Server, String> {
         let db = self.checked_db(run)?;
         let mut child = self
-            .command([OsStr::new("mcp"), OsStr::new("--stdio"), OsStr::new("--db")])
+            .command([OsStr::new("mcp"), OsStr::new("--stdio"), OsStr::new("--db")])?
             .arg(&db)
             .current_dir(self.copy(run))
             .stdin(Stdio::piped())
@@ -482,9 +644,8 @@ impl TravsrProcesses {
         kestrel_core::workspace::clone_at(self.git.as_ref(), &source.repo, &commit, &copy)
             .await
             .map_err(|e| format!("could not copy the run's code: {e}"))?;
-        let mut init = self.command(["init", "--no-connect"]);
-        init.current_dir(&copy);
-        self.run(init, "init", None).await?;
+        clear_committed_index(&copy)?;
+        self.init(&copy).await?;
         self.checked_db(run)?;
         std::fs::write(&done, "").map_err(|e| format!("could not mark the copy indexed: {e}"))
     }
@@ -559,26 +720,14 @@ impl RunIndexer for TravsrProcesses {
         self.stop(run).await;
     }
 
+    /// Stops `run`'s server and deletes its directory; a run with none is forgotten already. No
+    /// Travsr command runs: with `TRAVSR_DISABLE_REGISTRY=1` (see [`SET_ENV`]) `init` registered
+    /// nothing, so there is nothing to unregister.
     async fn forget(&self, run: RunId) -> Result<(), String> {
         self.stop(run).await;
-        // As `travsr init` would have registered it: by its canonical path. Nothing is
-        // registered with `TRAVSR_DISABLE_REGISTRY`; this removes what an older setup left, and
-        // Travsr exits 0 for a path it does not know.
-        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        let copy = root.join(run.to_string()).join("repo");
-        let remove = self.command([
-            OsStr::new("repos"),
-            OsStr::new("--remove"),
-            copy.as_os_str(),
-        ]);
-        let removed = self
-            .run(remove, "repos --remove", Some(self.command_timeout))
-            .await;
-        // The copy goes whatever Travsr said.
-        let deleted = remove_dir_if_any(&self.dir(run))
+        remove_dir_if_any(&self.dir(run))
             .await
-            .map_err(|e| format!("could not delete {}: {e}", self.dir(run).display()));
-        removed.and(deleted)
+            .map_err(|e| format!("could not delete {}: {e}", self.dir(run).display()))
     }
 
     async fn kept(&self) -> Result<Vec<RunId>, String> {
@@ -748,11 +897,172 @@ mod tests {
         // Not served: no call reaches anything.
         let err = p.request(run, "tools/list", json!({})).await.unwrap_err();
         assert!(err.contains("not available"), "{err}");
-        // Forgetting still deletes the copy, and says Travsr could not be asked.
+        // Forgetting needs no Travsr: it deletes the copy.
         assert!(p.dir(run).exists());
-        let err = p.forget(run).await.unwrap_err();
-        assert!(err.contains("could not start"), "{err}");
+        p.forget(run).await.unwrap();
         assert!(!p.dir(run).exists());
+        // A run with no directory at all is forgotten already.
+        p.forget(RunId::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_command_not_from_the_root_is_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = TravsrProcesses::new(
+            PathBuf::from("travsr"),
+            dir.path().join("travsr"),
+            Arc::new(FakeGit),
+            Duration::from_secs(5),
+        );
+        let run = RunId::new();
+        let err = p.index(run, &at(dir.path(), Some(SHA))).await.unwrap_err();
+        assert!(err.contains("not found on PATH"), "{err}");
+        // Nor as a server, with an index in place.
+        let index = p.copy(run).join(".travsr");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join("graph.db"), "").unwrap();
+        lock(&p.served).runs.insert(run);
+        let err = p.request(run, "tools/list", json!({})).await.unwrap_err();
+        assert_eq!(err, NOT_STARTED);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_start_tells_the_agent_no_host_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = missing(dir.path());
+        let run = RunId::new();
+        lock(&p.served).runs.insert(run);
+        // No index: the reason names the copy's path, which stays on the host.
+        let err = p.request(run, "tools/list", json!({})).await.unwrap_err();
+        assert_eq!(err, NOT_STARTED);
+        // An index, but no command to run: the same.
+        let index = p.copy(run).join(".travsr");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join("graph.db"), "").unwrap();
+        let err = p.request(run, "tools/list", json!({})).await.unwrap_err();
+        assert_eq!(err, NOT_STARTED);
+        let root = dir.path().display().to_string();
+        assert!(!NOT_STARTED.contains(&root));
+    }
+
+    #[test]
+    fn only_a_path_from_the_root_or_a_bare_name_is_a_command() {
+        let rooted = std::env::temp_dir().join("travsr");
+        for ok in [
+            Path::new("travsr"),
+            Path::new("travsr.exe"),
+            rooted.as_path(),
+        ] {
+            assert!(acceptable_command(ok), "{}", ok.display());
+        }
+        for bad in ["", "./travsr", "bin/travsr", "../travsr", "a/../travsr"] {
+            assert!(!acceptable_command(Path::new(bad)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bare_command_is_found_in_an_absolute_path_entry_only() {
+        let name = "kestrel-test-travsr";
+        // A directory reached by a relative entry (it is under the current directory) and the
+        // same directory by its absolute path.
+        let here = tempfile::Builder::new()
+            .prefix("resolve")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = Path::new(".").join(here.path().file_name().unwrap());
+        std::fs::write(relative.join(name), "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(relative.join(name), mode).unwrap();
+        }
+        let absolute = std::fs::canonicalize(&relative).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let only_relative = std::env::join_paths([&relative]).unwrap();
+        assert!(resolve_command(Path::new(name), Some(&only_relative)).is_err());
+        let path = std::env::join_paths([relative.clone(), empty.path().into(), absolute.clone()])
+            .unwrap();
+        assert_eq!(
+            resolve_command(Path::new(name), Some(&path)).unwrap(),
+            absolute.join(name)
+        );
+        // Not found anywhere, or no PATH: an error naming neither.
+        for path in [Some(path.as_os_str()), None] {
+            let err = resolve_command(Path::new("kestrel-no-such-travsr"), path).unwrap_err();
+            assert!(err.contains("travsr.command"), "{err}");
+            assert!(
+                !err.contains("kestrel-no-such") && !err.contains("resolve"),
+                "{err}"
+            );
+        }
+        // A relative path is never looked up.
+        let err = resolve_command(Path::new("./kestrel-test-travsr"), Some(&path)).unwrap_err();
+        assert!(err.contains("bare command name"), "{err}");
+        // A path from the root is used as it is.
+        let rooted = empty.path().join("anything");
+        assert_eq!(resolve_command(&rooted, None).unwrap(), rooted);
+        // On Unix a file that cannot be run is passed over.
+        #[cfg(unix)]
+        {
+            std::fs::write(empty.path().join("kestrel-plain-file"), "").unwrap();
+            let path = std::env::join_paths([empty.path()]).unwrap();
+            assert!(resolve_command(Path::new("kestrel-plain-file"), Some(&path)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_output_is_kept() {
+        let long: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let kept = tail_of(Some(&long[..])).await;
+        assert_eq!(kept.len(), KEPT_OUTPUT);
+        assert_eq!(kept, &long[long.len() - KEPT_OUTPUT..]);
+        assert!(tail_of::<&[u8]>(None).await.is_empty());
+        assert_eq!(tail_of(Some(&b"short"[..])).await, b"short");
+        // The reason keeps the last words, whole characters only.
+        let said = format!("{}\n", "é".repeat(400));
+        let words = last_words(said.as_bytes());
+        assert!(
+            words.len() <= TAIL && words.chars().all(|c| c == 'é'),
+            "{words}"
+        );
+        assert_eq!(last_words(b"  boom \n"), "boom");
+    }
+
+    #[test]
+    fn a_committed_index_is_deleted_before_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path();
+        // None: nothing to do.
+        clear_committed_index(copy).unwrap();
+        // A directory, whatever it holds.
+        std::fs::create_dir_all(copy.join(".travsr/sub")).unwrap();
+        std::fs::write(copy.join(".travsr/graph.db"), "forged").unwrap();
+        clear_committed_index(copy).unwrap();
+        assert!(!copy.join(".travsr").exists());
+        // A file.
+        std::fs::write(copy.join(".travsr"), "x").unwrap();
+        clear_committed_index(copy).unwrap();
+        assert!(!copy.join(".travsr").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_index_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (copy, elsewhere) = (dir.path().join("copy"), dir.path().join("elsewhere"));
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), "").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, copy.join(".travsr")).unwrap();
+        let err = clear_committed_index(&copy).unwrap_err();
+        assert!(err.contains("is a link"), "{err}");
+        // Nothing behind it was touched.
+        assert!(elsewhere.join("keep").exists());
+        // A link to nothing is refused too.
+        std::fs::remove_file(copy.join(".travsr")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("none"), copy.join(".travsr")).unwrap();
+        assert!(clear_committed_index(&copy).is_err());
     }
 
     #[tokio::test]
@@ -892,13 +1202,15 @@ mod tests {
         ///   `--no-connect` writes `.mcp.json`, `CLAUDE.md` and `AGENTS.md`; without `CI` starts a
         ///   daemon (a line in `<dir>/daemons`); without `TRAVSR_SKIP_DOWNLOAD` downloads (a line
         ///   in `<dir>/downloads`); without `TRAVSR_DISABLE_REGISTRY=1` registers the repo (a
-        ///   line in `<dir>/registry`).
-        /// * `repos --remove <path>` exits 0 whether or not the path is registered.
+        ///   line in `<dir>/registry`). It writes its index to `.travsr/graph.db` as it finds it,
+        ///   so through a `.travsr` link too, and keeps what a `.travsr` directory holds.
         /// * `mcp` starts a daemon without `CI`, then answers `tools/list`, echoes every
         ///   `tools/call` as its text, and for tools named `die`, `quit`, `hang` and `bad` dies,
         ///   answers then quits, never answers, or answers with an error.
         ///
-        /// Flag files in `<dir>`: `init_fails`, `init_sleeps`, `remove_fails`, `remove_hangs`.
+        /// Flag files in `<dir>`: `init_fails`; `init_sleeps`, with which `init` first starts a
+        /// helper in the background that writes `helper_done` after 2 s, then writes
+        /// `init_started`, sleeps 2 s and writes `init_done` (both only if not killed first).
         const SCRIPT: &str = r#"#!/bin/sh
 d='@DIR@'
 echo "argv $*" >> "$d/log"
@@ -910,7 +1222,12 @@ case "$1" in
   init)
     [ -d .git ] || { echo "error: not a git repository" >&2; exit 2; }
     if [ -f "$d/init_fails" ]; then echo "indexing 3 files"; echo "boom: no space left" >&2; exit 3; fi
-    if [ -f "$d/init_sleeps" ]; then sleep 30; fi
+    if [ -f "$d/init_sleeps" ]; then
+      (sleep 2; : > "$d/helper_done") &
+      echo $$ > "$d/init_started"
+      sleep 2
+      : > "$d/init_done"
+    fi
     [ -n "$TRAVSR_SKIP_DOWNLOAD" ] || echo "download in $(pwd -P)" >> "$d/downloads"
     [ "$TRAVSR_DISABLE_REGISTRY" = 1 ] || echo "$(pwd -P)" >> "$d/registry"
     mkdir -p .travsr .git/hooks && : > .travsr/graph.db
@@ -921,11 +1238,6 @@ case "$1" in
     esac
     daemon
     echo "indexed"
-    ;;
-  repos)
-    if [ -f "$d/remove_hangs" ]; then sleep 30; fi
-    if [ -f "$d/remove_fails" ]; then echo "registry locked" >&2; exit 1; fi
-    if grep -qx "$3" "$d/registry" 2>/dev/null; then echo "removed repo '$3'"; else echo "no repo named '$3' in the registry"; fi
     ;;
   mcp)
     daemon
@@ -1044,7 +1356,7 @@ exit 0
     mod with_fake {
         use super::fake::{Call, calls, calls_of, lines, travsr};
         use super::*;
-        use kestrel_sandbox::ProcessRunner;
+        use kestrel_sandbox::{KillOnDropRunner, ProcessRunner};
         use std::process::Command as Std;
 
         /// Runs git in `dir` and returns its trimmed stdout.
@@ -1077,6 +1389,25 @@ exit 0
                     "-q",
                     "-m",
                     "c",
+                ],
+            );
+            git(repo, &["rev-parse", "HEAD"])
+        }
+
+        /// Commits everything in `repo` as it is, and returns the commit.
+        fn commit_all(repo: &Path) -> String {
+            git(repo, &["add", "-A"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "all",
                 ],
             );
             git(repo, &["rev-parse", "HEAD"])
@@ -1124,10 +1455,10 @@ exit 0
             let mut p = TravsrProcesses::new(
                 travsr(dir.path()),
                 dir.path().join("data").join("travsr"),
-                Arc::new(ProcessRunner),
+                Arc::new(KillOnDropRunner),
                 Duration::from_secs(30),
             );
-            p.command_timeout = Duration::from_secs(10);
+            p.stop_timeout = Duration::from_secs(10);
             Setup {
                 dir,
                 repo,
@@ -1191,19 +1522,25 @@ exit 0
             assert_eq!(lines(s.fake(), "daemons"), [format!("daemon in {at}")]);
             assert_eq!(lines(s.fake(), "downloads"), [format!("download in {at}")]);
             assert_eq!(lines(s.fake(), "registry"), [at.as_str()]);
-            // Outside a git repo, init fails; an unknown repo is no error to remove.
+            // Outside a git repo, init fails.
             let out = Std::new(&s.p.command)
                 .arg("init")
                 .current_dir(s.fake())
                 .output()
                 .unwrap();
             assert!(!out.status.success());
+            // A `.travsr` link in the repo is written through.
+            let elsewhere = s.fake().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::remove_dir_all(s.workspace.join(".travsr")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, s.workspace.join(".travsr")).unwrap();
             let out = Std::new(&s.p.command)
-                .args(["repos", "--remove", "/nowhere"])
+                .arg("init")
+                .current_dir(&s.workspace)
                 .output()
                 .unwrap();
             assert!(out.status.success());
-            assert!(String::from_utf8_lossy(&out.stdout).contains("no repo named"));
+            assert!(elsewhere.join("graph.db").exists());
         }
 
         #[tokio::test]
@@ -1254,18 +1591,62 @@ exit 0
         }
 
         #[tokio::test]
-        async fn s2_a_dropped_index_kills_init() {
+        async fn s2_a_dropped_index_kills_init_and_the_helpers_it_started() {
             let s = setup();
             std::fs::write(s.fake().join("init_sleeps"), "").unwrap();
             let run = RunId::new();
             let source = at(&s.repo, Some(&s.first));
-            let gave_up =
-                tokio::time::timeout(Duration::from_millis(500), s.p.index(run, &source)).await;
-            assert!(gave_up.is_err());
-            // Killed: it never gets to make the index.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let started = s.fake().join("init_started");
+            // Driven until `init` has started its helper and said so (however long the clone
+            // before it takes), then dropped, as the engine's timeout does.
+            let mut index = Box::pin(s.p.index(run, &source));
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !started.exists() {
+                assert!(std::time::Instant::now() < deadline, "init never started");
+                tokio::select! {
+                    done = &mut index => panic!("index finished before it was dropped: {done:?}"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            drop(index);
+            // Both would have written by now (2 s after they started) had they not been killed.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            assert!(!s.fake().join("init_done").exists(), "init was not killed");
+            assert!(!s.fake().join("helper_done").exists(), "its helper was not");
             assert!(!s.p.copy(run).join(".travsr").exists());
             assert!(!s.p.dir(run).join("indexed").exists());
+        }
+
+        #[tokio::test]
+        async fn a_committed_travsr_link_is_refused_and_nothing_is_written_through_it() {
+            let s = setup();
+            let elsewhere = s.fake().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, s.repo.join(".travsr")).unwrap();
+            let linked = commit_all(&s.repo);
+            let run = RunId::new();
+            let err =
+                s.p.index(run, &at(&s.repo, Some(&linked)))
+                    .await
+                    .unwrap_err();
+            assert!(err.contains("`.travsr` that is a link"), "{err}");
+            assert!(calls_of(s.fake(), "init").is_empty());
+            assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_committed_travsr_directory_is_deleted_before_init() {
+            let s = setup();
+            std::fs::create_dir_all(s.repo.join(".travsr")).unwrap();
+            std::fs::write(s.repo.join(".travsr/graph.db"), "forged").unwrap();
+            std::fs::write(s.repo.join(".travsr/extra"), "x").unwrap();
+            let forged = commit_all(&s.repo);
+            let run = RunId::new();
+            s.p.index(run, &at(&s.repo, Some(&forged))).await.unwrap();
+            let index = s.p.copy(run).join(".travsr");
+            assert!(!index.join("extra").exists());
+            // The index is the one `init` wrote, not the commit's.
+            assert_eq!(std::fs::read(index.join("graph.db")).unwrap(), b"");
         }
 
         #[tokio::test]
@@ -1333,60 +1714,33 @@ exit 0
             std::fs::write(&other, "").unwrap();
             std::fs::remove_file(&db).unwrap();
             std::os::unix::fs::symlink(&other, &db).unwrap();
+            // The agent is told no host path; Kestrel's log has the reason.
             let err = s.p.request(run, "tools/list", json!({})).await.unwrap_err();
-            assert!(err.contains("not a regular file"), "{err}");
+            assert_eq!(err, NOT_STARTED);
             assert!(calls_of(s.fake(), "mcp").is_empty());
         }
 
         #[tokio::test]
-        async fn s8_forget_stops_the_server_unregisters_the_copy_and_deletes_it() {
+        async fn s8_forget_stops_the_server_and_deletes_the_copy_running_no_travsr() {
             let s = setup();
             let run = RunId::new();
             s.p.index(run, &at(&s.repo, Some(&s.first))).await.unwrap();
             s.p.request(run, "tools/list", json!({})).await.unwrap();
             assert!(lock(&s.p.served).servers.contains_key(&run));
             let before = snapshot(&s.workspace);
+            let ran = calls(s.fake()).len();
             s.p.forget(run).await.unwrap();
             assert!(!lock(&s.p.served).servers.contains_key(&run));
-            let removes = calls_of(s.fake(), "repos");
-            let copy = std::fs::canonicalize(&s.p.root)
-                .unwrap()
-                .join(run.to_string())
-                .join("repo");
-            assert_eq!(removes.len(), 1);
-            assert_eq!(
-                removes[0].argv,
-                format!("repos --remove {}", copy.display())
-            );
-            assert_safe_env(&removes[0]);
+            // Nothing was registered, so no Travsr command runs.
+            assert_eq!(calls(s.fake()).len(), ran);
+            assert!(lines(s.fake(), "registry").is_empty());
             assert!(!s.p.dir(run).exists());
             assert_eq!(snapshot(&s.workspace), before);
-            // Not served any more, and forgetting again is fine (Travsr exits 0 for a path it
-            // does not know).
+            // Not served any more, and forgetting again is fine.
             let err = s.p.request(run, "tools/list", json!({})).await.unwrap_err();
             assert!(err.contains("not available"), "{err}");
             s.p.forget(run).await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn s8_a_failed_or_hung_remove_is_an_error_and_the_copy_is_still_deleted() {
-            let mut s = setup();
-            s.p.command_timeout = Duration::from_secs(2);
-            let run = RunId::new();
-            s.p.index(run, &at(&s.repo, Some(&s.first))).await.unwrap();
-            std::fs::write(s.fake().join("remove_fails"), "").unwrap();
-            let err = s.p.forget(run).await.unwrap_err();
-            assert!(
-                err.contains("repos --remove") && err.contains("registry locked"),
-                "{err}"
-            );
-            assert!(!s.p.dir(run).exists());
-            std::fs::remove_file(s.fake().join("remove_fails")).unwrap();
-            std::fs::write(s.fake().join("remove_hangs"), "").unwrap();
-            let started = std::time::Instant::now();
-            let err = s.p.forget(run).await.unwrap_err();
-            assert!(err.contains("did not finish within 2 s"), "{err}");
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(calls(s.fake()).len(), ran);
         }
 
         #[tokio::test]
@@ -1399,7 +1753,7 @@ exit 0
             assert!(lock(&s.p.served).servers.is_empty());
             assert!(s.p.copy(run).join(".travsr/graph.db").is_file());
             assert!(s.p.request(run, "tools/list", json!({})).await.is_err());
-            assert!(calls_of(s.fake(), "repos").is_empty());
+            assert_eq!(calls(s.fake()).len(), 2, "init and mcp only");
             assert_eq!(s.p.kept().await.unwrap(), [run]);
         }
 
@@ -1487,7 +1841,7 @@ exit 0
         async fn forget_does_not_wait_long_for_a_call_that_holds_the_server() {
             // The call may take 30 s; forget waits for it at most 2 s.
             let mut s = setup();
-            s.p.command_timeout = Duration::from_secs(2);
+            s.p.stop_timeout = Duration::from_secs(2);
             let s = Arc::new(s);
             let run = RunId::new();
             s.p.index(run, &at(&s.repo, Some(&s.first))).await.unwrap();
@@ -1583,7 +1937,7 @@ exit 0
             let processes = Arc::new(TravsrProcesses::new(
                 s.p.command.clone(),
                 data.join("travsr"),
-                Arc::new(ProcessRunner),
+                Arc::new(KillOnDropRunner),
                 Duration::from_secs(5),
             ));
             let engine = Arc::new(
@@ -1706,7 +2060,7 @@ exit 0
             let p = TravsrProcesses::new(
                 bin,
                 dir.path().join("data").join("travsr"),
-                Arc::new(ProcessRunner),
+                Arc::new(KillOnDropRunner),
                 Duration::from_secs(60),
             );
             let run = RunId::new();
