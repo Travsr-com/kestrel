@@ -117,10 +117,23 @@ impl RunIndexer for FakeIndexer {
 
     async fn forget(&self, run: RunId, clone: &Path) -> Result<(), String> {
         lock(&self.forgotten).push((run, clone.to_path_buf()));
-        let failing = self
-            .forget_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+        // Takes one failure, if any are left. A loop rather than `fetch_update`, which newer
+        // toolchains deprecate, and its replacement is past the MSRV.
+        let mut left = self.forget_failures.load(Ordering::SeqCst);
+        let failing = loop {
+            if left == 0 {
+                break false;
+            }
+            match self.forget_failures.compare_exchange(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(now) => left = now,
+            }
+        };
         if failing {
             Err("travsr repos --remove exited with code 1".into())
         } else {
