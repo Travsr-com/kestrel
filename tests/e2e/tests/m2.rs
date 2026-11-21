@@ -697,8 +697,9 @@ const KERNEL_FS: [&str; 12] = [
 
 /// The `/proc/mounts` of a dump lists only the mounts the Docker driver of `kestrel-sandbox` makes
 /// (`/workspace` and `/kestrel`, both bind mounts) and the ones Docker adds to every container
-/// (`/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`), besides the root and the kernel's file
-/// systems. The echo agent read every one of them but `/workspace`, which the test reads on the host.
+/// (`/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`), besides the root, `/dev` (every runtime
+/// mounts it; gVisor emulates it under its own file system name, with no host files) and the
+/// kernel's file systems. The echo agent read every one of them but `/workspace`, which the test reads on the host.
 fn assert_mounts(id: &str, dump: &str) {
     let mounted: BTreeSet<&str> = section(dump, "/proc/mounts")
         .lines()
@@ -709,7 +710,7 @@ fn assert_mounts(id: &str, dump: &str) {
         })
         .collect();
     let driver = ["/workspace", "/kestrel"];
-    let docker = ["/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
+    let docker = ["/dev", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
     for point in driver {
         assert!(
             mounted.contains(point),
