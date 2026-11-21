@@ -1,6 +1,6 @@
 // Issue #45, scenario 12: the Run view shows a fan-out live. The tree grows as children are
 // spawned (one shows as running before the last exists), every status reaches Completed without a
-// reload, a child's stream shows its model call, the budget bar matches the API, and the Fleet and
+// reload, every child's stream shows its model call, the budget bar matches the API, and the Fleet and
 // Approvals pages load without console errors.
 import { expect, test } from '@playwright/test';
 import { api, formatUsd, kestrel, readTree, statusOf, type Node, type RunSummary } from './kestrel';
@@ -49,11 +49,23 @@ test('the spawn tree grows and completes live', async ({ page, request }) => {
   expect(page.url()).toContain(`#/runs/${root}`);
   expect(page.url(), 'the UI took the token out of the address').not.toContain('token=');
 
-  // A child's stream shows its model call.
-  await tree.getByRole('link', { name: 'worker', exact: true }).first().click();
-  await expect(page.getByRole('heading', { level: 1, name: 'worker' })).toBeVisible();
+  // Every child's stream shows its model call. Each node's link is described by its status, whose
+  // id carries the run id, so the loop opens each child by its id.
+  const kids = (await readTree(page)).filter((n) => n.id !== root);
+  expect(kids, 'the children in the tree').toHaveLength(children);
   const events = page.getByRole('list', { name: 'Events' });
-  await expect(events.getByText(/Model call: claude-e2e-1, 1000 in, 200 out, \$0\.006465/)).toBeVisible();
+  for (const kid of kids) {
+    const link = tree.locator(`a[aria-describedby="node-${kid.id}"]`);
+    await expect(link, `the tree link of child ${kid.id}`).toHaveText('worker');
+    await link.click();
+    await expect(page).toHaveURL(new RegExp(`#/runs/${kid.id}`));
+    await expect(link, `child ${kid.id} is the selected run`).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByRole('heading', { level: 1, name: 'worker' })).toBeVisible();
+    await expect(
+      events.getByText(/Model call: claude-e2e-1, 1000 in, 200 out, \$0\.006465/),
+      `the model call of child ${kid.id}`,
+    ).toBeVisible();
+  }
 
   // Back on the root, the budget bar says what the API says.
   await tree.getByRole('link', { name: 'lead', exact: true }).click();
