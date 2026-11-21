@@ -12,6 +12,8 @@
 //!   the run was not granted; a name off the allowlist is neither recorded nor echoed.
 //! * **A call lives as long as its request**: it is stopped when it times out and when the
 //!   request is dropped.
+//! * **Rate**: every `tools/list` and `tools/call` counts against the run's allowance, which it
+//!   shares with `/mcp`; past it the answer is 429.
 //! * **Arguments**: passed on as they are, without `repo`, which is dropped from calls and
 //!   from the listed schemas.
 //! * **Failure is the agent's to handle, never the run's**: a host error or a call slower than
@@ -105,10 +107,21 @@ pub(crate) async fn post(
     match method.as_str() {
         "initialize" => Json(rpc_result(id, initialized("travsr", &params))).into_response(),
         "ping" => Json(rpc_result(id, json!({}))).into_response(),
+        "tools/list" if !state.mcp.allow(run) => slow_down(id),
         "tools/list" => list(host, run, &tools, id).await,
         "tools/call" => call(&state, host, run, &tools, id, &params).await,
         _ => rpc_error(StatusCode::OK, id, -32601, "method not found"),
     }
+}
+
+/// The answer to a listing or a call past the run's allowance, which `/mcp` shares.
+fn slow_down(id: Value) -> Response {
+    rpc_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        id,
+        -32000,
+        "too many tool calls, slow down",
+    )
 }
 
 /// `GET /r/{run_token}/travsr`: no stream is offered, as on `/mcp`.
@@ -170,12 +183,7 @@ async fn call(
         );
     };
     if !state.mcp.allow(run) {
-        return rpc_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            id,
-            -32000,
-            "too many tool calls, slow down",
-        );
+        return slow_down(id);
     }
     // A name off the allowlist is the agent's own text, of any length: it is neither recorded
     // nor echoed, so it cannot flood the run's log or the answer.

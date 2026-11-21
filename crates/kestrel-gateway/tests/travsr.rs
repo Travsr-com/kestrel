@@ -683,6 +683,30 @@ async fn calls_share_the_run_s_rate_limit() {
     assert_eq!(limited, 5);
 }
 
+#[tokio::test(start_paused = true)]
+async fn listings_share_the_run_s_rate_limit_with_calls() {
+    // Each listing asks the host (Travsr's own `tools/list`), so it counts like a call.
+    let s = setup(&["get_callers"]);
+    let mut limited = 0;
+    for i in 0..25 {
+        let message = if i % 2 == 0 {
+            rpc(json!(i), "tools/list", json!({}))
+        } else {
+            call(i, "get_callers", json!({}))
+        };
+        let response = send(&s.app, TOKEN_A, &message).await;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+            assert_eq!(body(response).await["error"]["code"], -32000);
+        }
+    }
+    assert_eq!(limited, 5);
+    // Another run has its own allowance.
+    let response = send(&s.app, TOKEN_B, &rpc(json!(1), "tools/list", json!({}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body(response).await["result"]["tools"].is_array());
+}
+
 #[tokio::test]
 async fn get_is_405() {
     let s = setup(&["get_callers"]);
