@@ -1970,9 +1970,13 @@ impl Inner {
         Ok(Some(dir))
     }
 
-    /// Removes `run`'s config directory, if there is one (best effort).
+    /// Removes `run`'s config directory, if there is one (best effort). Like writing, never
+    /// through a root that is a link.
     fn remove_run_config(&self, run: RunId) {
-        let _ = std::fs::remove_dir_all(self.run_config_dir(run));
+        let real_dir = std::fs::symlink_metadata(&self.run_config).is_ok_and(|m| m.is_dir());
+        if real_dir {
+            let _ = std::fs::remove_dir_all(self.run_config_dir(run));
+        }
     }
 
     /// Best effort: destroys the last sandbox a previous engine provisioned for `run`, and its

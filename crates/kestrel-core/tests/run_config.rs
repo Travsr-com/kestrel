@@ -336,3 +336,34 @@ async fn a_root_owned_by_another_user_fails_the_run() {
     assert!(why.contains("owned by another user"), "{why}");
     assert!(!tmp.join(id.to_string()).exists());
 }
+
+// Removing goes no further through a linked root than writing does: recovery leaves alone what
+// the link points at.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn recovery_removes_nothing_through_a_linked_root() {
+    let holder = tempfile::tempdir().unwrap();
+    let root = holder.path().join("run-config");
+    let mut h = Harness::new(4);
+    let path = root.clone();
+    h.rebuild(|e| e.with_run_config(path));
+    h.driver.script(&["ok:done"], 0);
+    h.start();
+    let id = h.submit(spec()).await;
+    until("completed", || h.is(id, &RunStatus::Completed)).await;
+    h.shutdown.cancel();
+    if let Some(task) = h.task.take() {
+        task.await.unwrap().unwrap();
+    }
+    // The root is now a link to someone else's directory, which holds a run's name.
+    let target = tempfile::tempdir().unwrap();
+    let theirs = target.path().join(id.to_string());
+    std::fs::create_dir(&theirs).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    std::os::unix::fs::symlink(target.path(), &root).unwrap();
+
+    let path = root.clone();
+    h.rebuild(|e| e.with_run_config(path));
+    h.engine.recover().await.expect("recover");
+    assert!(theirs.exists());
+}

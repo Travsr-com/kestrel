@@ -835,7 +835,7 @@ fn s8_agent_spawns_a_child_through_its_mcp_config() {
     );
     assert!(text.contains("config_writable=no"), "{text}");
     assert!(text.contains("url=ok"), "{text}");
-    assert!(text.contains("kestrel.spawn"), "{text}");
+    assert!(text.contains(r#""name":"kestrel.spawn""#), "{text}");
 
     let events = env.events(&id);
     let spawned = events
