@@ -224,8 +224,9 @@ pub(crate) struct McpState {
 struct Busy;
 
 impl McpState {
-    /// Takes one tool call from `run`'s allowance; `false` when it has none left.
-    fn allow(&self, run: RunId) -> bool {
+    /// Takes one tool call from `run`'s allowance; `false` when it has none left. The Travsr
+    /// route draws on the same allowance.
+    pub(crate) fn allow(&self, run: RunId) -> bool {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&run) {
@@ -247,17 +248,161 @@ impl McpState {
 }
 
 /// A JSON-RPC error response.
-fn rpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Response {
+pub(crate) fn rpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Response {
     let body = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
     (status, Json(body)).into_response()
 }
 
-fn rpc_result(id: Value, result: Value) -> Value {
+pub(crate) fn rpc_result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// The `initialize` result of a server named `name`: the client's protocol version when this
+/// server speaks it, else this server's own.
+pub(crate) fn initialized(name: &str, params: &Value) -> Value {
+    json!({
+        "protocolVersion": params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|v| SUPPORTED_VERSIONS.contains(v))
+            .unwrap_or(MCP_PROTOCOL_VERSION),
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": name, "version": env!("CARGO_PKG_VERSION") }
+    })
+}
+
+/// The run the token names and the request body, read once the caller is known. `Err` is the
+/// answer: 401 for an unknown token, 413 for a body over [`MAX_BYTES`], 400 when it cannot be read.
+pub(crate) async fn caller(
+    state: &AppState,
+    token: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(RunId, axum::body::Bytes), Box<Response>> {
+    let Some(run) = state.deps.resolver.resolve(token).await else {
+        return Err(Box::new(rpc_error(
+            StatusCode::UNAUTHORIZED,
+            Value::Null,
+            -32001,
+            "unknown run token",
+        )));
+    };
+    let too_large = || {
+        rpc_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Value::Null,
+            -32002,
+            "request body is larger than 1 MiB",
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_BYTES) {
+        return Err(Box::new(too_large()));
+    }
+    match axum::body::to_bytes(body, MAX_BYTES).await {
+        Ok(bytes) => Ok((run, bytes)),
+        Err(e) if e.to_string().contains("length limit") => Err(Box::new(too_large())),
+        Err(_) => Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32700,
+            "the request body could not be read",
+        ))),
+    }
+}
+
+/// The answer for a run whose tools the host cannot list: 410 once it has finished, else 503.
+pub(crate) fn tools_error(e: ToolsError) -> Response {
+    match e {
+        ToolsError::Gone => rpc_error(
+            StatusCode::GONE,
+            Value::Null,
+            -32003,
+            "the run has finished",
+        ),
+        ToolsError::Unavailable => rpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Value::Null,
+            -32603,
+            "the tools are unavailable right now, try again",
+        ),
+    }
+}
+
+/// One JSON-RPC request to answer.
+pub(crate) struct Request {
+    pub(crate) id: Value,
+    pub(crate) method: String,
+    pub(crate) params: Value,
+}
+
+/// The request in `bytes`. `Err` is the answer: 400 for a message that is not a JSON-RPC
+/// request, 202 for a notification or a client's answer (nothing to answer).
+pub(crate) fn request(bytes: &[u8]) -> Result<Request, Box<Response>> {
+    let Ok(message) = serde_json::from_slice::<Value>(bytes) else {
+        return Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32700,
+            "parse error",
+        )));
+    };
+    let Some(object) = message.as_object() else {
+        return Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "invalid request: send one JSON-RPC object",
+        )));
+    };
+    let id = object.get("id").cloned().unwrap_or(Value::Null);
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "invalid request: jsonrpc must be \"2.0\"",
+        )));
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        // A client's answer to a server request (this server sends none): nothing to do.
+        if object.contains_key("result") || object.contains_key("error") {
+            return Err(Box::new(StatusCode::ACCEPTED.into_response()));
+        }
+        return Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "invalid request: no method",
+        )));
+    };
+    if id.is_null() {
+        // A notification, such as `notifications/initialized`: nothing to answer.
+        return Err(Box::new(StatusCode::ACCEPTED.into_response()));
+    }
+    // The id is kept with a call's result, so it must be small.
+    let short_text = id.as_str().is_some_and(|s| s.len() <= MAX_ID_BYTES);
+    if !short_text && !id.is_i64() && !id.is_u64() {
+        return Err(Box::new(rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "invalid request: id must be a string of at most 128 bytes or an integer",
+        )));
+    }
+    let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+    Ok(Request {
+        id,
+        method: method.to_string(),
+        params,
+    })
+}
+
 /// A tool result for the model: its text, structured content for JSON, and whether it failed.
-fn tool_result(outcome: Result<Value, String>) -> Value {
+pub(crate) fn tool_result(outcome: Result<Value, String>) -> Value {
     match outcome {
         Ok(Value::String(text)) => {
             json!({ "content": [{ "type": "text", "text": text }], "isError": false })
@@ -278,123 +423,20 @@ pub(crate) async fn post(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(run) = state.deps.resolver.resolve(&token).await else {
-        return rpc_error(
-            StatusCode::UNAUTHORIZED,
-            Value::Null,
-            -32001,
-            "unknown run token",
-        );
-    };
-    let too_large = || {
-        rpc_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Value::Null,
-            -32002,
-            "request body is larger than 1 MiB",
-        )
-    };
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > MAX_BYTES) {
-        return too_large();
-    }
-    // Read the body only once the caller is known.
-    let bytes = match axum::body::to_bytes(body, MAX_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.to_string().contains("length limit") => return too_large(),
-        Err(_) => {
-            return rpc_error(
-                StatusCode::BAD_REQUEST,
-                Value::Null,
-                -32700,
-                "the request body could not be read",
-            );
-        }
+    let (run, bytes) = match caller(&state, &token, &headers, body).await {
+        Ok(read) => read,
+        Err(answer) => return *answer,
     };
     let tools = match state.deps.tools.tools(run).await {
         Ok(tools) => tools,
-        Err(ToolsError::Gone) => {
-            return rpc_error(
-                StatusCode::GONE,
-                Value::Null,
-                -32003,
-                "the run has finished",
-            );
-        }
-        Err(ToolsError::Unavailable) => {
-            return rpc_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                Value::Null,
-                -32603,
-                "the tools are unavailable right now, try again",
-            );
-        }
+        Err(e) => return tools_error(e),
     };
-    let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
-        return rpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, "parse error");
+    let Request { id, method, params } = match request(&bytes) {
+        Ok(request) => request,
+        Err(answer) => return *answer,
     };
-    let Some(object) = message.as_object() else {
-        return rpc_error(
-            StatusCode::BAD_REQUEST,
-            Value::Null,
-            -32600,
-            "invalid request: send one JSON-RPC object",
-        );
-    };
-    let id = object.get("id").cloned().unwrap_or(Value::Null);
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return rpc_error(
-            StatusCode::BAD_REQUEST,
-            Value::Null,
-            -32600,
-            "invalid request: jsonrpc must be \"2.0\"",
-        );
-    }
-    let Some(method) = object.get("method").and_then(Value::as_str) else {
-        // A client's answer to a server request (this server sends none): nothing to do.
-        if object.contains_key("result") || object.contains_key("error") {
-            return StatusCode::ACCEPTED.into_response();
-        }
-        return rpc_error(
-            StatusCode::BAD_REQUEST,
-            Value::Null,
-            -32600,
-            "invalid request: no method",
-        );
-    };
-    if id.is_null() {
-        // A notification, such as `notifications/initialized`: nothing to answer.
-        return StatusCode::ACCEPTED.into_response();
-    }
-    // The id is kept with a call's result, so it must be small.
-    let short_text = id.as_str().is_some_and(|s| s.len() <= MAX_ID_BYTES);
-    if !short_text && !id.is_i64() && !id.is_u64() {
-        return rpc_error(
-            StatusCode::BAD_REQUEST,
-            Value::Null,
-            -32600,
-            "invalid request: id must be a string of at most 128 bytes or an integer",
-        );
-    }
-    let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
-    match method {
-        "initialize" => Json(rpc_result(
-            id,
-            json!({
-                // The client's version when this server speaks it, else this server's own.
-                "protocolVersion": params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .filter(|v| SUPPORTED_VERSIONS.contains(v))
-                    .unwrap_or(MCP_PROTOCOL_VERSION),
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "kestrel", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        ))
-        .into_response(),
+    match method.as_str() {
+        "initialize" => Json(rpc_result(id, initialized("kestrel", &params))).into_response(),
         "ping" => Json(rpc_result(id, json!({}))).into_response(),
         "tools/list" => {
             let listed: Vec<Value> = tools.iter().map(|t| t.describe()).collect();

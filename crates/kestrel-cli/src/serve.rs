@@ -1236,6 +1236,7 @@ async fn start_engine(
                 engine: engine.clone(),
                 agents,
             }),
+            travsr: None,
         },
     );
     let gateway =
