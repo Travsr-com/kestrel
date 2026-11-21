@@ -614,7 +614,7 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
         }
     }
     // Every file of every workspace, `.git` included, read on the host. Git compresses the objects
-    // it stores, so the history is also read through `git log`.
+    // it stores, so every object is also read uncompressed, reachable or not.
     for (id, _) in &tokens {
         let ws = env.workspace(id);
         let files = files_under(&ws);
@@ -623,7 +623,7 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
             "the walk of {} found the agent's files",
             ws.display()
         );
-        let history = git(&ws, &["log", "--all", "-p"]);
+        let objects = all_objects(&ws);
         for (other, theirs) in &tokens {
             if other == id {
                 continue;
@@ -638,8 +638,8 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
                 );
             }
             assert!(
-                !history.contains(theirs.as_str()),
-                "the git history of {id} holds the token of {other}"
+                !contains_bytes(&objects, theirs.as_bytes()),
+                "a git object in the workspace of {id} holds the token of {other}"
             );
         }
     }
@@ -736,6 +736,29 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Every object of the git repo at `dir`, uncompressed, as `git cat-file --batch-all-objects
+/// --batch` prints them: loose and packed, reachable or not. Bytes, since trees hold binary ids.
+fn all_objects(dir: &Path) -> Vec<u8> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .expect("start git");
+    assert!(
+        out.status.success(),
+        "git cat-file in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "no git objects in {}",
+        dir.display()
+    );
+    out.stdout
 }
 
 /// True when `needle` occurs in `haystack`.
