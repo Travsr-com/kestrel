@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use kestrel_core::caps::RootKey;
 use kestrel_core::{ChildResult, Engine, JoinMode, JoinOutcome};
-use kestrel_gateway::{JoinCall, JoinWait, KestrelTool, RunGone, SpawnCall, ToolHost};
+use kestrel_gateway::{JoinCall, JoinWait, KestrelTool, SpawnCall, ToolHost, ToolsError};
 use kestrel_types::{AgentSpec, RunId};
 use serde_json::{Value, json};
 
@@ -118,16 +118,16 @@ pub(crate) struct EngineTools {
 
 #[async_trait]
 impl ToolHost for EngineTools {
-    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, RunGone> {
+    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, ToolsError> {
         match self.engine.kestrel_tools(run) {
             Ok(Some(names)) => Ok(names
                 .into_iter()
                 .filter_map(KestrelTool::from_name)
                 .collect()),
             // Ended, or unknown: it can call nothing more.
-            Ok(None) => Err(RunGone),
-            // The store failed: offer nothing rather than guess.
-            Err(_) => Ok(Vec::new()),
+            Ok(None) => Err(ToolsError::Gone),
+            // The store failed: say so, rather than refuse a call that may be allowed.
+            Err(_) => Err(ToolsError::Unavailable),
         }
     }
 
@@ -321,7 +321,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("worker.yaml"), spec("worker")).unwrap();
         let (store, tools) = engine_tools(dir.path());
-        assert_eq!(tools.tools(RunId::new()).await, Err(RunGone));
+        assert_eq!(tools.tools(RunId::new()).await, Err(ToolsError::Gone));
         let lead = tools
             .engine
             .submit(

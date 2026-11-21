@@ -16,7 +16,8 @@ use axum::http::{Request, StatusCode, header};
 use common::{FakeBudget, FakeSink, config};
 use futures::StreamExt;
 use kestrel_gateway::{
-    GatewayDeps, JoinCall, JoinWait, KestrelTool, RunGone, RunResolver, SpawnCall, ToolHost, router,
+    GatewayDeps, JoinCall, JoinWait, KestrelTool, RunResolver, SpawnCall, ToolHost, ToolsError,
+    router,
 };
 use kestrel_types::{MicroUsd, RunId};
 use serde_json::{Value, json};
@@ -41,6 +42,7 @@ impl RunResolver for Tokens {
 struct FakeHost {
     allowed: Mutex<HashMap<RunId, Vec<KestrelTool>>>,
     gone: Mutex<Vec<RunId>>,
+    unavailable: Mutex<Vec<RunId>>,
     spawns: Mutex<Vec<(RunId, SpawnCall)>>,
     joins: Mutex<Vec<(RunId, JoinCall)>>,
     asks: Mutex<Vec<(RunId, String)>>,
@@ -52,10 +54,13 @@ struct FakeHost {
 
 #[async_trait]
 impl ToolHost for FakeHost {
-    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, RunGone> {
+    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, ToolsError> {
         *self.tools_asked.lock().unwrap() += 1;
         if self.gone.lock().unwrap().contains(&run) {
-            return Err(RunGone);
+            return Err(ToolsError::Gone);
+        }
+        if self.unavailable.lock().unwrap().contains(&run) {
+            return Err(ToolsError::Unavailable);
         }
         Ok(self
             .allowed
@@ -660,4 +665,265 @@ async fn get_offers_no_stream() {
     let response = s.app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(response.headers()[header::ALLOW], "POST");
+}
+
+// Review 1 of PR 76: what a sandbox can make the gateway hold, and protocol details.
+
+#[tokio::test]
+async fn an_id_that_is_not_a_short_string_or_an_integer_is_refused() {
+    let s = setup(&KestrelTool::ALL);
+    let long = "x".repeat(200);
+    for id in [
+        json!(long),
+        json!(1.5),
+        json!({ "a": 1 }),
+        json!([1]),
+        json!(true),
+    ] {
+        let body = rpc(
+            id.clone(),
+            "tools/call",
+            json!({ "name": "kestrel.ask_human", "arguments": { "question": "q" } }),
+        );
+        let msg = message(send(&s.app, TOKEN_A, body.to_string().into_bytes(), false).await).await;
+        assert_eq!(msg["error"]["code"], json!(-32600), "{id}: {msg}");
+    }
+    assert!(s.host.asks.lock().unwrap().is_empty());
+    // Short strings and integers are fine.
+    for id in [json!("abc-1"), json!(42), json!(-3)] {
+        let body = rpc(
+            id.clone(),
+            "tools/call",
+            json!({ "name": "kestrel.ask_human", "arguments": { "question": "q" } }),
+        );
+        let msg = message(send(&s.app, TOKEN_A, body.to_string().into_bytes(), false).await).await;
+        assert_eq!(msg["id"], id);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_has_at_most_8_calls_waiting() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_takes.lock().unwrap() = Duration::from_secs(600);
+    let mut waiting = Vec::new();
+    for i in 0..8 {
+        waiting.push(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(500 + i, "kestrel.join", json!({}))
+                    .to_string()
+                    .into_bytes(),
+                true,
+            )
+            .await,
+        );
+    }
+    let ninth = send(
+        &s.app,
+        TOKEN_A,
+        call(600, "kestrel.join", json!({}))
+            .to_string()
+            .into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(ninth.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        message(ninth).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("waiting")
+    );
+    // Another run is not held up by these.
+    let other = send(
+        &s.app,
+        TOKEN_B,
+        call(1, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::OK);
+    // Once they are done, there is room again.
+    tokio::time::sleep(Duration::from_secs(601)).await;
+    drop(waiting);
+    let later = send(
+        &s.app,
+        TOKEN_A,
+        call(700, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(later.status(), StatusCode::OK);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_keeps_at_most_256_finished_results() {
+    let s = setup(&KestrelTool::ALL);
+    for i in 0..300u64 {
+        // Spread out so the rate limit never answers.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i, "kestrel.ask_human", json!({ "question": "q" }))
+                    .to_string()
+                    .into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(content(&msg), json!("release/2.4"));
+    }
+    assert_eq!(s.host.asks.lock().unwrap().len(), 300);
+    // The newest result is still kept: calling again gives it without asking again.
+    message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(299, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(s.host.asks.lock().unwrap().len(), 300);
+    // The oldest was let go: calling again asks again.
+    message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(0, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(s.host.asks.lock().unwrap().len(), 301);
+}
+
+#[tokio::test]
+async fn join_takes_at_most_256_children() {
+    let s = setup(&KestrelTool::ALL);
+    let children: Vec<String> = (0..257).map(|_| RunId::new().to_string()).collect();
+    let msg = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(1, "kestrel.join", json!({ "children": children }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["error"]["code"], json!(-32602));
+    assert!(s.host.joins.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_say_which_tools_is_503_not_a_denial() {
+    let s = setup(&KestrelTool::ALL);
+    s.host.unavailable.lock().unwrap().push(s.a);
+    let response = send(
+        &s.app,
+        TOKEN_A,
+        call(1, "kestrel.spawn", json!({ "agent": "w", "input": "x" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(s.host.denied.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_client_response_and_a_wrong_version_are_handled() {
+    let s = setup(&KestrelTool::ALL);
+    // A JSON-RPC response from the client (to a server request) is accepted with no body.
+    let reply = json!({ "jsonrpc": "2.0", "id": 5, "result": {} });
+    let response = send(&s.app, TOKEN_A, reply.to_string().into_bytes(), false).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // Not JSON-RPC 2.0.
+    let old = json!({ "jsonrpc": "1.0", "id": 5, "method": "ping" });
+    let msg = message(send(&s.app, TOKEN_A, old.to_string().into_bytes(), false).await).await;
+    assert_eq!(msg["error"]["code"], json!(-32600));
+}
+
+#[tokio::test]
+async fn initialize_answers_the_version_the_client_asked_for_when_it_is_supported() {
+    let s = setup(&KestrelTool::ALL);
+    for (asked, answered) in [
+        ("2025-03-26", "2025-03-26"),
+        ("2025-06-18", "2025-06-18"),
+        ("1999-01-01", kestrel_gateway::MCP_PROTOCOL_VERSION),
+    ] {
+        let init = rpc(
+            json!(1),
+            "initialize",
+            json!({ "protocolVersion": asked, "capabilities": {} }),
+        );
+        let msg = message(send(&s.app, TOKEN_A, init.to_string().into_bytes(), false).await).await;
+        assert_eq!(msg["result"]["protocolVersion"], json!(answered), "{asked}");
+    }
+}
+
+#[tokio::test]
+async fn more_argument_shapes_are_checked() {
+    let s = setup(&KestrelTool::ALL);
+    let bad = [
+        (
+            "kestrel.spawn",
+            json!({ "agent": "w", "input": "x", "budget_usd": true }),
+        ),
+        ("kestrel.join", json!({ "children": "not-a-list" })),
+        ("kestrel.join", json!({ "timeout_s": "soon" })),
+    ];
+    for (i, (tool, args)) in bad.into_iter().enumerate() {
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i as u64, tool, args.clone()).to_string().into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["error"]["code"], json!(-32602), "{tool} {args}: {msg}");
+    }
+}
+
+#[tokio::test]
+async fn no_tools_offers_nothing_and_does_nothing() {
+    use kestrel_gateway::NoTools;
+    let run = RunId::new();
+    assert_eq!(NoTools.tools(run).await, Ok(vec![]));
+    let spawn = SpawnCall {
+        agent: "w".into(),
+        input: "x".into(),
+        budget: None,
+        wait: false,
+    };
+    assert!(NoTools.spawn(run, spawn).await.is_err());
+    let join = JoinCall {
+        children: vec![],
+        wait: JoinWait::All,
+        timeout: None,
+    };
+    assert!(NoTools.join(run, join).await.is_err());
+    assert!(NoTools.ask_human(run, "q".into()).await.is_err());
+    NoTools.denied(run, "kestrel.spawn").await;
 }

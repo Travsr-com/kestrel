@@ -13,8 +13,10 @@
 //! * **Calls survive a dropped connection**: each call runs in its own task, keyed by the run and
 //!   the JSON-RPC id. Calling again with the same id waits for the same result, so a client that
 //!   reconnects gets it without a second spawn or a second wait. Results are kept for an hour.
-//! * **Limits**: bodies up to 1 MiB (413 above), and per run a burst of 20 tool calls refilled at 10
-//!   per second (429 above). An unknown token is 401 and a finished run 410; neither echoes it.
+//! * **Limits**, so a sandbox cannot make the gateway hold much: bodies up to 1 MiB (413), ids a
+//!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
+//!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
+//!   most 256 children per join. An unknown token is 401 and a finished run 410; neither echoes it.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -37,6 +39,8 @@ use crate::AppState;
 
 /// The MCP protocol version this server speaks (streamable HTTP).
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Versions a client may ask for in `initialize`; the tools work the same in each.
+const SUPPORTED_VERSIONS: [&str; 2] = [MCP_PROTOCOL_VERSION, "2025-03-26"];
 
 /// Largest MCP request body.
 const MAX_BYTES: usize = 1024 * 1024;
@@ -47,6 +51,14 @@ const KEEP_RESULT: Duration = Duration::from_secs(60 * 60);
 /// Tool calls a run may make at once, and how many come back per second.
 const BURST: f64 = 20.0;
 const REFILL_PER_SECOND: f64 = 10.0;
+/// Calls of one run that may wait at once, and results of one run kept.
+const MAX_WAITING: usize = 8;
+const MAX_KEPT: usize = 256;
+/// Longest string id, and most children in one join.
+const MAX_ID_BYTES: usize = 128;
+const MAX_CHILDREN: usize = 256;
+/// Runs whose call allowance is remembered before full ones are forgotten.
+const MAX_BUCKETS: usize = 1024;
 
 /// A Kestrel tool a sandbox can call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +128,14 @@ impl KestrelTool {
     }
 }
 
-/// The run has finished: it can call nothing more.
+/// Why a host cannot say which tools a run may call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunGone;
+pub enum ToolsError {
+    /// The run has finished: it can call nothing more (410).
+    Gone,
+    /// The host cannot tell right now, for example its store failed (503). Nothing is denied.
+    Unavailable,
+}
 
 /// `kestrel.spawn` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,8 +165,8 @@ pub struct JoinCall {
 /// (budget, depth, an unknown agent), so it can adapt.
 #[async_trait]
 pub trait ToolHost: Send + Sync {
-    /// The tools `run` may call, or [`RunGone`] once it has finished.
-    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, RunGone>;
+    /// The tools `run` may call.
+    async fn tools(&self, run: RunId) -> Result<Vec<KestrelTool>, ToolsError>;
     async fn spawn(&self, run: RunId, call: SpawnCall) -> Result<Value, String>;
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String>;
     /// Asks a person; the answer text once they decide.
@@ -163,7 +180,7 @@ pub struct NoTools;
 
 #[async_trait]
 impl ToolHost for NoTools {
-    async fn tools(&self, _: RunId) -> Result<Vec<KestrelTool>, RunGone> {
+    async fn tools(&self, _: RunId) -> Result<Vec<KestrelTool>, ToolsError> {
         Ok(Vec::new())
     }
     async fn spawn(&self, _: RunId, _: SpawnCall) -> Result<Value, String> {
@@ -181,18 +198,34 @@ impl ToolHost for NoTools {
 /// A call's result once it is done, shared by every request with the same run and id.
 type CallResult = watch::Receiver<Option<Value>>;
 
-/// Calls in flight or recently finished, and each run's call allowance.
+/// One run's calls: in flight or recently finished, by id, each with its order of arrival.
+#[derive(Default)]
+struct RunCalls {
+    by_id: HashMap<String, (CallResult, u64)>,
+    next: u64,
+}
+
+/// Calls in flight or recently finished, by run, and each run's call allowance.
 #[derive(Default)]
 pub(crate) struct McpState {
-    calls: Mutex<HashMap<(RunId, String), CallResult>>,
+    calls: Mutex<HashMap<RunId, RunCalls>>,
     buckets: Mutex<HashMap<RunId, (f64, Instant)>>,
 }
+
+/// The run already has [`MAX_WAITING`] calls waiting.
+struct Busy;
 
 impl McpState {
     /// Takes one tool call from `run`'s allowance; `false` when it has none left.
     fn allow(&self, run: RunId) -> bool {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
+        if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&run) {
+            // A run whose allowance has refilled is as good as new: forget it.
+            buckets.retain(|_, (tokens, at)| {
+                *tokens + now.duration_since(*at).as_secs_f64() * REFILL_PER_SECOND < BURST
+            });
+        }
         let (tokens, at) = buckets.entry(run).or_insert((BURST, now));
         *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * REFILL_PER_SECOND).min(BURST);
         *at = now;
@@ -245,22 +278,52 @@ pub(crate) async fn post(
             "unknown run token",
         );
     };
-    // Read the body only once the caller is known.
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_BYTES).await else {
-        return rpc_error(
+    let too_large = || {
+        rpc_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             Value::Null,
             -32002,
             "request body is larger than 1 MiB",
-        );
+        )
     };
-    let Ok(tools) = state.deps.tools.tools(run).await else {
-        return rpc_error(
-            StatusCode::GONE,
-            Value::Null,
-            -32003,
-            "the run has finished",
-        );
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_BYTES) {
+        return too_large();
+    }
+    // Read the body only once the caller is known.
+    let bytes = match axum::body::to_bytes(body, MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.to_string().contains("length limit") => return too_large(),
+        Err(_) => {
+            return rpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32700,
+                "the request body could not be read",
+            );
+        }
+    };
+    let tools = match state.deps.tools.tools(run).await {
+        Ok(tools) => tools,
+        Err(ToolsError::Gone) => {
+            return rpc_error(
+                StatusCode::GONE,
+                Value::Null,
+                -32003,
+                "the run has finished",
+            );
+        }
+        Err(ToolsError::Unavailable) => {
+            return rpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Value::Null,
+                -32603,
+                "the tools are unavailable right now, try again",
+            );
+        }
     };
     let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
         return rpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, "parse error");
@@ -274,10 +337,22 @@ pub(crate) async fn post(
         );
     };
     let id = object.get("id").cloned().unwrap_or(Value::Null);
-    let Some(method) = object.get("method").and_then(Value::as_str) else {
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return rpc_error(
             StatusCode::BAD_REQUEST,
-            id,
+            Value::Null,
+            -32600,
+            "invalid request: jsonrpc must be \"2.0\"",
+        );
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        // A client's answer to a server request (this server sends none): nothing to do.
+        if object.contains_key("result") || object.contains_key("error") {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
             -32600,
             "invalid request: no method",
         );
@@ -286,12 +361,27 @@ pub(crate) async fn post(
         // A notification, such as `notifications/initialized`: nothing to answer.
         return StatusCode::ACCEPTED.into_response();
     }
+    // The id is kept with a call's result, so it must be small.
+    let short_text = id.as_str().is_some_and(|s| s.len() <= MAX_ID_BYTES);
+    if !short_text && !id.is_i64() && !id.is_u64() {
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "invalid request: id must be a string of at most 128 bytes or an integer",
+        );
+    }
     let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
     match method {
         "initialize" => Json(rpc_result(
             id,
             json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                // The client's version when this server speaks it, else this server's own.
+                "protocolVersion": params
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .filter(|v| SUPPORTED_VERSIONS.contains(v))
+                    .unwrap_or(MCP_PROTOCOL_VERSION),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "kestrel", "version": env!("CARGO_PKG_VERSION") }
             }),
@@ -375,7 +465,14 @@ async fn call(
             );
         }
     };
-    let mut result = start(state, run, &id, task);
+    let Ok(mut result) = start(state, run, &id, task) else {
+        return rpc_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            id,
+            -32000,
+            "too many tool calls waiting for this run, wait for one to finish",
+        );
+    };
     let wait = async move {
         loop {
             if let Some(value) = result.borrow_and_update().clone() {
@@ -399,24 +496,42 @@ async fn call(
 }
 
 /// The call for `(run, id)`: the one already running or done, or a new one in its own task, so a
-/// client that goes away does not cancel it.
-fn start(
-    state: &Arc<AppState>,
-    run: RunId,
-    id: &Value,
-    task: Task,
-) -> watch::Receiver<Option<Value>> {
-    let key = (run, id.to_string());
+/// client that goes away does not cancel it. [`Busy`] when the run has [`MAX_WAITING`] calls
+/// waiting; at [`MAX_KEPT`] results, the oldest finished one is let go.
+fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<CallResult, Busy> {
+    let key = id.to_string();
     let mut calls = state
         .mcp
         .calls
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = calls.get(&key) {
-        return existing.clone();
+    let mine = calls.entry(run).or_default();
+    if let Some((existing, _)) = mine.by_id.get(&key) {
+        return Ok(existing.clone());
+    }
+    let waiting = mine
+        .by_id
+        .values()
+        .filter(|(r, _)| r.borrow().is_none())
+        .count();
+    if waiting >= MAX_WAITING {
+        return Err(Busy);
+    }
+    if mine.by_id.len() >= MAX_KEPT {
+        let oldest = mine
+            .by_id
+            .iter()
+            .filter(|(_, (r, _))| r.borrow().is_some())
+            .min_by_key(|(_, (_, order))| *order)
+            .map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
+            mine.by_id.remove(&oldest);
+        }
     }
     let (tx, rx) = watch::channel(None);
-    calls.insert(key.clone(), rx.clone());
+    let order = mine.next;
+    mine.next += 1;
+    mine.by_id.insert(key.clone(), (rx.clone(), order));
     drop(calls);
     let state = state.clone();
     tokio::spawn(async move {
@@ -428,14 +543,22 @@ fn start(
         };
         let _ = tx.send(Some(tool_result(outcome)));
         tokio::time::sleep(KEEP_RESULT).await;
-        state
+        let mut calls = state
             .mcp
             .calls
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(mine) = calls.get_mut(&run) {
+            // Only this call's entry: the id may have been let go and used again since.
+            if mine.by_id.get(&key).is_some_and(|(_, o)| *o == order) {
+                mine.by_id.remove(&key);
+            }
+            if mine.by_id.is_empty() {
+                calls.remove(&run);
+            }
+        }
     });
-    rx
+    Ok(rx)
 }
 
 /// Checks a tool's arguments.
@@ -467,6 +590,9 @@ fn check(tool: KestrelTool, args: &Value) -> Result<Task, String> {
                 let list = list
                     .as_array()
                     .ok_or("children must be a list of run ids")?;
+                if list.len() > MAX_CHILDREN {
+                    return Err("children may name at most 256 runs".into());
+                }
                 for child in list {
                     let id = child.as_str().and_then(|c| RunId::from_str(c).ok());
                     children.push(id.ok_or("children must be a list of run ids")?);

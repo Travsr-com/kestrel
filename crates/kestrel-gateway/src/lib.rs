@@ -9,7 +9,7 @@
 pub mod mcp;
 
 pub use mcp::{
-    JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools, RunGone, SpawnCall, ToolHost,
+    JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools, SpawnCall, ToolHost, ToolsError,
 };
 
 use std::collections::HashMap;
