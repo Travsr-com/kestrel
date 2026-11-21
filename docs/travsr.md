@@ -79,11 +79,12 @@ once, when `kestrel serve` starts, in the absolute `PATH` entries only. If it is
    `travsr.<tool>`, Kestrel reads the commit the new clone is at, before the sandbox exists.
 2. While the sandbox is made, Kestrel clones the source repo again, into
    `<data dir>/travsr/<run id>/repo`, and checks out that commit. It uses the same git call as for
-   the workspace (`--local --no-hardlinks`, hooks off, a scrubbed environment). The commit is
-   recorded next to the copy. Each run gets its own full copy of the source repo, even when
-   runs start from the same commit.
+   the workspace (`--local --no-hardlinks`, hooks off, a scrubbed environment), plus
+   `core.symlinks=false`: a link the commit holds is a plain file in the copy, holding its
+   target's path. The commit is recorded next to the copy. Each run gets its own full copy of
+   the source repo, even when runs start from the same commit.
 3. If the commit holds a `.travsr`, Kestrel deletes it from the copy, so `init` never uses a
-   committed index. A `.travsr` that is a link is refused instead: indexing fails, saying so.
+   committed index. A committed `.travsr` link is a plain file in the copy, so it is deleted too.
 4. Kestrel runs `travsr init --no-connect` in the copy. The agent starts once it finishes.
 5. If copying or indexing fails, or the run waits longer than `index_timeout`, the run starts
    anyway, without Travsr. The wait for a free indexing slot (`max_indexing`) counts too, so a
@@ -94,7 +95,8 @@ once, when `kestrel serve` starts, in the absolute `PATH` entries only. If it is
    ```
 
    A run that gives up kills its git and, on Unix, `init`'s whole process group, so helpers
-   `init` started stop too.
+   `init` started stop too. An `init` that ends by itself has its group left alone, since the
+   group's id may be reused by then; a helper it left running keeps running.
 6. The run's first tool call starts `travsr mcp --stdio --db <copy>/.travsr/graph.db`, in the copy.
    Later calls of the run reuse it, one at a time. A server that died, or did not answer within
    `call_timeout`, is started again on the next call. A call whose request is dropped is stopped.
@@ -120,9 +122,14 @@ agent cannot write.
   git in a workspace only before its sandbox exists (the clone's checkout, and reading its commit).
 * **The private copy** is at `<data dir>/travsr/<run id>/repo`. The `travsr` directory and each
   run's directory are owner-only (0700). No sandbox mounts them.
+* **No links in the copy.** `init` writes files at the copy's root through whatever it finds
+  there: it rewrites `.gitignore`, and writes `.travsrignore` when none exists (a link to nothing
+  counts as none). A committed link could point those writes at any file Kestrel's user can
+  write. So the copy is checked out with `core.symlinks=false` (also kept in its config): every
+  committed link is a plain file holding its target's path.
 * **No committed index.** Travsr writes its index to `<copy>/.travsr/graph.db`, through whatever
-  `.travsr` it finds. So a `.travsr` from the commit is deleted before `init`, and one that is a
-  link (which could send the writes outside the copy) fails indexing.
+  `.travsr` it finds. So a `.travsr` from the commit is deleted before `init`. A `.travsr` that is
+  a link fails indexing; the copy never holds one, so this check is defence in depth.
 * **The index is checked before it is served.** `graph.db`, `.travsr`, the copy and the run's
   directory must be real directories and a regular file, inside the run's directory. A link is
   refused.
@@ -131,7 +138,10 @@ agent cannot write.
 * **No daemon, no download, no connect files, no registry entry.** Every Travsr command gets
   `CI=1`, `TRAVSR_SKIP_DOWNLOAD=1` and `TRAVSR_DISABLE_REGISTRY=1`, and `init` gets `--no-connect`.
   Travsr starts its background daemon only without `CI`, both in `init` and in `mcp`, so none is
-  ever left running. Hooks and `.travsrignore` that `init` writes land in the copy.
+  ever left running. The git hooks `init` installs go where git says the copy's hooks are
+  (`git rev-parse --git-path hooks`), its own `.git/hooks`: the clone made `.git`, and the
+  commit cannot hold it. Its `.gitignore` and `.travsrignore` writes stay in the copy,
+  as it holds no links (see above).
 * **A minimal environment.** Travsr gets `PATH`, `HOME`, the user and locale, temp and XDG
   directories (and their Windows equivalents), `TRAVSR_BIN_DIR` and `TRAVSR_LANG_TOML`. Never a
   run token, a provider key, or any other `TRAVSR_*` variable.
@@ -173,6 +183,7 @@ Known limits on Kestrel's side:
 * The private directories are made owner-only on Unix only. On Windows they keep the data
   directory's permissions.
 * On Windows, a timed-out `init` is killed, but helpers it started may keep running.
+* A helper that `init` leaves running when it ends by itself is not killed, on any platform.
 * With no `[travsr]` section, a spec that grants `travsr.*` tools still gets a `travsr` server
   entry in its MCP config, which answers 404.
 
@@ -185,6 +196,8 @@ quoted.
 | What Kestrel relies on | Where |
 |---|---|
 | `init` writes its index to `<repo>/.travsr/graph.db` | `crates/travsr-cli/src/init.rs` ~66 (`repo_root.join(".travsr/graph.db")`) |
+| `init` rewrites `<repo>/.gitignore` and writes `<repo>/.travsrignore` when `!path.exists()` | `crates/travsr-daemon/src/lib.rs` ~863 (`scaffold_gitignore`) and ~667 (`scaffold_travsrignore`), called ~1842 and ~1850 |
+| `init` puts its hooks where `git rev-parse --git-path hooks` says | `crates/travsr-daemon/src/hook.rs` ~185 (`install_hook`) and ~150 (`resolve_hooks_dir`) |
 | `init` starts no daemon with `CI`, also when interrupted | `crates/travsr-cli/src/init.rs` ~191 and ~47 (`var_os("CI")`) |
 | `mcp` starts no daemon with `CI` | `crates/travsr-cli/src/main.rs` ~1425 (`var_os("CI").is_none()`) |
 | `init` downloads nothing with `TRAVSR_SKIP_DOWNLOAD` | `crates/travsr-cli/src/init.rs` ~87 |
