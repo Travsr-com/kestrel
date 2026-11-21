@@ -151,7 +151,7 @@ describe('FleetState', () => {
     expect(fleet.over('r', 105, 10)).toBe(true);
   });
 
-  it('lists the roots that still have a live run, including a live child under an ended root', () => {
+  it('lists the roots of trees not over yet, including a live child under an ended root', () => {
     const fleet = new FleetState();
     fleet.load([
       summary('r', { status: 'Cancelled' }),
@@ -159,6 +159,23 @@ describe('FleetState', () => {
       summary('s', { status: { Failed: 'boom' } }),
       summary('t'),
     ]);
-    expect(fleet.liveRoots().sort()).toEqual(['r', 't']);
+    expect(fleet.liveRoots(100, 10).sort()).toEqual(['r', 't']);
+    fleet.apply(ev('t', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 95, () => {}, 't');
+    expect(fleet.liveRoots(100, 10).sort()).toEqual(['r', 't']);
+    expect(fleet.liveRoots(105, 10).sort()).toEqual(['r']);
+  });
+
+  it('a replay from the start counts a tree again without dropping what it shows', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('r', { spent: 0 }), summary('x', { spent: 0 })]);
+    fleet.apply(ev('r', call('r', 40)), 0, () => {}, 'r');
+    fleet.apply(ev('x', call('x', 40)), 0, () => {}, 'x');
+    fleet.rebuild('r');
+    expect(fleet.runs.r?.spent).toBe(40);
+    fleet.apply(ev('r', call('r', 40)), 0, () => {}, 'r');
+    expect(fleet.runs.r?.spent).toBe(40);
+    fleet.apply(ev('r', call('r', 5)), 0, () => {}, 'r');
+    expect(fleet.runs.r?.spent).toBe(45);
+    expect(fleet.runs.x).toMatchObject({ spent: 40, counted: 40 });
   });
 });

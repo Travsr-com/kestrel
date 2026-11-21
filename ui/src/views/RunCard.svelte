@@ -11,18 +11,30 @@
   }: { run: FleetRun; now: number; children?: ChildCount; parentAgent?: string } = $props();
 
   const plural = (n: number) => (n === 1 ? '1 child' : `${n} children`);
+
+  // A run seen to end shows how long it ran; one that had ended before the view loaded, just that.
+  const elapsed = $derived(
+    run.endedAt === null
+      ? formatElapsed(now - Date.parse(run.created_at))
+      : run.endedAt > 0
+        ? `ran ${formatElapsed(run.endedAt - Date.parse(run.created_at))}`
+        : 'ended',
+  );
 </script>
 
 <article class="card">
   <!-- The agent link covers the whole card, so a click anywhere on it opens the run. -->
-  <h2><a class="open" href={href({ name: 'run', id: run.id })}>{run.agent}</a></h2>
-  <span class="badge status-{statusName(run.status)}">{statusLabel(run.status)}</span>
+  <!-- Described by its status, so cards of the same agent are told apart in a list of links. -->
+  <h2>
+    <a class="open" href={href({ name: 'run', id: run.id })} aria-describedby="status-{run.id}">{run.agent}</a>
+  </h2>
+  <span class="badge status-{statusName(run.status)}" id="status-{run.id}">{statusLabel(run.status)}</span>
   <span class="label">Elapsed</span>
-  <span class="elapsed">
-    {run.endedAt === null ? formatElapsed(now - Date.parse(run.created_at)) : 'ended'}
-  </span>
+  <span class="elapsed">{elapsed}</span>
   <span class="label">Cost</span>
-  <span class="cost">{formatUsd(run.spent)} / {formatUsd(run.limit)}</span>
+  <span class="cost">
+    {formatUsd(run.spent)} / {run.provisional ? 'limit not known yet' : formatUsd(run.limit)}
+  </span>
   <span class="label">Sandbox</span>
   <span class="tier">{run.sandbox_tier ?? 'tier not known yet'}</span>
   {#if run.parent}

@@ -289,6 +289,124 @@ describe('Fleet', () => {
     expect(asks()).toHaveLength(2);
   });
 
+  it('follows at most 50 trees, those on the page first, and replays a tree it follows again without counting twice', async () => {
+    const runs = Array.from({ length: 60 }, (_, i) =>
+      run({ agent: `run-${i}`, spent: 0, created_at: new Date(NOW - 1_000 * (i + 1)).toISOString() }),
+    );
+    const { sockets } = show(runs);
+    await screen.findAllByRole('article');
+    const open = () => sockets.made.filter((s) => !s.closed).map((s) => s.url);
+    expect(open()).toHaveLength(50);
+    // The newest 50 are on page 1, and those are the ones followed.
+    expect(open()).toContain(`ws://kestrel.test/ws/tree/${runs[0]?.id}?after=0`);
+    expect(open()).not.toContain(`ws://kestrel.test/ws/tree/${runs[55]?.id}?after=0`);
+    // Page 2 shows runs 50 to 59; the 40 oldest-followed of page 1 stay, runs 40 to 49 make room.
+    const r45 = runs[45]?.id ?? '';
+    const first = socketFor(sockets, r45);
+    first.open();
+    first.event(1, event(r45, cost(r45, 10_000), 1));
+    await user().click(screen.getByRole('button', { name: 'Next' }));
+    expect(open()).toContain(`ws://kestrel.test/ws/tree/${runs[55]?.id}?after=0`);
+    expect(open()).toHaveLength(50);
+    await user().click(screen.getByRole('button', { name: 'Previous' }));
+    // Followed again from the start: the replayed cost is not added on top.
+    expect(first.closed).toBe(true);
+    const again = sockets.made.filter((s) => s.url.includes(r45)).at(-1);
+    if (!again || again === first) throw new Error('not followed again');
+    again.open();
+    again.event(1, event(r45, cost(r45, 10_000), 1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(card('run-45')).toHaveTextContent('$0.01 / $2.00');
+  });
+
+  it('asks for a token when a run fetch is refused', async () => {
+    const root = run({ agent: 'lead' });
+    const sockets = fakeSockets();
+    const onUnauthorized = vi.fn();
+    const fetch: typeof globalThis.fetch = async (input) =>
+      String(input).endsWith('/api/runs')
+        ? new Response(JSON.stringify([root]))
+        : new Response(JSON.stringify({ error: 'token required' }), { status: 401 });
+    render(Fleet, {
+      api: createApi({ fetch, getToken: () => 'old' }),
+      onUnauthorized,
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    socket.event(1, event(root.id, { kind: 'child_spawned', child: 'c', agent: 'kid', budget: 1 }, 1));
+    await vi.waitFor(() => expect(onUnauthorized).toHaveBeenCalledWith('old'));
+  });
+
+  it('closes every socket and ignores late answers once it is gone', async () => {
+    const a = run({ agent: 'alpha' });
+    const b = run({ agent: 'beta' });
+    let answer: (r: Response) => void = () => {};
+    const sockets = fakeSockets();
+    const fetch: typeof globalThis.fetch = (input) =>
+      String(input).endsWith('/api/runs')
+        ? Promise.resolve(new Response(JSON.stringify([a, b])))
+        : new Promise((resolve) => (answer = resolve));
+    const { unmount } = render(Fleet, {
+      api: createApi({ fetch, getToken: () => null }),
+      onUnauthorized: () => {},
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('link', { name: 'alpha' });
+    const socket = socketFor(sockets, a.id);
+    socket.open();
+    socket.event(1, event(a.id, { kind: 'child_spawned', child: 'c', agent: 'kid', budget: 1 }, 1));
+    unmount();
+    expect(sockets.made.every((s) => s.closed)).toBe(true);
+    expect(sockets.made).toHaveLength(2);
+    answer(new Response(JSON.stringify({ ...a, limit: 1 })));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sockets.made).toHaveLength(2);
+  });
+
+  it('announces a page change, not every change to the list', async () => {
+    show(Array.from({ length: 60 }, (_, i) => run({ agent: `run-${i}` })));
+    await screen.findAllByRole('article');
+    const pager = screen.getByRole('navigation', { name: 'Pages' });
+    expect(pager.querySelector('[aria-live]')).toBeNull();
+    await user().click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+  });
+
+  it('describes each card link with its status, so links with the same agent differ', async () => {
+    show([run({ agent: 'worker', status: 'Running' }), run({ agent: 'worker', status: { Suspended: 'Manual' } })]);
+    const links = await screen.findAllByRole('link', { name: 'worker' });
+    expect(links.map((l) => l.getAttribute('aria-describedby'))).toHaveLength(2);
+    const described = links.map((l) => document.getElementById(l.getAttribute('aria-describedby') ?? '')?.textContent);
+    expect(described[0]).not.toEqual(described[1]);
+  });
+
+  it('a run known only from its creation says its limit is not known yet, and an ended run keeps its run time', async () => {
+    const root = run({ agent: 'lead', spent: 0 });
+    const { api } = serve([root]);
+    const sockets = fakeSockets();
+    render(Fleet, {
+      // The fetch for the new child never answers.
+      api: { ...api, getRun: (id: string) => (id === root.id ? api.getRun(id) : new Promise(() => {})) },
+      onUnauthorized: () => {},
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    socket.event(1, event('kid-1', { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
+    socket.event(2, event(root.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }, 2));
+    await vi.advanceTimersByTimeAsync(0);
+    const u = user();
+    await u.click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    expect(card('kid')).toHaveTextContent('limit not known yet');
+    expect(card('lead')).toHaveTextContent('ran 2m 05s');
+  });
+
   it('a finished status filter shows finished runs without "Show finished"', async () => {
     show([run({ agent: 'done', status: 'Completed' }), run({ agent: 'live' })]);
     await screen.findByRole('link', { name: 'live' });

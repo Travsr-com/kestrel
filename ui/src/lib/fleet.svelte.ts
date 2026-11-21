@@ -32,7 +32,7 @@ export interface FleetRun extends RunSummary {
   provisional: boolean;
 }
 
-/** Runs below a root, as its card shows them. */
+/** A run's direct children, as its card shows them. */
 export interface ChildCount {
   total: number;
   running: number;
@@ -135,7 +135,7 @@ export class FleetState {
     }
   }
 
-  /** Children of each run, and how many of them run. */
+  /** Direct children of each run, and how many of them run. */
   children(): Record<RunId, ChildCount> {
     const counts: Record<RunId, ChildCount> = {};
     for (const run of Object.values(this.runs)) {
@@ -147,10 +147,25 @@ export class FleetState {
     return counts;
   }
 
-  /** The roots of every tree with a run that has not ended, including a live child of an ended root. */
-  liveRoots(): RunId[] {
-    const live = Object.values(this.runs).filter((run) => run.endedAt === null);
-    return live.map((run) => run.root).filter((root, i, all) => all.indexOf(root) === i);
+  /**
+   * The roots of every tree that is not over at `now` (see `over`), including the tree of a live
+   * child under an ended root.
+   */
+  liveRoots(now: number, linger: number): RunId[] {
+    const roots = Object.values(this.runs).map((run) => run.root);
+    return roots.filter((root, i) => roots.indexOf(root) === i && !this.over(root, now, linger));
+  }
+
+  /**
+   * A tree socket is about to replay `root`'s tree from the start: its runs count their events
+   * again from zero. What a card shows becomes the reported floor, so it never drops meanwhile.
+   */
+  rebuild(root: RunId): void {
+    for (const run of Object.values(this.runs)) {
+      if (run.root !== root) continue;
+      run.reported = run.spent;
+      run.counted = 0;
+    }
   }
 
   /** Every run in the tree of `root` ended at least `linger` ms before `now`. */

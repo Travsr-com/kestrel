@@ -13,6 +13,7 @@
     type EventStream,
     type SocketFactory,
   } from '../lib/ws';
+  import { untrack } from 'svelte';
   import RunCard from './RunCard.svelte';
 
   let {
@@ -32,6 +33,8 @@
   /** How long a run that ended stays in the active view after it was seen to end. */
   const LINGER_MS = 5_000;
   const STATUSES = ['queued', 'provisioning', 'running', 'suspended', 'completed', 'failed', 'cancelled'];
+  /** Open tree sockets at most: each one is polled by the server. */
+  const MAX_SOCKETS = 50;
 
   const fleet = new FleetState();
   let loaded = $state(false);
@@ -90,7 +93,9 @@
       .getRun(id)
       .then(
         (summary) => mounted && fleet.update(summary, Date.now()),
-        () => {},
+        // A 401 here is how a refused token shows: a browser reports a socket refused at the
+        // upgrade as an ordinary failed connection, so the sockets alone would retry forever.
+        (e: unknown) => mounted && failureText(e, onUnauthorized),
       )
       .finally(() => {
         asking.delete(id);
@@ -122,18 +127,6 @@
     streams.delete(root);
   }
 
-  // One tree socket per tree with a live run, once the list has loaded. A tree's socket closes once
-  // all of it has ended and lingered, so its last events still arrive.
-  $effect(() => {
-    if (!loaded) return;
-    for (const root of fleet.liveRoots()) {
-      if (!streams.has(root)) follow(root);
-    }
-    for (const root of [...streams.keys()]) {
-      if (fleet.over(root, now, LINGER_MS)) unfollow(root);
-    }
-  });
-
   $effect(() => () => {
     mounted = false;
     for (const root of [...streams.keys()]) unfollow(root);
@@ -163,6 +156,38 @@
   const pages = $derived(Math.max(1, Math.ceil(visible.length / PAGE)));
   const current = $derived(Math.min(page, pages - 1));
   const onPage = $derived(visible.slice(current * PAGE, current * PAGE + PAGE));
+
+  // A page that no longer exists is forgotten, so the view does not jump back to it later.
+  $effect(() => {
+    if (page > current) page = current;
+  });
+
+  /** What the pager last announced: a page change, never the list changing under it. */
+  let announce = $state('');
+  function goTo(next: number) {
+    page = Math.min(pages - 1, Math.max(0, next));
+    announce = `Page ${page + 1} of ${pages}`;
+  }
+
+  // Tree sockets, once the list has loaded: one per tree that is not over (a tree is over once all
+  // of it ended and lingered, so its last events still arrive), at most MAX_SOCKETS, the trees on
+  // this page first. A tree followed again replays from the start, so it counts its events afresh.
+  $effect(() => {
+    if (!loaded) return;
+    const live = fleet.liveRoots(now, LINGER_MS);
+    const first = onPage.map((run) => run.root).filter((root) => live.includes(root));
+    const wanted = [...first, ...live].filter((root, i, all) => all.indexOf(root) === i).slice(0, MAX_SOCKETS);
+    for (const root of [...streams.keys()]) {
+      if (!wanted.includes(root)) unfollow(root);
+    }
+    untrack(() => {
+      for (const root of wanted) {
+        if (streams.has(root)) continue;
+        fleet.rebuild(root);
+        follow(root);
+      }
+    });
+  });
 </script>
 
 <h1>Fleet</h1>
@@ -195,7 +220,7 @@
         <select id="fleet-status" bind:value={status} onchange={firstPage}>
           <option value="">All</option>
           {#each STATUSES as name (name)}
-            <option value={name}>{name}</option>
+            <option value={name}>{name[0]?.toUpperCase()}{name.slice(1)}</option>
           {/each}
         </select>
         <input id="fleet-roots" type="checkbox" bind:checked={rootsOnly} onchange={firstPage} />
@@ -220,22 +245,15 @@
           {/each}
         </ul>
         <nav class="pager" aria-label="Pages">
-          <span aria-live="polite">
+          <span>
             Showing {current * PAGE + 1} to {Math.min(visible.length, (current + 1) * PAGE)} of {visible.length}
           </span>
           {#if pages > 1}
             <!-- aria-disabled, not disabled: a disabled button would drop the keyboard focus on it. -->
-            <button type="button" aria-disabled={current === 0} onclick={() => (page = Math.max(0, current - 1))}>
-              Previous
-            </button>
-            <button
-              type="button"
-              aria-disabled={current >= pages - 1}
-              onclick={() => (page = Math.min(pages - 1, current + 1))}
-            >
-              Next
-            </button>
+            <button type="button" aria-disabled={current === 0} onclick={() => goTo(current - 1)}>Previous</button>
+            <button type="button" aria-disabled={current >= pages - 1} onclick={() => goTo(current + 1)}>Next</button>
           {/if}
+          <p class="hidden" role="status">{announce}</p>
         </nav>
       {/if}
     {/if}
@@ -282,6 +300,14 @@
   button,
   select {
     font: inherit;
+  }
+  .hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   button[aria-disabled='true'] {
     opacity: 0.5;
