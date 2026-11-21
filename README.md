@@ -1,3 +1,7 @@
+<p align="center">
+  <a href="https://github.com/Travsr-com/kestrel"><img src="docs/assets/logo.svg" width="160" height="160" alt="Kestrel"/></a>
+</p>
+
 <h1 align="center">Kestrel</h1>
 
 <p align="center"><b>Run fleets of AI agents on your own machine or server.<br/>Sandboxed, metered, and under a budget.</b></p>

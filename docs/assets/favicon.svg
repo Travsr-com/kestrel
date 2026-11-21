@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Kestrel">
+<rect width="64" height="64" rx="14" fill="#CF6A0A"/>
+<g fill="#F6F1ED" transform="translate(32 33) scale(0.0625) translate(-512 -512)">
+<path d="M90 190Q200 440 372 566Q448 620 512 626Q576 620 652 566Q824 440 934 190Q760 340 576 410L512 430L448 410Q264 340 90 190Z"/>
+<path d="M512 240c34 0 56 24 56 58 0 24-8 40-20 54l26 140c6 40-6 70-32 96l-30 32-30-32c-26-26-38-56-32-96l26-140c-12-14-20-30-20-54 0-34 22-58 56-58z"/>
+<path d="M512 640l66 200-66-50-66 50z"/>
+</g>
+</svg>
