@@ -1285,10 +1285,17 @@ async fn start_engine(
     .with_root_key(root_key)
     // Each run's MCP config and the like, mounted read-only at /kestrel in its sandbox.
     .with_run_config(data_dir.join("run-config"));
-    // Travsr, when configured: one process client indexes clones and answers the gateway.
-    let travsr = config
-        .travsr
-        .map(|t| (Arc::new(TravsrProcesses::new(t.command.clone())), t));
+    // Travsr, when configured: one process client keeps private copies of runs' code under
+    // `<data dir>/travsr`, indexes them and answers the gateway. Never a run's workspace.
+    let travsr = config.travsr.map(|t| {
+        let processes = TravsrProcesses::new(
+            t.command.clone(),
+            data_dir.join("travsr"),
+            Arc::new(ProcessRunner),
+            t.call_timeout,
+        );
+        (Arc::new(processes), t)
+    });
     let engine = match &travsr {
         Some((processes, t)) => engine.with_indexer(
             processes.clone(),
@@ -1304,10 +1311,13 @@ async fn start_engine(
         Some(pool) => engine.with_subnets(pool),
         None => engine,
     });
-    engine
+    let recovered = engine
         .recover()
         .await
         .map_err(|e| Failure::runtime(e.to_string()))?;
+    if let Some(why) = recovered.travsr_unlisted {
+        eprintln!("kestrel: Travsr copies of finished runs were not cleaned up: {why}");
+    }
 
     let api = match api {
         Some(options) => Some(bind_api(store.clone(), db, options, shutdown.clone()).await?),
