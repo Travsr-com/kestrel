@@ -247,6 +247,7 @@ impl Env {
              runtime: claude-code\n\
              role: Echo test agent\n\
              model_policy:\n  default: tier:cheap\n\
+             capabilities:\n  mcp: [kestrel.join, kestrel.ask_human]\n\
              sandbox:\n  tier: gvisor\n  image: kestrel-echo-agent:test\n  cpu: \"1\"\n  memory: 512Mi\n  workspace: git-clone\n\
              budget:\n  usd: \"{budget_usd}\"\n  wall_clock: 10m\n"
         );
@@ -761,4 +762,25 @@ fn s6_agent_can_commit_in_its_clone() {
         "main",
         "fetch_back must not move the user's checkout"
     );
+}
+
+// Issue #42, scenario 13: an agent in a gVisor sandbox reaches the Kestrel tools over MCP, through
+// the gateway bridge, at its run's /r/<token>/mcp, and sees the tools its capability allows.
+#[test]
+fn s7_sandbox_reaches_the_kestrel_tools_over_mcp() {
+    let env = Env::new();
+    let _serve = env.serve();
+    let id = env.submit("5", "list the tools mcp=1");
+    env.wait_status(&id, "Completed");
+    let text = std::fs::read_to_string(env.workspace(&id).join("mcp.txt"))
+        .unwrap_or_else(|e| panic!("no mcp.txt ({e}): {}", env.dump_events(&id)));
+    assert!(
+        text.contains("\"protocolVersion\":\"2025-06-18\""),
+        "{text}"
+    );
+    assert!(text.contains("\"name\":\"kestrel\""), "{text}");
+    assert!(text.contains("kestrel.join"), "{text}");
+    assert!(text.contains("kestrel.ask_human"), "{text}");
+    // Spawn is not in the capability, so it is not offered.
+    assert!(!text.contains("kestrel.spawn"), "{text}");
 }

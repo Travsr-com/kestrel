@@ -161,6 +161,17 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * While a run's cancel waits for the runs below it, the run may not spawn. A cancel still waiting when the engine stops goes back into the store, so the next start delivers it.
 * Pausing a parent, or changing its budget, does not touch its children.
 
+**How a sandbox calls the tools** (`kestrel-gateway`, MCP protocol version `2025-06-18`, streamable HTTP):
+
+* The tools live on the gateway at `POST {gateway}/r/{run_token}/mcp`, next to the model routes, because the gateway is a sandbox's only way out. The run is the one the token resolves to, never one named in a request. An unknown token is 401, a finished run 410; neither echoes the token.
+* Methods: `initialize`, `ping`, `tools/list`, `tools/call`. Tools: `kestrel.spawn(agent, input, budget_usd?, wait?)`, `kestrel.join(children?, mode?, timeout_s?)`, `kestrel.ask_human(question)`. `GET` is 405: the server sends nothing unasked.
+* `tools/list` shows the tools in the run's capability (`mcp` in its spec); `kestrel.spawn` also needs spawn rights. Calling another is a tool error, "not permitted", and the run's log records it.
+* `kestrel.spawn` finds the agent by name in `engine.agents_dir` (default `agents` next to the database): agent `worker` is `worker.yaml`.
+* `kestrel.ask_human` records a question approval and the run waits on it, as for any approval. The answer is the text a person approves it with (the Approvals view has an Answer box). Declining fails the run.
+* A long call (`join`, `ask_human`) answers with an event stream and a keepalive comment every 15 s, so the bridge (`socat -T 300`) never sees it idle. Each call is keyed by run and JSON-RPC id: a client that reconnects and calls again with the same id gets the same result, without a second spawn or wait. Results are kept for an hour.
+* Limits: bodies up to 1 MiB (413), and per run a burst of 20 tool calls refilled at 10 per second (429).
+* `serve` keeps the key that signs capability tokens in `root.key` next to the database. Keep it: a new key refuses the tokens of runs spawned before.
+
 ### 3.4 Sandbox drivers
 
 | Host | Default driver | Strong tier | Notes |

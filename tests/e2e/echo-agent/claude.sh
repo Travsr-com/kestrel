@@ -11,6 +11,8 @@
 #   README.txt   one line appended, so a tracked file changes (scenario 1)
 #   git.txt      only when the input contains `git=1` (scenario 6): the agent commits inside its
 #                git clone and records `branch=`, `status_rc=`, `add_rc=`, `commit_rc=` and `log=`
+#   mcp.txt      only when the input contains `mcp=1` (issue #42): the answers to an MCP
+#                `initialize` and `tools/list` at the gateway's /r/<token>/mcp, one per line
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
@@ -67,6 +69,19 @@ if [ -n "$secs" ] && [ ! -e /workspace/.echo-agent-slept ]; then
 fi
 
 case "$input" in
+  *mcp=1*)
+    # The Kestrel tools, reached the only way out of the sandbox: the gateway, through the bridge.
+    mcp() {
+      curl -sS -f --max-time 30 -H "content-type: application/json" \
+        -H "accept: application/json, text/event-stream" -d "$1" "${ANTHROPIC_BASE_URL%/}/mcp"
+    }
+    {
+      mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"echo-agent","version":"1"}}}'
+      echo
+      mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+      echo
+    } > /workspace/mcp.txt 2>&1
+    ;;
   *git=1*)
     # What a real coding agent does: configure an identity, look, write, add, commit. All of it
     # inside /workspace, which must be a self-contained git clone for this to work.
