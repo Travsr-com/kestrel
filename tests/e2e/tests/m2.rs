@@ -588,11 +588,18 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
         (grandchild.clone(), token(&grandchild)),
     ];
     for (id, own) in &tokens[1..] {
-        let seen = format!(
-            "{}\n{}",
-            env.read_out(id, "env.txt"),
-            env.read_out(id, "dump.out")
+        let dump = env.read_out(id, "dump.out");
+        // /kestrel was read: a file under it holds the run's own MCP URL. An empty or unreadable
+        // /kestrel fails here, not only in the token search below.
+        let mcp = format!("/r/{own}/mcp");
+        assert!(
+            sections(&dump)
+                .iter()
+                .any(|(title, body)| title.starts_with("/kestrel/") && body.contains(&mcp)),
+            "no file under /kestrel in the dump of {id} holds {mcp}:\n{dump}"
         );
+        assert_mounts(id, &dump);
+        let seen = format!("{}\n{dump}", env.read_out(id, "env.txt"));
         assert!(
             seen.contains(&format!("/r/{own}")),
             "run {id} reaches the gateway with its own token"
@@ -635,6 +642,79 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
                 "the git history of {id} holds the token of {other}"
             );
         }
+    }
+}
+
+/// Every `== <title>` section of an echo agent report, as (title, body), in order.
+fn sections(text: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("== ") {
+        if i > 0 && !rest[..i].ends_with('\n') {
+            rest = &rest[i + 3..];
+            continue;
+        }
+        let after = &rest[i + 3..];
+        let (title, body_on) = after.split_once('\n').unwrap_or((after, ""));
+        let end = body_on.find("\n== ").map_or(body_on.len(), |e| e + 1);
+        out.push((title, &body_on[..end]));
+        rest = &body_on[end..];
+    }
+    out
+}
+
+/// File systems the kernel provides, which hold no host files.
+const KERNEL_FS: [&str; 12] = [
+    "proc",
+    "sysfs",
+    "tmpfs",
+    "devtmpfs",
+    "devpts",
+    "mqueue",
+    "cgroup",
+    "cgroup2",
+    "securityfs",
+    "debugfs",
+    "tracefs",
+    "bpf",
+];
+
+/// The `/proc/mounts` of a dump lists only the mounts the Docker driver of `kestrel-sandbox` makes
+/// (`/workspace` and `/kestrel`, both bind mounts) and the ones Docker adds to every container
+/// (`/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`), besides the root and the kernel's file
+/// systems. The echo agent read every one of them but `/workspace`, which the test reads on the host.
+fn assert_mounts(id: &str, dump: &str) {
+    let mounted: BTreeSet<&str> = section(dump, "/proc/mounts")
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (_, point, fs) = (f.next()?, f.next()?, f.next()?);
+            (point != "/" && !KERNEL_FS.contains(&fs)).then_some(point)
+        })
+        .collect();
+    let driver = ["/workspace", "/kestrel"];
+    let docker = ["/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
+    for point in driver {
+        assert!(
+            mounted.contains(point),
+            "{point} is not in the /proc/mounts of {id}: {mounted:?}"
+        );
+    }
+    for point in &mounted {
+        assert!(
+            driver.contains(point) || docker.contains(point),
+            "the sandbox of {id} has a mount the driver does not make: {point} ({mounted:?})"
+        );
+    }
+    let read: BTreeSet<&str> = sections(dump)
+        .iter()
+        .filter_map(|(title, _)| title.strip_prefix("mount "))
+        .collect();
+    for point in mounted.iter().filter(|p| !driver.contains(p)) {
+        assert!(
+            read.contains(point),
+            "the agent of {id} did not read the mount {point}"
+        );
     }
 }
 

@@ -47,8 +47,8 @@
 #   ask=1        asks a person with kestrel.ask_human (ask.out) and writes the answer (answer.out).
 #   escalate=1   spawns with a budget above its own, then a grandchild with escalate=2 and wait
 #                (escalate.out); escalate=2 lists its tools and tries to spawn (escalate.out).
-#   dump=1       everything under /kestrel, listed and read at every depth, and the mounts
-#                (dump.out).
+#   dump=1       everything under /kestrel, listed and read at every depth, /proc/mounts, and every
+#                other mount but the root and the kernel's file systems, read in full (dump.out).
 #   commit=1     at the end writes kid-<n>.txt (shared.txt with same=1), commits everything but
 #                the test's own files in one commit, and records the result (commit.out).
 set -u
@@ -263,6 +263,27 @@ if marker dump > /dev/null; then
     done
     echo "== /proc/mounts"
     cat /proc/mounts 2>&1
+    # Every other mount, read in full: all but the root, the kernel's own file systems, /kestrel
+    # (read above) and /workspace (this file is written there; the test reads it on the host).
+    while read -r device point fstype rest; do
+      case "$fstype" in
+        proc | sysfs | tmpfs | devtmpfs | devpts | mqueue | cgroup | cgroup2 | securityfs | debugfs | tracefs | bpf) continue ;;
+      esac
+      case "$point" in
+        / | /kestrel | /workspace) continue ;;
+      esac
+      echo "== mount $point"
+      if [ -d "$point" ]; then
+        find "$point" -type f 2>&1 | while IFS= read -r f; do
+          echo "-- $f"
+          cat "$f" 2>&1
+          echo
+        done
+      else
+        cat "$point" 2>&1
+        echo
+      fi
+    done < /proc/mounts
   } > /workspace/dump.out 2>&1
 fi
 
