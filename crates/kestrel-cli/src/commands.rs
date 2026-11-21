@@ -140,9 +140,16 @@ fn describe(kind: &EventKind) -> String {
         EventKind::BudgetWarning { spent, limit } => {
             format!("budget warning: spent {spent} of {limit}")
         }
-        EventKind::ApprovalRequested { id, action } => {
-            format!("approval needed for {action}: kestrel approve {id}")
-        }
+        EventKind::ApprovalRequested {
+            id,
+            action,
+            question: false,
+        } => format!("approval needed for {action}: kestrel approve {id}"),
+        EventKind::ApprovalRequested {
+            id,
+            action,
+            question: true,
+        } => format!("question for you: {action} (answer it on the Approvals page, id {id})"),
         EventKind::ApprovalResolved {
             id,
             approved,
@@ -425,8 +432,19 @@ mod tests {
         let asked = describe(&EventKind::ApprovalRequested {
             id: aid,
             action: "push".into(),
+            question: false,
         });
         assert!(asked.contains(&format!("kestrel approve {aid}")), "{asked}");
+        let question = describe(&EventKind::ApprovalRequested {
+            id: aid,
+            action: "Which branch?".into(),
+            question: true,
+        });
+        assert!(
+            question.starts_with("question for you: Which branch?"),
+            "{question}"
+        );
+        assert!(question.contains(&aid.to_string()), "{question}");
     }
 
     #[test]

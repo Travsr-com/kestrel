@@ -307,6 +307,7 @@ pub(crate) async fn approvals(State(s): State<AppState>, Query(q): Params) -> Re
                 run_id: r.run_id,
                 action: r.action,
                 requested_at: r.requested_at,
+                question: r.question,
             });
         }
     }

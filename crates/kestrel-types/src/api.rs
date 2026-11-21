@@ -67,6 +67,10 @@ pub struct Approval {
     pub status: ApprovalStatus,
     #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
+    /// A question for a person (`ask_human`), answered with text, rather than an action to
+    /// approve. `false` when an older server leaves it out.
+    #[serde(default)]
+    pub question: bool,
 }
 
 /// The subprotocol every event socket speaks. The server echoes it back in the handshake.

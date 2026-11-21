@@ -187,6 +187,8 @@ pub struct ApprovalRecord {
     pub requested_at: OffsetDateTime,
     /// `None` while pending, else whether it was approved.
     pub resolved: Option<bool>,
+    /// A question for a person, answered with text, rather than an action to approve.
+    pub question: bool,
 }
 
 /// Handle on the SQLite store. Shareable across threads (`Send + Sync`).
@@ -846,12 +848,17 @@ impl Store {
         for body in bodies {
             let event: Event = serde_json::from_str(&body)?;
             match event.kind {
-                EventKind::ApprovalRequested { id, action } => records.push(ApprovalRecord {
+                EventKind::ApprovalRequested {
+                    id,
+                    action,
+                    question,
+                } => records.push(ApprovalRecord {
                     id,
                     run_id: event.run_id,
                     action,
                     requested_at: event.ts,
                     resolved: None,
+                    question,
                 }),
                 EventKind::ApprovalResolved { id, approved, .. } => {
                     if let Some(r) = records.iter_mut().find(|r| r.id == id) {

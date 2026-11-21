@@ -23,6 +23,7 @@ fn request(store: &Store, run: RunId, action: &str) -> ApprovalId {
             EventKind::ApprovalRequested {
                 id,
                 action: action.into(),
+                question: false,
             },
         )
         .unwrap();
