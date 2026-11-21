@@ -1,9 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 721 120" role="img" aria-label="Kestrel">
 <rect width="120" height="120" rx="26" fill="#CF6A0A"/>
-<g fill="#F6F1ED" transform="translate(60 60) scale(0.1) translate(-512 -508)">
-<path d="M118 206Q214 432 376 552Q450 604 512 610Q574 604 648 552Q810 432 906 206Q740 338 560 412L512 432L464 412Q284 338 118 206Z"/>
-<path d="M512 250c28 0 46 20 46 48 0 20-8 36-18 48l28 168c6 34-4 62-26 86l-30 32-30-32c-22-24-32-52-26-86l28-168c-10-12-18-28-18-48 0-28 18-48 46-48z"/>
-<path d="M512 646l54 178-54-42-54 42z"/>
+<g fill="#F6F1ED" transform="translate(60 60) scale(.0625) translate(-512 -512)">
+<mask id="w"><rect x="0" y="0" width="1024" height="1024" fill="#fff"/><path d="M360 454L486 420L458 498Z" fill="#000"/><path d="M406 544L504 530L546 716Z" fill="#000"/></mask>
+<path transform="translate(-110 -146) scale(1.1)" mask="url(#w)" d="M266 690Q192 560 300 464L374 392L500 322L660 316L760 410L772 540L900 866L736 826L650 884L560 800L520 742L440 696L392 662L322 668Z"/>
 </g>
 <g fill="none" stroke="#2B1D14" stroke-width="14" stroke-linecap="square" stroke-linejoin="miter">
 <path transform="translate(170 20)" d="M0 0V80M50 0L4 44M18 30L52 80"/>
