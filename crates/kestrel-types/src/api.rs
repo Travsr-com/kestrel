@@ -66,6 +66,21 @@ pub struct Approval {
     pub requested_at: OffsetDateTime,
 }
 
+/// The subprotocol every event socket speaks. The server echoes it back in the handshake.
+///
+/// Browsers cannot set headers on a WebSocket, so the client sends its token as a second
+/// subprotocol, [`WS_TOKEN_PREFIX`] followed by the token: `["kestrel.v1", "kestrel.token.<token>"]`.
+/// A subprotocol may only hold RFC 7230 token characters, so API tokens must be hex or base64url
+/// without padding.
+pub const WS_PROTOCOL: &str = "kestrel.v1";
+
+/// Prefix of the subprotocol that carries the API token. See [`WS_PROTOCOL`].
+pub const WS_TOKEN_PREFIX: &str = "kestrel.token.";
+
+/// The close code the server sends when a socket's token is missing or wrong. The client stops
+/// reconnecting and asks for a token instead.
+pub const WS_CLOSE_UNAUTHORIZED: u16 = 4401;
+
 /// One message on an event socket (`/ws/runs/{id}` or `/ws/tree/{root}`).
 ///
 /// `cursor` is what the client sends back as `after=` when it reconnects: the event's `seq` on a

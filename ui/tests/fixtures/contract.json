@@ -98,6 +98,37 @@
       "kind": { "kind": "agent_message", "text": "Reading the failing test." }
     }
   ],
+  "event_kinds": [
+    { "kind": "run_created", "agent": "fixer", "parent": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b" },
+    { "kind": "status_changed", "from": "Running", "to": { "Suspended": "Budget" } },
+    { "kind": "sandbox_provisioned", "driver": "gvisor", "sandbox_id": "kestrel-9a8b7c6d" },
+    { "kind": "agent_message", "text": "Running the tests." },
+    { "kind": "tool_call", "name": "bash", "input": { "command": "cargo test" } },
+    { "kind": "tool_result", "name": "bash", "ok": false, "output": "1 test failed" },
+    {
+      "kind": "model_call",
+      "run_id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "tokens_in": 1200,
+      "tokens_out": 340,
+      "tokens_cache_read": 800,
+      "tokens_cache_write": 0,
+      "cost": 8700,
+      "latency_ms": 2100,
+      "status": 200
+    },
+    { "kind": "budget_warning", "spent": 1600000, "limit": 2000000 },
+    { "kind": "approval_requested", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "action": "git push" },
+    { "kind": "approval_resolved", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "approved": true },
+    { "kind": "agent_log", "line": "test result: FAILED. 11 passed; 1 failed" },
+    { "kind": "run_finished", "summary": null }
+  ],
+  "socket": {
+    "protocol": "kestrel.v1",
+    "token_prefix": "kestrel.token.",
+    "close_unauthorized": 4401
+  },
   "frames": [
     {
       "type": "event",

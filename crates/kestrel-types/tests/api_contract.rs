@@ -6,9 +6,12 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
+
 use kestrel_types::{
-    ApiError, Approval, ApprovalStatus, Event, MicroUsd, RunStatus, RunSummary, SandboxTier,
-    SuspendReason, TreeNode, WsFrame,
+    ApiError, Approval, ApprovalStatus, Event, EventKind, MicroUsd, RunStatus, RunSummary,
+    SandboxTier, SuspendReason, TreeNode, WS_CLOSE_UNAUTHORIZED, WS_PROTOCOL, WS_TOKEN_PREFIX,
+    WsFrame,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -76,6 +79,35 @@ fn events_decode_and_encode_unchanged() {
     let events: Vec<Event> = round_trip(&contract()["events"]);
     let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, [1, 2, 3]);
+}
+
+#[test]
+fn every_event_kind_decodes_and_encodes_unchanged() {
+    let kinds: Vec<EventKind> = round_trip(&contract()["event_kinds"]);
+    let names: BTreeSet<String> = contract()["event_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kind"].as_str().unwrap().to_owned())
+        .collect();
+    // One sample of each of the 12 variants, so a new variant shows up here first.
+    assert_eq!(kinds.len(), 12);
+    assert_eq!(names.len(), 12);
+    assert!(matches!(
+        &kinds[0],
+        EventKind::RunCreated {
+            parent: Some(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn socket_conventions_match_the_constants() {
+    let socket = &contract()["socket"];
+    assert_eq!(socket["protocol"], WS_PROTOCOL);
+    assert_eq!(socket["token_prefix"], WS_TOKEN_PREFIX);
+    assert_eq!(socket["close_unauthorized"], WS_CLOSE_UNAUTHORIZED);
 }
 
 #[test]
