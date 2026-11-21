@@ -128,7 +128,10 @@ async fn s2_over_budget_is_refused_and_creates_nothing() {
 }
 
 // 3. Given concurrent spawns that together ask for more than the parent has, then exactly the
-//    spawns that fit succeed (no overspend), tested with parallel tasks.
+//    spawns that fit succeed (no overspend). The race itself is tested in the store
+//    (`spawn_carving::s3_*`, eight threads on separate connections); the paused clock needs a
+//    single-threaded runtime, so here the tasks interleave and this checks the engine's mapping of
+//    the refusals.
 #[tokio::test(start_paused = true)]
 async fn s3_concurrent_spawns_never_overspend() {
     let key = RootKey::generate();
@@ -174,14 +177,22 @@ async fn s4_a_finished_child_returns_its_unspent_budget() {
     assert_eq!(h.store.remaining(lead).unwrap(), MicroUsd(18 * DOLLAR / 10));
 }
 
-// The parent's own budget check uses its current limit: after a carve, the parent may only spend
-// what it kept.
+// The parent's own budget check uses its current limit, not the one it started with: after a
+// child spent its whole carve, the parent may only spend what it kept.
 #[tokio::test(start_paused = true)]
 async fn a_parent_is_suspended_at_the_limit_it_kept_after_carving() {
     let key = RootKey::generate();
     let mut h = harness(4, &key);
     let (lead, session) = running_lead(&mut h, "1").await;
-    spawn(&h, lead, Some(9 * DOLLAR / 10)).await.unwrap();
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead, Some(9 * DOLLAR / 10)).await.unwrap();
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    h.store
+        .record_model_call(&model_call(child, 9 * DOLLAR / 10))
+        .unwrap();
+    child_session.exit(0);
+    until("child completed", || h.is(child, &RunStatus::Completed)).await;
+    assert_eq!(h.store.limit(lead).unwrap(), MicroUsd(DOLLAR / 10));
     h.store
         .record_model_call(&model_call(lead, 15 * DOLLAR / 100))
         .unwrap();
@@ -288,6 +299,14 @@ async fn s10_the_child_gets_the_intersection_and_records_what_was_dropped() {
     let spawn = grant.spawn.expect("child keeps spawn limits");
     assert_eq!(spawn.max_depth, 0);
     assert_eq!(spawn.agents, set(&["worker"]));
+    // The stored spec holds only what was granted, so nothing reading it later sees more.
+    let stored = h.store.run_spec(child).unwrap().unwrap().capabilities;
+    assert_eq!(stored.mcp, ["fs.read", "kestrel.spawn"]);
+    assert_eq!(stored.network, ["crates.io"]);
+    assert!(stored.secrets.is_empty());
+    let policy = stored.spawn.expect("spawn policy kept");
+    assert_eq!((policy.max_children, policy.max_depth), (2, 0));
+    assert_eq!(policy.agents, ["worker"]);
     assert!(h.has_event(child, |e| *e
         == EventKind::CapabilitiesDropped {
             tools: vec!["fs.write".into()],
@@ -451,17 +470,138 @@ async fn a_non_root_run_without_a_token_may_not_spawn() {
     assert!(matches!(err, SpawnError::NotPermitted(_)), "{err:?}");
 }
 
+// A root's token is made from its spec, so an expired one is simply made again.
 #[tokio::test(start_paused = true)]
-async fn an_expired_parent_token_is_not_permitted() {
+async fn an_expired_root_token_is_issued_again() {
     let key = RootKey::generate();
     let mut h = harness(4, &key);
     let (lead, _s) = running_lead(&mut h, "2").await;
-    let mut cap = Capability::from_spec(lead, &lead_spec_for_token(), OffsetDateTime::UNIX_EPOCH);
-    cap.expires_at = OffsetDateTime::UNIX_EPOCH;
+    let cap = Capability::from_spec(lead, &lead_spec_for_token(), OffsetDateTime::UNIX_EPOCH);
     let old = caps::issue(&key, &cap).unwrap();
     h.store.set_run_cap(lead, old.as_bytes()).unwrap();
-    let err = spawn(&h, lead, None).await.unwrap_err();
+    spawn(&h, lead, Some(DOLLAR / 10)).await.unwrap();
+    let fresh = caps::grant(&token(&h, lead), &key.public()).unwrap();
+    assert!(fresh.expires_at > OffsetDateTime::now_utc());
+}
+
+// A spawned run's token comes from its parent's, so an expired one cannot be remade.
+#[tokio::test(start_paused = true)]
+async fn an_expired_child_token_is_not_permitted() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    // Two levels, so the child may spawn and only its token's expiry stops it.
+    let deep = "{ mcp: [kestrel.spawn, fs.read], spawn: { max_children: 10, max_depth: 2, agents: [worker] } }";
+    let _s = h.driver.live();
+    h.start();
+    let lead = h.submit(agent("lead", "", deep, "2", "empty-dir")).await;
+    until("lead running", || h.is(lead, &RunStatus::Running)).await;
+    let child = spawn(&h, lead, Some(DOLLAR / 2)).await.unwrap();
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    let mut cap = caps::grant(&token(&h, child), &key.public()).unwrap();
+    cap.expires_at = OffsetDateTime::UNIX_EPOCH;
+    let old = caps::issue(&key, &cap).unwrap();
+    h.store.set_run_cap(child, old.as_bytes()).unwrap();
+    let err = spawn(&h, child, Some(DOLLAR / 10)).await.unwrap_err();
     assert!(matches!(err, SpawnError::NotPermitted(_)), "{err:?}");
+}
+
+// A parent that handed out all of its own budget keeps running while its children do: it cannot
+// spend (the gateway refuses it at its limit), but it can wait for them.
+#[tokio::test(start_paused = true)]
+async fn a_parent_that_gave_everything_away_keeps_running_while_its_children_run() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let (lead, session) = running_lead(&mut h, "1").await;
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead, Some(DOLLAR)).await.unwrap();
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    session.line("msg: waiting for my child");
+    settle().await;
+    assert!(h.is(lead, &RunStatus::Running));
+    child_session.exit(0);
+    until("child completed", || h.is(child, &RunStatus::Completed)).await;
+    assert_eq!(h.store.remaining(lead).unwrap(), MicroUsd(DOLLAR));
+    session.line("msg: done waiting");
+    settle().await;
+    assert!(h.is(lead, &RunStatus::Running));
+}
+
+// `kestrel budget` on a running child takes the raise from its parent, or is refused with a log
+// line when the parent cannot cover it.
+#[tokio::test(start_paused = true)]
+async fn raising_a_running_child_takes_from_the_parent_or_is_refused() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let (lead, _s) = running_lead(&mut h, "1").await;
+    let _child_session = h.driver.live();
+    let child = spawn(&h, lead, Some(DOLLAR / 2)).await.unwrap();
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    h.control(child, ControlCommand::SetBudget(MicroUsd(7 * DOLLAR / 10)));
+    until("raise applied", || {
+        h.store.limit(child).unwrap() == MicroUsd(7 * DOLLAR / 10)
+    })
+    .await;
+    assert_eq!(h.store.remaining(lead).unwrap(), MicroUsd(3 * DOLLAR / 10));
+    h.control(child, ControlCommand::SetBudget(MicroUsd(5 * DOLLAR)));
+    until("refusal logged", || {
+        h.has_event(
+            child,
+            |e| matches!(e, EventKind::AgentLog { line } if line.contains("raise the root")),
+        )
+    })
+    .await;
+    assert_eq!(h.store.limit(child).unwrap(), MicroUsd(7 * DOLLAR / 10));
+    assert!(h.is(child, &RunStatus::Running));
+}
+
+// The same for a child still waiting for a slot (no actor yet).
+#[tokio::test(start_paused = true)]
+async fn raising_a_queued_child_past_the_parent_is_refused_with_a_log_line() {
+    let key = RootKey::generate();
+    // One slot: the parent holds it, so the child stays queued.
+    let mut h = harness(1, &key);
+    let (lead, _s) = running_lead(&mut h, "1").await;
+    let child = spawn(&h, lead, Some(DOLLAR / 2)).await.unwrap();
+    h.control(child, ControlCommand::SetBudget(MicroUsd(5 * DOLLAR)));
+    until("refusal logged", || {
+        h.has_event(
+            child,
+            |e| matches!(e, EventKind::AgentLog { line } if line.contains("raise the root")),
+        )
+    })
+    .await;
+    assert!(h.is(child, &RunStatus::Queued));
+    assert_eq!(h.store.limit(child).unwrap(), MicroUsd(DOLLAR / 2));
+}
+
+// The 80% warning is once per limit: when a child's refund grows the parent's limit again, the
+// parent is warned again at 80% of the larger limit.
+#[tokio::test(start_paused = true)]
+async fn the_budget_warning_comes_again_after_the_limit_grows() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let (lead, session) = running_lead(&mut h, "1").await;
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead, Some(DOLLAR / 2)).await.unwrap();
+    let warnings =
+        |h: &Harness| h.count_events(lead, |e| matches!(e, EventKind::BudgetWarning { .. }));
+    h.store
+        .record_model_call(&model_call(lead, 45 * DOLLAR / 100))
+        .unwrap();
+    session.line("msg: one");
+    until("first warning", || warnings(&h) == 1).await;
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    child_session.exit(0);
+    until("child completed", || h.is(child, &RunStatus::Completed)).await;
+    // The limit is back to $1: $0.45 spent is under 80%, so no warning yet.
+    session.line("msg: two");
+    settle().await;
+    assert_eq!(warnings(&h), 1);
+    h.store
+        .record_model_call(&model_call(lead, 40 * DOLLAR / 100))
+        .unwrap();
+    session.line("msg: three");
+    until("second warning", || warnings(&h) == 2).await;
 }
 
 fn lead_spec_for_token() -> AgentSpec {

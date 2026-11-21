@@ -197,6 +197,27 @@ fn authorise(
     }
 }
 
+/// The log line for a `kestrel budget` raise its parent cannot cover.
+fn budget_refused(asked: MicroUsd, remaining: MicroUsd) -> String {
+    format!(
+        "kestrel: budget not changed: the raise needs {asked} from the parent, which has {remaining} left; raise the root's budget first"
+    )
+}
+
+/// `spec.capabilities` for a grant.
+fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
+    kestrel_types::Capabilities {
+        mcp: cap.tools.iter().cloned().collect(),
+        network: cap.hosts.iter().cloned().collect(),
+        secrets: cap.secrets.iter().cloned().collect(),
+        spawn: cap.spawn.as_ref().map(|s| kestrel_types::SpawnPolicy {
+            max_children: s.max_children,
+            max_depth: s.max_depth,
+            agents: s.agents.iter().cloned().collect(),
+        }),
+    }
+}
+
 /// The spec a child runs with: one tier below the parent unless it states a `model_policy`, and
 /// the parent's repo when its `git-clone` repo is relative.
 fn child_spec(child: &AgentSpec, parent: &AgentSpec) -> AgentSpec {
@@ -594,9 +615,12 @@ impl Engine {
         authorise(&held, &token, &public, parent, &child.name, now)?;
         let max_children = held.spawn.as_ref().map_or(0, |s| s.max_children);
 
-        let spec = child_spec(child, &parent_spec);
+        let mut spec = child_spec(child, &parent_spec);
         let wanted = caps::Capability::from_spec(parent, &spec, now + TOKEN_LIFETIME);
         let (narrowed, dropped) = caps::narrow(&held, &wanted);
+        // The stored spec says only what the child was granted, so nothing that reads it later
+        // can see more than its token holds.
+        spec.capabilities = granted_capabilities(&narrowed);
         let mut child_events = Vec::new();
         if !dropped.is_empty() {
             child_events.push(EventKind::CapabilitiesDropped {
@@ -637,9 +661,14 @@ impl Engine {
     ) -> std::result::Result<caps::CapToken, SpawnError> {
         let store = &self.inner.store;
         if let Some(bytes) = store.run_cap(row.id)? {
-            return Ok(caps::CapToken::from_bytes(bytes));
-        }
-        if row.parent.is_some() {
+            let token = caps::CapToken::from_bytes(bytes);
+            // A spawned run's token comes from its parent's and cannot be remade here. A root's
+            // comes from its spec, so an expired (or unreadable) one is made again below.
+            let fresh = caps::grant(&token, &key.public()).is_ok_and(|c| c.expires_at > now);
+            if row.parent.is_some() || fresh {
+                return Ok(token);
+            }
+        } else if row.parent.is_some() {
             return Err(SpawnError::NotPermitted(
                 "the run has no capability token".into(),
             ));
@@ -1228,7 +1257,14 @@ impl Inner {
             }
             (RunStatus::Queued, ControlCommand::SetBudget(limit)) => {
                 // The run starts later and reads its stored spec then.
-                self.store.set_budget(run, limit)?;
+                match self.store.set_budget(run, limit) {
+                    Ok(_) => {}
+                    Err(StoreError::ParentBudget { asked, remaining }) => {
+                        let line = budget_refused(asked, remaining);
+                        self.store.append(run, EventKind::AgentLog { line })?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             (RunStatus::Queued, ControlCommand::Cancel) => {
                 self.store
@@ -1394,7 +1430,10 @@ struct Actor {
     status: RunStatus,
     adapter: Box<dyn RuntimeAdapter>,
     sandbox: Option<Sandbox>,
+    /// Whether the 80% budget warning was written for the limit in `limit_seen`.
     warned: bool,
+    /// The limit the last budget check saw. A larger one gets its own warning.
+    limit_seen: MicroUsd,
     clock: WallClock,
     cmds: mpsc::UnboundedReceiver<ControlCommand>,
 }
@@ -1411,6 +1450,7 @@ impl Actor {
     ) -> Actor {
         let adapter = (inner.adapters)(spec.runtime);
         let mut clock = WallClock::new(spec.budget.wall_clock);
+        let limit_seen = spec.budget.limit;
         if status == RunStatus::Provisioning {
             clock.run();
         }
@@ -1424,6 +1464,7 @@ impl Actor {
             adapter,
             sandbox: None,
             warned: false,
+            limit_seen,
             clock,
             cmds,
         }
@@ -1773,10 +1814,18 @@ impl Actor {
             }
             C::SetBudget(limit) => {
                 // Stored first, so the new limit survives a restart.
-                self.inner.store.set_budget(self.id, limit)?;
-                self.spec.budget.limit = limit;
-                // One warning per limit.
-                self.warned = false;
+                match self.inner.store.set_budget(self.id, limit) {
+                    Ok(set) => {
+                        self.spec.budget.limit = set;
+                        // One warning per limit.
+                        self.warned = false;
+                        self.limit_seen = set;
+                    }
+                    Err(StoreError::ParentBudget { asked, remaining }) => {
+                        self.log(&budget_refused(asked, remaining))?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 Ok(Next::Continue)
             }
             C::Pause if self.status == RunStatus::Running => {
@@ -1837,7 +1886,13 @@ impl Actor {
         // Read from the store, not the spec this actor started with: spawning a child lowers the
         // limit, and a finished child's unspent budget raises it again.
         let limit = self.inner.store.limit(self.id)?;
-        if spent >= limit {
+        if limit > self.limit_seen {
+            self.warned = false;
+        }
+        self.limit_seen = limit;
+        // A parent with children still going may have handed out all of its own budget: it cannot
+        // spend (the gateway refuses it at its limit), but it stays up to wait for them.
+        if spent >= limit && self.inner.store.live_children(self.id)? == 0 {
             self.set(RunStatus::Suspended(SuspendReason::Budget))?;
             return Ok(Next::Stop);
         }
