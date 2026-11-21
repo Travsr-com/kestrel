@@ -12,7 +12,11 @@ kestrel up --no-open  # the same, without opening a browser
 
 * **Token.** Every `/api` and `/ws` request needs the token: `Authorization: Bearer <token>`. It is
   made on first start and kept in `server.token` next to the database (mode 0600). Without it the
-  answer is `401`.
+  answer is `401`. A token you write into that file yourself must be at least 32 letters, digits,
+  `-` or `_`.
+* **The printed address carries the token.** When `kestrel up` opens your browser, the address is
+  on the browser's command line, which other users of the same machine can see while the browser
+  runs. On a shared machine use `--no-open` and paste the token into the UI instead.
 * **Host and Origin.** `Host` must be the address the server listens on (`127.0.0.1:7171` or
   `localhost:7171` by default), and a browser's `Origin` must be that same address. Anything else
   gets `403`. This stops other web pages, and DNS names pointed at 127.0.0.1, from calling it.
@@ -21,8 +25,10 @@ kestrel up --no-open  # the same, without opening a browser
   protects it. On such a bind, `Host` must be an IP address, not a name.
 * **The UI** (`/`, `/fleet`, `/runs/<id>`, and its files) needs no token: it holds no data. Any
   path that is not under `/api` or `/ws` and has no file extension gets the UI's `index.html`.
+  Unknown `/api` and `/ws` paths get a JSON `404`.
 
-The examples set the token once:
+The examples set the token once. The file is next to the database: `~/.local/share/kestrel/` on
+Linux, `~/Library/Application Support/kestrel/` on macOS, or the folder of `--db`.
 
 ```sh
 export T=$(cat ~/.local/share/kestrel/server.token)
@@ -73,12 +79,14 @@ curl -X POST -H "Authorization: Bearer $T" -d '{"text":"also fix the docs"}' "$K
 
 | Route | What it does |
 | :--- | :--- |
-| `GET /api/approvals?status=pending` | Approvals in request order. `status` is `pending`, `approved` or `rejected`; leave it out for all. |
+| `GET /api/approvals?status=pending` | Approvals in request order. `status` is `pending`, `approved`, `rejected` or `expired` (never decided, and its run ended without it); leave it out for all. |
 | `POST /api/approvals/{id}/approve` | Approves. Optional body `{"payload": "<edited action>"}` for "edit and approve"; it is stored on the `approval_resolved` event. |
 | `POST /api/approvals/{id}/reject` | Rejects. Optional body `{"reason": "..."}`, stored on the event and in the run's failure message. |
 
-Approve and reject answer `202`, `404` for an unknown approval, and `409` when it is resolved
-already or its run no longer waits on it.
+Approve and reject answer `202`, `404` for an unknown approval, `409` when it is resolved
+already or its run no longer waits on it, and `400` for a body field the action does not take
+(`reason` on approve, `payload` on reject). When two people decide at once, both get `202` and
+the engine applies the first.
 
 ```sh
 curl -H "Authorization: Bearer $T" "$K/api/approvals?status=pending"

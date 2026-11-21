@@ -2,6 +2,10 @@
 // reconnects with `after=<last cursor>`, and skips anything at or below that cursor, so the caller
 // sees every event once, in order.
 //
+// The server refuses a wrong token at the upgrade with HTTP 401, which a browser reports as an
+// ordinary failed connection, so this client keeps retrying with backoff; the app's REST calls
+// get the 401 and ask for a new token, which the next attempt picks up.
+//
 // Browsers cannot set headers on a WebSocket, so the token travels as a subprotocol:
 // `kestrel.v1` (which the server echoes) plus `kestrel.token.<token>`. A close with code 4401 means
 // the token was refused: the stream stops in state `unauthorized` instead of retrying. These values
