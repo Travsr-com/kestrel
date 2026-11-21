@@ -25,19 +25,13 @@ pub(crate) fn say(line: &str) -> Result<(), Failure> {
 
 /// `kestrel run`: checks the agent file, then queues the run the way `Engine::submit` does.
 pub(crate) fn run(db: Option<PathBuf>, args: RunArgs, out: Output) -> Result<(), Failure> {
-    let spec = load_spec(&args.agent)?;
+    let mut spec = load_spec(&args.agent)?;
+    resolve_repo(&mut spec)?;
     let input = args
         .input
         .ok_or_else(|| Failure::usage("--input is required: the task for the agent"))?;
     let store = open(db)?;
-    let id = store.create_run(&spec, &input)?;
-    store.append(
-        id,
-        EventKind::RunCreated {
-            agent: spec.name,
-            parent: None,
-        },
-    )?;
+    let id = store.create_run_with_event(&spec, &input)?;
     if out.json {
         say(&json!({ "run_id": id.to_string() }).to_string())?;
     } else {
@@ -49,16 +43,40 @@ pub(crate) fn run(db: Option<PathBuf>, args: RunArgs, out: Output) -> Result<(),
     Ok(())
 }
 
-/// Reads and checks an agent file. A git-clone repo path becomes absolute, resolved against
-/// the current dir, so the engine (running elsewhere) finds the same repo.
+/// Reads and checks an agent file.
 fn load_spec(path: &PathBuf) -> Result<AgentSpec, Failure> {
     let bad = |e: &dyn std::fmt::Display| Failure::usage(format!("{}: {e}", path.display()));
     let yaml = std::fs::read_to_string(path).map_err(|e| bad(&e))?;
-    let mut spec = AgentSpec::from_yaml(&yaml).map_err(|e| bad(&e))?;
-    if let WorkspaceSpec::GitClone { repo, .. } = &mut spec.sandbox.workspace {
-        *repo = std::path::absolute(&*repo).map_err(|e| bad(&e))?;
+    AgentSpec::from_yaml(&yaml).map_err(|e| bad(&e))
+}
+
+/// A git-clone agent works on the repo around the current dir. Its root is stored as an
+/// absolute path, so the engine (running elsewhere) finds the same repo. Fails with a usage
+/// error at submit time when there is no repo or no git.
+fn resolve_repo(spec: &mut AgentSpec) -> Result<(), Failure> {
+    let WorkspaceSpec::GitClone { repo, .. } = &mut spec.sandbox.workspace else {
+        return Ok(());
+    };
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Failure::usage("git was not found on PATH; a git-clone agent needs git")
+            } else {
+                Failure::usage(format!("could not run git: {e}"))
+            }
+        })?;
+    let top = String::from_utf8_lossy(&out.stdout);
+    let top = top.trim();
+    if !out.status.success() || top.is_empty() {
+        return Err(Failure::usage(
+            "this agent uses a git clone, so run it from inside a git repository",
+        ));
     }
-    Ok(spec)
+    *repo = std::path::absolute(top)
+        .map_err(|e| Failure::usage(format!("could not resolve the git repository: {e}")))?;
+    Ok(())
 }
 
 /// `kestrel watch`: prints events as they arrive until the run reaches a terminal status.

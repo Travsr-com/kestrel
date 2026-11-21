@@ -3,10 +3,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use kestrel_core::{AdapterFactory, Engine, Limits, ModelMap, Workspaces, default_models};
+use kestrel_core::{
+    AdapterFactory, Engine, Limits, ModelMap, ShutdownReport, Workspaces, default_models,
+};
 use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
 };
@@ -20,6 +23,7 @@ use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -63,7 +67,6 @@ struct RawGateway {
 struct RawEngine {
     max_concurrent_runs: Option<usize>,
     /// Kept as a raw value so a wrong type is reported against the key and never echoed.
-    #[allow(dead_code)]
     shutdown_grace_secs: Option<toml::Value>,
 }
 
@@ -107,8 +110,7 @@ struct Config {
     /// [`DEFAULT_SUBNET_POOL`].
     subnet_pool: Ipv4Cidr,
     /// `engine.shutdown_grace_secs`: how long a stop may take, in total. Default 10s.
-    #[allow(dead_code)]
-    shutdown_grace: std::time::Duration,
+    shutdown_grace: Duration,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -148,6 +150,10 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
             "engine.max_concurrent_runs must be at least 1",
         ));
     }
+    let shutdown_grace = raw
+        .engine
+        .shutdown_grace_secs
+        .map_or(Ok(DEFAULT_GRACE), shutdown_grace_secs)?;
     let mut models = default_models();
     for (tier, model) in raw.models {
         let t: Tier = format!("tier:{tier}").parse().map_err(|_| {
@@ -190,8 +196,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         advertise_url,
         docker_host,
         subnet_pool,
-        // Skeleton (issue #25): the real value is read from `raw.engine.shutdown_grace_secs`.
-        shutdown_grace: std::time::Duration::ZERO,
+        shutdown_grace,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -203,6 +208,22 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
             prices,
         },
     })
+}
+
+/// How long a stop may take when `engine.shutdown_grace_secs` is not set.
+const DEFAULT_GRACE: Duration = Duration::from_secs(10);
+
+/// `engine.shutdown_grace_secs`: a whole number of seconds from 1 to 3600. The value is never
+/// echoed.
+fn shutdown_grace_secs(value: toml::Value) -> Result<Duration, Failure> {
+    value
+        .as_integer()
+        .and_then(|n| u64::try_from(n).ok())
+        .filter(|n| (1..=3600).contains(n))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            Failure::usage("engine.shutdown_grace_secs must be a whole number from 1 to 3600")
+        })
 }
 
 /// `gateway.port`: an integer from 1 to 65535.
@@ -405,6 +426,7 @@ const CONFIG_NAMES: &[&str] = &[
     "subnet_pool",
     "engine",
     "max_concurrent_runs",
+    "shutdown_grace_secs",
     "providers",
     "anthropic",
     "openai",
@@ -881,15 +903,13 @@ async fn run(
     out: Output,
     api: Option<ApiOptions>,
 ) -> Result<(), Failure> {
-    // Catch SIGINT before anything else, so Ctrl-C always means a clean stop.
+    // Catch SIGINT and SIGTERM before anything else, so a stop is always a clean one.
     let shutdown = CancellationToken::new();
-    let interrupted = interrupt()?;
-    let stop = shutdown.clone();
-    tokio::spawn(async move {
-        interrupted.await;
-        stop.cancel();
-    });
+    let signalled = Arc::new(OnceLock::new());
+    watch_signals(shutdown.clone(), signalled.clone())?;
 
+    // Until something is started, a signal just ends serve: nothing is left behind. Probing
+    // docker can hang, so it is raced against the signal.
     let drivers = match drivers {
         Some(d) => d,
         None => {
@@ -898,7 +918,10 @@ async fn run(
             // run network. Without a bridge (`advertise_url`) there are no run networks.
             let bridge = GatewayBridge::container_name(&instance);
             let bridge = config.advertise_url.is_none().then_some(bridge.as_str());
-            detect_with(&HostInfo::current().await, false, Some(&instance), bridge)
+            let Some(host) = until_stopped(&shutdown, HostInfo::current()).await else {
+                return Ok(());
+            };
+            detect_with(&host, false, Some(&instance), bridge)
                 .map_err(|e| Failure::runtime(e.to_string()))?
         }
     };
@@ -908,15 +931,22 @@ async fn run(
         eprintln!("{warning}");
     }
     let explicit = config.listen_explicit.then_some(config.listen.as_str());
-    let (host, listen) = resolve_gateway(
-        &ProcessRunner,
-        config.docker_host,
-        explicit,
-        config.port,
-        needs_bridge,
-        &mut std::io::stderr(),
+    let Some(resolved) = until_stopped(
+        &shutdown,
+        resolve_gateway(
+            &ProcessRunner,
+            config.docker_host,
+            explicit,
+            config.port,
+            needs_bridge,
+            &mut std::io::stderr(),
+        ),
     )
-    .await?;
+    .await
+    else {
+        return Ok(());
+    };
+    let (host, listen) = resolved?;
     let listener = TcpListener::bind(&listen)
         .await
         .map_err(|e| Failure::runtime(format!("gateway.listen: cannot listen there: {e}")))?;
@@ -959,24 +989,52 @@ async fn run(
     )
     .await?;
     let bridge_url = bridge.as_ref().map(GatewayBridge::url);
-    let result = match gateway_url_for(config.advertise_url.as_ref(), bridge_url.as_ref(), addr) {
-        Ok(gateway_url) => {
-            let bound = Bound {
-                listener,
-                addr,
-                gateway_url,
-                shutdown,
-                subnets,
-            };
-            serve_bound(&db, config, drivers, bound, out, api).await
-        }
-        Err(e) => Err(e),
-    };
+    let grace = config.shutdown_grace;
+    let (result, report) =
+        match gateway_url_for(config.advertise_url.as_ref(), bridge_url.as_ref(), addr) {
+            Ok(gateway_url) => {
+                let bound = Bound {
+                    listener,
+                    addr,
+                    gateway_url,
+                    shutdown,
+                    subnets,
+                    signalled: signalled.clone(),
+                };
+                serve_bound(&db, config, drivers, bound, out, api).await
+            }
+            Err(e) => (Err(e), ShutdownReport::default()),
+        };
     // Every way out of serving, clean or not, removes the bridge.
     if let Some(bridge) = &bridge {
-        bridge.stop().await;
+        let left = stop_deadline(&signalled, grace).saturating_duration_since(Instant::now());
+        if tokio::time::timeout(left.max(BRIDGE_STOP_MIN), bridge.stop())
+            .await
+            .is_err()
+        {
+            eprintln!("kestrel: gateway bridge stop took too long, giving up");
+        }
     }
-    result
+    eprintln!("{}", shutdown_summary(&report));
+    result?;
+    shutdown_result(&report)
+}
+
+/// The least time the bridge removal gets, even when the grace period is already used up.
+const BRIDGE_STOP_MIN: Duration = Duration::from_secs(2);
+
+/// Runs `work` unless the stop begins first. `None` means it was stopped, and `work` is dropped.
+async fn until_stopped<T>(stop: &CancellationToken, work: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        out = work => Some(out),
+        () = stop.cancelled() => None,
+    }
+}
+
+/// When the stop must be finished: the grace period after the first signal (or after now, when
+/// the stop did not come from a signal).
+fn stop_deadline(signalled: &OnceLock<Instant>, grace: Duration) -> Instant {
+    signalled.get().copied().unwrap_or_else(Instant::now) + grace
 }
 
 /// The gateway socket and what depends on it.
@@ -987,8 +1045,12 @@ struct Bound {
     shutdown: CancellationToken,
     /// The subnet plan for run networks, when serve runs the bridge.
     subnets: Option<Arc<SubnetPool>>,
+    /// Set by the signal handler just before it cancels `shutdown`.
+    signalled: Arc<OnceLock<Instant>>,
 }
 
+/// Serves until a stop, then stops within the grace period. The report says what the stop could
+/// not clean up; it is empty when serving never got going.
 async fn serve_bound(
     db: &Path,
     config: Config,
@@ -996,14 +1058,55 @@ async fn serve_bound(
     bound: Bound,
     out: Output,
     api: Option<ApiOptions>,
-) -> Result<(), Failure> {
+) -> (Result<(), Failure>, ShutdownReport) {
+    let grace = config.shutdown_grace;
+    let signalled = bound.signalled.clone();
+    let shutdown = bound.shutdown.clone();
+    let engine = match start_engine(db, config, drivers, bound, out, api).await {
+        Ok(engine) => engine,
+        Err(e) => return (Err(e), ShutdownReport::default()),
+    };
+    let Started {
+        engine,
+        server,
+        shutdown: stopped,
+    } = engine;
+    // The gateway and the engine stop side by side, both within the grace period.
+    let (result, report) = tokio::join!(
+        supervise(engine.run_forever(shutdown.clone()), server, stopped),
+        async {
+            shutdown.cancelled().await;
+            let left = stop_deadline(&signalled, grace).saturating_duration_since(Instant::now());
+            engine.shutdown(left).await
+        }
+    );
+    (result, report)
+}
+
+/// What `start_engine` leaves running.
+struct Started {
+    engine: Engine,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    shutdown: CancellationToken,
+}
+
+async fn start_engine(
+    db: &Path,
+    config: Config,
+    drivers: Vec<Box<dyn SandboxDriver>>,
+    bound: Bound,
+    out: Output,
+    api: Option<ApiOptions>,
+) -> Result<Started, Failure> {
     let Bound {
         listener,
         addr,
         gateway_url,
         shutdown,
         subnets,
+        signalled,
     } = bound;
+    let grace = config.shutdown_grace;
     let store = Arc::new(open(Some(db.to_path_buf()))?);
     // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
     let workspace_root = std::path::absolute(db)
@@ -1051,11 +1154,22 @@ async fn serve_bound(
         Some(api) => ((api.addr, api.url, api.open).into(), Some(api.serve)),
         None => (None, None),
     };
+    // A request that never finishes must not hold the stop: the gateway gets the grace period.
+    let late = shutdown.clone();
     let server = tokio::spawn(async move {
-        match serve_api {
-            // Both stop on `shutdown`; the first error stops the pair.
-            Some(serve_api) => tokio::try_join!(async { gateway.await }, serve_api).map(|_| ()),
-            None => gateway.await,
+        let served = async {
+            match serve_api {
+                // Both stop on `shutdown`; the first error stops the pair.
+                Some(serve_api) => tokio::try_join!(async { gateway.await }, serve_api).map(|_| ()),
+                None => gateway.await,
+            }
+        };
+        tokio::select! {
+            served = served => served,
+            () = async {
+                late.cancelled().await;
+                tokio::time::sleep_until(stop_deadline(&signalled, grace)).await;
+            } => Ok(()),
         }
     });
 
@@ -1075,7 +1189,11 @@ async fn serve_bound(
     if let Some((_, url, true)) = &shown {
         open_browser(url);
     }
-    supervise(engine.run_forever(shutdown.clone()), server, shutdown).await
+    Ok(Started {
+        engine,
+        server,
+        shutdown,
+    })
 }
 
 /// Runs the engine until it stops, and stops it early if the gateway dies. Either one stopping
@@ -1113,30 +1231,10 @@ async fn supervise<E: std::fmt::Display>(
     }
 }
 
-/// Resolves on the first SIGINT. The handler is installed before this returns.
-#[cfg(unix)]
-fn interrupt() -> Result<impl Future<Output = ()>, Failure> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sig = signal(SignalKind::interrupt())
-        .map_err(|e| Failure::runtime(format!("listening for Ctrl-C: {e}")))?;
-    Ok(async move {
-        sig.recv().await;
-    })
-}
-
-#[cfg(not(unix))]
-fn interrupt() -> Result<impl Future<Output = ()>, Failure> {
-    Ok(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-}
-
 /// Exit code of a forced stop: a second signal while shutting down (128 + SIGINT).
-#[allow(dead_code)]
 pub(crate) const FORCED_EXIT: u8 = 130;
 
 /// What a signal means while serve runs.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalAction {
     /// The first SIGINT or SIGTERM: start the bounded shutdown.
@@ -1146,13 +1244,11 @@ pub(crate) enum SignalAction {
 }
 
 /// Counts the signals serve has received. SIGINT and SIGTERM are the same signal here.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct ShutdownPlan {
     seen: u32,
 }
 
-#[allow(clippy::todo, dead_code)]
 impl ShutdownPlan {
     pub(crate) fn new() -> ShutdownPlan {
         ShutdownPlan::default()
@@ -1160,27 +1256,103 @@ impl ShutdownPlan {
 
     /// Records one signal and says what to do about it.
     pub(crate) fn on_signal(&mut self) -> SignalAction {
-        todo!("issue #25")
+        self.seen = self.seen.saturating_add(1);
+        if self.seen == 1 {
+            SignalAction::Begin
+        } else {
+            SignalAction::Abort
+        }
+    }
+}
+
+/// Handles SIGINT and SIGTERM from now on. The handlers are installed before this returns. The
+/// first signal records the time and cancels `stop`; a second one ends the process at once.
+#[cfg(unix)]
+fn watch_signals(
+    stop: CancellationToken,
+    signalled: Arc<OnceLock<Instant>>,
+) -> Result<(), Failure> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let listen = |kind| {
+        signal(kind).map_err(|e| Failure::runtime(format!("listening for Ctrl-C and SIGTERM: {e}")))
+    };
+    let mut int = listen(SignalKind::interrupt())?;
+    let mut term = listen(SignalKind::terminate())?;
+    tokio::spawn(async move {
+        let mut plan = ShutdownPlan::new();
+        loop {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
+            }
+            on_signal(&mut plan, &stop, &signalled);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn watch_signals(
+    stop: CancellationToken,
+    signalled: Arc<OnceLock<Instant>>,
+) -> Result<(), Failure> {
+    tokio::spawn(async move {
+        let mut plan = ShutdownPlan::new();
+        while tokio::signal::ctrl_c().await.is_ok() {
+            on_signal(&mut plan, &stop, &signalled);
+        }
+    });
+    Ok(())
+}
+
+fn on_signal(plan: &mut ShutdownPlan, stop: &CancellationToken, signalled: &OnceLock<Instant>) {
+    match plan.on_signal() {
+        SignalAction::Begin => {
+            eprintln!("kestrel: stopping, press Ctrl-C again to force it");
+            // Recorded before the cancel, so the stop's deadline never starts late.
+            let _ = signalled.set(Instant::now());
+            stop.cancel();
+        }
+        SignalAction::Abort => {
+            eprintln!("kestrel: forced stop");
+            std::process::exit(i32::from(FORCED_EXIT));
+        }
     }
 }
 
 /// One paragraph for stderr: how many sandboxes were destroyed, then each failed or timed-out
 /// run with its reason. No newlines.
-#[allow(clippy::todo, dead_code)]
-pub(crate) fn shutdown_summary(report: &kestrel_core::ShutdownReport) -> String {
-    let _ = report;
-    todo!("issue #25")
+pub(crate) fn shutdown_summary(report: &ShutdownReport) -> String {
+    let mut text = format!("shutdown: {} destroyed", report.destroyed.len());
+    for (run, why) in &report.failed {
+        let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+        text.push_str(&format!("; failed to destroy {run}: {why}"));
+    }
+    for run in &report.timed_out {
+        text.push_str(&format!("; timed out destroying {run}"));
+    }
+    text
 }
 
 /// `Ok` when the report is clean (exit 0); otherwise a runtime failure (exit 1) whose message
 /// says which of `failed` and `timed out` happened.
-#[allow(clippy::todo, dead_code)]
-pub(crate) fn shutdown_result(report: &kestrel_core::ShutdownReport) -> Result<(), Failure> {
-    let _ = report;
-    todo!("issue #25")
+pub(crate) fn shutdown_result(report: &ShutdownReport) -> Result<(), Failure> {
+    let mut parts = Vec::new();
+    if !report.failed.is_empty() {
+        parts.push(format!("{} failed", report.failed.len()));
+    }
+    if !report.timed_out.is_empty() {
+        parts.push(format!("{} timed out", report.timed_out.len()));
+    }
+    if parts.is_empty() {
+        return Ok(());
+    }
+    Err(Failure::runtime(format!(
+        "shutdown left sandboxes behind: {}",
+        parts.join(", ")
+    )))
 }
 
-/// The gateway
 /// The gateway's view of the store: run tokens, budgets and metering.
 struct StoreDeps(Arc<Store>);
 

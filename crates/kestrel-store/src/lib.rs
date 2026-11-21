@@ -328,19 +328,28 @@ impl Store {
     /// Creates a root run in `Queued` (no parent, its own root, depth 0) and stores its full spec
     /// (see [`Store::run_spec`]). Writes no event, so the run's first appended event gets seq 1.
     pub fn create_run(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id = insert_run(&tx, agent, input, None)?;
-        tx.commit()?;
-        Ok(id)
+        self.create(agent, input, false)
     }
 
     /// Like [`Store::create_run`], and appends the run's `RunCreated` event (seq 1) in the same
     /// transaction: either both exist afterwards or neither does.
-    #[allow(clippy::todo)]
     pub fn create_run_with_event(&self, agent: &AgentSpec, input: &str) -> Result<RunId> {
-        let _ = (agent, input);
-        todo!("issue #25")
+        self.create(agent, input, true)
+    }
+
+    fn create(&self, agent: &AgentSpec, input: &str, with_event: bool) -> Result<RunId> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = insert_run(&tx, agent, input, None)?;
+        if with_event {
+            let kind = EventKind::RunCreated {
+                agent: agent.name.clone(),
+                parent: None,
+            };
+            insert_event(&tx, id, kind)?;
+        }
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Creates a child of `parent` in `Queued`: same root as the parent, depth one more. Stores

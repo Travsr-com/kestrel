@@ -39,6 +39,8 @@ Kestrel warns you if other users can read it.
 
 [engine]
 max_concurrent_runs = 4
+# Seconds a stop may take, from 1 to 3600. Default 10.
+shutdown_grace_secs = 10
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
@@ -133,7 +135,12 @@ kestrel serve
 ```
 
 Leave it running. It runs the engine and the gateway, and picks up runs that you submit. Press
-Ctrl-C to stop it.
+Ctrl-C (or send SIGTERM) to stop it.
+
+A stop takes at most `engine.shutdown_grace_secs` seconds. Serve destroys the sandboxes and prints
+one `shutdown:` line. It exits 0 when all is clean and 1 when a sandbox could not be destroyed in
+time. Press Ctrl-C a second time to quit at once (exit 130); sandboxes may be left behind, and the
+next `kestrel serve` removes them.
 
 For the web UI, start `kestrel up` instead. It runs the same, plus the API server on
 `127.0.0.1:7171`, and opens the UI in your browser (`--no-open` only prints the address). The UI

@@ -27,7 +27,13 @@ fn one_call_creates_the_run_its_spec_its_token_and_a_run_created_event_at_seq_1(
     let events = store.events_since(id, 0).expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].seq, 1);
-    assert_eq!(events[0].kind, EventKind::RunCreated { agent: "a".into() });
+    assert_eq!(
+        events[0].kind,
+        EventKind::RunCreated {
+            agent: "a".into(),
+            parent: None
+        }
+    );
 }
 
 #[test]
