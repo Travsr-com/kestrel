@@ -357,10 +357,17 @@ async fn serve_waits_for_tracked_sockets_after_it_stops() {
         flag.store(true, Ordering::SeqCst);
     });
     shutdown.cancel();
+    let started = std::time::Instant::now();
     serve(listener, app, shutdown, sockets).await.unwrap();
     assert!(
         done.load(Ordering::SeqCst),
         "serve returned before the socket ended"
+    );
+    // It returned as soon as the socket ended, not after the whole grace.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
     );
 }
 
