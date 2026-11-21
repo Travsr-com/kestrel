@@ -340,3 +340,45 @@ async fn a_client_close_ends_the_socket_on_the_server() {
         .unwrap()
         .unwrap();
 }
+
+// `serve` waits for tracked sockets after it stops accepting, so each sends its close frame.
+#[tokio::test]
+async fn serve_waits_for_tracked_sockets_after_it_stops() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config::new(TOKEN, listener.local_addr().unwrap());
+    let sockets = config.sockets.clone();
+    let shutdown = CancellationToken::new();
+    let app = router(store(), config, Arc::new(MemUi::build()), shutdown.clone());
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    sockets.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        flag.store(true, Ordering::SeqCst);
+    });
+    shutdown.cancel();
+    serve(listener, app, shutdown, sockets).await.unwrap();
+    assert!(
+        done.load(Ordering::SeqCst),
+        "serve returned before the socket ended"
+    );
+}
+
+// ...but not forever: a socket that never ends is given a few seconds.
+#[tokio::test(start_paused = true)]
+async fn serve_gives_a_stuck_socket_a_bounded_grace() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config::new(TOKEN, listener.local_addr().unwrap());
+    let sockets = config.sockets.clone();
+    let shutdown = CancellationToken::new();
+    let app = router(store(), config, Arc::new(MemUi::build()), shutdown.clone());
+    sockets.spawn(std::future::pending::<()>());
+    shutdown.cancel();
+    let started = tokio::time::Instant::now();
+    serve(listener, app, shutdown, sockets).await.unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(3) && waited < Duration::from_secs(10),
+        "{waited:?}"
+    );
+}

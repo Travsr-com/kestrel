@@ -27,5 +27,6 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true

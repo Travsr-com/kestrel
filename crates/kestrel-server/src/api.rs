@@ -257,8 +257,8 @@ pub(crate) async fn command(
     }
 }
 
-/// An undecided approval is pending only while its run waits on it; once the run has moved on
-/// (cancelled, failed), it can never be decided and is expired.
+/// An undecided approval is pending only while its run waits on it. Otherwise (the run ended, or
+/// waits on another approval) it cannot be decided now and is expired.
 fn approval_status(store: &Store, record: &ApprovalRecord) -> Result<ApprovalStatus, StoreError> {
     Ok(match record.resolved {
         Some(true) => ApprovalStatus::Approved,
