@@ -17,7 +17,7 @@ import type {
   SuspendReason,
   TreeNode,
 } from '../src/lib/types';
-import { formatUsd, isTerminal, statusLabel } from '../src/lib/format';
+import { formatElapsed, formatUsd, isTerminal, statusLabel, statusName } from '../src/lib/format';
 
 const RUN_KEYS = {
   id: true,
@@ -240,15 +240,32 @@ describe('isTerminal', () => {
 });
 
 describe('formatUsd', () => {
-  it('turns micro-dollars into dollars with cents', () => {
+  it('shows dollars with at least cents and never rounds a micro-dollar away', () => {
     expect(formatUsd(0)).toBe('$0.00');
     expect(formatUsd(420_000)).toBe('$0.42');
     expect(formatUsd(2_000_000)).toBe('$2.00');
-    expect(formatUsd(1_234_567)).toBe('$1.23');
+    expect(formatUsd(125_000)).toBe('$0.125');
+    expect(formatUsd(1)).toBe('$0.000001');
+    expect(formatUsd(1_234_567)).toBe('$1.234567');
+    expect(formatUsd(12_000_000_000)).toBe('$12000.00');
   });
   it('puts the sign in front of a negative amount', () => {
-    expect(formatUsd(-1)).toBe('-$0.00');
-    expect(formatUsd(-1_234_567)).toBe('-$1.23');
+    expect(formatUsd(-1)).toBe('-$0.000001');
+    expect(formatUsd(-1_234_567)).toBe('-$1.234567');
+  });
+  it('shows elapsed time as seconds, minutes or hours', () => {
+    expect(formatElapsed(0)).toBe('0s');
+    expect(formatElapsed(59_999)).toBe('59s');
+    expect(formatElapsed(125_000)).toBe('2m 05s');
+    expect(formatElapsed(3_725_000)).toBe('1h 02m');
+    expect(formatElapsed(-5)).toBe('0s');
+  });
+  it('names each status for the filters', () => {
+    const names = ([
+      'Queued', 'Provisioning', 'Running', 'Completed', 'Cancelled',
+      { Suspended: 'Budget' }, { Failed: 'x' },
+    ] as RunStatus[]).map(statusName);
+    expect(names).toEqual(['queued', 'provisioning', 'running', 'completed', 'cancelled', 'suspended', 'failed']);
   });
   it('shows "no limit" for a missing limit', () => {
     expect(formatUsd(null)).toBe('no limit');
