@@ -71,14 +71,6 @@ pub enum SandboxError {
         "invalid config directory `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
     )]
     InvalidConfig { path: String },
-    /// The config directory of a run without a workspace could not be inspected, so the host
-    /// user to run the sandbox as (the one that can read the config) is unknown.
-    #[error("cannot read the owner of config directory `{path}`: {source}")]
-    ConfigUnreadable {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
     /// A container id that is empty, starts with `-`, or has characters outside
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
@@ -657,13 +649,6 @@ impl Cli {
             })?;
             // Root-owned workspace: Kestrel runs as root, nothing to map.
             user = (ids != (0, 0)).then_some(ids);
-        } else if let Some(config) = &spec.config {
-            // The config is readable by its owner only, so run as that owner.
-            let ids = owner(config).map_err(|source| SandboxError::ConfigUnreadable {
-                path: config.display().to_string(),
-                source,
-            })?;
-            user = (ids != (0, 0)).then_some(ids);
         }
         match &spec.network {
             NetworkPolicy::GatewayOnly { .. } => {
@@ -1174,8 +1159,7 @@ macro_rules! cli_driver {
                 }
             }
 
-            /// Replaces how the workspace owner (or, for a run without a workspace, the config
-            /// directory's owner) is read. For tests that cannot be root.
+            /// Replaces how the workspace owner is read. For tests that cannot be root.
             pub fn with_workspace_owner(
                 mut self,
                 lookup: impl Fn(&Path) -> std::io::Result<(u32, u32)> + Send + Sync + 'static,

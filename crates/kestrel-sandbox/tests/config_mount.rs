@@ -58,56 +58,6 @@ async fn no_config_dir_means_no_kestrel_mount() {
     );
 }
 
-/// The value after `flag` in `argv`.
-fn after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
-    argv.iter()
-        .position(|a| a == flag)
-        .and_then(|i| argv.get(i + 1))
-        .map(String::as_str)
-}
-
-// The config files are readable by their owner only, so a run without a workspace runs as the
-// owner of its config directory, or a non-root agent image could not read them.
-#[tokio::test]
-async fn without_a_workspace_the_sandbox_runs_as_the_config_dir_owner() {
-    let dir = tempfile::tempdir().expect("config dir");
-    let mut spec = spec();
-    spec.workspace = None;
-    spec.config = Some(dir.path().to_path_buf());
-    let runner = FakeRunner::ok();
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = seen.clone();
-    GvisorDriver::new(runner.clone())
-        .with_workspace_owner(move |p| {
-            log.lock().expect("lock").push(p.to_path_buf());
-            Ok((1234, 5678))
-        })
-        .create(&spec)
-        .await
-        .expect("create");
-    assert_eq!(after(&runner.runs()[0], "--user"), Some("1234:5678"));
-    assert_eq!(*seen.lock().expect("lock"), [dir.path().to_path_buf()]);
-}
-
-#[tokio::test]
-async fn a_config_dir_whose_owner_cannot_be_read_is_refused_before_any_command() {
-    let dir = tempfile::tempdir().expect("config dir");
-    let mut spec = spec();
-    spec.workspace = None;
-    spec.config = Some(dir.path().to_path_buf());
-    let runner = FakeRunner::ok();
-    let err = GvisorDriver::new(runner.clone())
-        .with_workspace_owner(|_| Err(std::io::Error::other("gone")))
-        .create(&spec)
-        .await
-        .expect_err("unreadable config dir");
-    assert!(
-        matches!(err, SandboxError::ConfigUnreadable { .. }),
-        "{err}"
-    );
-    assert!(runner.runs().is_empty());
-}
-
 #[tokio::test]
 async fn a_config_dir_that_would_change_the_mount_options_is_refused() {
     for bad in [
