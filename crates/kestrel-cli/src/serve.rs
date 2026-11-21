@@ -1201,6 +1201,7 @@ async fn start_engine(
             resolver: deps.clone(),
             budget: deps.clone(),
             meter: deps,
+            tools: Arc::new(kestrel_gateway::NoTools),
         },
     );
     let gateway =

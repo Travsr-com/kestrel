@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
-    router,
+    BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, NoTools, ProviderConfig,
+    RunResolver, router,
 };
 use kestrel_types::{MicroUsd, ModelCallRecord, RunId};
 use url::Url;
@@ -177,6 +177,7 @@ pub async fn start(anthropic_base: &str, openai_base: &str, allow_budget: bool) 
         resolver: resolver.clone(),
         budget: budget.clone(),
         meter: sink.clone(),
+        tools: Arc::new(NoTools),
     };
     let app = router(config(anthropic_base, openai_base), deps);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
