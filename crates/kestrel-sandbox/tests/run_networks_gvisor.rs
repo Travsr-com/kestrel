@@ -295,6 +295,7 @@ fn spec(instance: &str, port: u16, run: RunId, net: &PreparedNetwork, script: &s
         argv: vec!["sh".into(), "-c".into(), script.into()],
         env: BTreeMap::new(),
         workspace: None,
+        config: None,
         cpu_millis: 500,
         memory_mb: 128,
         network: NetworkPolicy::RunNetwork {
