@@ -510,6 +510,8 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 * Accept: one run fans out to 5+ parallel children in separate per-run clones with no conflicts; a child cannot use a
   tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget; the UI
   shows the whole tree live.
+* Status: built. Acceptance is in progress: the suite in [m2.md](milestones/m2.md) (#45) runs in the `e2e-m2` CI
+  job, and M2 is done once that job passes. Scenario 11 (Travsr) lands with #44.
 
 **M3. Cheaper**
 * Model profiles, role tiers, cache-aware prompt shaping, context bundles, reserved hard budgets,
