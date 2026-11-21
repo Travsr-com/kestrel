@@ -77,6 +77,8 @@ struct RawEngine {
     max_concurrent_runs: Option<usize>,
     /// Kept as a raw value so a wrong type is reported against the key and never echoed.
     shutdown_grace_secs: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    agents_dir: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -123,6 +125,9 @@ struct Config {
     /// `sandbox.allowed_roots`: where workspaces may be mounted from. `None` means the default,
     /// the `workspaces` directory next to the database (see [`effective_allowed_roots`]).
     allowed_roots: Option<Vec<PathBuf>>,
+    /// `engine.agents_dir`: where `kestrel.spawn` finds agent specs by name. `None` means the
+    /// default, `agents` next to the database.
+    agents_dir: Option<PathBuf>,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -201,6 +206,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .transpose()?
         .unwrap_or_default();
     let subnet_pool = subnet_pool(raw.gateway.subnet_pool)?;
+    let agents_dir = raw.engine.agents_dir.map(agents_dir_setting).transpose()?;
     let allowed_roots = raw
         .sandbox
         .allowed_roots
@@ -215,6 +221,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         subnet_pool,
         shutdown_grace,
         allowed_roots,
+        agents_dir,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -242,6 +249,16 @@ fn shutdown_grace_secs(value: toml::Value) -> Result<Duration, Failure> {
         .ok_or_else(|| {
             Failure::usage("engine.shutdown_grace_secs must be a whole number from 1 to 3600")
         })
+}
+
+/// `engine.agents_dir`: an absolute path string. Anything else is a usage error that names the key
+/// and never echoes the value.
+fn agents_dir_setting(value: toml::Value) -> Result<PathBuf, Failure> {
+    value
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| Failure::usage("engine.agents_dir must be an absolute path string"))
 }
 
 /// `sandbox.allowed_roots`: a non-empty array of absolute path strings. Anything else is a usage
@@ -481,6 +498,7 @@ const CONFIG_NAMES: &[&str] = &[
     "engine",
     "max_concurrent_runs",
     "shutdown_grace_secs",
+    "agents_dir",
     "providers",
     "anthropic",
     "openai",
@@ -1140,7 +1158,7 @@ async fn serve_bound(
 
 /// What `start_engine` leaves running.
 struct Started {
-    engine: Engine,
+    engine: Arc<Engine>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
     shutdown: CancellationToken,
 }
@@ -1162,6 +1180,14 @@ async fn start_engine(
         signalled,
     } = bound;
     let grace = config.shutdown_grace;
+    // Every capability token is signed with this key, so it is kept across restarts.
+    let root_key = crate::tools::load_or_create_root_key(&crate::tools::root_key_path(db))?;
+    let agents = crate::tools::AgentDir(
+        config
+            .agents_dir
+            .clone()
+            .unwrap_or_else(|| crate::tools::default_agents_dir(db)),
+    );
     let store = Arc::new(open(Some(db.to_path_buf()))?);
     // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
     let workspace_root = std::path::absolute(db)
@@ -1180,11 +1206,12 @@ async fn start_engine(
         config.models,
     )
     .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
-    .with_instance(GatewayBridge::instance_id(db));
-    let engine = match subnets {
+    .with_instance(GatewayBridge::instance_id(db))
+    .with_root_key(root_key);
+    let engine = Arc::new(match subnets {
         Some(pool) => engine.with_subnets(pool),
         None => engine,
-    };
+    });
     engine
         .recover()
         .await
@@ -1201,6 +1228,10 @@ async fn start_engine(
             resolver: deps.clone(),
             budget: deps.clone(),
             meter: deps,
+            tools: Arc::new(crate::tools::EngineTools {
+                engine: engine.clone(),
+                agents,
+            }),
         },
     );
     let gateway =
@@ -1969,6 +2000,24 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let msg = err(&format!("[gateway]\nadvertise_url = {bad}\n{ANTHROPIC}"));
             assert!(msg.contains("gateway.advertise_url"), "{msg}");
             assert!(!msg.contains("secret-host"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn agents_dir_defaults_to_none_and_must_be_an_absolute_path() {
+        let (_dir, path) = write(ANTHROPIC);
+        assert_eq!(load_config(&path).expect("config").agents_dir, None);
+        let abs = std::env::temp_dir().join("kestrel-agents");
+        let (_dir, path) = write(&format!(
+            "[engine]\nagents_dir = '{}'\n{ANTHROPIC}",
+            abs.display()
+        ));
+        assert_eq!(load_config(&path).expect("config").agents_dir, Some(abs));
+        for bad in ["'relative-secret-x/agents'", "42", "['/a']"] {
+            let (_dir, path) = write(&format!("[engine]\nagents_dir = {bad}\n{ANTHROPIC}"));
+            let err = load_config(&path).expect_err(bad).message;
+            assert!(err.contains("engine.agents_dir"), "{bad}: {err}");
+            assert!(!err.contains("secret-x"), "{bad}: {err}");
         }
     }
 

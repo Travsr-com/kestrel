@@ -72,6 +72,7 @@ fn deps() -> (RunId, Arc<FakeSink>, GatewayDeps) {
         resolver: Arc::new(FakeResolver::with(RUN_TOKEN, run)),
         budget: Arc::new(FakeBudget::new(true)),
         meter: sink.clone(),
+        tools: Arc::new(kestrel_gateway::NoTools),
     };
     (run, sink, deps)
 }

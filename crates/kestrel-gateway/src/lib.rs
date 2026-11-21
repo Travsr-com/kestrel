@@ -4,6 +4,13 @@
 //!
 //! * `POST /r/{run_token}/v1/messages` forwards to `{anthropic.base_url}/v1/messages`.
 //! * `POST /r/{run_token}/v1/chat/completions` forwards to `{openai.base_url}/v1/chat/completions`.
+//! * `POST /r/{run_token}/mcp` serves the Kestrel tools over MCP (see [`mcp`]).
+
+pub mod mcp;
+
+pub use mcp::{
+    JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools, SpawnCall, ToolHost, ToolsError,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +21,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
 use kestrel_types::{MicroUsd, ModelCallRecord, RunId};
@@ -101,6 +108,8 @@ pub struct GatewayDeps {
     pub resolver: Arc<dyn RunResolver>,
     pub budget: Arc<dyn BudgetGuard>,
     pub meter: Arc<dyn MeterSink>,
+    /// Serves the Kestrel tools at `/r/{run_token}/mcp`; [`NoTools`] for none.
+    pub tools: Arc<dyn ToolHost>,
 }
 
 /// Largest request body the gateway accepts (LLM prompts can be large).
@@ -189,6 +198,7 @@ struct AppState {
     cfg: GatewayConfig,
     deps: GatewayDeps,
     http: reqwest::Client,
+    mcp: mcp::McpState,
 }
 
 impl AppState {
@@ -217,7 +227,12 @@ pub fn router_with_timeouts(
         .read_timeout(timeouts.idle)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let state = Arc::new(AppState { cfg, deps, http });
+    let state = Arc::new(AppState {
+        cfg,
+        deps,
+        http,
+        mcp: mcp::McpState::default(),
+    });
     axum::Router::new()
         .route(
             "/r/{run_token}/v1/messages",
@@ -240,6 +255,16 @@ pub fn router_with_timeouts(
                     proxy(s, Provider::OpenAi, token, headers, body).await
                 },
             ),
+        )
+        .route(
+            "/r/{run_token}/mcp",
+            post(
+                |State(s): State<Arc<AppState>>,
+                 Path(token): Path<String>,
+                 headers: HeaderMap,
+                 body: Body| async move { mcp::post(s, token, headers, body).await },
+            )
+            .merge(get(mcp::get)),
         )
         .with_state(state)
 }

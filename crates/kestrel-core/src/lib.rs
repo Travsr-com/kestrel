@@ -15,6 +15,25 @@ mod join;
 mod slots;
 pub mod workspace;
 pub use join::{ChildResult, JoinError, JoinMode, JoinOutcome};
+
+/// Why [`Engine::ask_human`] has no answer. The text is what the agent reads.
+#[derive(Debug, thiserror::Error)]
+pub enum AskError {
+    /// Only a running run can ask (an unknown run is not running either).
+    #[error("the run is not running, so it cannot ask")]
+    NotRunning,
+    /// The person declined, with their reason if they gave one.
+    #[error("the person declined{}", .0.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Declined(Option<String>),
+    /// The run ended while the question waited.
+    #[error("the run ended ({0:?}) before the question was answered")]
+    Ended(RunStatus),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// The Kestrel tools, by the names a capability's `mcp` list uses.
+const KESTREL_TOOLS: [&str; 3] = ["kestrel.spawn", "kestrel.join", "kestrel.ask_human"];
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -626,6 +645,124 @@ impl Engine {
         self
     }
 
+    /// The Kestrel tools `run` may call, in the order spawn, join, ask_human; `None` once it has
+    /// ended (or for an unknown run). A tool must be in the run's capability, and
+    /// `kestrel.spawn` also needs spawn rights. A spawned run's stored spec holds only what it was
+    /// granted, so its capability is read from that spec; spawning itself checks the token.
+    pub fn kestrel_tools(&self, run: RunId) -> Result<Option<Vec<&'static str>>> {
+        let store = &self.inner.store;
+        let Some(row) = store.get_run(run)? else {
+            return Ok(None);
+        };
+        if row.status.is_terminal() {
+            return Ok(None);
+        }
+        let Some(spec) = store.run_spec(run)? else {
+            return Ok(Some(Vec::new()));
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let held = caps::Capability::from_spec(run, &spec, now + TOKEN_LIFETIME);
+        Ok(Some(
+            KESTREL_TOOLS
+                .into_iter()
+                .filter(|tool| held.allows(&caps::Action::Tool((*tool).into())).is_ok())
+                .filter(|tool| *tool != "kestrel.spawn" || held.spawn.is_some())
+                .collect(),
+        ))
+    }
+
+    /// Whether approval `id` of `run` has been decided.
+    fn is_resolved(&self, run: RunId, id: ApprovalId) -> Result<bool> {
+        Ok(self.inner.store.events_since(run, 0)?.into_iter().any(
+            |e| matches!(e.kind, EventKind::ApprovalResolved { id: decided, .. } if decided == id),
+        ))
+    }
+
+    /// Whether approval `id` of `run` is a question (`kestrel.ask_human`).
+    fn is_question(&self, run: RunId, id: ApprovalId) -> Result<bool> {
+        Ok(self.inner.store.events_since(run, 0)?.into_iter().any(|e| {
+            matches!(e.kind, EventKind::ApprovalRequested { id: asked, question: true, .. } if asked == id)
+        }))
+    }
+
+    /// Records that `run` called `tool`, which its capabilities do not allow.
+    pub fn tool_denied(&self, run: RunId, tool: &str) -> Result<()> {
+        self.inner.store.append(
+            run,
+            EventKind::AgentLog {
+                line: format!(
+                    "kestrel: {tool} is not permitted for this run, the call was refused"
+                ),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Asks a person `question` for `run` (`kestrel.ask_human`) and waits for the answer. The run
+    /// records it as a question approval and waits on it (its sandbox keeps running, in the tool
+    /// call); approving with text answers it. Declining fails the run, as any rejection does.
+    pub async fn ask_human(
+        &self,
+        run: RunId,
+        question: String,
+    ) -> std::result::Result<String, AskError> {
+        let store = &self.inner.store;
+        let running = store
+            .get_run(run)?
+            .is_some_and(|r| r.status == RunStatus::Running);
+        if !running {
+            return Err(AskError::NotRunning);
+        }
+        let id = ApprovalId::new();
+        // The run's own actor records it, so the request and the wait happen in its order.
+        store.push_control(run, ControlCommand::Ask { id, question })?;
+        let poll = self
+            .inner
+            .limits
+            .poll_interval
+            .max(Duration::from_millis(1));
+        let mut cursor = 0;
+        // Whether the run recorded the question: one that stopped running first refuses it unasked.
+        let mut asked = false;
+        loop {
+            // Every new event, a page at a time until a short one, so a long log is read once
+            // (not a page per poll) and never held whole.
+            loop {
+                let page = store.events_page(run, cursor, 256)?;
+                let full = page.len() == 256;
+                for event in page {
+                    cursor = event.seq;
+                    match event.kind {
+                        EventKind::ApprovalRequested { id: requested, .. } if requested == id => {
+                            asked = true;
+                        }
+                        EventKind::ApprovalResolved {
+                            id: resolved,
+                            approved,
+                            payload,
+                        } if resolved == id => {
+                            return match (asked, approved) {
+                                (false, _) => Err(AskError::NotRunning),
+                                (true, true) => Ok(payload.unwrap_or_default()),
+                                (true, false) => Err(AskError::Declined(payload)),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                if !full {
+                    break;
+                }
+            }
+            if let Some(row) = store.get_run(run)?
+                && row.status.is_terminal()
+            {
+                return Err(AskError::Ended(row.status));
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+
     /// Creates a child run of `parent` from `child` and returns its id. The child starts like
     /// any run: it waits `Queued` for a slot, and gets its own workspace.
     ///
@@ -863,7 +1000,10 @@ impl Engine {
     /// Call once at startup, before `run_forever`.
     ///
     /// `Running` runs become `Suspended(Error("engine restarted"))`, `Provisioning` runs fail,
-    /// `Suspended` runs stay suspended and `Queued` runs stay queued. Sandboxes left behind by the
+    /// `Suspended` runs stay suspended and `Queued` runs stay queued, except a run waiting on its
+    /// own question (`kestrel.ask_human`): nobody waits for that answer any more, so the question is
+    /// declined (unless already answered), the run fails, and its live children are cancelled
+    /// (unless its spec keeps them). Sandboxes left behind by the
     /// previous engine are destroyed; a resumed run gets a fresh one. Then every leftover run
     /// network the drivers find is removed (best effort, like the sandboxes).
     ///
@@ -891,6 +1031,45 @@ impl Engine {
                 RunStatus::Provisioning => {
                     let next = RunStatus::Failed(format!("{ENGINE_RESTARTED} while provisioning"));
                     store.transition(run.id, &RunStatus::Provisioning, next)?;
+                }
+                // A question (`kestrel.ask_human`) was asked from inside a tool call that is gone
+                // now: nobody waits for the answer, and a resumed agent would start again from its
+                // input. The question is declined and the run fails, saying why. (A suspended run
+                // cannot move to another suspension, so it is not left resumable.)
+                RunStatus::Suspended(SuspendReason::Approval(id))
+                    if self.is_question(run.id, id)? =>
+                {
+                    // An answer written just before the stop stays the only decision.
+                    if !self.is_resolved(run.id, id)? {
+                        store.append(
+                            run.id,
+                            EventKind::ApprovalResolved {
+                                id,
+                                approved: false,
+                                payload: Some(format!("{ENGINE_RESTARTED} before it was answered")),
+                            },
+                        )?;
+                    }
+                    // No orphans, as for any run that ends: its live children are cancelled when
+                    // the engine starts, unless its spec keeps them. Queued before the run fails,
+                    // so a stop in between leaves the run to this same path again.
+                    let keeps = store.run_spec(run.id)?.is_some_and(|s| {
+                        s.capabilities
+                            .spawn
+                            .as_ref()
+                            .is_some_and(|p| p.keep_children)
+                    });
+                    if !keeps {
+                        for below in store.subtree(run.id)? {
+                            if !below.status.is_terminal() {
+                                store.push_control(below.id, ControlCommand::Cancel)?;
+                            }
+                        }
+                    }
+                    let next = RunStatus::Failed(format!(
+                        "{ENGINE_RESTARTED} while its question waited; run it again"
+                    ));
+                    store.transition(run.id, &run.status, next)?;
                 }
                 _ => report.suspended.push(run.id),
             }
@@ -1741,6 +1920,9 @@ struct Actor {
     /// warning; the same one (a limit that dropped for a spawn and came back) does not.
     warned_at: Option<MicroUsd>,
     clock: WallClock,
+    /// The question (`kestrel.ask_human`) this run asked last. While the run waits on it, its
+    /// sandbox keeps working, so its wall clock keeps going.
+    asking: Option<ApprovalId>,
     cmds: mpsc::UnboundedReceiver<ControlCommand>,
 }
 
@@ -1770,6 +1952,7 @@ impl Actor {
             sandbox: None,
             warned_at: None,
             clock,
+            asking: None,
             cmds,
         }
     }
@@ -2191,6 +2374,20 @@ impl Actor {
             cmd @ (C::Approve(_) | C::Reject(_) | C::ApproveWith { .. } | C::RejectWith { .. }) => {
                 self.on_approval(cmd, pending)
             }
+            C::Ask { id, question } => {
+                if self.status == RunStatus::Running {
+                    self.asking = Some(id);
+                    self.record(EventKind::ApprovalRequested {
+                        id,
+                        action: question,
+                        question: true,
+                    })?;
+                } else {
+                    // The run stopped running before it got here: the asker hears no.
+                    self.resolve(id, false, Some("the run is not running".into()))?;
+                }
+                Ok(Next::Continue)
+            }
             other => {
                 self.inner
                     .store
@@ -2314,8 +2511,12 @@ impl Actor {
         self.inner
             .store
             .transition(self.id, &self.status, next.clone())?;
-        match next {
+        match &next {
             RunStatus::Provisioning | RunStatus::Running => self.clock.run(),
+            // The agent waits inside a tool call, and its sandbox keeps working meanwhile.
+            RunStatus::Suspended(SuspendReason::Approval(id)) if self.asking == Some(*id) => {
+                self.clock.run();
+            }
             _ => self.clock.pause(),
         }
         self.status = next;

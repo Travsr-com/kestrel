@@ -154,6 +154,12 @@ pub enum ControlCommand {
         id: ApprovalId,
         reason: String,
     },
+    /// Ask a person `question` for the run (`kestrel.ask_human`): the run records it as the
+    /// approval `id` and waits on it. The answer comes back as that approval's text.
+    Ask {
+        id: ApprovalId,
+        question: String,
+    },
 }
 
 impl ControlCommand {

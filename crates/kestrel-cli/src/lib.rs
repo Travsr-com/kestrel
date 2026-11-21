@@ -19,6 +19,7 @@ mod commands;
 mod fake;
 mod paths;
 mod serve;
+mod tools;
 
 /// Success.
 pub const EXIT_OK: u8 = 0;
