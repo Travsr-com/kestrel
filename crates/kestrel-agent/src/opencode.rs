@@ -4,8 +4,8 @@ use kestrel_types::{AgentSpec, EventKind, Runtime};
 use serde_json::{Value, json};
 
 use crate::{
-    AGENT_NOTE, API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result,
-    RunContext, RuntimeAdapter, Servers, events, parse_json, plan, str_of,
+    API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result, RunContext,
+    RuntimeAdapter, Servers, events, parse_json, plan, str_of,
 };
 
 #[derive(Debug, Default)]
@@ -73,10 +73,10 @@ impl RuntimeAdapter for OpenCodeAdapter {
                 servers.entries(|url| json!({ "type": "remote", "url": url, "enabled": true }));
             config["mcp"] = entries.into();
         }
-        if servers.kestrel.is_some() {
+        if let Some(note) = servers.note() {
             files.push(PlanFile {
                 name: "kestrel.md".into(),
-                contents: AGENT_NOTE.into(),
+                contents: note,
             });
             config["instructions"] = json!([format!("{CONFIG_DIR}/kestrel.md")]);
         }

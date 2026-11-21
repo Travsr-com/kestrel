@@ -7,8 +7,8 @@ use kestrel_types::{AgentSpec, EventKind, Runtime};
 use serde_json::{Value, json};
 
 use crate::{
-    AGENT_NOTE, API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result,
-    RunContext, RuntimeAdapter, Servers, events, parse_json, plan, str_of,
+    API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result, RunContext,
+    RuntimeAdapter, Servers, events, parse_json, plan, str_of,
 };
 
 /// Keeps the tool name of every `tool_use` id seen so far, because a `tool_result` carries only the id.
@@ -134,8 +134,9 @@ impl RuntimeAdapter for ClaudeCodeAdapter {
                 &allowed,
             ]);
         }
-        if servers.kestrel.is_some() {
-            argv.extend(["--append-system-prompt", AGENT_NOTE]);
+        let note = servers.note();
+        if let Some(note) = &note {
+            argv.extend(["--append-system-prompt", note]);
         }
         // Ends the options, so an input that starts with `-` is never read as a flag.
         argv.extend(["--", input]);

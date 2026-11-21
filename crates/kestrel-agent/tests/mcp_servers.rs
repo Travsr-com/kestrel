@@ -5,7 +5,7 @@ mod common;
 
 use common::{GATEWAY, MODEL, ctx, image_for};
 use kestrel_agent::{
-    AGENT_NOTE, API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, RunContext, adapter_for,
+    API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, RunContext, adapter_for, agent_note,
 };
 use kestrel_types::{AgentSpec, Runtime};
 use serde_json::{Value, json};
@@ -88,7 +88,7 @@ fn claude_code_gets_the_kestrel_server_and_only_the_granted_tools() {
     );
     assert_eq!(
         after(&plan.argv, "--append-system-prompt"),
-        Some(AGENT_NOTE)
+        agent_note(true, true).as_deref()
     );
     // The task still comes last, after the end of the options.
     assert_eq!(
@@ -126,6 +126,50 @@ fn spawn_is_not_offered_without_depth_left_or_an_agent_to_spawn() {
             "{spawn}"
         );
     }
+}
+
+// A run that cannot spawn is not told how to: a leaf child, or one that may only ask a person.
+#[test]
+fn the_note_covers_only_the_tools_the_run_was_offered() {
+    let ask_only = agent_note(false, true).expect("a note for ask_human");
+    assert!(ask_only.contains("kestrel.ask_human"), "{ask_only}");
+    assert!(!ask_only.contains("kestrel.spawn"), "{ask_only}");
+    assert!(!ask_only.contains("kestrel.join"), "{ask_only}");
+    let spawn_only = agent_note(true, false).expect("a note for spawn");
+    assert!(!spawn_only.contains("kestrel.ask_human"), "{spawn_only}");
+    assert_eq!(agent_note(false, false), None);
+
+    let leaf = plan_for(
+        Runtime::ClaudeCode,
+        "{ mcp: [kestrel.spawn, kestrel.join, kestrel.ask_human],          spawn: { max_children: 1, max_depth: 0, agents: [worker] } }",
+        &ctx(),
+    );
+    assert_eq!(
+        after(&leaf.argv, "--append-system-prompt"),
+        Some(ask_only.as_str())
+    );
+    let join_only = plan_for(Runtime::ClaudeCode, "{ mcp: [kestrel.join] }", &ctx());
+    assert!(after(&join_only.argv, "--append-system-prompt").is_none());
+    let open = plan_for(Runtime::OpenCode, "{ mcp: [kestrel.join] }", &ctx());
+    assert!(file(&open, "kestrel.md").is_none());
+    let config = json_of(open.env.get("OPENCODE_CONFIG_CONTENT").expect("config"));
+    assert!(config.get("instructions").is_none(), "{config}");
+}
+
+// The gateway has three Kestrel tools; a misspelt one is never offered, and none twice.
+#[test]
+fn unknown_or_repeated_tool_names_are_left_out() {
+    let plan = plan_for(
+        Runtime::ClaudeCode,
+        "{ mcp: [kestrel.joinn, kestrel.join, kestrel.join, travsr.get_callers, travsr.get_callers] }",
+        &ctx(),
+    );
+    assert_eq!(
+        after(&plan.argv, "--allowedTools"),
+        Some("mcp__kestrel__kestrel_join,mcp__travsr__get_callers")
+    );
+    let typo = plan_for(Runtime::ClaudeCode, "{ mcp: [kestrel.joinn] }", &ctx());
+    assert!(typo.files.is_empty(), "{:?}", typo.files);
 }
 
 // 2
@@ -173,7 +217,7 @@ fn travsr_tools_add_a_travsr_server_and_its_tools() {
 fn opencode_gets_the_same_servers_as_remote_mcp_and_the_note_as_instructions() {
     let plan = plan_for(
         Runtime::OpenCode,
-        "{ mcp: [kestrel.join, travsr.get_callers] }",
+        "{ mcp: [kestrel.spawn, kestrel.join, travsr.get_callers],          spawn: { max_children: 1, max_depth: 1, agents: [worker] } }",
         &ctx(),
     );
     let config = json_of(
@@ -198,7 +242,10 @@ fn opencode_gets_the_same_servers_as_remote_mcp_and_the_note_as_instructions() {
         config["instructions"],
         json!([format!("{CONFIG_DIR}/kestrel.md")])
     );
-    assert_eq!(file(&plan, "kestrel.md"), Some(AGENT_NOTE));
+    assert_eq!(
+        file(&plan, "kestrel.md"),
+        agent_note(true, false).as_deref()
+    );
 }
 
 // 6
@@ -260,22 +307,21 @@ fn server_urls_are_built_as_urls_not_strings() {
 // 8
 #[test]
 fn the_agent_note_is_short_and_holds_no_token_or_path() {
-    assert!(
-        AGENT_NOTE.lines().count() <= 30,
-        "{} lines",
-        AGENT_NOTE.lines().count()
-    );
-    assert!(AGENT_NOTE.contains("kestrel.spawn") && AGENT_NOTE.contains("kestrel.join"));
-    for leak in [
-        "tok_",
-        "/r/",
-        "/home",
-        "/Users",
-        "/workspace",
-        "C:\\",
-        "http",
-    ] {
-        assert!(!AGENT_NOTE.contains(leak), "{leak}");
+    let full = agent_note(true, true).expect("a note");
+    assert!(full.lines().count() <= 30, "{} lines", full.lines().count());
+    assert!(full.contains("kestrel.spawn") && full.contains("kestrel.join"));
+    for note in [full.clone(), agent_note(false, true).expect("a note")] {
+        for leak in [
+            "tok_",
+            "/r/",
+            "/home",
+            "/Users",
+            "/workspace",
+            "C:\\",
+            "http",
+        ] {
+            assert!(!note.contains(leak), "{leak}");
+        }
     }
     // The plans carry the note as written, so they carry no token through it either.
     let plan = plan_for(Runtime::OpenCode, SPAWNER, &ctx());
