@@ -26,6 +26,7 @@ kestrel-core.workspace = true
 kestrel-sandbox.workspace = true
 kestrel-gateway.workspace = true
 kestrel-agent.workspace = true
+kestrel-server.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true

@@ -1324,6 +1324,7 @@ dependencies = [
  "kestrel-core",
  "kestrel-gateway",
  "kestrel-sandbox",
+ "kestrel-server",
  "kestrel-store",
  "kestrel-types",
  "predicates",

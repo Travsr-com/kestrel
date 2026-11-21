@@ -52,6 +52,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the engine and the gateway in the foreground.
     Serve(ServeArgs),
+    /// Run the engine, the gateway and the API server with the web UI, and open the UI.
+    Up(UpArgs),
     /// Submit a run and print its id.
     Run(RunArgs),
     /// Follow a run's events live.
@@ -112,6 +114,21 @@ pub struct ServeArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct UpArgs {
+    #[command(flatten)]
+    pub serve: ServeArgs,
+
+    /// Where the API server and the UI listen. Defaults to 127.0.0.1:7171. Another address
+    /// works too, with a warning: the token is then all that protects it.
+    #[arg(long, value_name = "ADDR")]
+    pub listen: Option<String>,
+
+    /// Print the UI address but do not open a browser.
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RunArgs {
     /// Agent spec file (YAML).
     pub agent: PathBuf,
@@ -145,6 +162,7 @@ fn execute(cli: Cli) -> Result<(), Failure> {
     let db = cli.db;
     match cli.command {
         Command::Serve(args) => serve::serve(db, args, out),
+        Command::Up(args) => serve::up(db, args, out),
         Command::Run(args) => commands::run(db, args, out),
         Command::Watch { run_id } => commands::watch(&open(db)?, run_id, out),
         Command::Ps { all } => commands::ps(&open(db)?, all, out),
