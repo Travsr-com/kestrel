@@ -389,3 +389,115 @@ async fn serve_gives_a_stuck_socket_a_bounded_grace() {
         "{waited:?}"
     );
 }
+
+// Issue #41: `/ws/events` follows every run on the global cursor, optionally only some kinds. It
+// feeds the approvals inbox and the nav badge on every view.
+
+fn ask(store: &Store, run: RunId) -> kestrel_types::ApprovalId {
+    let id = kestrel_types::ApprovalId::new();
+    store
+        .append(
+            run,
+            EventKind::ApprovalRequested {
+                id,
+                action: "git push".into(),
+                question: false,
+            },
+        )
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn the_events_socket_follows_every_run_and_only_the_kinds_asked_for() {
+    let store = store();
+    let a = store.create_run(&agent("a"), "x").unwrap();
+    let b = store.create_run(&agent("b"), "y").unwrap();
+    log(&store, a, "noise");
+    let first = ask(&store, a);
+    log(&store, b, "noise");
+    let second = ask(&store, b);
+    let server = start(store.clone(), |_| {}).await;
+    let mut socket = open(&server, "/ws/events?after=0&kinds=approval_requested").await;
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        match next(&mut socket, false).await {
+            Some(WsFrame::Event { cursor, event }) => match event.kind {
+                EventKind::ApprovalRequested { id, .. } => got.push((cursor, id, event.run_id)),
+                other => panic!("unexpected kind {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        got.iter().map(|g| (g.1, g.2)).collect::<Vec<_>>(),
+        [(first, a), (second, b)]
+    );
+    assert!(got[0].0 < got[1].0);
+    // Live: a log is skipped, a new request from either tree arrives.
+    log(&store, a, "more noise");
+    let third = ask(&store, a);
+    match next(&mut socket, false).await {
+        Some(WsFrame::Event { event, .. }) => {
+            assert!(matches!(event.kind, EventKind::ApprovalRequested { id, .. } if id == third));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn without_after_the_events_socket_starts_at_the_newest_event() {
+    let store = store();
+    let a = store.create_run(&agent("a"), "x").unwrap();
+    for i in 0..5 {
+        log(&store, a, &format!("old {i}"));
+    }
+    let server = start(store.clone(), |_| {}).await;
+    let mut socket = open(&server, "/ws/events").await;
+    // Give the socket a poll or two, so an old event would have been sent by now.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    log(&store, a, "new");
+    match next(&mut socket, false).await {
+        Some(WsFrame::Event { event, .. }) => {
+            assert!(matches!(&event.kind, EventKind::AgentLog { line } if line == "new"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_events_socket_resumes_after_its_cursor() {
+    let store = store();
+    let a = store.create_run(&agent("a"), "x").unwrap();
+    log(&store, a, "one");
+    log(&store, a, "two");
+    let server = start(store.clone(), |_| {}).await;
+    let mut socket = open(&server, "/ws/events?after=0").await;
+    let Some(WsFrame::Event { cursor, .. }) = next(&mut socket, false).await else {
+        panic!("no first event");
+    };
+    drop(socket);
+    let mut again = open(&server, &format!("/ws/events?after={cursor}")).await;
+    match next(&mut again, false).await {
+        Some(WsFrame::Event { event, .. }) => {
+            assert!(matches!(&event.kind, EventKind::AgentLog { line } if line == "two"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_events_socket_refuses_a_bad_cursor_or_kind() {
+    let server = start(store(), |_| {}).await;
+    for query in ["after=soon", "kinds=approval_requested,DROP%20TABLE"] {
+        let mut request = format!("ws://{}/ws/events?{query}", server.addr)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("{WS_PROTOCOL}, {WS_TOKEN_PREFIX}{TOKEN}")).unwrap(),
+        );
+        let err = connect_async(request).await.unwrap_err();
+        assert!(err.to_string().contains("400"), "{query}: {err}");
+    }
+}

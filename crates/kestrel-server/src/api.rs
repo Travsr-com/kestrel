@@ -30,7 +30,7 @@ pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response 
         .into_response()
 }
 
-fn internal(e: StoreError) -> Response {
+pub(crate) fn internal(e: StoreError) -> Response {
     error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
