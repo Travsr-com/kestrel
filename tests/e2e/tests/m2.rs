@@ -728,7 +728,10 @@ fn assert_mounts(id: &str, dump: &str) {
         .filter_map(|(title, _)| title.strip_prefix("mount "))
         .collect();
     // `/dev` holds the runtime's emulated devices, not host files, so it is not read.
-    for point in mounted.iter().filter(|p| !driver.contains(p) && **p != "/dev") {
+    for point in mounted
+        .iter()
+        .filter(|p| !driver.contains(p) && **p != "/dev")
+    {
         assert!(
             read.contains(point),
             "the agent of {id} did not read the mount {point}"
