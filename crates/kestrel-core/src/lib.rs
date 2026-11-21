@@ -13,6 +13,7 @@ pub mod workspace;
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -21,7 +22,8 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use kestrel_agent::{ParsedLine, RunContext, RuntimeAdapter};
 use kestrel_sandbox::{
-    INSTANCE_LABEL, LaunchSpec, NetworkPolicy, RUN_LABEL, SandboxDriver, SandboxHandle,
+    INSTANCE_LABEL, LaunchSpec, NetworkPolicy, PreparedNetwork, RUN_LABEL, SandboxDriver,
+    SandboxHandle,
 };
 use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
 use kestrel_types::{
@@ -407,6 +409,7 @@ impl Engine {
         }
         let store = &self.inner.store;
         self.inner.sweep_leftovers().await;
+        self.inner.sweep_networks().await;
         let mut report = RecoveryReport::default();
         for run in store.list_runs(RunFilter::default())? {
             if run.status.is_terminal() || run.status == RunStatus::Queued {
@@ -514,6 +517,18 @@ impl Inner {
             };
             for h in found {
                 let _ = self.destroy_tracked(idx, &h).await;
+            }
+        }
+    }
+
+    /// Best effort: removes the per-run networks the drivers list as left over.
+    async fn sweep_networks(&self) {
+        for driver in &self.drivers {
+            let Ok(found) = driver.leftover_networks().await else {
+                continue;
+            };
+            for network in found {
+                let _ = driver.remove_network(&network).await;
             }
         }
     }
@@ -754,8 +769,12 @@ impl Inner {
     }
 
     /// The per-run gateway URL, `{gateway}/r/{token}`.
-    fn run_gateway(&self, token: &str) -> Url {
+    fn run_gateway(&self, token: &str, host: Option<IpAddr>) -> Url {
         let mut url = self.gateway_url.clone();
+        if let Some(ip) = host {
+            // Only fails for URLs that cannot have a host, which a gateway URL always has.
+            let _ = url.set_ip_host(ip);
+        }
         if let Ok(mut path) = url.path_segments_mut() {
             path.pop_if_empty().push("r").push(token);
         }
@@ -970,8 +989,15 @@ impl Actor {
             .driver_for(self.spec.sandbox.tier)
             .ok_or(EngineError::NoDriver)?;
         let driver = &inner.drivers[idx];
-        let mut launch = self.launch_spec()?;
-        launch.workspace = self.workspace().await?;
+        let prepared = driver.prepare_network(self.id).await?;
+        let mut launch = self.launch_spec(prepared.as_ref())?;
+        launch.workspace = match self.workspace().await {
+            Ok(ws) => ws,
+            Err(e) => {
+                Self::drop_network(driver.as_ref(), prepared.as_ref()).await;
+                return Err(e);
+            }
+        };
         let mut create = inner.start_create(self.id, idx, launch);
         let created = loop {
             let deadline = self.clock.deadline();
@@ -985,9 +1011,16 @@ impl Actor {
                 }
             }
         };
+        let handle = match created {
+            Ok(h) => h,
+            Err(e) => {
+                Self::drop_network(driver.as_ref(), prepared.as_ref()).await;
+                return Err(e.into());
+            }
+        };
         let sb = Sandbox {
             driver: idx,
-            handle: created?,
+            handle,
         };
         self.sandbox = Some(sb.clone());
         if self.status.is_terminal() {
@@ -1018,10 +1051,19 @@ impl Actor {
         Ok(Some(workspaces.prepare(self.id, spec).await?))
     }
 
-    fn launch_spec(&self) -> Result<LaunchSpec> {
+    /// Best effort: removes a network no sandbox was created on.
+    async fn drop_network(driver: &dyn SandboxDriver, prepared: Option<&PreparedNetwork>) {
+        if let Some(p) = prepared {
+            let _ = driver.remove_network(&p.network).await;
+        }
+    }
+
+    fn launch_spec(&self, prepared: Option<&PreparedNetwork>) -> Result<LaunchSpec> {
         let ctx = RunContext {
             run_id: self.id,
-            gateway_url: self.inner.run_gateway(&self.token),
+            gateway_url: self
+                .inner
+                .run_gateway(&self.token, prepared.map(|p| p.gateway_host)),
             model: self.inner.model(self.spec.model_policy.default),
         };
         let plan = self.adapter.launch_plan(&self.spec, &self.input, &ctx)?;
@@ -1040,7 +1082,7 @@ impl Actor {
                 gateway: self.inner.gateway_url.clone(),
             },
             labels,
-            prepared_network: None,
+            prepared_network: prepared.map(|p| p.network.clone()),
         })
     }
 

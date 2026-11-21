@@ -11,7 +11,8 @@ use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
-    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver, detect_for,
+    BridgeSpec, CommandRunner, GatewayBridge, HostInfo, ProcessRunner, SandboxDriver,
+    detect_with_bridge, shared_network_warning,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -655,12 +656,24 @@ async fn run(
         Some(d) => d,
         None => {
             let instance = GatewayBridge::instance_id(&db);
-            detect_for(&HostInfo::current().await, false, Some(&instance))
-                .map_err(|e| Failure::runtime(e.to_string()))?
+            let bridge = config
+                .advertise_url
+                .is_none()
+                .then(|| GatewayBridge::container_name(&instance));
+            detect_with_bridge(
+                &HostInfo::current().await,
+                false,
+                Some(&instance),
+                bridge.as_deref(),
+            )
+            .map_err(|e| Failure::runtime(e.to_string()))?
         }
     };
     let docker = uses_docker(&drivers);
     let needs_bridge = docker && config.advertise_url.is_none();
+    if docker && let Some(warning) = shared_network_warning(needs_bridge) {
+        eprintln!("{warning}");
+    }
     let explicit = config.listen_explicit.then_some(config.listen.as_str());
     let (host, listen) = resolve_gateway(
         &ProcessRunner,

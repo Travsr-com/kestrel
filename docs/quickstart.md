@@ -176,7 +176,11 @@ A resumed run starts the agent command again in the same workspace.
 * The agent cannot run `git` inside the sandbox yet ([#22](https://github.com/Travsr-com/kestrel/issues/22)).
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
-* All sandboxes share one internal network ([#10](https://github.com/Travsr-com/kestrel/issues/10)).
+* Each run gets its own internal network, so sandboxes cannot reach each other. Docker's default address
+  pools hold about 30 networks, so more than about 30 runs at once fail with a clear error
+  ([#34](https://github.com/Travsr-com/kestrel/issues/34) lifts the limit).
+* With `gateway.advertise_url` there is no bridge, so all sandboxes share one network and can reach each
+  other. `kestrel serve` prints a warning.
 
 ## If something goes wrong
 

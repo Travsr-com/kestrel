@@ -63,7 +63,7 @@ pub enum SandboxError {
     /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run`, `connect` or `inspect`.
     #[error("gateway bridge step `{step}` failed: {stderr}")]
     Bridge { step: &'static str, stderr: String },
-    /// The bridge port is 0.
+    /// A step of preparing or removing a per-run network failed.
     #[error("network step `{step}` failed: {stderr}")]
     Network { step: &'static str, stderr: String },
     /// Docker has no address pool left for another per-run network (issue #34 lifts the limit).
@@ -71,6 +71,7 @@ pub enum SandboxError {
         "docker has no free address pool for another run network: {stderr}. Docker's default pools hold about 30 networks, so fewer runs can be active at once (see issue #34)"
     )]
     NetworkPoolExhausted { stderr: String },
+    /// The bridge port is 0.
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
     /// The workspace directory could not be inspected (missing, no permission, ...), so the
@@ -150,8 +151,9 @@ pub struct PreparedNetwork {
 /// The one-line warning printed when sandboxes share a network (no gateway bridge), or `None`
 /// when each run has its own.
 pub fn shared_network_warning(has_bridge: bool) -> Option<String> {
-    let _ = has_bridge;
-    todo!("issue #10")
+    (!has_bridge).then(|| {
+        "warning: no gateway bridge (gateway.advertise_url is set), so all sandboxes share one network and can reach each other".to_string()
+    })
 }
 
 /// Label key every sandbox of a run carries; the value is the run id.
@@ -387,6 +389,23 @@ pub trait SandboxDriver: Send + Sync {
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.
 const GATEWAY_NETWORK: &str = "kestrel-gw";
 
+/// Name prefix of per-run networks. The rest is the last 12 characters of the run id.
+const NETWORK_PREFIX: &str = "kestrel-gw-";
+
+/// Docker's answers when it has no address range left for another network.
+const POOL_EXHAUSTED: [&str; 2] = [
+    "all predefined address pools have been fully subnetted",
+    "Pool overlaps with other one",
+];
+
+/// Docker's answers meaning the network, the connection or the bridge is already gone.
+const GONE: &[&str] = &[
+    "No such network",
+    "is not connected",
+    "not found",
+    "No such container",
+];
+
 /// How one container CLI spells things. The three drivers differ only here.
 struct Cli {
     name: &'static str,
@@ -472,9 +491,10 @@ impl Cli {
 
     fn create_argv(&self, spec: &LaunchSpec, user: Option<(u32, u32)>) -> Vec<String> {
         let suffix = if self.apple { "M" } else { "m" };
-        let network = match spec.network {
-            NetworkPolicy::None => "none",
-            NetworkPolicy::GatewayOnly { .. } => GATEWAY_NETWORK,
+        let network = match (&spec.network, &spec.prepared_network) {
+            (NetworkPolicy::None, _) => "none",
+            (NetworkPolicy::GatewayOnly { .. }, Some(own)) => own.as_str(),
+            (NetworkPolicy::GatewayOnly { .. }, None) => GATEWAY_NETWORK,
         };
         let mut argv = self.argv(&["create"]);
         argv.extend(self.runtime.map(str::to_string));
@@ -556,6 +576,31 @@ impl Cli {
             .collect())
     }
 
+    /// Runs one network step. A failed command becomes [`SandboxError::Network`] naming `step`.
+    async fn net_step(
+        &self,
+        runner: &dyn CommandRunner,
+        step: &'static str,
+        args: &[&str],
+        tolerated: &[&str],
+    ) -> Result<String> {
+        let out = runner
+            .run(&self.argv(args))
+            .await
+            .map_err(|source| SandboxError::Spawn {
+                program: self.program.to_string(),
+                source,
+            })?;
+        if out.status == 0 || tolerated.iter().any(|t| out.stderr.contains(t)) {
+            return Ok(out.stdout);
+        }
+        let stderr = out.stderr.trim_end().to_string();
+        if POOL_EXHAUSTED.iter().any(|t| stderr.contains(t)) {
+            return Err(SandboxError::NetworkPoolExhausted { stderr });
+        }
+        Err(SandboxError::Network { step, stderr })
+    }
+
     async fn prepare_network(
         &self,
         runner: &dyn CommandRunner,
@@ -563,11 +608,86 @@ impl Cli {
         instance: Option<&str>,
         run: RunId,
     ) -> Result<Option<PreparedNetwork>> {
-        let _ = (runner, instance, run);
-        if self.apple || bridge.is_none() {
+        let Some(bridge) = bridge.filter(|_| !self.apple) else {
             return Ok(None);
+        };
+        let check = check_id(bridge)?;
+        let text = run.to_string();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let network = format!("{NETWORK_PREFIX}{tail}");
+        let run_label = format!("{RUN_LABEL}={text}");
+        let mut create = vec![
+            "network",
+            "create",
+            "--internal",
+            "--label",
+            run_label.as_str(),
+        ];
+        let instance_label = match instance {
+            Some(id) => Some(format!("{INSTANCE_LABEL}={}", check_id(id)?)),
+            None => None,
+        };
+        create.extend(instance_label.iter().flat_map(|l| ["--label", l.as_str()]));
+        create.push(&network);
+        self.net_step(runner, "network create", &create, &[])
+            .await?;
+
+        let connect = self
+            .net_step(
+                runner,
+                "network connect",
+                &["network", "connect", &network, check],
+                &[],
+            )
+            .await;
+        if let Err(e) = connect {
+            let _ = self
+                .net_step(runner, "network rm", &["network", "rm", &network], &[])
+                .await;
+            return Err(e);
         }
-        todo!("issue #10")
+        match self.bridge_ip(runner, &network, check).await {
+            Ok(gateway_host) => Ok(Some(PreparedNetwork {
+                network,
+                gateway_host,
+            })),
+            Err(e) => {
+                let _ = self.remove_network(runner, Some(check), &network).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The bridge's IPv4 address on `network`.
+    async fn bridge_ip(
+        &self,
+        runner: &dyn CommandRunner,
+        network: &str,
+        bridge: &str,
+    ) -> Result<std::net::IpAddr> {
+        let format = format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}");
+        let out = self
+            .net_step(
+                runner,
+                "inspect",
+                &["inspect", "--format", &format, bridge],
+                &[],
+            )
+            .await?;
+        out.trim()
+            .parse::<std::net::Ipv4Addr>()
+            .map(std::net::IpAddr::V4)
+            .map_err(|_| SandboxError::Network {
+                step: "inspect",
+                stderr: format!("unexpected address for the bridge on {network}: {out:?}"),
+            })
     }
 
     async fn remove_network(
@@ -576,8 +696,18 @@ impl Cli {
         bridge: Option<&str>,
         network: &str,
     ) -> Result<()> {
-        let _ = (runner, bridge, network);
-        todo!("issue #10")
+        let network = check_id(network)?;
+        if self.apple {
+            return Ok(());
+        }
+        if let Some(bridge) = bridge {
+            let args = ["network", "disconnect", network, check_id(bridge)?];
+            self.net_step(runner, "network disconnect", &args, GONE)
+                .await?;
+        }
+        self.net_step(runner, "network rm", &["network", "rm", network], GONE)
+            .await
+            .map(drop)
     }
 
     async fn leftover_networks(
@@ -585,18 +715,43 @@ impl Cli {
         runner: &dyn CommandRunner,
         instance: Option<&str>,
     ) -> Result<Vec<String>> {
-        let _ = (runner, instance);
-        todo!("issue #10")
+        if self.apple {
+            return Ok(Vec::new());
+        }
+        let run_filter = format!("label={RUN_LABEL}");
+        let mut args = vec!["network", "ls", "--filter", run_filter.as_str()];
+        let instance_filter = match instance {
+            Some(id) => Some(format!("label={INSTANCE_LABEL}={}", check_id(id)?)),
+            None => None,
+        };
+        args.extend(
+            instance_filter
+                .iter()
+                .flat_map(|f| ["--filter", f.as_str()]),
+        );
+        args.extend(["--format", "{{.Name}}"]);
+        let stdout = self.net_step(runner, "network ls", &args, &[]).await?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|n| check_id(n).is_ok())
+            .map(String::from)
+            .collect())
     }
 
     async fn create(
         &self,
         runner: &dyn CommandRunner,
         owner: &OwnerLookup,
+        nets: &Nets,
         spec: &LaunchSpec,
     ) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
+        let own_network = match (&spec.network, &spec.prepared_network) {
+            (NetworkPolicy::GatewayOnly { .. }, Some(own)) => Some(check_id(own)?),
+            _ => None,
+        };
         let mut user = None;
         if let Some(ws) = &spec.workspace {
             validate_workspace_path(ws)?;
@@ -607,16 +762,18 @@ impl Cli {
             // Root-owned workspace: Kestrel runs as root, nothing to map.
             user = (ids != (0, 0)).then_some(ids);
         }
-        if let NetworkPolicy::GatewayOnly { .. } = spec.network {
+        if let (NetworkPolicy::GatewayOnly { .. }, None) = (&spec.network, own_network) {
             let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
             self.run(runner, &argv, Some("already exists")).await?;
         }
         let stdout = self
             .run(runner, &self.create_argv(spec, user), None)
             .await?;
-        Ok(SandboxHandle {
-            id: check_id(stdout.trim())?.to_string(),
-        })
+        let id = check_id(stdout.trim())?.to_string();
+        if let Some(own) = own_network {
+            nets.insert(&id, own);
+        }
+        Ok(SandboxHandle { id })
     }
 
     async fn start(
@@ -681,14 +838,20 @@ impl Cli {
         &self,
         runner: &dyn CommandRunner,
         exits: &Exits,
+        nets: &Nets,
+        bridge: Option<&str>,
         h: &SandboxHandle,
     ) -> Result<()> {
         exits.remove(&h.id);
         let rm = if self.apple { "delete" } else { "rm" };
         let argv = self.argv(&[rm, "--force", check_id(&h.id)?]);
-        self.run(runner, &argv, Some(self.not_found))
-            .await
-            .map(drop)
+        self.run(runner, &argv, Some(self.not_found)).await?;
+        // The network is forgotten only once it is gone, so a failed destroy can be retried.
+        if let Some(network) = nets.get(&h.id) {
+            self.remove_network(runner, bridge, &network).await?;
+            nets.remove(&h.id);
+        }
+        Ok(())
     }
 }
 
@@ -709,6 +872,28 @@ impl Exits {
     }
 
     fn get(&self, id: &str) -> Option<SharedExit> {
+        self.map().get(id).cloned()
+    }
+
+    fn remove(&self, id: &str) {
+        self.map().remove(id);
+    }
+}
+
+/// The per-run network of each sandbox a driver created, by sandbox id.
+#[derive(Default)]
+struct Nets(Mutex<HashMap<String, String>>);
+
+impl Nets {
+    fn map(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn insert(&self, id: &str, network: &str) {
+        self.map().insert(id.to_string(), network.to_string());
+    }
+
+    fn get(&self, id: &str) -> Option<String> {
         self.map().get(id).cloned()
     }
 
@@ -789,6 +974,7 @@ macro_rules! cli_driver {
                 Self {
                     runner,
                     exits: Exits::default(),
+                    nets: Nets::default(),
                     owner: default_owner(),
                     instance: None,
                     bridge: None,
@@ -842,7 +1028,8 @@ macro_rules! cli_driver {
                 $cli.strong
             }
             async fn create(&self, spec: &LaunchSpec) -> Result<SandboxHandle> {
-                $cli.create(self.runner.as_ref(), &self.owner, spec).await
+                $cli.create(self.runner.as_ref(), &self.owner, &self.nets, spec)
+                    .await
             }
             async fn start(&self, h: &SandboxHandle) -> Result<OutputStream> {
                 $cli.start(self.runner.as_ref(), &self.exits, h).await
@@ -854,7 +1041,14 @@ macro_rules! cli_driver {
                 $cli.stop(self.runner.as_ref(), h).await
             }
             async fn destroy(&self, h: &SandboxHandle) -> Result<()> {
-                $cli.destroy(self.runner.as_ref(), &self.exits, h).await
+                $cli.destroy(
+                    self.runner.as_ref(),
+                    &self.exits,
+                    &self.nets,
+                    self.bridge.as_deref(),
+                    h,
+                )
+                .await
             }
             async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
                 $cli.leftovers(self.runner.as_ref(), self.instance.as_deref())
@@ -885,6 +1079,7 @@ macro_rules! cli_driver {
 pub struct GvisorDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    nets: Nets,
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
@@ -898,6 +1093,7 @@ pub struct GvisorDriver {
 pub struct AppleContainerDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    nets: Nets,
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
@@ -907,6 +1103,7 @@ pub struct AppleContainerDriver {
 pub struct DockerRuncDriver {
     runner: Arc<dyn CommandRunner>,
     exits: Exits,
+    nets: Nets,
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
