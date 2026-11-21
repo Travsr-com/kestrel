@@ -38,7 +38,7 @@ use kestrel_sandbox::{
     Subnet, SubnetPool,
 };
 use kestrel_store::ControlCommand;
-use kestrel_types::{EventKind, RunId, RunStatus, SuspendReason};
+use kestrel_types::{ApprovalId, EventKind, RunId, RunStatus, SuspendReason};
 use url::Url;
 
 use RunStatus::{Cancelled, Queued, Running, Suspended};
@@ -765,4 +765,43 @@ async fn a_resume_from_a_dead_pool_is_dropped_with_a_note_and_the_run_stays_susp
         0,
         "no wait note: the resume is not waiting"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approve_from_a_dead_pool_is_dropped_naming_the_approve() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = dir.path().join("kestrel.db");
+
+    // First engine: `a` asks for an approval, then the engine stops.
+    let (mut first, _net, _pool) = with(Harness::on(&db, 4), 4, "10.200.0.0/29");
+    let s1 = first.driver.live();
+    first.start();
+    let a = first.submit(spec()).await;
+    running(&first, a).await;
+    let aid = ApprovalId::new();
+    s1.line(&format!("approval:{aid}:gh.comment"));
+    let pending = Suspended(SuspendReason::Approval(aid));
+    until("a waits for the approval", || first.is(a, &pending)).await;
+    first.engine.shutdown(GRACE).await;
+    drop(first);
+
+    // Second engine: a network outside Kestrel covers the only block, so the approval cannot get
+    // a new sandbox.
+    let (mut h, net, pool) = with(Harness::on(&db, 4), 4, "10.200.0.0/29");
+    h.engine.recover().await.expect("recover");
+    assert!(h.is(a, &pending), "the approval wait survives the restart");
+    pool.exclude(&[Ipv4Cidr::parse("10.200.0.0/29").expect("cidr")]);
+    h.start();
+
+    h.control(a, ControlCommand::Approve(aid));
+    until("a is told the approve is not possible", || {
+        h.has_event(a, |e| {
+            matches!(e, EventKind::AgentLog { line }
+                if line.contains("approve not possible") && line.contains("gateway.subnet_pool"))
+        })
+    })
+    .await;
+    settle().await;
+    assert!(h.is(a, &pending), "the run still waits for its approval");
+    assert!(net.blocks_of(a).is_empty());
 }

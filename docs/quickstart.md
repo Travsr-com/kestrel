@@ -187,5 +187,8 @@ A resumed run starts the agent command again in the same workspace.
   from environment variables.
 * A run stays `Queued`: `kestrel serve` is not running, or it is already at `max_concurrent_runs`. A
   `subnet pool` line in its log means every network block is in use.
+* `no block of subnet pool ... can be used until kestrel serve restarts`: every block of the pool is
+  taken by networks outside Kestrel, or by run networks Kestrel could not remove. Set
+  `gateway.subnet_pool` to a free range, or restart `kestrel serve`.
 * `subnet pool ... has no free /29 block`: docker networks or host routes already cover the pool. Set
   `gateway.subnet_pool` to a free range, for example `subnet_pool = "10.201.0.0/16"`.

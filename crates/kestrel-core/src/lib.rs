@@ -173,9 +173,9 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 ///
 /// Resuming a run whose sandbox is stopped needs a free slot (a `Resume`, or an `Approve` after a
 /// restart). If none is free the command stays pending: the run stays suspended and the command
-/// is not dropped (the one exception is a dead subnet pool, see "Run networks" below). `SetBudget`
-/// and `Cancel` still apply at once, and a `Cancel` removes the
-/// pending resume. A resume still pending when the engine stops is lost and must be sent again
+/// is not dropped (the one exception is an exhausted subnet pool, see "Run networks" below).
+/// `SetBudget` and `Cancel` still apply at once, and a `Cancel` removes the pending resume. A
+/// resume still pending when the engine stops is lost and must be sent again
 /// (the run stays suspended). After [`Engine::recover`] no run holds a slot, and commands for the
 /// recovered runs wait for one like any other.
 ///
@@ -191,12 +191,14 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// subnet pool. The scheduler reserves it together with the slot, in the same FIFO line. A waiter
 /// that gets a slot but no block gives the slot back and stays where it is (the run stays
 /// `Queued`, the resume stays pending). It gets one `AgentLog` naming the subnet pool for the
-/// whole wait, not one per tick. When the pool is exhausted ([`SubnetPool::exhausted`]: nothing is
-/// free and no block in use will come back until the next start), waiting would never end: a
-/// queued run fails with a message naming the pool, and a resume or approve is dropped with a log
-/// line while the run stays suspended. Waiters behind it that also need a block wait too; ones that
+/// whole wait, not one per tick. Waiters behind it that also need a block wait too; ones that
 /// need none (a resume of a run whose stopped sandbox still exists) may take a free slot, so
 /// runs that hold blocks while suspended can always be resumed.
+///
+/// When the pool is exhausted ([`SubnetPool::exhausted`]: nothing is free and no block in use will
+/// come back until the next start), waiting would never end. Then every waiter that needs a block
+/// stops waiting in the same tick: a queued run fails with a message naming the pool, and a resume
+/// or approve is dropped with a log line naming it while the run stays suspended.
 ///
 /// The run actor turns the block into the run's network with `SandboxDriver::prepare_network`
 /// before it builds the launch plan, and the gateway URL of the run points at the bridge on that
@@ -734,7 +736,10 @@ impl Inner {
             Some(cmd) => {
                 let what = match cmd {
                     ControlCommand::Approve(_) => "approve",
-                    _ => "resume",
+                    ControlCommand::Resume => "resume",
+                    // Only resumes and approves wait for a slot (see `route`); anything else is
+                    // named generically rather than mislabelled.
+                    _ => "command",
                 };
                 let line = format!("kestrel: {what} not possible: {why}");
                 self.store.append(run, EventKind::AgentLog { line })?;
@@ -878,8 +883,8 @@ impl Inner {
                 self.slots().release(run);
                 if self.pool_is_dead() {
                     // Nothing is free and no run holds a block that will come back: waiting would
-                    // never end. A queued run fails; a resume is dropped and the run stays
-                    // suspended.
+                    // never end. A queued run fails; a resume or approve is dropped and the run
+                    // stays suspended.
                     let dropped = s.waiting.remove(i).and_then(|w| w.resume);
                     self.give_up_on_pool(run, dropped.as_ref())?;
                     continue;
