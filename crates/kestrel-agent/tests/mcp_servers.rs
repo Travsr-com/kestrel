@@ -71,6 +71,8 @@ fn claude_code_gets_the_kestrel_server_and_only_the_granted_tools() {
     let plan = plan_for(Runtime::ClaudeCode, SPAWNER, &ctx());
     let config = format!("{CONFIG_DIR}/mcp.json");
     assert_eq!(after(&plan.argv, "--mcp-config"), Some(config.as_str()));
+    // Only these servers: none from an `.mcp.json` the cloned repo may hold.
+    assert!(plan.argv.iter().any(|a| a == "--strict-mcp-config"));
     let mcp = json_of(file(&plan, "mcp.json").expect("mcp.json in the plan"));
     assert_eq!(mcp["mcpServers"]["kestrel"]["type"], json!("http"));
     assert_eq!(
@@ -106,6 +108,24 @@ fn spawn_without_spawn_rights_is_not_offered() {
         after(&plan.argv, "--allowedTools"),
         Some("mcp__kestrel__kestrel_join")
     );
+}
+
+// The gateway offers spawn only to a grant that may spawn something: depth left, and an agent.
+// A child narrowed to depth 0 keeps its spawn policy, so the policy alone is not enough.
+#[test]
+fn spawn_is_not_offered_without_depth_left_or_an_agent_to_spawn() {
+    for spawn in [
+        "{ max_children: 2, max_depth: 0, agents: [worker] }",
+        "{ max_children: 2, max_depth: 1, agents: [] }",
+    ] {
+        let caps = format!("{{ mcp: [kestrel.spawn, kestrel.join], spawn: {spawn} }}");
+        let plan = plan_for(Runtime::ClaudeCode, &caps, &ctx());
+        assert_eq!(
+            after(&plan.argv, "--allowedTools"),
+            Some("mcp__kestrel__kestrel_join"),
+            "{spawn}"
+        );
+    }
 }
 
 // 2
@@ -220,6 +240,8 @@ fn server_urls_are_built_as_urls_not_strings() {
         ),
         // A run root with a trailing slash gets no double slash.
         ("http://gw:8787/r/tok/", "http://gw:8787/r/tok/mcp"),
+        // `/mcp` goes into the path, not after a query, as appending to the string would do.
+        ("http://gw:8787/r/tok?k=v", "http://gw:8787/r/tok/mcp?k=v"),
     ] {
         let ctx = RunContext {
             gateway_url: Url::parse(gateway).unwrap_or_else(|e| panic!("{e}")),

@@ -127,7 +127,7 @@ impl Servers {
         for name in &caps.mcp {
             if let Some(tool) = name.strip_prefix("kestrel.") {
                 // Spawning also needs spawn rights, as the gateway checks.
-                if tool == "spawn" && caps.spawn.is_none() {
+                if tool == "spawn" && !caps.spawn.as_ref().is_some_and(|s| s.may_spawn()) {
                     continue;
                 }
                 kestrel = true;
