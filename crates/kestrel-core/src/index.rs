@@ -6,7 +6,8 @@
 //! every sandbox, and indexes and serves that. What the engine remembers:
 //!
 //! * which runs it handed over and not forgotten yet, and which of them are ready, so the
-//!   gateway lists Travsr tools only for a run whose copy is indexed;
+//!   gateway lists Travsr tools only for a run whose copy is indexed, and only a run handed
+//!   over (or listed as kept after a restart) is ever forgotten;
 //! * which forgets failed, so they are tried again later. That list lives in memory; a restart
 //!   finds what is left through [`RunIndexer::kept`] instead.
 
@@ -50,8 +51,8 @@ pub trait RunIndexer: Send + Sync {
 /// How the engine uses a [`RunIndexer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexLimits {
-    /// The longest one indexing job may take. Past it, the run starts without Travsr. A run may
-    /// first wait for a job slot, see `max_jobs`.
+    /// The longest a run waits for its index, the wait for a job slot (see `max_jobs`)
+    /// included. Past it, the run starts without Travsr.
     pub timeout: Duration,
     /// Most indexing jobs at once. Runs past it wait for a slot, in turn.
     pub max_jobs: usize,
@@ -85,8 +86,12 @@ pub(crate) struct Indexing {
     host: Arc<dyn RunIndexer>,
     limits: IndexLimits,
     jobs: Semaphore,
-    /// Runs handed to the indexer and not released or forgotten yet, and whether each is ready.
+    /// Runs being indexed or served (not released or forgotten yet), and whether each is ready.
     runs: Mutex<HashMap<RunId, bool>>,
+    /// Runs the indexer may keep something for: handed to it (it got a job slot) or listed by
+    /// [`RunIndexer::kept`], and not forgotten since. Only these are forgotten, so a run that
+    /// never reached the indexer never asks it for anything.
+    handed: Mutex<HashSet<RunId>>,
     /// Runs whose forget failed, to try again.
     failed: Mutex<HashSet<RunId>>,
     /// A retry is under way.
@@ -104,6 +109,7 @@ impl Indexing {
             limits,
             jobs: Semaphore::new(limits.max_jobs.max(1)),
             runs: Mutex::default(),
+            handed: Mutex::default(),
             failed: Mutex::default(),
             retrying: AtomicBool::new(false),
         }
@@ -113,15 +119,24 @@ impl Indexing {
         self.limits.retry_every
     }
 
-    /// Indexes `run`'s `source`: waits for a job slot, then at most the timeout. `Err` says why
-    /// the run is not ready. A forget still to retry for the run is dropped: the run is in use.
+    /// Indexes `run`'s `source`: waits for a job slot, then for the index, both together at
+    /// most the timeout. `Err` says why the run is not ready. A forget still to retry for the
+    /// run is dropped: the run is in use.
     pub(crate) async fn index(&self, run: RunId, source: IndexSource) -> Result<(), String> {
         lock(&self.failed).remove(&run);
         lock(&self.runs).insert(run, false);
-        // The semaphore is never closed, so this always gets a slot.
-        let _slot = self.jobs.acquire().await.ok();
         let limit = self.limits.timeout;
-        match tokio::time::timeout(limit, self.host.index(run, &source)).await {
+        let deadline = tokio::time::Instant::now() + limit;
+        // The semaphore is never closed, so a slot that comes free in time is always had.
+        let Ok(slot) = tokio::time::timeout_at(deadline, self.jobs.acquire()).await else {
+            return Err(format!(
+                "no indexing slot came free within {} s",
+                limit.as_secs()
+            ));
+        };
+        let _slot = slot.ok();
+        lock(&self.handed).insert(run);
+        match tokio::time::timeout_at(deadline, self.host.index(run, &source)).await {
             Ok(Ok(())) => {
                 if let Some(ready) = lock(&self.runs).get_mut(&run) {
                     *ready = true;
@@ -148,10 +163,15 @@ impl Indexing {
         }
     }
 
-    /// Forgets `run`, at most the forget timeout. A failure is kept for [`Indexing::retry`].
+    /// Forgets `run`, at most the forget timeout. A failure is kept for [`Indexing::retry`]. A
+    /// run the indexer was never handed, and does not list as kept, has nothing to forget: the
+    /// indexer is not asked, so a run without Travsr never starts a Travsr process.
     pub(crate) async fn forget(&self, run: RunId) -> Result<(), String> {
         lock(&self.runs).remove(&run);
         lock(&self.failed).remove(&run);
+        if !lock(&self.handed).contains(&run) {
+            return Ok(());
+        }
         let forgotten = self.bounded_forget(run).await;
         if forgotten.is_err() {
             lock(&self.failed).insert(run);
@@ -159,19 +179,28 @@ impl Indexing {
         forgotten
     }
 
+    /// Asks the indexer to forget `run`; once it has, the run is no longer handed over.
     async fn bounded_forget(&self, run: RunId) -> Result<(), String> {
         let limit = self.limits.forget_timeout;
-        match tokio::time::timeout(limit, self.host.forget(run)).await {
+        let forgotten = match tokio::time::timeout(limit, self.host.forget(run)).await {
             Ok(done) => done,
             Err(_) => Err(format!("it did not finish within {} s", limit.as_secs())),
+        };
+        if forgotten.is_ok() {
+            lock(&self.handed).remove(&run);
         }
+        forgotten
     }
 
-    /// The runs the indexer keeps a copy for.
+    /// The runs the indexer keeps a copy for. Each one listed may be forgotten later.
     pub(crate) async fn kept(&self) -> Result<Vec<RunId>, String> {
         let limit = self.limits.forget_timeout;
         match tokio::time::timeout(limit, self.host.kept()).await {
-            Ok(kept) => kept,
+            Ok(Ok(kept)) => {
+                lock(&self.handed).extend(kept.iter().copied());
+                Ok(kept)
+            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(format!(
                 "listing did not finish within {} s",
                 limit.as_secs()
@@ -214,17 +243,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// Forgets fail until `works` is set; each forget waits for `gate` when there is one.
+    /// Forgets fail until `works` is set; each forget waits for `gate` when there is one. An index
+    /// takes `takes`, and `kept` lists `kept`.
     #[derive(Default)]
     struct Host {
+        indexes: AtomicUsize,
+        takes: Mutex<Duration>,
         forgets: AtomicUsize,
         works: AtomicBool,
         gate: Mutex<Option<Arc<Semaphore>>>,
+        kept: Mutex<Vec<RunId>>,
     }
 
     #[async_trait]
     impl RunIndexer for Host {
         async fn index(&self, _: RunId, _: &IndexSource) -> Result<(), String> {
+            self.indexes.fetch_add(1, Ordering::SeqCst);
+            let takes = *lock(&self.takes);
+            tokio::time::sleep(takes).await;
             Ok(())
         }
         async fn release(&self, _: RunId) {}
@@ -241,7 +277,7 @@ mod tests {
             }
         }
         async fn kept(&self) -> Result<Vec<RunId>, String> {
-            Ok(Vec::new())
+            Ok(lock(&self.kept).clone())
         }
     }
 
@@ -290,6 +326,9 @@ mod tests {
         let host = Arc::new(Host::default());
         let ix = Indexing::new(host.clone(), IndexLimits::default());
         let (resumed, listed) = (RunId::new(), RunId::new());
+        for run in [resumed, listed] {
+            ix.index(run, source()).await.unwrap();
+        }
         ix.forget(resumed).await.unwrap_err();
         ix.forget(listed).await.unwrap_err();
         assert_eq!(host.forgets.load(Ordering::SeqCst), 2);
@@ -303,6 +342,84 @@ mod tests {
         assert_eq!(host.forgets.load(Ordering::SeqCst), 3, "only `listed`");
         assert!(lock(&ix.failed).is_empty());
         assert!(ix.ready(resumed));
+    }
+
+    #[tokio::test]
+    async fn only_a_run_handed_to_the_indexer_or_kept_by_it_is_forgotten() {
+        let host = Arc::new(Host::default());
+        host.works.store(true, Ordering::SeqCst);
+        let ix = Indexing::new(host.clone(), IndexLimits::default());
+        // Never handed over: nothing to forget, and the indexer is not asked.
+        let never = RunId::new();
+        assert_eq!(ix.forget(never).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 0);
+        // Kept from before a restart: forgotten once.
+        let kept = RunId::new();
+        lock(&host.kept).push(kept);
+        assert_eq!(ix.kept().await, Ok(vec![kept]));
+        assert_eq!(ix.forget(kept).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 1);
+        assert_eq!(ix.forget(kept).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 1);
+        // Handed over and released (served no more, its copy kept): still forgotten later.
+        let released = RunId::new();
+        ix.index(released, source()).await.unwrap();
+        ix.release(released).await;
+        assert_eq!(ix.forget(released).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 2);
+        // A failed forget stays listed until a retry works, then is not tried again.
+        host.works.store(false, Ordering::SeqCst);
+        let failing = RunId::new();
+        ix.index(failing, source()).await.unwrap();
+        ix.forget(failing).await.unwrap_err();
+        host.works.store(true, Ordering::SeqCst);
+        ix.retry().await;
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 4);
+        assert_eq!(ix.forget(failing).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_covers_the_wait_for_a_slot() {
+        let limits = IndexLimits {
+            timeout: Duration::from_secs(5),
+            max_jobs: 1,
+            ..IndexLimits::default()
+        };
+        let host = Arc::new(Host::default());
+        let ix = Indexing::new(host.clone(), limits);
+        // Every slot is taken past the timeout: the run gives up without reaching the indexer.
+        let held = ix.jobs.acquire().await.unwrap();
+        let run = RunId::new();
+        let started = tokio::time::Instant::now();
+        let err = ix.index(run, source()).await.unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(
+            err.contains("no indexing slot came free within 5 s"),
+            "{err}"
+        );
+        assert_eq!(host.indexes.load(Ordering::SeqCst), 0);
+        assert!(!ix.ready(run));
+        // Nothing was handed over, so nothing is forgotten.
+        assert_eq!(ix.forget(run).await, Ok(()));
+        assert_eq!(host.forgets.load(Ordering::SeqCst), 0);
+        // A slot that comes free after 2 s leaves 3 s for an index that takes 4.
+        *lock(&host.takes) = Duration::from_secs(4);
+        let started = tokio::time::Instant::now();
+        let free_later = async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(held);
+        };
+        let ((), indexed) = tokio::join!(free_later, ix.index(RunId::new(), source()));
+        let err = indexed.unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(err.contains("did not finish within 5 s"), "{err}");
+        assert_eq!(host.indexes.load(Ordering::SeqCst), 1);
+        // One that takes less is ready.
+        *lock(&host.takes) = Duration::from_secs(1);
+        let run = RunId::new();
+        ix.index(run, source()).await.unwrap();
+        assert!(ix.ready(run));
     }
 
     #[tokio::test(start_paused = true)]
@@ -330,6 +447,7 @@ mod tests {
         };
         let ix = Indexing::new(Arc::new(Stuck), limits);
         let run = RunId::new();
+        ix.index(run, source()).await.unwrap();
         let err = ix.forget(run).await.unwrap_err();
         assert!(err.contains("within 7 s"), "{err}");
         assert!(lock(&ix.failed).contains(&run));

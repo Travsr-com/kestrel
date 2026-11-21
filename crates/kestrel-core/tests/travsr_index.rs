@@ -190,7 +190,7 @@ impl RunIndexer for FakeIndexer {
             gate.acquire().await.unwrap().forget();
         }
         if take_one(&self.forget_failures) {
-            return Err("travsr repos --remove exited with code 1".into());
+            return Err("could not delete the copy: permission denied".into());
         }
         lock(&self.disk).remove(&run);
         Ok(())
@@ -581,6 +581,69 @@ async fn an_empty_dir_or_a_run_without_travsr_tools_is_not_indexed() {
     assert_eq!(s.h.engine.travsr_tools(no_tools).unwrap(), Some(Vec::new()));
     // Nor is the commit of their workspace read.
     assert!(s.git.inside(&s.root.join(no_tools.to_string())).len() == 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_never_handed_to_the_indexer_is_never_forgotten() {
+    // Finished runs without Travsr tools, or without a clone, never reach the indexer: not when
+    // indexing, and not when they end (a missing travsr would otherwise fail every forget).
+    let mut s = setup(4, LIMITS);
+    s.h.driver.script(&["ok:done"], 0);
+    s.h.driver.script(&["ok:done"], 0);
+    s.h.start();
+    let no_tools = s.h.submit(clone_spec(&s.repo, &["kestrel.join"])).await;
+    let mut empty = clone_spec(&s.repo, &["travsr.get_callers"]);
+    empty.sandbox.workspace = WorkspaceSpec::EmptyDir;
+    let empty = s.h.submit(empty).await;
+    until("both completed", || {
+        s.h.is(no_tools, &Completed) && s.h.is(empty, &Completed)
+    })
+    .await;
+    settle_for(400).await;
+    assert!(s.ix.indexed().is_empty());
+    assert!(s.ix.forgotten().is_empty(), "{:?}", s.ix.forgotten());
+    assert!(s.ix.released().is_empty());
+    assert!(travsr_logs(&s.h, no_tools).is_empty());
+    assert!(travsr_logs(&s.h, empty).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_run_starts_without_travsr_once_the_timeout_passes_however_long_it_queued() {
+    // One job slot, held by a run whose index never finishes. The run behind it waits for the
+    // slot and then for its own index, but both together at most the 5 s timeout: it starts
+    // about 5 s after it began to wait, never 5 s after the slot came free.
+    let limits = IndexLimits {
+        max_jobs: 1,
+        ..LIMITS
+    };
+    let mut s = setup(4, limits);
+    let _gate = s.ix.close();
+    let _first_session = s.h.driver.live();
+    let _second_session = s.h.driver.live();
+    s.h.start();
+    let first =
+        s.h.submit(clone_spec(&s.repo, &["travsr.get_callers"]))
+            .await;
+    until("first indexing", || s.ix.indexed().len() == 1).await;
+    // Most of the first run's timeout is gone before the second one starts to wait.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let waited_from = tokio::time::Instant::now();
+    let second =
+        s.h.submit(clone_spec(&s.repo, &["travsr.get_callers"]))
+            .await;
+    until("second running", || s.h.is(second, &Running)).await;
+    let waited = waited_from.elapsed();
+    assert!(
+        waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+        "{waited:?}"
+    );
+    let logs = travsr_logs(&s.h, second);
+    assert!(
+        logs.len() == 1 && logs[0].contains("within 5 s"),
+        "{logs:?}"
+    );
+    assert_eq!(s.h.engine.travsr_tools(second).unwrap(), Some(Vec::new()));
+    assert!(s.h.is(first, &Running));
 }
 
 #[tokio::test(start_paused = true)]

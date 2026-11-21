@@ -734,16 +734,18 @@ impl Engine {
     ///   has no commit: the indexer uses the one it recorded. The index therefore shows the code
     ///   the run started from, never the agent's edits.
     /// * **When**: after the workspace exists and before the agent starts (while the sandbox is
-    ///   made). At most `limits.max_jobs` jobs run at once; each may take `limits.timeout`. A job
-    ///   that fails or takes longer does not hold the run: it starts without Travsr, and its log
-    ///   says why. [`Engine::travsr_tools`] then lists nothing for it.
+    ///   made). At most `limits.max_jobs` jobs run at once. A run waits at most `limits.timeout`
+    ///   for its index, the wait for a free job slot included. A job that fails or takes longer
+    ///   does not hold the run: it starts without Travsr, and its log says why.
+    ///   [`Engine::travsr_tools`] then lists nothing for it.
     /// * **Released** (served no more, its copy kept for a resume) when [`Engine::shutdown`]
     ///   stops a run.
     /// * **Forgotten** (nothing kept) when the run ends, after its slot is given back, and by
     ///   [`Engine::recover`] for every copy the indexer keeps ([`RunIndexer::kept`]) whose run
-    ///   ended or no longer exists. Each forget may take `limits.forget_timeout`. One that fails
-    ///   is logged on the run and tried again every `limits.retry_every` while `run_forever`
-    ///   runs. It never fails the run.
+    ///   ended or no longer exists. Only a run handed to the indexer (it got a job slot), or
+    ///   listed as kept, is forgotten; any other run never reaches the indexer. Each forget may
+    ///   take `limits.forget_timeout`. One that fails is logged on the run and tried again every
+    ///   `limits.retry_every` while `run_forever` runs. It never fails the run.
     pub fn with_indexer(mut self, indexer: Arc<dyn RunIndexer>, limits: IndexLimits) -> Engine {
         let inner = Arc::get_mut(&mut self.inner);
         debug_assert!(inner.is_some(), "engine state is shared");
