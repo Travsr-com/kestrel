@@ -24,6 +24,8 @@ calls them `mcp__travsr__get_callers`.
 * Every call answers about the code the run started from: its source repo at the commit its
   workspace was cloned at. The agent's own edits are not in the index (see
   [Security model](#security-model)).
+* A tool that fails because Travsr's server could not start says only that. The reason, which
+  may name host paths, goes to Kestrel's log on the host.
 * A child run is indexed on its own, from its own workspace's commit.
 * A child holds at most its parent's tools, so a parent can pass on fewer.
 * A tool that fails (Travsr down, too slow, an error) returns an MCP tool error with a short reason.
@@ -58,13 +60,18 @@ A read tool the run was not granted is refused too, and the run's log says so.
 ```toml
 [travsr]
 command = "/usr/local/bin/travsr"   # default "travsr", looked up on PATH
-index_timeout = 300                 # seconds one run may take to copy and index, 1 to 86400
+index_timeout = 300                 # seconds a run waits for its index, 1 to 86400
 call_timeout = 30                   # seconds one tool call may take, 1 to 3600
 max_indexing = 2                    # runs indexed at once, 1 to 64
 ```
 
 Every key is optional; an empty `[travsr]` turns Travsr on with these defaults. An unknown key is a
 usage error. Without the section, `/r/{token}/travsr` answers 404 and no Travsr tool is listed.
+
+`command` is an absolute path or a bare name. A relative path (`./travsr`, `bin/travsr`) is a
+usage error: Travsr runs inside the run's copy, where it would resolve. A bare name is looked up
+once, when `kestrel serve` starts, in the absolute `PATH` entries only. If it is not found,
+`serve` says so and every run starts without Travsr.
 
 ## How a run is indexed and forgotten
 
@@ -73,26 +80,34 @@ usage error. Without the section, `/r/{token}/travsr` answers 404 and no Travsr 
 2. While the sandbox is made, Kestrel clones the source repo again, into
    `<data dir>/travsr/<run id>/repo`, and checks out that commit. It uses the same git call as for
    the workspace (`--local --no-hardlinks`, hooks off, a scrubbed environment). The commit is
-   recorded next to the copy.
-3. Kestrel runs `travsr init --no-connect` in the copy. The agent starts once it finishes.
-4. If copying or indexing fails or takes longer than `index_timeout`, the run starts anyway,
-   without Travsr. Its log says why:
+   recorded next to the copy. Each run gets its own full copy of the source repo, even when
+   runs start from the same commit.
+3. If the commit holds a `.travsr`, Kestrel deletes it from the copy, so `init` never uses a
+   committed index. A `.travsr` that is a link is refused instead: indexing fails, saying so.
+4. Kestrel runs `travsr init --no-connect` in the copy. The agent starts once it finishes.
+5. If copying or indexing fails, or the run waits longer than `index_timeout`, the run starts
+   anyway, without Travsr. The wait for a free indexing slot (`max_indexing`) counts too, so a
+   queued run starts at most `index_timeout` after it began to wait. Its log says why:
 
    ```
    kestrel: Travsr is unavailable for this run (indexing did not finish within 300 s); the agent starts without it
    ```
 
-5. The run's first tool call starts `travsr mcp --stdio --db <copy>/.travsr/graph.db`, in the copy.
+   A run that gives up kills its git and, on Unix, `init`'s whole process group, so helpers
+   `init` started stop too.
+6. The run's first tool call starts `travsr mcp --stdio --db <copy>/.travsr/graph.db`, in the copy.
    Later calls of the run reuse it, one at a time. A server that died, or did not answer within
    `call_timeout`, is started again on the next call. A call whose request is dropped is stopped.
-6. When `kestrel serve` stops, each run's server stops; the copies stay. A run resumed later
+   An idle server keeps running until its run ends.
+7. When `kestrel serve` stops, each run's server stops; the copies stay. A run resumed later
    reuses its copy and index. If they are gone, Kestrel makes them again from the source at the
    recorded commit.
-7. When the run ends, Kestrel stops its server, runs `travsr repos --remove <copy>` and deletes
-   `<data dir>/travsr/<run id>`. Each step is bounded (30 s for the server and `repos --remove`, 60
-   s for the whole forget). If it fails, the run's log says so and Kestrel tries again every
-   minute. It never fails the run, and never holds the run's slot.
-8. When `kestrel serve` starts, it forgets every copy whose run ended or no longer exists.
+8. When the run ends, Kestrel stops its server and deletes `<data dir>/travsr/<run id>`. No
+   Travsr command runs: `init` registered nothing. Only a run that was handed to the indexer, or
+   whose copy recovery listed, is forgotten; a run without Travsr never reaches it. Stopping the
+   server may take 30 s, the whole forget 60 s. If it fails, the run's log says so and Kestrel
+   tries again every minute. It never fails the run, and never holds the run's slot.
+9. When `kestrel serve` starts, it forgets every copy whose run ended or no longer exists.
 
 ## Security model
 
@@ -105,9 +120,14 @@ agent cannot write.
   git in a workspace only before its sandbox exists (the clone's checkout, and reading its commit).
 * **The private copy** is at `<data dir>/travsr/<run id>/repo`. The `travsr` directory and each
   run's directory are owner-only (0700). No sandbox mounts them.
+* **No committed index.** Travsr writes its index to `<copy>/.travsr/graph.db`, through whatever
+  `.travsr` it finds. So a `.travsr` from the commit is deleted before `init`, and one that is a
+  link (which could send the writes outside the copy) fails indexing.
 * **The index is checked before it is served.** `graph.db`, `.travsr`, the copy and the run's
   directory must be real directories and a regular file, inside the run's directory. A link is
   refused.
+* **The command is absolute.** A bare `command` is resolved once at startup, in absolute `PATH`
+  entries only, so no file in the copy can stand in for it.
 * **No daemon, no download, no connect files, no registry entry.** Every Travsr command gets
   `CI=1`, `TRAVSR_SKIP_DOWNLOAD=1` and `TRAVSR_DISABLE_REGISTRY=1`, and `init` gets `--no-connect`.
   Travsr starts its background daemon only without `CI`, both in `init` and in `mcp`, so none is
@@ -117,9 +137,17 @@ agent cannot write.
   run token, a provider key, or any other `TRAVSR_*` variable.
 * **Code Travsr may run.** Travsr's language pass may run build tooling of the indexed code (for
   Rust, `build.rs` and proc macros), and without bubblewrap it grants Rust that unsandboxed. It runs
-  on the copy, which is the operator's source repo at a commit, never code an agent wrote.
+  on the copy: the operator's source repo at the commit the run started from. Kestrel never
+  indexes a workspace, but that commit may include agent work the operator fetched back and
+  merged into the source repo.
+* **A lasting grant in `~/.travsr`.** When bubblewrap is missing, `travsr init` records that Rust
+  may run unsandboxed, in the operator's `~/.travsr/lang.toml` (or the file `TRAVSR_LANG_TOML`
+  names). The grant is keyed by the copy's `origin`, which is the source repo's path, so it holds
+  for every later `init` of a clone of that source repo, and it stays after the run. Install
+  bubblewrap, or point `TRAVSR_LANG_TOML` at a file of Kestrel's own, to keep it apart.
 * **The gateway** serves only the ten read tools a run was granted, drops `repo`, caps answers at
-  256 KiB and every call at `call_timeout`, and answers 404 without a `[travsr]` section.
+  256 KiB and every call at `call_timeout`, counts listings and calls against the run's rate
+  limit, and answers 404 without a `[travsr]` section.
 
 This is a deliberate limit: **the index shows the code the run started from, not the agent's
 edits.** Indexing the agent's edits safely means running Travsr inside the sandbox, which is the
@@ -131,18 +159,40 @@ follow-up.
 |---|---|
 | Answer size | 256 KiB of text; the rest is cut, ending with `[truncated by Kestrel: ...]` |
 | One tool call | `call_timeout`, then a tool error |
-| Indexing | `index_timeout` per run, `max_indexing` at once; the others wait their turn |
+| Indexing | `max_indexing` at once; a run waits at most `index_timeout`, its turn included |
 | Forgetting a run | 60 s, then retried every minute |
-| Tool calls per run | 20 at once, 10 more per second, shared with the Kestrel tools |
+| Tool calls and listings per run | 20 at once, 10 more per second, shared with the Kestrel tools |
 | Request body | 1 MiB |
 
 Known limits on Kestrel's side:
 
 * The index is of the run's starting commit; the agent's edits never show (see above).
+* Each run gets its own full copy of the source repo, so disk use grows with the runs that use
+  Travsr at once. Sharing one copy per commit is a possible follow-up.
+* A run's Travsr server stays up, idle, until the run ends.
 * The private directories are made owner-only on Unix only. On Windows they keep the data
   directory's permissions.
+* On Windows, a timed-out `init` is killed, but helpers it started may keep running.
 * With no `[travsr]` section, a spec that grants `travsr.*` tools still gets a `travsr` server
   entry in its MCP config, which answers 404.
+
+## Travsr source this relies on
+
+The security model above rests on these places in Travsr's source, checked at Travsr commit
+`c1305034`. Paths are relative to the travsr repo; line numbers move, so search for the code
+quoted.
+
+| What Kestrel relies on | Where |
+|---|---|
+| `init` writes its index to `<repo>/.travsr/graph.db` | `crates/travsr-cli/src/init.rs` ~66 (`repo_root.join(".travsr/graph.db")`) |
+| `init` starts no daemon with `CI`, also when interrupted | `crates/travsr-cli/src/init.rs` ~191 and ~47 (`var_os("CI")`) |
+| `mcp` starts no daemon with `CI` | `crates/travsr-cli/src/main.rs` ~1425 (`var_os("CI").is_none()`) |
+| `init` downloads nothing with `TRAVSR_SKIP_DOWNLOAD` | `crates/travsr-cli/src/init.rs` ~87 |
+| `--no-connect` writes no connect files | `crates/travsr-cli/src/init.rs` ~304 (`maybe_connect`) |
+| No registry entry with `TRAVSR_DISABLE_REGISTRY=1` | `crates/travsr-daemon/src/lib.rs` ~1675 (`register`) and ~2522 (`mark_indexed`) |
+| The index stores the `repo_root` it was made for | `crates/travsr-daemon/src/lib.rs` ~1827 (`set_meta("repo_root", ...)`) |
+| The unsandboxed grant, and where it is saved | `crates/travsr-cli/src/init.rs` ~482 (`grant_unsandboxed_where_needed`), `crates/travsr-cli/src/lang.rs` ~1858 and ~2111 (`config_path`) |
+| The grant's key: the repo's `origin` | `crates/travsr-daemon/src/lib.rs` ~6721 (`detect_corpus`) |
 
 ## Known Travsr issues
 
