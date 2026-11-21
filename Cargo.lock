@@ -1369,6 +1369,7 @@ dependencies = [
  "axum",
  "kestrel-core",
  "kestrel-sandbox",
+ "kestrel-store",
  "kestrel-types",
  "serde_json",
  "tempfile",
