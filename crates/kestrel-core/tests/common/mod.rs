@@ -364,9 +364,15 @@ pub struct AdapterLog {
     runtimes: Mutex<Vec<Runtime>>,
     lines: Mutex<Vec<Vec<String>>>,
     plans: Mutex<Vec<Vec<RunContext>>>,
+    files: Mutex<Vec<kestrel_agent::PlanFile>>,
 }
 
 impl AdapterLog {
+    /// The files every plan from now on carries.
+    pub fn set_files(&self, files: Vec<kestrel_agent::PlanFile>) {
+        *lock(&self.files) = files;
+    }
+
     pub fn instances(&self) -> usize {
         lock(&self.runtimes).len()
     }
@@ -427,7 +433,7 @@ impl RuntimeAdapter for FakeAdapter {
                 .unwrap_or_else(|| "fake-image".into()),
             argv: vec!["fake-agent".into(), input.into()],
             env: BTreeMap::new(),
-            files: Vec::new(),
+            files: lock(&self.log.files).clone(),
         })
     }
 

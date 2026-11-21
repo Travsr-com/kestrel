@@ -82,6 +82,9 @@ pub enum EngineError {
     /// CLI resolves the path when it submits the run.
     #[error("git-clone repo `{}` must be an absolute path", repo.display())]
     RelativeRepo { repo: PathBuf },
+    /// The run's config directory (its launch plan's files) could not be written.
+    #[error("run config: {0}")]
+    RunConfig(String),
     /// `recover` was called while `run_forever` is active.
     #[error("the engine is already running; wait until run_forever has returned")]
     AlreadyRunning,
@@ -434,6 +437,8 @@ struct Inner {
     subnets: Option<Arc<SubnetPool>>,
     /// Signs and checks capability tokens, see [`Engine::with_root_key`].
     root_key: Option<caps::RootKey>,
+    /// Where each run's config directory goes, see [`Engine::with_run_config`].
+    run_config: Option<PathBuf>,
     /// Most runs in one spawn tree, see [`Engine::with_tree_limit`].
     tree_limit: u32,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
@@ -570,6 +575,7 @@ impl Engine {
                 instance: None,
                 subnets: None,
                 root_key: None,
+                run_config: None,
                 tree_limit: DEFAULT_TREE_LIMIT,
                 live: Mutex::default(),
                 rejoins: Mutex::default(),
@@ -618,6 +624,18 @@ impl Engine {
         debug_assert!(inner.is_some(), "engine state is shared");
         if let Some(inner) = inner {
             inner.subnets = Some(pool);
+        }
+        self
+    }
+
+    /// Each run's config directory (the files of its launch plan, such as the MCP config) goes in
+    /// `root`, as `{root}/{run id}`: readable by its owner only, mounted read-only at `/kestrel`
+    /// in the sandbox, removed when the run's sandbox goes. Without this, a temp directory.
+    pub fn with_run_config(mut self, root: PathBuf) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.run_config = Some(root);
         }
         self
     }
@@ -1826,6 +1844,75 @@ impl Inner {
     }
 
     /// Best effort: destroys the last sandbox a previous engine provisioned for `run`.
+    /// The config directory of `run`.
+    fn run_config_dir(&self, run: RunId) -> PathBuf {
+        self.run_config
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("kestrel-run-config"))
+            .join(run.to_string())
+    }
+
+    /// Writes `files` to `run`'s config directory, made afresh: the directory readable by its
+    /// owner only, each file too. `None` when there are no files. A name that is not a plain file
+    /// name is refused, so nothing is written outside the directory.
+    fn write_run_config(
+        &self,
+        run: RunId,
+        files: &[kestrel_agent::PlanFile],
+    ) -> Result<Option<PathBuf>> {
+        self.remove_run_config(run);
+        if files.is_empty() {
+            return Ok(None);
+        }
+        for file in files {
+            let plain = !file.name.is_empty()
+                && file.name != "."
+                && file.name != ".."
+                && !file.name.contains(['/', '\\', '\0']);
+            if !plain {
+                return Err(EngineError::RunConfig(format!(
+                    "plan file name `{}` is not a plain file name",
+                    file.name
+                )));
+            }
+        }
+        let dir = self.run_config_dir(run);
+        let failed = |e: std::io::Error| EngineError::RunConfig(format!("{}: {e}", dir.display()));
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(failed)?;
+        }
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        builder.create(&dir).map_err(failed)?;
+        for file in files {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let path = dir.join(&file.name);
+            let written = options
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, file.contents.as_bytes()));
+            written.map_err(failed)?;
+        }
+        Ok(Some(dir))
+    }
+
+    /// Removes `run`'s config directory, if there is one (best effort).
+    fn remove_run_config(&self, run: RunId) {
+        let _ = std::fs::remove_dir_all(self.run_config_dir(run));
+    }
+
     async fn destroy_old_sandbox(&self, run: RunId) -> Result<()> {
         let old = self
             .store
@@ -1842,6 +1929,7 @@ impl Inner {
             // The sandbox may well be gone already.
             let _ = self.destroy_tracked(idx, &SandboxHandle { id }).await;
         }
+        self.remove_run_config(run);
         Ok(())
     }
 }
@@ -1970,6 +2058,8 @@ impl Actor {
         if let Some(sb) = self.sandbox.take() {
             let _ = self.inner.destroy_tracked(sb.driver, &sb.handle).await;
         }
+        // The sandbox is gone, so its config goes too (a resumed run writes it again).
+        self.inner.remove_run_config(self.id);
         // After the sandbox: docker refuses to remove a network a container still uses.
         if let Err(e) = self.inner.release_network(self.id).await {
             let _ = self.log(&format!("kestrel: removing the run network failed: {e}"));
@@ -2228,6 +2318,7 @@ impl Actor {
             model: self.inner.model(self.spec.model_policy.default),
         };
         let plan = self.adapter.launch_plan(&self.spec, &self.input, &ctx)?;
+        let config = self.inner.write_run_config(self.id, &plan.files)?;
         let mut labels = BTreeMap::from([(RUN_LABEL.to_string(), self.id.to_string())]);
         if let Some(instance) = &self.inner.instance {
             labels.insert(INSTANCE_LABEL.to_string(), instance.clone());
@@ -2237,7 +2328,7 @@ impl Actor {
             argv: plan.argv,
             env: plan.env,
             workspace: None,
-            config: None,
+            config,
             cpu_millis: self.spec.sandbox.cpu_millis,
             memory_mb: self.spec.sandbox.memory_mb,
             network: match network {
