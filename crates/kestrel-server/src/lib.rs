@@ -131,7 +131,12 @@ const MIN_TOKEN_LEN: usize = 32;
 /// file only its owner can read (mode 0600 on Unix). A token found there must be at least 32
 /// characters of letters, digits, `-` and `_`, which fit in a WebSocket subprotocol; on Unix
 /// the file is set to 0600 if others could read it.
+/// Every error names the file.
 pub fn load_or_create_token(path: &Path) -> io::Result<String> {
+    load_or_create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+fn load_or_create(path: &Path) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let token = text.trim();
@@ -143,8 +148,7 @@ pub fn load_or_create_token(path: &Path) -> io::Result<String> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "{}: the token must be at least {MIN_TOKEN_LEN} letters, digits, - or _; delete the file to make a new one",
-                        path.display()
+                        "the token must be at least {MIN_TOKEN_LEN} letters, digits, - or _; delete the file to make a new one"
                     ),
                 ));
             }
@@ -190,7 +194,7 @@ fn create_token(path: &Path) -> io::Result<String> {
             Ok(token)
         }
         // Another process made it first: use theirs.
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => load_or_create_token(path),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => load_or_create(path),
         Err(e) => Err(e),
     }
 }

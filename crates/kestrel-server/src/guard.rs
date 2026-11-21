@@ -38,7 +38,12 @@ fn split_host(host: &str) -> Option<(&str, u16)> {
     let (name, port) = match host.strip_prefix('[') {
         Some(rest) => {
             let (inside, after) = rest.split_once(']')?;
-            (inside, after.strip_prefix(':'))
+            // After the bracket: nothing (port 80) or `:port`, never anything else.
+            let port = match after {
+                "" => None,
+                a => Some(a.strip_prefix(':')?),
+            };
+            (inside, port)
         }
         None => match host.rsplit_once(':') {
             Some((name, port)) => (name, Some(port)),
@@ -151,6 +156,10 @@ mod tests {
         assert!(!allowed_host("localhost", addr("127.0.0.1:7171")));
         assert!(!allowed_host("[::1]", addr("127.0.0.1:7171")));
         assert!(allowed_host("[::1]", bind));
+        // Anything after the bracket other than a port is not a host.
+        assert!(!allowed_host("[::1]x", bind));
+        assert!(!allowed_host("[::1]evil.example", bind));
+        assert!(!allowed_host("[::1]]:80", bind));
     }
 
     #[test]

@@ -28,6 +28,7 @@ struct Server {
     addr: SocketAddr,
     shutdown: CancellationToken,
     task: JoinHandle<std::io::Result<()>>,
+    sockets: tokio_util::task::TaskTracker,
 }
 
 async fn start(store: Arc<Store>, tune: impl FnOnce(&mut Config)) -> Server {
@@ -39,11 +40,12 @@ async fn start(store: Arc<Store>, tune: impl FnOnce(&mut Config)) -> Server {
     let shutdown = CancellationToken::new();
     let sockets = config.sockets.clone();
     let app = router(store, config, Arc::new(MemUi::build()), shutdown.clone());
-    let task = tokio::spawn(serve(listener, app, shutdown.clone(), sockets));
+    let task = tokio::spawn(serve(listener, app, shutdown.clone(), sockets.clone()));
     Server {
         addr,
         shutdown,
         task,
+        sockets,
     }
 }
 
@@ -255,7 +257,22 @@ async fn s16_stopping_closes_sockets_and_frees_the_port() {
     let id = store.create_run(&agent("a"), "x").unwrap();
     let server = start(store, |_| {}).await;
     let mut socket = open(&server, &format!("/ws/runs/{id}")).await;
+    // The open socket is tracked, so `serve` waits for it to say goodbye.
+    timeout(Duration::from_secs(10), async {
+        while server.sockets.len() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     server.shutdown.cancel();
+    timeout(Duration::from_secs(10), server.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    // `serve` returned only after the socket task ended: its close frame is already sent.
+    assert!(server.sockets.is_empty());
     let close = timeout(Duration::from_secs(10), async {
         loop {
             match socket.next().await {
@@ -268,12 +285,32 @@ async fn s16_stopping_closes_sockets_and_frees_the_port() {
     .await
     .unwrap();
     assert!(close.is_some());
-    timeout(Duration::from_secs(10), server.task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
     TcpListener::bind(server.addr).await.unwrap();
+}
+
+// A replay longer than one page is read page after page without waiting a poll tick in between.
+#[tokio::test]
+async fn a_long_replay_does_not_wait_a_poll_per_page() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    for i in 0..700 {
+        log(&store, id, &format!("{i}"));
+    }
+    let server = start(store, |c| c.poll = Duration::from_secs(30)).await;
+    let mut socket = open(&server, &format!("/ws/runs/{id}?after=3")).await;
+    let all = timeout(Duration::from_secs(5), async {
+        let mut seqs = Vec::new();
+        while seqs.len() < 697 {
+            match next(&mut socket, false).await {
+                Some(WsFrame::Event { event, .. }) => seqs.push(event.seq),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        seqs
+    })
+    .await
+    .expect("the whole replay well inside one poll interval");
+    assert_eq!(all, (4..=700).collect::<Vec<_>>());
 }
 
 #[tokio::test]

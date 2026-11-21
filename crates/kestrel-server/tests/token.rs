@@ -36,6 +36,19 @@ fn a_short_or_unsafe_token_is_refused() {
     assert_eq!(load_or_create_token(&path).unwrap(), good);
 }
 
+// Every token file error names the file, so the user knows what to fix.
+#[test]
+fn a_token_file_error_names_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.token");
+    std::fs::create_dir(&path).unwrap();
+    let err = load_or_create_token(&path).unwrap_err();
+    assert!(err.to_string().contains("server.token"), "{err}");
+    let missing = dir.path().join("no-such-dir").join("server.token");
+    let err = load_or_create_token(&missing).unwrap_err();
+    assert!(err.to_string().contains("server.token"), "{err}");
+}
+
 #[test]
 fn an_empty_token_file_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
