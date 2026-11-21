@@ -1189,12 +1189,14 @@ async fn start_engine(
             .unwrap_or_else(|| crate::tools::default_agents_dir(db)),
     );
     let store = Arc::new(open(Some(db.to_path_buf()))?);
-    // Workspaces live next to the database, so a temp `--db` keeps everything in one place.
-    let workspace_root = std::path::absolute(db)
+    // Workspaces and run configs live next to the database, so a temp `--db` keeps everything
+    // in one place.
+    let data_dir = std::path::absolute(db)
         .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
         .parent()
-        .map(|d| d.join("workspaces"))
+        .map(Path::to_path_buf)
         .ok_or_else(|| Failure::runtime(format!("{}: no parent dir", db.display())))?;
+    let workspace_root = data_dir.join("workspaces");
 
     let adapters: AdapterFactory = Arc::new(kestrel_agent::adapter_for);
     let engine = Engine::with_models(
@@ -1207,7 +1209,9 @@ async fn start_engine(
     )
     .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
     .with_instance(GatewayBridge::instance_id(db))
-    .with_root_key(root_key);
+    .with_root_key(root_key)
+    // Each run's MCP config and the like, mounted read-only at /kestrel in its sandbox.
+    .with_run_config(data_dir.join("run-config"));
     let engine = Arc::new(match subnets {
         Some(pool) => engine.with_subnets(pool),
         None => engine,
