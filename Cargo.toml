@@ -7,6 +7,7 @@ members = [
     "crates/kestrel-sandbox",
     "crates/kestrel-gateway",
     "crates/kestrel-agent",
+    "crates/kestrel-server",
     "crates/kestrel-cli",
     "tests/e2e",
 ]
@@ -26,6 +27,7 @@ kestrel-core    = { path = "crates/kestrel-core" }
 kestrel-sandbox = { path = "crates/kestrel-sandbox" }
 kestrel-gateway = { path = "crates/kestrel-gateway" }
 kestrel-agent   = { path = "crates/kestrel-agent" }
+kestrel-server  = { path = "crates/kestrel-server" }
 
 # Shared third-party versions. Add new ones here, not in crate manifests.
 tokio        = { version = "1", features = ["full"] }
@@ -53,6 +55,10 @@ tempfile     = "3"
 proptest     = "1"
 wiremock     = "0.6"
 tower        = { version = "0.5", features = ["util"] }
+# The embedded UI (#37). With `allow_missing`, a build without ui/dist still compiles.
+rust-embed   = { version = "8", features = ["mime-guess"] }
+# Test client for the event sockets. The same version axum's `ws` feature uses.
+tokio-tungstenite = "0.29"
 assert_cmd   = "2"
 predicates   = "3"
 toml         = "0.8"
