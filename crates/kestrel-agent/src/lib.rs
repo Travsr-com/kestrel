@@ -2,6 +2,12 @@
 //!
 //! An adapter turns an [`AgentSpec`] and a task into a [`LaunchPlan`] for a headless runtime, and turns
 //! each line of the runtime's streaming JSON output into a [`ParsedLine`].
+//!
+//! A runtime gets the run's MCP servers on the gateway when its capability grants their tools:
+//! `kestrel` at `{run root}/mcp` for `kestrel.*` tools (#42) and `travsr` at `{run root}/travsr` for
+//! `travsr.*` tools (#44). The run token in the path is their only credential. Config the runtime
+//! reads from a file goes in [`LaunchPlan::files`], which the engine mounts read-only at
+//! [`CONFIG_DIR`], outside the workspace, so nothing of it is committed.
 
 use std::collections::BTreeMap;
 
@@ -43,7 +49,41 @@ pub struct LaunchPlan {
     pub image: String,
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Files the runtime reads, found in the sandbox at [`CONFIG_DIR`]`/{name}`.
+    pub files: Vec<PlanFile>,
 }
+
+/// One file of a [`LaunchPlan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFile {
+    /// A plain file name, no directories.
+    pub name: String,
+    pub contents: String,
+}
+
+/// Where a sandbox finds the files of its plan: read-only, outside `/workspace`.
+pub const CONFIG_DIR: &str = "/kestrel";
+
+/// What an agent is told about the Kestrel tools when it has them. No token, URL or path.
+pub const AGENT_NOTE: &str = "\
+# Kestrel tools
+
+You can hand parts of your task to other agents and wait for them. Do it only when the work splits
+into parts that can go on at the same time.
+
+* kestrel.spawn(agent, input, budget_usd?, wait?) starts a child run of another agent. Its budget
+  comes out of yours: what you give it you cannot spend, and what it does not spend comes back
+  when it ends. Without budget_usd it gets half of what you have left, at most its own budget.
+* A child starts from nothing: give it a complete, self-contained task.
+* Each child works in its own clone of the repository. It does not see your uncommitted changes,
+  and you do not see its work until it ends: its commits come back as a branch named after it.
+* kestrel.join(children?, mode?, timeout_s?) waits for children and returns how each ended:
+  completed with its summary, failed with a reason, cancelled, or timed out. Waiting costs no
+  model calls. With wait set, kestrel.spawn waits for its child the same way.
+* kestrel.ask_human(question) asks a person and waits for the answer. Ask only what you cannot
+  find out yourself.
+* Few well-scoped children beat many small ones: each one costs a sandbox and its own model calls.
+";
 
 /// The meaning of one line of runtime output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +108,77 @@ pub fn adapter_for(r: Runtime) -> Box<dyn RuntimeAdapter> {
     }
 }
 
+/// The run's MCP servers on the gateway, from what its capability grants.
+struct Servers {
+    /// `{run root}/mcp`, when any `kestrel.*` tool is granted.
+    kestrel: Option<String>,
+    /// `{run root}/travsr`, when any `travsr.*` tool is granted.
+    travsr: Option<String>,
+    /// The granted tools as Claude Code names MCP tools: `mcp__{server}__{tool}`, with every
+    /// character other than a letter, digit, `_` or `-` made `_`.
+    tools: Vec<String>,
+}
+
+impl Servers {
+    fn of(spec: &AgentSpec, ctx: &RunContext) -> Servers {
+        let caps = &spec.capabilities;
+        let mut tools = Vec::new();
+        let (mut kestrel, mut travsr) = (false, false);
+        for name in &caps.mcp {
+            if let Some(tool) = name.strip_prefix("kestrel.") {
+                // Spawning also needs spawn rights, as the gateway checks.
+                if tool == "spawn" && caps.spawn.is_none() {
+                    continue;
+                }
+                kestrel = true;
+                tools.push(format!("mcp__kestrel__{}", claude_name(name)));
+            } else if let Some(tool) = name.strip_prefix("travsr.") {
+                travsr = true;
+                tools.push(format!("mcp__travsr__{}", claude_name(tool)));
+            }
+        }
+        Servers {
+            kestrel: kestrel.then(|| endpoint(&ctx.gateway_url, "mcp")),
+            travsr: travsr.then(|| endpoint(&ctx.gateway_url, "travsr")),
+            tools,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.kestrel.is_some() || self.travsr.is_some()
+    }
+
+    /// The servers by name, each to `entry(url)`.
+    fn entries(&self, entry: impl Fn(&str) -> Value) -> serde_json::Map<String, Value> {
+        [("kestrel", &self.kestrel), ("travsr", &self.travsr)]
+            .into_iter()
+            .filter_map(|(name, url)| url.as_ref().map(|u| (name.to_string(), entry(u))))
+            .collect()
+    }
+}
+
+fn claude_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `{run root}/{segment}`, built as a URL: the token stays as escaped as it was, and a run root
+/// with a trailing slash gets no double slash.
+fn endpoint(root: &Url, segment: &str) -> String {
+    let mut url = root.clone();
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().push(segment);
+    }
+    url.to_string()
+}
+
 /// A plan for `runtime`. The image is the spec's sandbox image, or the stock image for `runtime` when the
 /// spec names none. The env holds only `env`: nothing is copied from the host environment.
 fn plan(
@@ -75,6 +186,7 @@ fn plan(
     runtime: Runtime,
     argv: &[&str],
     env: &[(&str, &str)],
+    files: Vec<PlanFile>,
 ) -> Result<LaunchPlan> {
     if spec.runtime != runtime {
         return Err(AgentError::RuntimeMismatch {
@@ -90,6 +202,7 @@ fn plan(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        files,
     })
 }
 

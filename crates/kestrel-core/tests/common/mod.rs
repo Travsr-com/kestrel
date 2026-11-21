@@ -427,6 +427,7 @@ impl RuntimeAdapter for FakeAdapter {
                 .unwrap_or_else(|| "fake-image".into()),
             argv: vec!["fake-agent".into(), input.into()],
             env: BTreeMap::new(),
+            files: Vec::new(),
         })
     }
 

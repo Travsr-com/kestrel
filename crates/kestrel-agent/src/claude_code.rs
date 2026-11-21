@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use kestrel_types::{AgentSpec, EventKind, Runtime};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
-    API_KEY_PLACEHOLDER, LaunchPlan, ParsedLine, Result, RunContext, RuntimeAdapter, events,
-    parse_json, plan, str_of,
+    AGENT_NOTE, API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result,
+    RunContext, RuntimeAdapter, Servers, events, parse_json, plan, str_of,
 };
 
 /// Keeps the tool name of every `tool_use` id seen so far, because a `tool_result` carries only the id.
@@ -101,7 +101,7 @@ impl RuntimeAdapter for ClaudeCodeAdapter {
     }
 
     fn launch_plan(&self, spec: &AgentSpec, input: &str, ctx: &RunContext) -> Result<LaunchPlan> {
-        let argv = [
+        let mut argv = vec![
             "claude",
             "--bare",
             "-p",
@@ -112,17 +112,32 @@ impl RuntimeAdapter for ClaudeCodeAdapter {
             &ctx.model,
             "--permission-mode",
             "bypassPermissions",
-            // Ends the options, so an input that starts with `-` is never read as a flag.
-            "--",
-            input,
         ];
+        let servers = Servers::of(spec, ctx);
+        let mut files = Vec::new();
+        let config = format!("{CONFIG_DIR}/mcp.json");
+        let allowed = servers.tools.join(",");
+        if servers.any() {
+            let entries = servers.entries(|url| json!({ "type": "http", "url": url }));
+            files.push(PlanFile {
+                name: "mcp.json".into(),
+                contents: json!({ "mcpServers": entries }).to_string(),
+            });
+            // The agent's own tool list matches its capability.
+            argv.extend(["--mcp-config", &config, "--allowedTools", &allowed]);
+        }
+        if servers.kestrel.is_some() {
+            argv.extend(["--append-system-prompt", AGENT_NOTE]);
+        }
+        // Ends the options, so an input that starts with `-` is never read as a flag.
+        argv.extend(["--", input]);
         let env = [
             ("ANTHROPIC_API_KEY", API_KEY_PLACEHOLDER),
             // Claude Code appends `/v1/messages` to the run root itself.
             ("ANTHROPIC_BASE_URL", ctx.gateway_url.as_str()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
         ];
-        plan(spec, self.runtime(), &argv, &env)
+        plan(spec, self.runtime(), &argv, &env, files)
     }
 
     fn parse_line(&self, line: &str) -> ParsedLine {
