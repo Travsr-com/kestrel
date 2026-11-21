@@ -68,6 +68,9 @@ impl RuntimeAdapter for OpenCodeAdapter {
             json!({ "providers": { "anthropic": { "settings": { "baseURL": base_url } } } });
         let servers = Servers::of(spec, ctx);
         let mut files = Vec::new();
+        // OpenCode has no switch like Claude Code's `--strict-mcp-config`: a cloned repo's own
+        // config can add servers next to these. The sandbox reaches only the gateway, so such a
+        // server gets nowhere outside it.
         if servers.any() {
             let entries =
                 servers.entries(|url| json!({ "type": "remote", "url": url, "enabled": true }));

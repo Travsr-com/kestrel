@@ -310,6 +310,11 @@ fn the_agent_note_is_short_and_holds_no_token_or_path() {
     let full = agent_note(true, true).expect("a note");
     assert!(full.lines().count() <= 30, "{} lines", full.lines().count());
     assert!(full.contains("kestrel.spawn") && full.contains("kestrel.join"));
+    // What a child sees is what the engine does: a clone of the original repository, and no
+    // branch handed back, so the summary is how its work returns.
+    assert!(full.contains("original repository"), "{full}");
+    assert!(full.contains("summary"), "{full}");
+    assert!(!full.contains("branch"), "{full}");
     for note in [full.clone(), agent_note(false, true).expect("a note")] {
         for leak in [
             "tok_",

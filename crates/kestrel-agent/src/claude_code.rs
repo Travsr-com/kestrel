@@ -124,8 +124,9 @@ impl RuntimeAdapter for ClaudeCodeAdapter {
                 contents: json!({ "mcpServers": entries }).to_string(),
             });
             // Only Kestrel's servers, never one from an `.mcp.json` in the cloned repo. The
-            // allowed list names the granted tools so they run without a prompt; what the agent
-            // may actually call is decided by the gateway, which lists and checks the grant.
+            // allowed list names the granted tools; it restricts nothing (permissions are
+            // bypassed anyway). What the agent may call is decided by the gateway, which lists
+            // and checks the grant.
             argv.extend([
                 "--mcp-config",
                 &config,

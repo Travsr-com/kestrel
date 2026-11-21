@@ -73,8 +73,9 @@ into parts that can go on at the same time.
   comes out of yours: what you give it you cannot spend, and what it does not spend comes back
   when it ends. Without budget_usd it gets half of what you have left, at most its own budget.
 * A child starts from nothing: give it a complete, self-contained task.
-* Each child works in its own clone of the repository. It does not see your uncommitted changes,
-  and you do not see its work until it ends: its commits come back as a branch named after it.
+* Each child works in its own clone of the original repository. It sees none of your changes,
+  committed or not, and its changes do not reach yours: put what it needs in its input, and ask
+  for what you need back in its summary.
 * kestrel.join(children?, mode?, timeout_s?) waits for children and returns how each ended:
   completed with its summary, failed with a reason, cancelled, or timed out. Waiting costs no
   model calls. With wait set, kestrel.spawn waits for its child the same way.
