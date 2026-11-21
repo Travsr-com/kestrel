@@ -291,3 +291,109 @@ async fn a_question_still_waiting_at_a_restart_is_declined_and_its_run_failed() 
         &RunStatus::Suspended(SuspendReason::Approval(action))
     ));
 }
+
+// Review 2 of PR 76.
+
+/// A run that the first engine left waiting on question `q`, as if it had stopped there.
+fn left_waiting(store: &kestrel_store::Store, run: kestrel_types::RunId, q: ApprovalId) {
+    store
+        .transition(run, &RunStatus::Queued, RunStatus::Provisioning)
+        .unwrap();
+    store
+        .transition(run, &RunStatus::Provisioning, RunStatus::Running)
+        .unwrap();
+    store
+        .append(
+            run,
+            EventKind::ApprovalRequested {
+                id: q,
+                action: "x".into(),
+                question: true,
+            },
+        )
+        .unwrap();
+    store
+        .transition(
+            run,
+            &RunStatus::Running,
+            RunStatus::Suspended(SuspendReason::Approval(q)),
+        )
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_failed_at_a_restart_for_its_question_leaves_no_children_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let (parent, child) = {
+        let first = Harness::on(&db, 4);
+        let parent = first.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+        left_waiting(&first.store, parent, ApprovalId::new());
+        let child = first
+            .store
+            .create_child_run(parent, &agent("{ mcp: [] }"), "help")
+            .unwrap();
+        (parent, child)
+    };
+    let mut h = Harness::on(&db, 4);
+    h.engine.recover().await.unwrap();
+    assert!(h.is_failed(parent).is_some());
+    let _s = h.driver.live();
+    h.start();
+    until("the child cancelled", || h.is(child, &RunStatus::Cancelled)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_question_answered_just_before_a_restart_is_not_resolved_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let (run, q) = {
+        let first = Harness::on(&db, 4);
+        let run = first.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+        let q = ApprovalId::new();
+        left_waiting(&first.store, run, q);
+        // The answer was written; the engine stopped before the run moved on.
+        first
+            .store
+            .append(
+                run,
+                EventKind::ApprovalResolved {
+                    id: q,
+                    approved: true,
+                    payload: Some("main".into()),
+                },
+            )
+            .unwrap();
+        (run, q)
+    };
+    let h = Harness::on(&db, 4);
+    h.engine.recover().await.unwrap();
+    assert_eq!(
+        h.count_events(
+            run,
+            |k| matches!(k, EventKind::ApprovalResolved { id, .. } if *id == q)
+        ),
+        1
+    );
+    assert!(h.is_failed(run).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_the_agent_asked_for_still_stops_the_clock() {
+    // Only the run's own question keeps the clock going; an action approval pauses it as before.
+    let mut h = Harness::new(4);
+    let s = h.driver.live();
+    h.start();
+    let id = h
+        .submit(agent_for("{ mcp: [kestrel.ask_human] }", "5s"))
+        .await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let aid = ApprovalId::new();
+    s.line(&format!("approval:{aid}:gh.comment"));
+    until("waiting on the approval", || {
+        h.is(id, &RunStatus::Suspended(SuspendReason::Approval(aid)))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    assert!(h.is(id, &RunStatus::Suspended(SuspendReason::Approval(aid))));
+}

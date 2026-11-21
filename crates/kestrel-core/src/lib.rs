@@ -671,6 +671,13 @@ impl Engine {
         ))
     }
 
+    /// Whether approval `id` of `run` has been decided.
+    fn is_resolved(&self, run: RunId, id: ApprovalId) -> Result<bool> {
+        Ok(self.inner.store.events_since(run, 0)?.into_iter().any(
+            |e| matches!(e.kind, EventKind::ApprovalResolved { id: decided, .. } if decided == id),
+        ))
+    }
+
     /// Whether approval `id` of `run` is a question (`kestrel.ask_human`).
     fn is_question(&self, run: RunId, id: ApprovalId) -> Result<bool> {
         Ok(self.inner.store.events_since(run, 0)?.into_iter().any(|e| {
@@ -718,7 +725,16 @@ impl Engine {
         // Whether the run recorded the question: one that stopped running first refuses it unasked.
         let mut asked = false;
         loop {
-            for event in store.events_page(run, cursor, 256)? {
+            // Every new event, page after page, so a long log is read once, not a page per poll.
+            let mut page = store.events_page(run, cursor, 256)?;
+            let mut more = page.len() == 256;
+            while more {
+                let last = page.last().map_or(cursor, |e| e.seq);
+                let next = store.events_page(run, last, 256)?;
+                more = next.len() == 256;
+                page.extend(next);
+            }
+            for event in page {
                 cursor = event.seq;
                 match event.kind {
                     EventKind::ApprovalRequested { id: requested, .. } if requested == id => {
@@ -984,7 +1000,10 @@ impl Engine {
     /// Call once at startup, before `run_forever`.
     ///
     /// `Running` runs become `Suspended(Error("engine restarted"))`, `Provisioning` runs fail,
-    /// `Suspended` runs stay suspended and `Queued` runs stay queued. Sandboxes left behind by the
+    /// `Suspended` runs stay suspended and `Queued` runs stay queued, except a run waiting on its
+    /// own question (`kestrel.ask_human`): nobody waits for that answer any more, so the question is
+    /// declined (unless already answered), the run fails, and its live children are cancelled
+    /// (unless its spec keeps them). Sandboxes left behind by the
     /// previous engine are destroyed; a resumed run gets a fresh one. Then every leftover run
     /// network the drivers find is removed (best effort, like the sandboxes).
     ///
@@ -1020,18 +1039,36 @@ impl Engine {
                 RunStatus::Suspended(SuspendReason::Approval(id))
                     if self.is_question(run.id, id)? =>
                 {
-                    store.append(
-                        run.id,
-                        EventKind::ApprovalResolved {
-                            id,
-                            approved: false,
-                            payload: Some(format!("{ENGINE_RESTARTED} before it was answered")),
-                        },
-                    )?;
+                    // An answer written just before the stop stays the only decision.
+                    if !self.is_resolved(run.id, id)? {
+                        store.append(
+                            run.id,
+                            EventKind::ApprovalResolved {
+                                id,
+                                approved: false,
+                                payload: Some(format!("{ENGINE_RESTARTED} before it was answered")),
+                            },
+                        )?;
+                    }
                     let next = RunStatus::Failed(format!(
                         "{ENGINE_RESTARTED} while its question waited; run it again"
                     ));
                     store.transition(run.id, &run.status, next)?;
+                    // No orphans, as for any run that ends: its live children are cancelled when
+                    // the engine starts, unless its spec keeps them.
+                    let keeps = store.run_spec(run.id)?.is_some_and(|s| {
+                        s.capabilities
+                            .spawn
+                            .as_ref()
+                            .is_some_and(|p| p.keep_children)
+                    });
+                    if !keeps {
+                        for below in store.subtree(run.id)? {
+                            if !below.status.is_terminal() {
+                                store.push_control(below.id, ControlCommand::Cancel)?;
+                            }
+                        }
+                    }
                 }
                 _ => report.suspended.push(run.id),
             }
