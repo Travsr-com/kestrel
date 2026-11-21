@@ -11,8 +11,10 @@
 //! [`caps`] holds the capability grant a run carries and the signed tokens that narrow it per child.
 
 pub mod caps;
+mod join;
 mod slots;
 pub mod workspace;
+pub use join::{ChildResult, JoinError, JoinMode, JoinOutcome};
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -35,7 +37,7 @@ use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
     SuspendReason, Tier, WorkspaceSpec,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, Interval, MissedTickBehavior, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -205,7 +207,10 @@ fn budget_refused(asked: MicroUsd, remaining: MicroUsd) -> String {
 }
 
 /// `spec.capabilities` for a grant.
-fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
+fn granted_capabilities(
+    cap: &caps::Capability,
+    keep_children: bool,
+) -> kestrel_types::Capabilities {
     kestrel_types::Capabilities {
         mcp: cap.tools.iter().cloned().collect(),
         network: cap.hosts.iter().cloned().collect(),
@@ -214,6 +219,7 @@ fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
             max_children: s.max_children,
             max_depth: s.max_depth,
             agents: s.agents.iter().cloned().collect(),
+            keep_children,
         }),
     }
 }
@@ -410,6 +416,8 @@ struct Inner {
     tree_limit: u32,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
     live: Mutex<Live>,
+    /// Parents leaving a join that wait for their slot back, picked up by the scheduler.
+    rejoins: Mutex<Vec<(RunId, oneshot::Sender<()>)>>,
     /// Signals a change of `live`.
     changed: Notify,
 }
@@ -441,15 +449,21 @@ struct Scheduler {
     tasks: JoinSet<()>,
     /// Everything waiting for a slot, in arrival order (the front is served first).
     waiting: VecDeque<Waiter>,
+    /// Runs a cancel was asked for, until it is delivered.
+    cancelling: HashSet<RunId>,
+    /// Cancels held back until the run's live children have ended, deepest runs first.
+    pending_cancels: Vec<RunId>,
 }
 
-/// A queued run, or a resume command that needs a slot.
+/// A queued run, a resume command that needs a slot, or a parent leaving a join.
 struct Waiter {
     run: RunId,
     /// `None` for a `Queued` run to start.
     resume: Option<ControlCommand>,
     /// Whether the run was told it waits for a network block, so it is told once per wait.
     told: bool,
+    /// A parent that gave its slot back for a join: told here once it has the slot again.
+    rejoin: Option<oneshot::Sender<()>>,
 }
 
 impl Waiter {
@@ -502,6 +516,7 @@ impl Engine {
                 root_key: None,
                 tree_limit: DEFAULT_TREE_LIMIT,
                 live: Mutex::default(),
+                rejoins: Mutex::default(),
                 changed: Notify::new(),
             }),
         }
@@ -620,7 +635,12 @@ impl Engine {
         let (narrowed, dropped) = caps::narrow(&held, &wanted);
         // The stored spec says only what the child was granted, so nothing that reads it later
         // can see more than its token holds.
-        spec.capabilities = granted_capabilities(&narrowed);
+        let keep = spec
+            .capabilities
+            .spawn
+            .as_ref()
+            .is_some_and(|s| s.keep_children);
+        spec.capabilities = granted_capabilities(&narrowed, keep);
         let mut child_events = Vec::new();
         if !dropped.is_empty() {
             child_events.push(EventKind::CapabilitiesDropped {
@@ -681,6 +701,17 @@ impl Engine {
 
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
     /// engine on the same database can resume the run.
+    /// How many concurrency slots are held right now. For diagnostics and tests.
+    pub fn slots_in_use(&self) -> usize {
+        self.inner.slots().used()
+    }
+
+    /// Whether `run` holds a concurrency slot right now (a parent in a join holds none). For
+    /// diagnostics and tests.
+    pub fn holds_slot(&self, run: RunId) -> bool {
+        self.inner.slots().holds(run)
+    }
+
     pub async fn submit(&self, spec: AgentSpec, input: String) -> Result<RunId> {
         let store = &self.inner.store;
         let id = store.create_run(&spec, &input)?;
@@ -1056,9 +1087,110 @@ impl Inner {
                 let _ = self.store.append(run, EventKind::AgentLog { line });
             }
         }
+        self.cancel_ready(s, &mut resumes)?;
         self.line_up_queued(s)?;
         s.waiting.extend(resumes);
+        for (run, tx) in self.take_rejoins() {
+            s.waiting.push_back(Waiter {
+                run,
+                resume: None,
+                told: false,
+                rejoin: Some(tx),
+            });
+        }
         self.grant(s)
+    }
+
+    /// Asks for a cancel of `run` and of every live run below it. Each run's cancel is held back
+    /// until its children have ended, so a tree is cancelled from the leaves up and every child's
+    /// `Cancelled` is committed before its parent's.
+    fn cancel_tree(self: &Arc<Self>, run: RunId, s: &mut Scheduler) -> Result<()> {
+        if !s.cancelling.insert(run) {
+            return Ok(());
+        }
+        for child in self.live_children(run)? {
+            self.cancel_tree(child, s)?;
+        }
+        s.pending_cancels.push(run);
+        Ok(())
+    }
+
+    /// Delivers the held-back cancels whose runs have no live child left. A child spawned since
+    /// the cancel was asked for is cancelled too.
+    fn cancel_ready(self: &Arc<Self>, s: &mut Scheduler, resumes: &mut Vec<Waiter>) -> Result<()> {
+        let mut i = 0;
+        while let Some(&run) = s.pending_cancels.get(i) {
+            let live = self.live_children(run)?;
+            for child in &live {
+                self.cancel_tree(*child, s)?;
+            }
+            if !live.is_empty() {
+                i += 1;
+                continue;
+            }
+            s.pending_cancels.remove(i);
+            s.cancelling.remove(&run);
+            s.waiting.retain(|w| !w.is_resume_of(run));
+            resumes.retain(|w| !w.is_resume_of(run));
+            if let Err(e) = self.deliver(run, ControlCommand::Cancel, s) {
+                let line = format!("kestrel: command Cancel failed: {e}");
+                let _ = self.store.append(run, EventKind::AgentLog { line });
+            }
+        }
+        Ok(())
+    }
+
+    /// The children of `run` that have not ended.
+    fn live_children(&self, run: RunId) -> Result<Vec<RunId>> {
+        Ok(self
+            .store
+            .children(run)?
+            .into_iter()
+            .filter(|r| !r.status.is_terminal())
+            .map(|r| r.id)
+            .collect())
+    }
+
+    /// Lines `run` up for its slot back after a join; `tx` is told when it has it.
+    fn rejoin(&self, run: RunId, tx: oneshot::Sender<()>) {
+        self.rejoins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((run, tx));
+    }
+
+    fn take_rejoins(&self) -> Vec<(RunId, oneshot::Sender<()>)> {
+        std::mem::take(&mut *self.rejoins.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Gives the waiter at `i`, a parent leaving a join, its slot back. False when no slot is
+    /// free (nobody behind it can go either). A parent that stopped running, or whose join was
+    /// dropped, leaves the line with nothing.
+    fn grant_rejoin(&self, i: usize, s: &mut Scheduler) -> Result<bool> {
+        let Some(w) = s.waiting.get(i) else {
+            return Ok(true);
+        };
+        let run = w.run;
+        let wanted = w.rejoin.as_ref().is_some_and(|tx| !tx.is_closed());
+        let running = self
+            .store
+            .get_run(run)?
+            .is_some_and(|r| matches!(r.status, RunStatus::Running | RunStatus::Provisioning));
+        if !(wanted && running) {
+            s.waiting.remove(i);
+            return Ok(true);
+        }
+        if !self.slots().reacquire(run) {
+            return Ok(false);
+        }
+        if let Some(Waiter {
+            rejoin: Some(tx), ..
+        }) = s.waiting.remove(i)
+            && tx.send(()).is_err()
+        {
+            self.slots().release(run);
+        }
+        Ok(true)
     }
 
     /// Delivers `cmd` now, or, when it resumes a run that holds no slot, adds it to `resumes`.
@@ -1072,6 +1204,8 @@ impl Inner {
         if matches!(cmd, ControlCommand::Cancel) {
             s.waiting.retain(|w| !w.is_resume_of(run));
             resumes.retain(|w| !w.is_resume_of(run));
+            // Children first: the run's own cancel goes out once its subtree has ended.
+            return self.cancel_tree(run, s);
         }
         let needs_slot = cmd == ControlCommand::Resume || cmd.approves();
         if needs_slot && !self.slots().holds(run) && self.is_suspended(run)? {
@@ -1093,6 +1227,7 @@ impl Inner {
                     run,
                     resume: Some(cmd),
                     told: false,
+                    rejoin: None,
                 });
             }
             return Ok(());
@@ -1111,7 +1246,7 @@ impl Inner {
         let known: HashSet<RunId> = s
             .waiting
             .iter()
-            .filter(|w| w.resume.is_none())
+            .filter(|w| w.resume.is_none() && w.rejoin.is_none())
             .map(|w| w.run)
             .collect();
         let queued = self.store.list_runs(RunFilter {
@@ -1123,6 +1258,7 @@ impl Inner {
                 run: run.id,
                 resume: None,
                 told: false,
+                rejoin: None,
             });
         }
         Ok(())
@@ -1138,6 +1274,12 @@ impl Inner {
         let mut i = 0;
         let mut starved = false;
         while let Some(waiter) = s.waiting.get_mut(i) {
+            if waiter.rejoin.is_some() {
+                if self.grant_rejoin(i, s)? {
+                    continue;
+                }
+                break;
+            }
             let (run, resume) = (waiter.run, waiter.resume.is_some());
             let needs_block = self.needs_block(run);
             if starved && needs_block {
@@ -1475,6 +1617,8 @@ impl Actor {
             // Nothing more to do if the store refuses this too.
             let _ = self.set(RunStatus::Failed(self.scrub(&e.to_string())));
         }
+        // However the run ended, it leaves no child behind (a no-op when they ended already).
+        let _ = self.reap_children().await;
         if let Some(sb) = self.sandbox.take() {
             let _ = self.inner.destroy_tracked(sb.driver, &sb.handle).await;
         }
@@ -1484,6 +1628,42 @@ impl Actor {
         }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
+    }
+
+    /// Cancels the children still going and waits until they have ended, unless the spec says to
+    /// keep them (`spawn.keep_children`).
+    async fn reap_children(&mut self) -> Result<()> {
+        let keep = self
+            .spec
+            .capabilities
+            .spawn
+            .as_ref()
+            .is_some_and(|s| s.keep_children);
+        if keep {
+            return Ok(());
+        }
+        let live = self.inner.live_children(self.id)?;
+        if live.is_empty() {
+            return Ok(());
+        }
+        self.log(&format!(
+            "kestrel: cancelling {} child run(s) still going",
+            live.len()
+        ))?;
+        for child in live {
+            self.inner
+                .store
+                .push_control(child, ControlCommand::Cancel)?;
+        }
+        let period = self
+            .inner
+            .limits
+            .poll_interval
+            .max(Duration::from_millis(1));
+        while self.inner.store.live_children(self.id)? > 0 {
+            tokio::time::sleep(period).await;
+        }
+        Ok(())
     }
 
     /// Whether the run's sandbox is running or being provisioned, which is what a slot pays for.
@@ -1741,6 +1921,9 @@ impl Actor {
                     None => {
                         // Output read to the end: the exit code is final.
                         let exit = driver.wait(&sb.handle).await?;
+                        // No orphans: children still going are cancelled first, so the run's
+                        // `RunFinished` comes after theirs.
+                        self.reap_children().await?;
                         return self.finish(finished, exit.code);
                     }
                 },

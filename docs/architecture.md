@@ -146,6 +146,19 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * **Workspace.** Each child gets its own clone. A `git-clone` child whose `repo` is relative clones its parent's repo.
 * Because a parent's limit shrinks when it spawns, `kestrel ps` shows the budget the parent kept, not the one it started with.
 
+**How a parent waits** (`Engine::join`):
+
+* `join(parent, children, mode, timeout)` waits for the named children (all of them when none are named) and returns each one's result: `Completed` with its summary, `Failed` with the reason, `Cancelled`, or `TimedOut`. Each result also has what the child spent. `All` waits for every child; `Any` returns as soon as one has ended, with only those that ended. A child that times out keeps running.
+* A parent that waits gives its concurrency slot back. It takes it back in line with queued runs before the join returns, so a fan-out to as many children as there are slots cannot deadlock. Its sandbox keeps running meanwhile (it is inside a tool call), so running sandboxes can briefly outnumber the slots by the parents that wait.
+* A join reads everything from the store. Calling it again, after a restart too, returns the children that ended at once.
+
+**Cancelling a tree:**
+
+* Cancelling a run cancels every run below it first, from the leaves up, then the run itself. Every sandbox is stopped. A queued child never starts.
+* Cancelling a child alone never touches its parent: the parent's join reports `Cancelled`.
+* A run that ends with children still going cancels them before its own `RunFinished`, so no child is left behind. `spawn.keep_children: true` in the spec leaves them running.
+* Pausing a parent, or changing its budget, does not touch its children.
+
 ### 3.4 Sandbox drivers
 
 | Host | Default driver | Strong tier | Notes |

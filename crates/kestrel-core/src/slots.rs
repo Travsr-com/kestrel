@@ -31,7 +31,6 @@ impl Slots {
     }
 
     /// Slots currently held.
-    #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
         self.held.len()
     }
