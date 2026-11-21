@@ -8,7 +8,10 @@
 //!   server, which is bound to its own clone, so a request can never name another repo.
 //! * **What it may call**: the read tools in [`TRAVSR_TOOLS`] that the run's capability grants
 //!   (`travsr.<tool>`), listed by Travsr's own names (`get_callers`). Anything else is a tool
-//!   error "not permitted" and nothing is forwarded; the host records the denial.
+//!   error "not permitted" and nothing is forwarded. The host records the denial of a read tool
+//!   the run was not granted; a name off the allowlist is neither recorded nor echoed.
+//! * **A call lives as long as its request**: it is stopped when it times out and when the
+//!   request is dropped.
 //! * **Arguments**: passed on as they are, without `repo`, which is dropped from calls and
 //!   from the listed schemas.
 //! * **Failure is the agent's to handle, never the run's**: a host error or a call slower than
@@ -65,7 +68,8 @@ pub trait TravsrHost: Send + Sync {
     /// Calls `tool` with `args` on `run`'s Travsr. `Ok` is Travsr's tool result (its `content`
     /// and `isError`); `Err` is why Travsr could not answer.
     async fn call(&self, run: RunId, tool: &str, args: Value) -> Result<Value, String>;
-    /// Records that `run` called `tool` (as `travsr.<tool>`), which it may not.
+    /// Records that `run` called `tool` (as `travsr.<tool>`), a read tool it was not granted.
+    /// Never called with a name off [`TRAVSR_TOOLS`].
     async fn denied(&self, run: RunId, tool: &str);
     /// The longest one call, or one listing, may take.
     fn call_timeout(&self) -> Duration {
@@ -173,15 +177,16 @@ async fn call(
             "too many tool calls, slow down",
         );
     }
-    let full = format!("travsr.{name}");
+    // A name off the allowlist is the agent's own text, of any length: it is neither recorded
+    // nor echoed, so it cannot flood the run's log or the answer.
     if !TRAVSR_TOOLS.contains(&name) {
-        host.denied(run, &full).await;
         let reason = format!(
-            "not permitted: {name} is not one of the Travsr read tools Kestrel serves ({})",
+            "not permitted: Kestrel serves only these Travsr read tools: {}",
             TRAVSR_TOOLS.join(", ")
         );
         return Json(rpc_result(id, tool_result(Err(reason)))).into_response();
     }
+    let full = format!("travsr.{name}");
     if !tools.iter().any(|t| t == name) {
         host.denied(run, &full).await;
         let reason = format!("not permitted: this run's capabilities do not include {full}");
@@ -210,24 +215,31 @@ async fn call(
     Json(rpc_result(id, shaped(answer))).into_response()
 }
 
+/// Aborts its task when dropped: when the call times out, and when the request handling it is
+/// dropped (the client hung up), so a call never outlives its request and holds nothing after.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs `work` in its own task, so a host that panics still gives an answer, and gives up after
 /// `limit`. Every `Err` is a reason for the agent, starting with "Travsr".
 async fn in_task<T: Send + 'static>(
     limit: Duration,
     work: impl Future<Output = Result<T, String>> + Send + 'static,
 ) -> Result<T, String> {
-    let mut task = tokio::spawn(work);
-    match tokio::time::timeout(limit, &mut task).await {
+    let mut task = AbortOnDrop(tokio::spawn(work));
+    match tokio::time::timeout(limit, &mut task.0).await {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(reason))) => Err(format!("Travsr could not answer: {}", short(&reason))),
         Ok(Err(_)) => Err("Travsr: the call failed inside Kestrel; try again".into()),
-        Err(_) => {
-            task.abort();
-            Err(format!(
-                "Travsr did not answer within {} s; try again or a narrower query",
-                limit.as_secs()
-            ))
-        }
+        Err(_) => Err(format!(
+            "Travsr did not answer within {} s; try again or a narrower query",
+            limit.as_secs()
+        )),
     }
 }
 

@@ -9,6 +9,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,7 +68,18 @@ struct FakeTravsr {
     schemas: Mutex<Result<Vec<Value>, String>>,
     calls: Mutex<Vec<(RunId, String, Value)>>,
     denied: Mutex<Vec<(RunId, String)>>,
+    /// Set when work the host was hanging in is dropped.
+    hung_dropped: Arc<AtomicBool>,
     timeout: Duration,
+}
+
+/// Sets its flag when dropped.
+struct Dropped(Arc<AtomicBool>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl FakeTravsr {
@@ -97,6 +109,7 @@ impl FakeTravsr {
             schemas: Mutex::new(Ok(schemas)),
             calls: Mutex::default(),
             denied: Mutex::default(),
+            hung_dropped: Arc::default(),
             timeout,
         }
     }
@@ -107,6 +120,12 @@ impl FakeTravsr {
 
     fn set(&self, answer: Answer) {
         *self.answer.lock().unwrap() = answer;
+    }
+
+    /// Never returns; notes it when dropped.
+    async fn hang(&self) {
+        let _dropped = Dropped(self.hung_dropped.clone());
+        std::future::pending::<()>().await;
     }
 }
 
@@ -129,6 +148,10 @@ impl TravsrHost for FakeTravsr {
     }
 
     async fn schemas(&self, _run: RunId) -> Result<Vec<Value>, String> {
+        let hangs = matches!(*self.answer.lock().unwrap(), Answer::Hang);
+        if hangs {
+            self.hang().await;
+        }
         self.schemas.lock().unwrap().clone()
     }
 
@@ -151,8 +174,8 @@ impl TravsrHost for FakeTravsr {
             }
             Answer::Fail(reason) => Err(reason),
             Answer::Hang => {
-                std::future::pending::<()>().await;
-                unreachable!()
+                self.hang().await;
+                Err("hung".into())
             }
             Answer::Panic => panic!("the host fell over"),
             Answer::Bare => Ok(json!({ "answer": 42 })),
@@ -403,26 +426,29 @@ async fn s3_an_absolute_repo_path_is_dropped_too() {
 async fn s4_a_tool_off_the_allowlist_is_refused_and_nothing_is_forwarded() {
     // Granted in the capability, still refused: only the read tools are served.
     let s = setup(&["get_callers", "index_repo"]);
+    let long = "x".repeat(100_000);
     for (i, tool) in [
         "index_repo",
         "repos_remove",
         "get_index_status",
         "get_daemon_logs",
         "synonym_add",
+        long.as_str(),
     ]
     .into_iter()
     .enumerate()
     {
         let msg = ask(&s, &call(i as u64, tool, json!({ "path": "/" }))).await;
-        assert!(is_error(&msg), "{tool}: {msg}");
+        assert!(is_error(&msg), "{msg}");
+        // One fixed reason, which never echoes the name the agent sent.
         let reason = text(&msg);
-        assert!(
-            reason.contains("not permitted") && reason.contains(tool),
-            "{reason}"
-        );
+        assert!(reason.starts_with("not permitted"), "{reason}");
+        assert!(!reason.contains(tool), "{reason}");
+        assert!(reason.len() < 300, "{}", reason.len());
     }
     assert!(s.host.calls().is_empty());
-    assert_eq!(s.host.denied.lock().unwrap().len(), 5);
+    // A name off the allowlist is never recorded, so the event log cannot be flooded with it.
+    assert!(s.host.denied.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -499,6 +525,40 @@ async fn s7_a_travsr_that_does_not_answer_times_out_as_a_tool_error() {
     s.host.set(Answer::Echo);
     let msg = ask(&s, &call(2, "get_callers", json!({ "symbol": "main" }))).await;
     assert!(!is_error(&msg));
+}
+
+/// Sends `message` as run A, and drops the request after 200 ms, as a client that hangs up.
+async fn hang_up(s: &Setup, message: &Value) {
+    let gave_up = tokio::time::timeout(Duration::from_millis(200), ask(s, message)).await;
+    assert!(gave_up.is_err(), "the host answered");
+}
+
+/// Waits up to 2 s for the host's hanging work to be dropped.
+async fn until_dropped(host: &FakeTravsr) -> bool {
+    for _ in 0..200 {
+        if host.hung_dropped.load(Ordering::SeqCst) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn s7_a_call_whose_request_is_dropped_is_stopped_with_it() {
+    // A call timeout far away: only dropping the request can stop the call.
+    let s = setup_with(&["get_callers"], Duration::from_secs(3600));
+    s.host.set(Answer::Hang);
+    hang_up(&s, &call(1, "get_callers", json!({ "symbol": "main" }))).await;
+    assert!(until_dropped(&s.host).await, "the call kept running");
+}
+
+#[tokio::test]
+async fn a_listing_whose_request_is_dropped_is_stopped_with_it() {
+    let s = setup_with(&["get_callers"], Duration::from_secs(3600));
+    s.host.set(Answer::Hang);
+    hang_up(&s, &rpc(json!(1), "tools/list", json!({}))).await;
+    assert!(until_dropped(&s.host).await, "the listing kept running");
 }
 
 #[tokio::test]
