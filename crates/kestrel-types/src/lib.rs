@@ -1,11 +1,16 @@
 //! Shared data types: agent spec, run, event, budget.
 
+mod api;
 mod event;
 mod ids;
 mod money;
 mod spec;
 mod status;
 
+pub use api::{
+    ApiError, Approval, ApprovalStatus, RunSummary, TreeNode, WS_CLOSE_UNAUTHORIZED, WS_PROTOCOL,
+    WS_TOKEN_PREFIX, WsFrame,
+};
 pub use event::{Event, EventKind, ModelCallRecord};
 pub use ids::{ApprovalId, RunId};
 pub use money::MicroUsd;

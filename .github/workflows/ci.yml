@@ -40,6 +40,42 @@ jobs:
         run: cargo llvm-cov --workspace --fail-under-lines 95
       - run: cargo deny check
 
+  ui:
+    name: ui
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - name: Licenses on the allow list
+        run: npm run licenses
+      # Every UI package is a dev dependency (only the compiled bundle ships), so the first audit
+      # covers no packages today. The second one also checks the build and test toolchain.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit all dependencies
+        run: npm audit --audit-level=high
+      - name: Lint (Svelte a11y warnings are errors)
+        run: npm run lint
+      - name: Type check
+        run: npm run check
+      - name: Tests with coverage gate (95% lines), including axe checks of every view
+        run: npm test -- --coverage
+      - run: npm run build
+      - name: Bundle under 150 kB gzipped
+        run: npm run size
+      - name: CLAUDE.md states the UI coverage rule
+        working-directory: .
+        run: |
+          grep -q 'UI: ' .claude/CLAUDE.md
+
   macos:
     name: test (macos)
     runs-on: macos-latest

@@ -19,9 +19,11 @@ sub-agents, run them headless in sandboxes, and watch everything live in a UI.
 3. **No em-dashes or en-dashes** anywhere: code, comments, docs, commits, issues, PRs. Use a comma, period or
    parentheses.
 4. **Tests first.** Every issue lists test scenarios before any code is written. Tests are written from those
-   scenarios and fail first, then the implementation makes them pass.
-5. **Coverage at or above 95%** (line coverage, whole workspace), enforced in CI with
-   `cargo llvm-cov --workspace --fail-under-lines 95`. A PR that drops coverage below 95% does not merge.
+   scenarios and fail first, then the implementation makes them pass. This applies to UI components too:
+   component tests are written from the issue's scenarios and fail first.
+5. **Coverage at or above 95% (line coverage).** Rust: whole workspace,
+   `cargo llvm-cov --workspace --fail-under-lines 95`. UI: `ui/src`, vitest coverage threshold 95% lines.
+   Both are enforced in CI. A PR that drops either below 95% does not merge.
 6. **No `unwrap()`/`expect()` in library code, no `unsafe`** without a written RFC and reviewer sign-off.
 7. **Crate dependencies never form a cycle:**
    `types ← store ← core ← {sandbox, gateway, mcp, agent, channels} ← server ← cli`.
@@ -65,6 +67,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --fail-under-lines 95
 cargo deny check
 ./scripts/check-dashes.sh
+```
+
+When `ui/` changes, also run these in `ui/` (Node version in `ui/.nvmrc`):
+
+```sh
+npm run lint
+npm run check
+npm test -- --coverage
+npm run build
 ```
 
 Tests that need real sandboxes (gVisor, Apple `container`, Firecracker) or network are behind the

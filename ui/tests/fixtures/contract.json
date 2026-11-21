@@ -1,0 +1,146 @@
+{
+  "runs": [
+    {
+      "id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "agent": "planner",
+      "status": "Running",
+      "parent": null,
+      "root": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "depth": 0,
+      "spent": 420000,
+      "limit": 2000000,
+      "sandbox_tier": "gvisor",
+      "created_at": "2026-11-21T08:00:00Z"
+    },
+    {
+      "id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "agent": "fixer",
+      "status": { "Suspended": { "Approval": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a" } },
+      "parent": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "root": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "depth": 1,
+      "spent": 125000,
+      "limit": 500000,
+      "sandbox_tier": "docker-runc",
+      "created_at": "2026-11-21T08:01:30Z"
+    },
+    {
+      "id": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+      "agent": "reviewer",
+      "status": { "Failed": "sandbox exited with code 1" },
+      "parent": null,
+      "root": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+      "depth": 0,
+      "spent": 0,
+      "limit": null,
+      "sandbox_tier": null,
+      "created_at": "2026-11-20T17:45:12Z"
+    }
+  ],
+  "tree": [
+    {
+      "id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "parent": null,
+      "agent": "planner",
+      "status": "Running",
+      "spent": 420000,
+      "limit": 2000000
+    },
+    {
+      "id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "parent": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "agent": "fixer",
+      "status": { "Suspended": "Budget" },
+      "spent": 125000,
+      "limit": 500000
+    }
+  ],
+  "approvals": [
+    {
+      "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a",
+      "run_id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "action": "git push origin kestrel/run-9a8b",
+      "status": "pending",
+      "requested_at": "2026-11-21T08:02:00Z"
+    },
+    {
+      "id": "3f4a5b6c-7d8e-4f9a-8b1c-2d3e4f5a6b7c",
+      "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "action": "delete branch old-work",
+      "status": "approved",
+      "requested_at": "2026-11-21T07:50:00Z"
+    },
+    {
+      "id": "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e",
+      "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "action": "send email to the team",
+      "status": "rejected",
+      "requested_at": "2026-11-21T07:40:00Z"
+    }
+  ],
+  "events": [
+    {
+      "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "seq": 1,
+      "ts": "2026-11-21T08:00:00Z",
+      "kind": { "kind": "run_created", "agent": "planner" }
+    },
+    {
+      "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "seq": 2,
+      "ts": "2026-11-21T08:00:01Z",
+      "kind": { "kind": "status_changed", "from": "Queued", "to": "Provisioning" }
+    },
+    {
+      "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "seq": 3,
+      "ts": "2026-11-21T08:00:05Z",
+      "kind": { "kind": "agent_message", "text": "Reading the failing test." }
+    }
+  ],
+  "event_kinds": [
+    { "kind": "run_created", "agent": "fixer", "parent": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b" },
+    { "kind": "status_changed", "from": "Running", "to": { "Suspended": "Budget" } },
+    { "kind": "sandbox_provisioned", "driver": "gvisor", "sandbox_id": "kestrel-9a8b7c6d" },
+    { "kind": "agent_message", "text": "Running the tests." },
+    { "kind": "tool_call", "name": "bash", "input": { "command": "cargo test" } },
+    { "kind": "tool_result", "name": "bash", "ok": false, "output": "1 test failed" },
+    {
+      "kind": "model_call",
+      "run_id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "tokens_in": 1200,
+      "tokens_out": 340,
+      "tokens_cache_read": 800,
+      "tokens_cache_write": 0,
+      "cost": 8700,
+      "latency_ms": 2100,
+      "status": 200
+    },
+    { "kind": "budget_warning", "spent": 1600000, "limit": 2000000 },
+    { "kind": "approval_requested", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "action": "git push" },
+    { "kind": "approval_resolved", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "approved": true },
+    { "kind": "agent_log", "line": "test result: FAILED. 11 passed; 1 failed" },
+    { "kind": "run_finished", "summary": null }
+  ],
+  "socket": {
+    "protocol": "kestrel.v1",
+    "token_prefix": "kestrel.token.",
+    "close_unauthorized": 4401
+  },
+  "frames": [
+    {
+      "type": "event",
+      "cursor": 17,
+      "event": {
+        "run_id": "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+        "seq": 3,
+        "ts": "2026-11-21T08:00:05Z",
+        "kind": { "kind": "agent_message", "text": "Reading the failing test." }
+      }
+    },
+    { "type": "heartbeat" }
+  ],
+  "error": { "error": "token required" }
+}
