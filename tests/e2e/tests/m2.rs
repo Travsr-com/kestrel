@@ -20,6 +20,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -883,7 +884,8 @@ fn m2_s09_cancel_removes_the_whole_subtree() {
 /// said about each network the first time it was seen.
 type NetSample = (Vec<Container>, Vec<(String, Option<(Vec<String>, String)>)>);
 
-fn network_sampler(instance: String) -> Sampler<NetSample> {
+/// Samples every 300 ms and counts each sample it has taken in `taken`.
+fn network_sampler(instance: String, taken: Arc<AtomicUsize>) -> Sampler<NetSample> {
     let mut known: HashSet<String> = HashSet::new();
     Sampler::start(Duration::from_millis(300), move || {
         let cs = containers(&instance);
@@ -893,8 +895,43 @@ fn network_sampler(instance: String) -> Sampler<NetSample> {
                 new.push((name.clone(), network_info(name)));
             }
         }
+        taken.fetch_add(1, Ordering::SeqCst);
         (cs, new)
     })
+}
+
+/// A file in the workspace of `id`, on the host.
+fn in_workspace(env: &Env, id: &str, name: &str) -> PathBuf {
+    env.dir.path().join("workspaces").join(id).join(name)
+}
+
+/// Waits until the agent of every run in `runs` holds (`hold=N`: it wrote `holding.out` and waits
+/// for a `go` file), then until the sampler has taken a sample that started after that, and only
+/// then writes `go` into every workspace. So the samples hold one in which every run's sandbox
+/// was running, whatever the timing of the runner.
+fn hold_then_go(env: &Env, runs: &[String], taken: &AtomicUsize) {
+    wait_until(Duration::from_secs(300), "every run holds", || {
+        runs.iter()
+            .all(|id| in_workspace(env, id, "holding.out").exists())
+    });
+    // The sample that ends next may have started before the last run held; the one after it
+    // started once all of them held.
+    let seen = taken.load(Ordering::SeqCst);
+    wait_until(Duration::from_secs(60), "two more docker samples", || {
+        taken.load(Ordering::SeqCst) >= seen + 2
+    });
+    for id in runs {
+        std::fs::write(in_workspace(env, id, "go"), "go\n").expect("write go");
+    }
+}
+
+/// The agent of `id` went on because the test said go, not because its hold timed out.
+fn assert_went_on_go(env: &Env, id: &str) {
+    assert_eq!(
+        env.read_out(id, "held.out").trim(),
+        "go",
+        "run {id} stopped holding before the test said go"
+    );
 }
 
 /// Checks that every run in `runs` was seen on exactly one network of its own, labelled with its
@@ -951,7 +988,8 @@ fn assert_own_networks(samples: &[(Instant, NetSample)], runs: &[String]) -> usi
 /// Scenario 10: in the 6-way fan-out every run gets its own network from the Kestrel pool, and a
 /// separate group of 20 short sandboxes starts without "address pools exhausted", with the CI
 /// host's default Docker pools as they are. Both groups have every network up at once: 7 for the
-/// fan-out, 20 for the group.
+/// fan-out, 20 for the group. The test holds every run until all of them are up, so the overlap
+/// does not depend on timing.
 #[test]
 fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     let env = Env::with_max(20);
@@ -960,32 +998,44 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     let short = env.root_agent("short", "1", WORKER_CAPS);
     let _up = env.up();
 
-    let sampler = network_sampler(env.instance());
-    let root = env.submit_file(&lead, "fanout=6 each=0.20 c.nap=6");
+    let taken = Arc::new(AtomicUsize::new(0));
+    let sampler = network_sampler(env.instance(), taken.clone());
+    let root = env.submit_file(&lead, "fanout=6 each=0.20 c.hold=900");
+    let kids: Vec<String> = env
+        .wait_children(&root, 6)
+        .iter()
+        .map(|k| k.id.to_string())
+        .collect();
+    hold_then_go(&env, &kids, &taken);
     env.wait_status(&root, "Completed");
     let mut tree = vec![root.clone()];
-    for kid in env.children(&root) {
-        let id = kid.id.to_string();
-        env.wait_status(&id, "Completed");
-        tree.push(id);
+    for id in &kids {
+        env.wait_status(id, "Completed");
+        assert_went_on_go(&env, id);
+        tree.push(id.clone());
     }
     let samples = sampler.finish();
     assert_eq!(tree.len(), 7);
     let most = assert_own_networks(&samples, &tree);
     eprintln!("m2-result: fan-out of 6, 7 runs on 7 networks, at most {most} at once");
-    // The parent spawns its 6 children back to back and waits in its join (its sandbox keeps
-    // running), and each child naps 6 s after its model call, under a cap of 20. So all 7 networks
-    // are up at once.
+    // Every child holds until the test says go, and the test says it only after a sample taken
+    // while all 6 held. The parent is in its spawns or its join (its sandbox keeps running) until
+    // its children end. So that sample saw all 7 networks.
     assert_eq!(
         most, 7,
         "the parent and its 6 children had their networks at once"
     );
 
-    let sampler = network_sampler(env.instance());
-    let group: Vec<String> = (0..20).map(|_| env.submit_file(&short, "nap=4")).collect();
+    let taken = Arc::new(AtomicUsize::new(0));
+    let sampler = network_sampler(env.instance(), taken.clone());
+    let group: Vec<String> = (0..20)
+        .map(|_| env.submit_file(&short, "hold=900"))
+        .collect();
+    hold_then_go(&env, &group, &taken);
     for id in &group {
         let row = env.wait_status_within(id, "Completed", Duration::from_secs(300));
         assert_eq!(status_name(&row["status"]), "Completed");
+        assert_went_on_go(&env, id);
         for e in env.events(id) {
             let text = e.to_string();
             assert!(
@@ -997,9 +1047,10 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     let samples = sampler.finish();
     let most = assert_own_networks(&samples, &group);
     eprintln!("m2-result: 20 short sandboxes on 20 networks, at most {most} at once");
-    // The point of the group: 20 run networks exist at once on the default Docker pools. The 20
-    // are submitted back to back under a cap of 20 and each naps 4 s, so all 20 overlap (CI run
-    // 44936723548 saw 20). Each run has one network of its own, so 20 is also the most possible.
+    // The point of the group: 20 run networks exist at once on the default Docker pools. Under a
+    // cap of 20, every run holds until a sample was taken while all 20 held, so that sample saw
+    // all 20 (CI run 44940626625, which timed the overlap with naps instead, also saw 20). Each
+    // run has one network of its own, so 20 is also the most possible.
     assert_eq!(
         most, 20,
         "the 20 short sandboxes had their networks at once"

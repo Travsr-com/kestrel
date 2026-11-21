@@ -37,6 +37,8 @@
 #                grandchild as `nap=9`).
 # A child:
 #   nap=N        sleep N seconds after the model call, once per workspace.
+#   hold=N       after the model call, write holding.out and wait until the test writes `go` into
+#                the workspace, for at most N seconds; then write `go` or `timeout` to held.out.
 #   spend=N      make model calls until N were made or the gateway refuses one (spend.out); after a
 #                refusal it waits, so the engine suspends it while it runs.
 #   hosts=1      also try api.github.com and evil.example (egress.txt).
@@ -330,6 +332,18 @@ if [ -n "$n" ]; then
   done
   echo joining > /workspace/joining.out
   mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 3600 > /workspace/join.out 2>&1
+fi
+
+hold=$(marker hold || true)
+if [ -n "$hold" ]; then
+  # Wait for the test to write /workspace/go, so the test decides when this sandbox may end.
+  echo holding > /workspace/holding.out
+  waited=0
+  while [ ! -e /workspace/go ] && [ "$waited" -lt "$hold" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [ -e /workspace/go ]; then echo go > /workspace/held.out; else echo timeout > /workspace/held.out; fi
 fi
 
 nap=$(marker nap || true)
