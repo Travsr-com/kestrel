@@ -196,9 +196,10 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// runs that hold blocks while suspended can always be resumed.
 ///
 /// When the pool is exhausted ([`SubnetPool::exhausted`]: nothing is free and no block in use will
-/// come back until the next start), waiting would never end. Then every waiter that needs a block
-/// stops waiting in the same tick: a queued run fails with a message naming the pool, and a resume
-/// or approve is dropped with a log line naming it while the run stays suspended.
+/// come back until the next start), waiting would never end. Then each waiter that needs a block
+/// stops waiting as soon as it reaches a free slot (at once when slots are free, else when one
+/// frees up): a queued run fails with a message naming the pool, and a resume or approve is
+/// dropped with a log line naming it while the run stays suspended.
 ///
 /// The run actor turns the block into the run's network with `SandboxDriver::prepare_network`
 /// before it builds the launch plan, and the gateway URL of the run points at the bridge on that
