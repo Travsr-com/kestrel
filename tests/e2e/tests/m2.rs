@@ -18,6 +18,7 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -511,7 +512,8 @@ fn m2_s05_child_gets_no_secret_its_parent_lacks() {
 }
 
 /// Scenario 6: a child cannot spawn with more budget than it has, a grandchild at max_depth 0
-/// cannot spawn at all, and no sandbox holds any token but its own.
+/// cannot spawn at all, and no sandbox holds any token but its own: not in its environment, under
+/// `/kestrel` or its mounts, nor in any file of its workspace.
 #[test]
 fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
     let env = Env::with_max(8);
@@ -571,7 +573,7 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
         "the refused spawn is recorded: {events:?}"
     );
 
-    // Tokens: each sandbox's environment and mounts hold its own run token and no other.
+    // Tokens: each sandbox's environment, mounts and workspace hold its own run token and no other.
     let store = env.store();
     let token = |id: &str| {
         store
@@ -603,6 +605,61 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
             }
         }
     }
+    // Every file of every workspace, `.git` included, read on the host. Git compresses the objects
+    // it stores, so the history is also read through `git log`.
+    for (id, _) in &tokens {
+        let ws = env.workspace(id);
+        let files = files_under(&ws);
+        assert!(
+            files.iter().any(|f| f.ends_with("env.txt")),
+            "the walk of {} found the agent's files",
+            ws.display()
+        );
+        let history = git(&ws, &["log", "--all", "-p"]);
+        for (other, theirs) in &tokens {
+            if other == id {
+                continue;
+            }
+            for file in &files {
+                let bytes =
+                    std::fs::read(file).unwrap_or_else(|e| panic!("read {} ({e})", file.display()));
+                assert!(
+                    !contains_bytes(&bytes, theirs.as_bytes()),
+                    "{} in the workspace of {id} holds the token of {other}",
+                    file.display()
+                );
+            }
+            assert!(
+                !history.contains(theirs.as_str()),
+                "the git history of {id} holds the token of {other}"
+            );
+        }
+    }
+}
+
+/// Every regular file under `dir`, at any depth, `.git` included. Symlinks are not followed.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let entries =
+            std::fs::read_dir(&d).unwrap_or_else(|e| panic!("list {} ({e})", d.display()));
+        for entry in entries {
+            let entry = entry.expect("a directory entry");
+            let kind = entry.file_type().expect("its file type");
+            if kind.is_dir() {
+                todo.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files
+}
+
+/// True when `needle` occurs in `haystack`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Scenario 7: a root of $1.00 carves $0.15 for each of 6 children that each try to spend $0.30.

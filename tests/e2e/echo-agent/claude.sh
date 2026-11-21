@@ -45,7 +45,8 @@
 #   ask=1        asks a person with kestrel.ask_human (ask.out) and writes the answer (answer.out).
 #   escalate=1   spawns with a budget above its own, then a grandchild with escalate=2 and wait
 #                (escalate.out); escalate=2 lists its tools and tries to spawn (escalate.out).
-#   dump=1       everything under /kestrel and the mounts (dump.out).
+#   dump=1       everything under /kestrel, listed and read at every depth, and the mounts
+#                (dump.out).
 #   commit=1     at the end writes kid-<n>.txt (shared.txt with same=1), commits everything but
 #                the test's own files in one commit, and records the result (commit.out).
 set -u
@@ -250,9 +251,10 @@ fi
 
 if marker dump > /dev/null; then
   {
-    echo "== ls /kestrel"
-    ls -la /kestrel 2>&1
-    for f in /kestrel/*; do
+    echo "== ls -laR /kestrel"
+    ls -laR /kestrel 2>&1
+    # Every file at any depth, not only the top level.
+    find /kestrel -type f 2>&1 | while IFS= read -r f; do
       echo "== $f"
       cat "$f" 2>&1
       echo
