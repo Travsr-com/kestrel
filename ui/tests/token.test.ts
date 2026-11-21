@@ -70,6 +70,8 @@ describe('late answers', () => {
     const held = new Promise<void>((resolve) => (release = resolve));
     const server = createMockServer('s3cret');
     const slow: typeof fetch = async (input, init) => {
+      // The app's own approvals count is not part of this: it answers at once.
+      if (String(input).includes('/api/approvals')) return new Response('[]');
       await held;
       return server.fetch(input, init);
     };
@@ -125,9 +127,11 @@ describe('Token required screen', () => {
     const server = createMockServer('s3cret');
     render(App, { fetch: server.fetch });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'Continue' }));
+    const continueButton = await screen.findByRole('button', { name: 'Continue' });
+    const before = server.calls.length;
+    await user.click(continueButton);
     expect(screen.getByRole('heading', { level: 1, name: 'Token required' })).toBeInTheDocument();
-    expect(server.calls).toHaveLength(1);
+    expect(server.calls).toHaveLength(before);
   });
 });
 

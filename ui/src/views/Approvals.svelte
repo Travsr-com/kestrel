@@ -1,39 +1,87 @@
 <script lang="ts">
+  // Pending approvals across all runs, newest first, with enough context to decide without
+  // opening the run. The list and its live updates come from the app (`ApprovalsState`), which
+  // also counts them in the nav; this view adds each run's agent and root.
   import type { Api } from '../lib/api';
-  import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
-  import { href } from '../lib/router';
-  import type { Approval } from '../lib/types';
+  import type { ApprovalsState } from '../lib/approvals.svelte';
+  import { newestFirst } from '../lib/format';
+  import type { OnUnauthorized } from '../lib/load';
+  import type { RunId, RunSummary } from '../lib/types';
+  import ApprovalRow from './ApprovalRow.svelte';
 
-  let { api, onUnauthorized }: { api: Api; onUnauthorized: OnUnauthorized } = $props();
+  let {
+    approvals,
+    api,
+    onUnauthorized,
+    onRetry,
+  }: { approvals: ApprovalsState; api: Api; onUnauthorized: OnUnauthorized; onRetry: () => void } = $props();
 
-  let pending: Approval[] | null = $state(null);
-  let error: string | null = $state(null);
+  let now = $state(Date.now());
+  $effect(() => {
+    const tick = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(tick);
+  });
 
-  $effect(() =>
-    whileMounted(
-      () => api.approvals('pending'),
-      (list) => (pending = list),
-      (e) => (error = failureText(e, onUnauthorized)),
-    ),
+  /** Each approval's run, for its agent and root. */
+  let runs: Record<RunId, RunSummary> = $state({});
+  /** Runs asked for already: bookkeeping only, never rendered. */
+  const asked: Record<RunId, true> = {};
+  let mounted = true;
+  $effect(() => () => {
+    mounted = false;
+  });
+  $effect(() => {
+    for (const row of Object.values(approvals.rows)) {
+      const id = row.approval.run_id;
+      if (asked[id]) continue;
+      asked[id] = true;
+      api.getRun(id).then(
+        (summary) => {
+          if (mounted) runs[id] = summary;
+        },
+        () => {},
+      );
+    }
+  });
+
+  /** Said once after a row is taken away because someone else decided it first. */
+  let notice = $state('');
+
+  const list = $derived(
+    Object.values(approvals.rows).sort((a, b) => newestFirst(a.approval.requested_at, b.approval.requested_at)),
   );
 </script>
 
 <h1>Approvals</h1>
-{#if error !== null}
-  <p role="alert" data-testid="ready">{error}</p>
-{:else if pending === null}
+
+<p class="notice" role="status">{notice}</p>
+
+{#if approvals.error !== null && !approvals.loaded}
+  <div class="banner" role="alert" data-testid="ready">
+    <p>{approvals.error}</p>
+    <button type="button" onclick={onRetry}>Retry</button>
+  </div>
+{:else if !approvals.loaded}
   <p>Loading approvals.</p>
 {:else}
   <div data-testid="ready">
-    {#if pending.length === 0}
-      <p>No pending approvals.</p>
+    {#if list.length === 0}
+      <p>Nothing waiting for you</p>
     {:else}
-      <ul class="approvals">
-        {#each pending as approval (approval.id)}
-          <li>
-            <code>{approval.action}</code>
-            <a href={href({ name: 'run', id: approval.run_id })}>Run {approval.run_id}</a>
-          </li>
+      <ul class="approvals" aria-label="Pending approvals">
+        {#each list as row (row.approval.id)}
+          <ApprovalRow
+            {row}
+            run={runs[row.approval.run_id]}
+            {now}
+            {api}
+            {onUnauthorized}
+            onGone={() => {
+              approvals.remove(row.approval.id);
+              notice = 'Already resolved by someone else';
+            }}
+            onDismiss={() => approvals.dismiss(row.approval.id)}
+          />
         {/each}
       </ul>
     {/if}
@@ -48,13 +96,21 @@
     padding: 0;
     list-style: none;
   }
-  li {
-    display: grid;
-    gap: var(--space-1);
-    padding: var(--space-3);
-    border: 1px solid var(--color-border);
+  .notice:empty {
+    display: none;
+  }
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-danger);
     border-radius: var(--radius);
-    background: var(--color-surface);
-    overflow-wrap: anywhere;
+  }
+  .banner p {
+    margin: 0;
+  }
+  button {
+    font: inherit;
   }
 </style>

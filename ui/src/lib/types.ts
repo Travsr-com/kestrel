@@ -52,6 +52,8 @@ export interface Approval {
   status: ApprovalStatus;
   /** RFC 3339. */
   requested_at: string;
+  /** A question for a person (`ask_human`): `action` is the question, answered with text. */
+  question: boolean;
 }
 
 export interface ModelCallFields {
@@ -76,7 +78,7 @@ export type EventKind =
   | { kind: 'tool_result'; name: string; ok: boolean; output: string }
   | ({ kind: 'model_call' } & ModelCallFields)
   | { kind: 'budget_warning'; spent: MicroUsd; limit: MicroUsd }
-  | { kind: 'approval_requested'; id: ApprovalId; action: string }
+  | { kind: 'approval_requested'; id: ApprovalId; action: string; question?: boolean }
   | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean; payload?: string }
   | { kind: 'agent_log'; line: string }
   | { kind: 'run_finished'; summary: string | null }
