@@ -39,8 +39,10 @@
 #   nap=N        sleep N seconds after the model call, once per workspace.
 #   hold=N       after the model call, write holding.out and wait until the test writes `go` into
 #                the workspace, for at most N seconds; then write `go` or `timeout` to held.out.
-#   spend=N      make model calls until N were made or the gateway refuses one (spend.out); after a
-#                refusal it waits, so the engine suspends it while it runs.
+#   spend=N      make model calls until N were made or the gateway refuses one; after a refusal it
+#                waits, so the engine suspends it while it runs. spend.out holds `calls=<made>` after
+#                every call, `calls=<made> refused=yes` once a call is refused, and
+#                `calls=<made> refused=no` when all N were made.
 #   hosts=1      also try api.github.com and evil.example (egress.txt).
 #   tools=1      the `--allowedTools`, a tools/list, a call of kestrel.ask_human and a call of
 #                kestrel.join with no children (tools.out).
@@ -219,17 +221,23 @@ kid=$(marker kid || echo 0)
 
 spend=$(marker spend || true)
 if [ -n "$spend" ]; then
-  # The call above was the first one.
+  # The call above was the first one. spend.out is written after every call, because the engine
+  # can stop the sandbox at any point once the run is out of budget.
   calls=1
   refused=no
+  echo "calls=$calls" > /workspace/spend.out
   while [ "$calls" -lt "$spend" ]; do
     if ! model_call; then
       refused=yes
+      echo "calls=$calls refused=yes" > /workspace/spend.out
       break
     fi
     calls=$((calls + 1))
+    echo "calls=$calls" > /workspace/spend.out
   done
-  echo "calls=$calls refused=$refused" > /workspace/spend.out
+  if [ "$refused" = no ]; then
+    echo "calls=$calls refused=no" > /workspace/spend.out
+  fi
   if [ "$refused" = yes ]; then
     # Out of budget: wait for the engine to suspend the run, as a real agent would be cut off.
     sleep 600

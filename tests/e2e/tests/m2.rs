@@ -798,10 +798,29 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
             spent, at_share,
             "child {id} is held to its $0.15 plus at most one call ({n} calls)"
         );
+        // What the agent recorded. It asked for 47 calls and writes spend.out after each one, but
+        // a budget tick can stop its sandbox between a call and that write, so the refusal (or
+        // the last call) may be missing. The exact spend above, 24 calls and not 47, already
+        // proves the cut; the file must only agree with it.
+        let progress = env.read_out(&id, "spend.out");
+        let made: usize = progress
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("calls="))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("child {id}: no calls= in spend.out: {progress:?}"));
+        assert!(n < 47, "child {id} made all {n} calls it asked for");
         assert!(
-            env.read_out(&id, "spend.out").contains("refused=yes"),
-            "child {id} was refused a call"
+            !progress.contains("refused=no"),
+            "child {id} made all its calls: {progress}"
         );
+        if progress.contains("refused=yes") {
+            assert_eq!(made, n, "child {id}: {progress}");
+        } else {
+            assert!(
+                made == n || made + 1 == n,
+                "child {id} recorded {made} of its {n} calls: {progress}"
+            );
+        }
         children_spent += spent;
     }
     let events = env.events_now(&root);
