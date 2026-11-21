@@ -11,6 +11,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use kestrel_core::caps::RootKey;
@@ -41,7 +42,16 @@ pub(crate) fn load_or_create_root_key(path: &Path) -> Result<RootKey, Failure> {
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let key = RootKey::generate();
-            match write_new(path, &hex(&key.to_bytes())) {
+            // Written whole to a file of this process first, then linked into place: a link never
+            // replaces a file, so another serve starting at the same moment reads a whole key,
+            // never a half-written one.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let tmp = path.with_file_name(format!("root.key.{}.{n}.tmp", std::process::id()));
+            write_new(&tmp, &hex(&key.to_bytes())).map_err(|e| named(e.to_string()))?;
+            let linked = std::fs::hard_link(&tmp, path);
+            let _ = std::fs::remove_file(&tmp);
+            match linked {
                 Ok(()) => Ok(key),
                 // Another process made it first: use theirs.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => load_or_create_root_key(path),
@@ -215,6 +225,12 @@ mod tests {
         let made = load_or_create_root_key(&path).unwrap();
         let read = load_or_create_root_key(&path).unwrap();
         assert_eq!(made.to_bytes(), read.to_bytes());
+        // Only the key is left: the file it was written to first is gone.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("root.key")]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -234,6 +250,19 @@ mod tests {
         }
         assert!(unhex("").is_none());
         assert_eq!(unhex("0aFf"), Some(vec![0x0a, 0xff]));
+    }
+
+    #[test]
+    fn two_serves_starting_together_end_up_with_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = root_key_path(&dir.path().join("kestrel.db"));
+        let keys: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| load_or_create_root_key(&path).unwrap().to_bytes()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(keys.windows(2).all(|w| w[0] == w[1]));
     }
 
     #[test]
