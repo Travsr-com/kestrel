@@ -56,6 +56,7 @@ fn launch_spec(runtime: Runtime, name: &str) -> LaunchSpec {
         argv: plan.argv,
         env: plan.env,
         workspace: Some("/tmp/.tmpAbC123/data/workspaces/run-1".into()),
+        config: None,
         cpu_millis: 1000,
         memory_mb: 512,
         network: NetworkPolicy::GatewayOnly {

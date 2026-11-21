@@ -4,8 +4,8 @@ use kestrel_types::{AgentSpec, EventKind, Runtime};
 use serde_json::{Value, json};
 
 use crate::{
-    API_KEY_PLACEHOLDER, LaunchPlan, ParsedLine, Result, RunContext, RuntimeAdapter, events,
-    parse_json, plan, str_of,
+    API_KEY_PLACEHOLDER, CONFIG_DIR, LaunchPlan, ParsedLine, PlanFile, Result, RunContext,
+    RuntimeAdapter, Servers, events, parse_json, plan, str_of,
 };
 
 #[derive(Debug, Default)]
@@ -64,13 +64,30 @@ impl RuntimeAdapter for OpenCodeAdapter {
         ];
         // The Anthropic provider appends `/messages`, so its base URL is the run root plus `/v1`.
         let base_url = format!("{}/v1", ctx.gateway_url.as_str().trim_end_matches('/'));
-        let config =
+        let mut config =
             json!({ "providers": { "anthropic": { "settings": { "baseURL": base_url } } } });
+        let servers = Servers::of(spec, ctx);
+        let mut files = Vec::new();
+        // OpenCode has no switch like Claude Code's `--strict-mcp-config`: a cloned repo's own
+        // config can add servers next to these. The sandbox reaches only the gateway, so such a
+        // server gets nowhere outside it.
+        if servers.any() {
+            let entries =
+                servers.entries(|url| json!({ "type": "remote", "url": url, "enabled": true }));
+            config["mcp"] = entries.into();
+        }
+        if let Some(note) = servers.note() {
+            files.push(PlanFile {
+                name: "kestrel.md".into(),
+                contents: note,
+            });
+            config["instructions"] = json!([format!("{CONFIG_DIR}/kestrel.md")]);
+        }
         let env = [
             ("ANTHROPIC_API_KEY", API_KEY_PLACEHOLDER),
             ("OPENCODE_CONFIG_CONTENT", &config.to_string()),
         ];
-        plan(spec, self.runtime(), &argv, &env)
+        plan(spec, self.runtime(), &argv, &env, files)
     }
 
     fn parse_line(&self, line: &str) -> ParsedLine {

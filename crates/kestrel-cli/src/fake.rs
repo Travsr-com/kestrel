@@ -67,6 +67,7 @@ mod tests {
             argv: vec![],
             env: Default::default(),
             workspace: None,
+            config: None,
             cpu_millis: 1000,
             memory_mb: 512,
             network: NetworkPolicy::None,

@@ -199,6 +199,14 @@ pub struct SpawnPolicy {
     pub keep_children: bool,
 }
 
+impl SpawnPolicy {
+    /// Whether a run with this policy can spawn anything: depth left and at least one agent.
+    /// The gateway offers `kestrel.spawn` on the same terms, so the runtime is told the same.
+    pub fn may_spawn(&self) -> bool {
+        self.max_depth >= 1 && !self.agents.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {

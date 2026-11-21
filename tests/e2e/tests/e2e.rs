@@ -242,22 +242,21 @@ impl Env {
     /// Writes an agent file with `budget_usd` and returns its path.
     fn agent(&self, budget_usd: &str) -> PathBuf {
         let path = self.dir.path().join(format!("echo-{budget_usd}.yaml"));
-        let yaml = format!(
-            "name: echo\n\
-             runtime: claude-code\n\
-             role: Echo test agent\n\
-             model_policy:\n  default: tier:cheap\n\
-             capabilities:\n  mcp: [kestrel.join, kestrel.ask_human]\n\
-             sandbox:\n  tier: gvisor\n  image: kestrel-echo-agent:test\n  cpu: \"1\"\n  memory: 512Mi\n  workspace: git-clone\n\
-             budget:\n  usd: \"{budget_usd}\"\n  wall_clock: 10m\n"
-        );
-        std::fs::write(&path, yaml).expect("write agent file");
+        std::fs::write(
+            &path,
+            agent_yaml("echo", budget_usd, "mcp: [kestrel.join, kestrel.ask_human]"),
+        )
+        .expect("write agent file");
         path
     }
 
     /// Submits a run and returns its id.
     fn submit(&self, budget_usd: &str, input: &str) -> String {
-        let agent = self.agent(budget_usd);
+        self.submit_file(&self.agent(budget_usd), input)
+    }
+
+    /// Submits a run of the agent file at `agent` and returns its id.
+    fn submit_file(&self, agent: &Path, input: &str) -> String {
         let agent = agent.to_str().expect("utf-8 path");
         let out = self.ok(&["run", agent, "--input", input, "--json"]);
         let v: Value = serde_json::from_str(out.trim())
@@ -346,6 +345,19 @@ impl Env {
     fn events(&self, id: &str) -> Vec<Value> {
         parse_events(&self.ok(&["watch", id, "--json"]))
     }
+}
+
+/// An echo agent spec named `name` with `budget_usd` and the given `capabilities` body.
+fn agent_yaml(name: &str, budget_usd: &str, capabilities: &str) -> String {
+    format!(
+        "name: {name}\n\
+         runtime: claude-code\n\
+         role: Echo test agent\n\
+         model_policy:\n  default: tier:cheap\n\
+         capabilities: {{ {capabilities} }}\n\
+         sandbox:\n  tier: gvisor\n  image: kestrel-echo-agent:test\n  cpu: \"1\"\n  memory: 512Mi\n  workspace: git-clone\n\
+         budget:\n  usd: \"{budget_usd}\"\n  wall_clock: 10m\n"
+    )
 }
 
 /// `kestrel serve`, SIGKILLed when dropped.
@@ -786,4 +798,56 @@ fn s7_sandbox_reaches_the_kestrel_tools_over_mcp() {
     // A tool call comes back as an event stream through the bridge: no children to wait for.
     assert!(text.contains("event: message"), "{text}");
     assert!(text.contains("\"children\":[]"), "{text}");
+}
+
+// Issue #43, scenario 9: the runtime finds the Kestrel server in the MCP config mounted read-only
+// at /kestrel, and a kestrel.spawn it makes there reaches the gateway under gVisor and starts a
+// child run that completes.
+#[test]
+fn s8_agent_spawns_a_child_through_its_mcp_config() {
+    let env = Env::new();
+    // `kestrel serve` looks spawned agents up by name next to its database.
+    let agents = env.dir.path().join("agents");
+    std::fs::create_dir(&agents).expect("mkdir agents");
+    std::fs::write(
+        agents.join("echo.yaml"),
+        agent_yaml("echo", "1", "mcp: [kestrel.join]"),
+    )
+    .expect("write child agent");
+    let lead = env.dir.path().join("lead.yaml");
+    std::fs::write(
+        &lead,
+        agent_yaml(
+            "lead",
+            "5",
+            "mcp: [kestrel.spawn, kestrel.join], spawn: { max_children: 2, max_depth: 1, agents: [echo] }",
+        ),
+    )
+    .expect("write lead agent");
+    let _serve = env.serve();
+    let id = env.submit_file(&lead, "delegate spawn=1");
+    env.wait_status(&id, "Completed");
+    let text = std::fs::read_to_string(env.workspace(&id).join("spawn.txt"))
+        .unwrap_or_else(|e| panic!("no spawn.txt ({e}): {}", env.dump_events(&id)));
+    assert!(
+        text.contains("allowed=mcp__kestrel__kestrel_spawn,mcp__kestrel__kestrel_join"),
+        "{text}"
+    );
+    assert!(text.contains("config_writable=no"), "{text}");
+    assert!(text.contains("url=ok"), "{text}");
+    assert!(text.contains(r#""name":"kestrel.spawn""#), "{text}");
+
+    let events = env.events(&id);
+    let spawned = events
+        .iter()
+        .find(|e| e["kind"]["kind"] == "child_spawned")
+        .unwrap_or_else(|| panic!("no child_spawned event: {}", env.dump_events(&id)));
+    assert_eq!(spawned["kind"]["agent"], "echo");
+    let child = spawned["kind"]["child"]
+        .as_str()
+        .expect("child run id")
+        .to_string();
+    // The call waited for the child, so its id is in the answer the agent got.
+    assert!(text.contains(&child), "{text}");
+    env.wait_status(&child, "Completed");
 }
