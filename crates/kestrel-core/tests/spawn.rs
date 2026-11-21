@@ -574,6 +574,31 @@ async fn raising_a_queued_child_past_the_parent_is_refused_with_a_log_line() {
     assert_eq!(h.store.limit(child).unwrap(), MicroUsd(DOLLAR / 2));
 }
 
+// A limit that drops at each spawn and comes back at each refund is still the same limit: the
+// warning for it is not written again.
+#[tokio::test(start_paused = true)]
+async fn the_budget_warning_is_not_repeated_when_the_limit_comes_back() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let (lead, session) = running_lead(&mut h, "1").await;
+    let warnings =
+        |h: &Harness| h.count_events(lead, |e| matches!(e, EventKind::BudgetWarning { .. }));
+    h.store
+        .record_model_call(&model_call(lead, 85 * DOLLAR / 100))
+        .unwrap();
+    session.line("msg: one");
+    until("first warning", || warnings(&h) == 1).await;
+    for i in 0..3 {
+        h.driver.script(&[], 0);
+        let child = spawn(&h, lead, Some(DOLLAR / 10)).await.unwrap();
+        until("child completed", || h.is(child, &RunStatus::Completed)).await;
+        session.line(&format!("msg: after child {i}"));
+        settle().await;
+    }
+    assert_eq!(h.store.limit(lead).unwrap(), MicroUsd(DOLLAR));
+    assert_eq!(warnings(&h), 1);
+}
+
 // The 80% warning is once per limit: when a child's refund grows the parent's limit again, the
 // parent is warned again at 80% of the larger limit.
 #[tokio::test(start_paused = true)]

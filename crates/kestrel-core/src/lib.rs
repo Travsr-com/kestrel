@@ -1430,10 +1430,9 @@ struct Actor {
     status: RunStatus,
     adapter: Box<dyn RuntimeAdapter>,
     sandbox: Option<Sandbox>,
-    /// Whether the 80% budget warning was written for the limit in `limit_seen`.
-    warned: bool,
-    /// The limit the last budget check saw. A larger one gets its own warning.
-    limit_seen: MicroUsd,
+    /// The limit the last 80% budget warning was written for. A larger limit gets its own
+    /// warning; the same one (a limit that dropped for a spawn and came back) does not.
+    warned_at: Option<MicroUsd>,
     clock: WallClock,
     cmds: mpsc::UnboundedReceiver<ControlCommand>,
 }
@@ -1450,7 +1449,6 @@ impl Actor {
     ) -> Actor {
         let adapter = (inner.adapters)(spec.runtime);
         let mut clock = WallClock::new(spec.budget.wall_clock);
-        let limit_seen = spec.budget.limit;
         if status == RunStatus::Provisioning {
             clock.run();
         }
@@ -1463,8 +1461,7 @@ impl Actor {
             status,
             adapter,
             sandbox: None,
-            warned: false,
-            limit_seen,
+            warned_at: None,
             clock,
             cmds,
         }
@@ -1817,9 +1814,8 @@ impl Actor {
                 match self.inner.store.set_budget(self.id, limit) {
                     Ok(set) => {
                         self.spec.budget.limit = set;
-                        // One warning per limit.
-                        self.warned = false;
-                        self.limit_seen = set;
+                        // A limit a human set gets its own warning.
+                        self.warned_at = None;
                     }
                     Err(StoreError::ParentBudget { asked, remaining }) => {
                         self.log(&budget_refused(asked, remaining))?;
@@ -1886,18 +1882,20 @@ impl Actor {
         // Read from the store, not the spec this actor started with: spawning a child lowers the
         // limit, and a finished child's unspent budget raises it again.
         let limit = self.inner.store.limit(self.id)?;
-        if limit > self.limit_seen {
-            self.warned = false;
-        }
-        self.limit_seen = limit;
         // A parent with children still going may have handed out all of its own budget: it cannot
-        // spend (the gateway refuses it at its limit), but it stays up to wait for them.
-        if spent >= limit && self.inner.store.live_children(self.id)? == 0 {
+        // spend (the gateway refuses it at its limit), but it stays up to wait for them. With none
+        // left, read the limit again: the last child's refund commits with its end, so a child that
+        // ended after the first read has already given its budget back.
+        if spent >= limit
+            && self.inner.store.live_children(self.id)? == 0
+            && spent >= self.inner.store.limit(self.id)?
+        {
             self.set(RunStatus::Suspended(SuspendReason::Budget))?;
             return Ok(Next::Stop);
         }
-        if !self.warned && i128::from(spent.0) * 5 >= i128::from(limit.0) * 4 {
-            self.warned = true;
+        let new_limit = self.warned_at.is_none_or(|at| limit > at);
+        if new_limit && i128::from(spent.0) * 5 >= i128::from(limit.0) * 4 {
+            self.warned_at = Some(limit);
             self.inner
                 .store
                 .append(self.id, EventKind::BudgetWarning { spent, limit })?;
