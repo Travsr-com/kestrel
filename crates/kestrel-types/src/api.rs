@@ -52,8 +52,8 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Rejected,
-    /// Never decided, and its run no longer waits on it (the run was cancelled or failed), so it
-    /// can no longer be decided.
+    /// Undecided, and its run is not waiting on it (the run ended, or it waits on another
+    /// approval), so it cannot be decided now.
     Expired,
 }
 

@@ -27,8 +27,9 @@ kestrel up --no-open  # the same, without opening a browser
   path that is not under `/api` or `/ws` and has no file extension gets the UI's `index.html`.
   Unknown `/api` and `/ws` paths get a JSON `404`.
 
-The examples set the token once. The file is next to the database: `~/.local/share/kestrel/` on
-Linux, `~/Library/Application Support/kestrel/` on macOS, or the folder of `--db`.
+The examples set the token once. The file is next to the database: `$XDG_DATA_HOME/kestrel/` when
+that is set, else `~/.local/share/kestrel/` on Linux and `~/Library/Application Support/kestrel/`
+on macOS, or the folder of `--db`.
 
 ```sh
 export T=$(cat ~/.local/share/kestrel/server.token)
@@ -79,7 +80,7 @@ curl -X POST -H "Authorization: Bearer $T" -d '{"text":"also fix the docs"}' "$K
 
 | Route | What it does |
 | :--- | :--- |
-| `GET /api/approvals?status=pending` | Approvals in request order. `status` is `pending`, `approved`, `rejected` or `expired` (never decided, and its run ended without it); leave it out for all. |
+| `GET /api/approvals?status=pending` | Approvals in request order. `status` is `pending`, `approved`, `rejected` or `expired` (undecided, and its run is not waiting on it, so it cannot be decided now); leave it out for all. |
 | `POST /api/approvals/{id}/approve` | Approves. Optional body `{"payload": "<edited action>"}` for "edit and approve"; it is stored on the `approval_resolved` event. |
 | `POST /api/approvals/{id}/reject` | Rejects. Optional body `{"reason": "..."}`, stored on the event and in the run's failure message. |
 
