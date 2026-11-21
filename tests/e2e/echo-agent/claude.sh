@@ -12,7 +12,8 @@
 #   git.txt      only when the input contains `git=1` (scenario 6): the agent commits inside its
 #                git clone and records `branch=`, `status_rc=`, `add_rc=`, `commit_rc=` and `log=`
 #   mcp.txt      only when the input contains `mcp=1` (issue #42): the answers to an MCP
-#                `initialize` and `tools/list` at the gateway's /r/<token>/mcp, one per line
+#                `initialize`, `tools/list` and a `tools/call` of kestrel.join (as an event
+#                stream) at the gateway's /r/<token>/mcp
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
@@ -79,6 +80,8 @@ case "$input" in
       mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"echo-agent","version":"1"}}}'
       echo
       mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+      echo
+      mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}'
       echo
     } > /workspace/mcp.txt 2>&1
     ;;

@@ -783,4 +783,7 @@ fn s7_sandbox_reaches_the_kestrel_tools_over_mcp() {
     assert!(text.contains("kestrel.ask_human"), "{text}");
     // Spawn is not in the capability, so it is not offered.
     assert!(!text.contains("kestrel.spawn"), "{text}");
+    // A tool call comes back as an event stream through the bridge: no children to wait for.
+    assert!(text.contains("event: message"), "{text}");
+    assert!(text.contains("\"children\":[]"), "{text}");
 }
