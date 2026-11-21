@@ -154,6 +154,7 @@ async fn clone_at_copies_the_source_and_checks_out_the_commit_detached() {
     let repo = dir.path().join("repo");
     let git = FakeGit::new(0, "");
     clone_at(git.as_ref(), &repo, SHA, &dest).await.unwrap();
+    let hooks = format!("core.hooksPath={}", text(&dest.join(".git").join("hooks")));
     let (repo, dest) = (text(&repo), text(&dest));
     assert_eq!(
         git.argvs(),
@@ -166,6 +167,10 @@ async fn clone_at_copies_the_source_and_checks_out_the_commit_detached() {
                 "--no-checkout",
                 "--config",
                 "core.symlinks=false",
+                "--config",
+                &hooks,
+                "--config",
+                "core.fsmonitor=false",
                 "--",
                 &repo,
                 &dest,
@@ -391,4 +396,13 @@ async fn committed_links_are_plain_files_in_the_copy_so_nothing_is_written_throu
         !values.is_empty() && values.lines().all(|v| v == "false"),
         "{values}"
     );
+    // Hooks a later git call finds (Travsr installs some) are the copy's own, never a global
+    // core.hooksPath shared with the operator's other repos.
+    let hooks = git(&copy, &["config", "--local", "--get", "core.hooksPath"]);
+    assert_eq!(
+        std::path::Path::new(hooks.trim()),
+        copy.join(".git").join("hooks")
+    );
+    let fsmonitor = git(&copy, &["config", "--local", "--get", "core.fsmonitor"]);
+    assert_eq!(fsmonitor.trim(), "false");
 }

@@ -139,12 +139,14 @@ agent cannot write.
   `CI=1`, `TRAVSR_SKIP_DOWNLOAD=1` and `TRAVSR_DISABLE_REGISTRY=1`, and `init` gets `--no-connect`.
   Travsr starts its background daemon only without `CI`, both in `init` and in `mcp`, so none is
   ever left running. The git hooks `init` installs go where git says the copy's hooks are
-  (`git rev-parse --git-path hooks`), its own `.git/hooks`: the clone made `.git`, and the
-  commit cannot hold it. Its `.gitignore` and `.travsrignore` writes stay in the copy,
-  as it holds no links (see above).
-* **A minimal environment.** Travsr gets `PATH`, `HOME`, the user and locale, temp and XDG
-  directories (and their Windows equivalents), `TRAVSR_BIN_DIR` and `TRAVSR_LANG_TOML`. Never a
-  run token, a provider key, or any other `TRAVSR_*` variable.
+  (`git rev-parse --git-path hooks`). The copy's own config sets `core.hooksPath` to its own
+  `.git/hooks` (and `core.fsmonitor=false`), so a global `core.hooksPath` of the operator's
+  never sends them to a hooks directory shared with other repos. Its `.gitignore` and
+  `.travsrignore` writes stay in the copy, as it holds no links (see above).
+* **A minimal environment.** Travsr gets the absolute entries of `PATH` (a relative one would be
+  looked up in the copy), `HOME`, the user and locale, temp and XDG directories (and their
+  Windows equivalents), `TRAVSR_BIN_DIR` and `TRAVSR_LANG_TOML`. Never a run token, a provider
+  key, or any other `TRAVSR_*` variable.
 * **Code Travsr may run.** Travsr's language pass may run build tooling of the indexed code (for
   Rust, `build.rs` and proc macros), and without bubblewrap it grants Rust that unsandboxed. It runs
   on the copy: the operator's source repo at the commit the run started from. Kestrel never
@@ -183,7 +185,10 @@ Known limits on Kestrel's side:
 * The private directories are made owner-only on Unix only. On Windows they keep the data
   directory's permissions.
 * On Windows, a timed-out `init` is killed, but helpers it started may keep running.
-* A helper that `init` leaves running when it ends by itself is not killed, on any platform.
+* A helper that `init` leaves running when it ends by itself is not killed, on any platform, and
+  forgetting the run could delete the copy under it. Today's Travsr leaves none with `CI=1`.
+  Killing the group without reaping the leader first (`waitid` with `NOWAIT`) would close this,
+  and the id-reuse window after a failed pipe read with it.
 * With no `[travsr]` section, a spec that grants `travsr.*` tools still gets a `travsr` server
   entry in its MCP config, which answers 404.
 

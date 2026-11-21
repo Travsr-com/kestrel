@@ -123,6 +123,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const NOT_STARTED: &str =
     "Travsr's server for this run could not be started; Kestrel's log on the host says why";
 
+/// The absolute entries of `path`, in order: Travsr runs with the copy as its working directory,
+/// so a relative entry (`.`, an empty one, `bin`) could run a file committed in the source.
+/// `None` when no entry is absolute.
+fn absolute_path_entries(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|p| p.is_absolute())
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    std::env::join_paths(kept).ok()
+}
+
 /// Whether Kestrel's variable `name` is passed to Travsr. Windows names are not case sensitive
 /// (`SystemRoot` may be `SYSTEMROOT`), Unix ones are.
 fn passed(name: &str) -> bool {
@@ -461,9 +474,13 @@ impl TravsrProcesses {
         cmd.args(args)
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(passed)))
+            .env_remove("PATH")
             .envs(SET_ENV.iter().copied())
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(path) = std::env::var_os("PATH").and_then(|p| absolute_path_entries(&p)) {
+            cmd.env("PATH", path);
+        }
         Ok(cmd)
     }
 
@@ -849,6 +866,27 @@ mod tests {
         assert_eq!(d.index_timeout, Duration::from_secs(300));
         assert_eq!(d.call_timeout, Duration::from_secs(30));
         assert_eq!(d.max_indexing, 2);
+    }
+
+    // Travsr's own children (git among them) are looked up on the PATH it gets, with the copy as
+    // working directory, so a relative entry could run a file committed in the source.
+    #[test]
+    fn travsr_gets_only_the_absolute_path_entries() {
+        let abs = std::env::temp_dir();
+        let other = abs.join("bin");
+        let path = std::env::join_paths([
+            abs.clone(),
+            PathBuf::from("."),
+            PathBuf::from(""),
+            PathBuf::from("rel/dir"),
+            other.clone(),
+        ])
+        .unwrap();
+        let kept: Vec<PathBuf> =
+            std::env::split_paths(&absolute_path_entries(&path).unwrap()).collect();
+        assert_eq!(kept, [abs, other]);
+        let none = std::env::join_paths([PathBuf::from("."), PathBuf::from("rel")]).unwrap();
+        assert_eq!(absolute_path_entries(&none), None);
     }
 
     #[test]

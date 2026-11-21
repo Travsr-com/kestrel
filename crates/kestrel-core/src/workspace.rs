@@ -355,6 +355,13 @@ pub async fn clone_at(
         repo: repo.to_path_buf(),
     })?;
     let dest_text = dest.to_string_lossy();
+    // Kept in the copy's own config, so it wins over the operator's global settings for every
+    // later git call there: Travsr installs hooks wherever `core.hooksPath` points, and a global
+    // one would put them in a hooks directory the operator shares with their other repos.
+    let hooks = format!(
+        "core.hooksPath={}",
+        dest.join(".git").join("hooks").to_string_lossy()
+    );
     let clone = argv(&[
         "git",
         "clone",
@@ -363,6 +370,10 @@ pub async fn clone_at(
         "--no-checkout",
         "--config",
         "core.symlinks=false",
+        "--config",
+        &hooks,
+        "--config",
+        "core.fsmonitor=false",
         "--",
         repo_text,
         &dest_text,
