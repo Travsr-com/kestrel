@@ -11,8 +11,10 @@
 //! [`caps`] holds the capability grant a run carries and the signed tokens that narrow it per child.
 
 pub mod caps;
+mod join;
 mod slots;
 pub mod workspace;
+pub use join::{ChildResult, JoinError, JoinMode, JoinOutcome};
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -35,7 +37,7 @@ use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
     SuspendReason, Tier, WorkspaceSpec,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, Interval, MissedTickBehavior, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -114,6 +116,9 @@ pub enum SpawnError {
     Depth,
     #[error("the parent may not spawn agent `{0}`")]
     AgentNotAllowed(String),
+    /// The parent is being cancelled: it may not add to its tree.
+    #[error("run {0} is being cancelled")]
+    Cancelling(RunId),
     #[error("the parent already has {0} children (max_children)")]
     TooManyChildren(u32),
     #[error("the tree already has {0} runs, the most one tree may have")]
@@ -205,7 +210,10 @@ fn budget_refused(asked: MicroUsd, remaining: MicroUsd) -> String {
 }
 
 /// `spec.capabilities` for a grant.
-fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
+fn granted_capabilities(
+    cap: &caps::Capability,
+    keep_children: bool,
+) -> kestrel_types::Capabilities {
     kestrel_types::Capabilities {
         mcp: cap.tools.iter().cloned().collect(),
         network: cap.hosts.iter().cloned().collect(),
@@ -214,6 +222,7 @@ fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
             max_children: s.max_children,
             max_depth: s.max_depth,
             agents: s.agents.iter().cloned().collect(),
+            keep_children,
         }),
     }
 }
@@ -410,6 +419,12 @@ struct Inner {
     tree_limit: u32,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
     live: Mutex<Live>,
+    /// Parents leaving a join that wait for their slot back, picked up by the scheduler.
+    rejoins: Mutex<Vec<(RunId, Rejoin)>>,
+    /// Joins waiting, by parent, and whether the first one gave the parent's slot back.
+    joins: Mutex<HashMap<RunId, JoinState>>,
+    /// Runs a cancel was asked for, until it is delivered. `spawn_child` refuses them.
+    cancelling: Mutex<HashSet<RunId>>,
     /// Signals a change of `live`.
     changed: Notify,
 }
@@ -441,15 +456,51 @@ struct Scheduler {
     tasks: JoinSet<()>,
     /// Everything waiting for a slot, in arrival order (the front is served first).
     waiting: VecDeque<Waiter>,
+    /// Cancels held back. Each is delivered once nothing live is below its run, so a tree is
+    /// cancelled from the leaves up whatever the order here.
+    pending_cancels: Vec<RunId>,
+    /// Set by `run_forever`: when the scheduler goes (the loop ended, or its future was
+    /// dropped), the held-back cancels go back into the store for the next start.
+    requeue: Option<Arc<Inner>>,
 }
 
-/// A queued run, or a resume command that needs a slot.
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if let Some(inner) = &self.requeue {
+            inner.requeue_cancels(&self.pending_cancels);
+        }
+    }
+}
+
+/// A queued run, a resume command that needs a slot, or a parent leaving a join.
 struct Waiter {
     run: RunId,
     /// `None` for a `Queued` run to start.
     resume: Option<ControlCommand>,
     /// Whether the run was told it waits for a network block, so it is told once per wait.
     told: bool,
+    /// A parent that gave its slot back for a join and wants it again.
+    rejoin: Option<Rejoin>,
+}
+
+/// How a parent leaving a join waits for its slot.
+enum Rejoin {
+    /// The join waits: told once the slot is back. Dropped unanswered if the join went away.
+    Told(oneshot::Sender<()>),
+    /// Nobody waits (the join was dropped or timed out): the slot is simply taken back.
+    Detached,
+}
+
+/// The joins of one parent that are waiting.
+#[derive(Default)]
+struct JoinState {
+    waiting: usize,
+    /// Whether the first join gave the parent's slot back, so the last one takes it again.
+    released: bool,
+    /// The last join left and the slot is on its way back. A join that starts now takes that
+    /// over (it will take the slot back when it ends), and the scheduler grants no slot to a
+    /// parent while one of its joins waits.
+    regaining: bool,
 }
 
 impl Waiter {
@@ -502,6 +553,9 @@ impl Engine {
                 root_key: None,
                 tree_limit: DEFAULT_TREE_LIMIT,
                 live: Mutex::default(),
+                rejoins: Mutex::default(),
+                joins: Mutex::default(),
+                cancelling: Mutex::default(),
                 changed: Notify::new(),
             }),
         }
@@ -607,6 +661,9 @@ impl Engine {
         let parent_spec = store
             .run_spec(parent)?
             .ok_or(SpawnError::ParentNotFound(parent))?;
+        if inner.is_cancelling(parent) {
+            return Err(SpawnError::Cancelling(parent));
+        }
         let now = time::OffsetDateTime::now_utc();
         let token = self.token_of(&row, &parent_spec, key, now)?;
         let public = key.public();
@@ -620,7 +677,15 @@ impl Engine {
         let (narrowed, dropped) = caps::narrow(&held, &wanted);
         // The stored spec says only what the child was granted, so nothing that reads it later
         // can see more than its token holds.
-        spec.capabilities = granted_capabilities(&narrowed);
+        // A child keeps its children only if its parent keeps its own.
+        let keeps = |s: &AgentSpec| {
+            s.capabilities
+                .spawn
+                .as_ref()
+                .is_some_and(|p| p.keep_children)
+        };
+        let keep = keeps(&spec) && keeps(&parent_spec);
+        spec.capabilities = granted_capabilities(&narrowed, keep);
         let mut child_events = Vec::new();
         if !dropped.is_empty() {
             child_events.push(EventKind::CapabilitiesDropped {
@@ -679,6 +744,17 @@ impl Engine {
         Ok(token)
     }
 
+    /// How many concurrency slots are held right now. For diagnostics and tests.
+    pub fn slots_in_use(&self) -> usize {
+        self.inner.slots().used()
+    }
+
+    /// Whether `run` holds a concurrency slot right now (a parent in a join holds none). For
+    /// diagnostics and tests.
+    pub fn holds_slot(&self, run: RunId) -> bool {
+        self.inner.slots().holds(run)
+    }
+
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
     /// engine on the same database can resume the run.
     pub async fn submit(&self, spec: AgentSpec, input: String) -> Result<RunId> {
@@ -707,14 +783,21 @@ impl Engine {
         let _active = self.inner.activate(&stop)?;
         // Dropping the scheduler on return aborts every run actor, before `_active` resets slots.
         let mut scheduler = Scheduler::default();
+        scheduler.requeue = Some(self.inner.clone());
         let mut tick = self.inner.ticker();
-        loop {
+        let result = loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
-                _ = stop.cancelled() => return Ok(()),
-                _ = tick.tick() => self.inner.poll(&mut scheduler)?,
+                _ = shutdown.cancelled() => break Ok(()),
+                _ = stop.cancelled() => break Ok(()),
+                _ = tick.tick() => {
+                    if let Err(e) = self.inner.poll(&mut scheduler) {
+                        break Err(e);
+                    }
+                }
             }
-        }
+        };
+        // Dropping the scheduler puts a cancel still held back into the store again.
+        result
     }
 
     /// Stops `run_forever` and destroys every sandbox this engine created and has not destroyed,
@@ -836,6 +919,19 @@ impl Inner {
         live.active = Some(stop.clone());
         drop(live);
         self.reset_slots();
+        // Every slot is free again, so no parent is owed one: a request from before is stale (it
+        // could hand a slot to a run whose sandbox the restart removed).
+        self.rejoins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        joins.retain(|_, j| j.waiting > 0);
+        for j in joins.values_mut() {
+            j.released = false;
+            j.regaining = false;
+        }
+        drop(joins);
         Ok(Active(self))
     }
 
@@ -1056,9 +1152,210 @@ impl Inner {
                 let _ = self.store.append(run, EventKind::AgentLog { line });
             }
         }
+        self.cancel_ready(s, &mut resumes)?;
         self.line_up_queued(s)?;
         s.waiting.extend(resumes);
+        for (run, rejoin) in self.take_rejoins() {
+            s.waiting.push_back(Waiter {
+                run,
+                resume: None,
+                told: false,
+                rejoin: Some(rejoin),
+            });
+        }
         self.grant(s)
+    }
+
+    /// Asks for a cancel of `run` and of every live run below it. Each run's cancel is held back
+    /// until its children have ended, so a tree is cancelled from the leaves up and every child's
+    /// `Cancelled` is committed before its parent's.
+    fn cancel_tree(self: &Arc<Self>, run: RunId, s: &mut Scheduler) -> Result<()> {
+        if self.is_cancelling(run) {
+            return Ok(());
+        }
+        // Read first, and hold the cancel back before going down: a store error on the way leaves
+        // the run held back (`cancel_ready` looks below it again), never just marked.
+        let below = self.live_below(run)?;
+        self.cancelling_insert(run);
+        s.pending_cancels.push(run);
+        for run_below in below {
+            self.cancel_tree(run_below, s)?;
+        }
+        Ok(())
+    }
+
+    /// Delivers the held-back cancels whose runs have no live child left. A child spawned since
+    /// the cancel was asked for is cancelled too.
+    fn cancel_ready(self: &Arc<Self>, s: &mut Scheduler, resumes: &mut Vec<Waiter>) -> Result<()> {
+        let mut i = 0;
+        while let Some(&run) = s.pending_cancels.get(i) {
+            let live = self.live_below(run)?;
+            for below in &live {
+                self.cancel_tree(*below, s)?;
+            }
+            if !live.is_empty() {
+                i += 1;
+                continue;
+            }
+            s.pending_cancels.remove(i);
+            self.cancelling_remove(run);
+            s.waiting.retain(|w| !w.is_resume_of(run));
+            resumes.retain(|w| !w.is_resume_of(run));
+            if let Err(e) = self.deliver(run, ControlCommand::Cancel, s) {
+                let line = format!("kestrel: command Cancel failed: {e}");
+                let _ = self.store.append(run, EventKind::AgentLog { line });
+            }
+        }
+        Ok(())
+    }
+
+    /// The nearest runs below `run` that have not ended: its live children, and below a child
+    /// that ended (it may have kept its children), that child's nearest live runs.
+    fn live_below(&self, run: RunId) -> Result<Vec<RunId>> {
+        let mut live = Vec::new();
+        let mut look = vec![run];
+        while let Some(r) = look.pop() {
+            for child in self.store.children(r)? {
+                if child.status.is_terminal() {
+                    look.push(child.id);
+                } else {
+                    live.push(child.id);
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    fn cancelling(&self) -> MutexGuard<'_, HashSet<RunId>> {
+        self.cancelling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cancelling_insert(&self, run: RunId) -> bool {
+        self.cancelling().insert(run)
+    }
+
+    fn cancelling_remove(&self, run: RunId) {
+        self.cancelling().remove(&run);
+    }
+
+    fn is_cancelling(&self, run: RunId) -> bool {
+        self.cancelling().contains(&run)
+    }
+
+    /// Puts held-back cancels back into the store when the scheduler stops.
+    fn requeue_cancels(&self, pending: &[RunId]) {
+        for run in pending {
+            self.cancelling_remove(*run);
+            let _ = self.store.push_control(*run, ControlCommand::Cancel);
+        }
+    }
+
+    /// A join of `parent` starts waiting. The first one gives the parent's slot back.
+    fn enter_join(&self, parent: RunId) {
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = joins.entry(parent).or_default();
+        state.waiting += 1;
+        if state.waiting == 1 {
+            if state.regaining {
+                // The slot is still on its way back from an earlier join: this one takes it back.
+                state.regaining = false;
+                state.released = true;
+            } else {
+                state.released = self.slots().release(parent);
+            }
+        }
+    }
+
+    /// A join of `parent` stops waiting. True when it was the last one and the first gave the
+    /// slot back, so the slot is to be taken again.
+    fn leave_join(&self, parent: RunId) -> bool {
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(state) = joins.get_mut(&parent) else {
+            return false;
+        };
+        state.waiting = state.waiting.saturating_sub(1);
+        if state.waiting > 0 {
+            return false;
+        }
+        if state.released {
+            // Kept until the slot is back, so a join that starts meanwhile knows.
+            state.released = false;
+            state.regaining = true;
+            return true;
+        }
+        joins.remove(&parent);
+        false
+    }
+
+    /// Lines `run` up for its slot back after a join.
+    fn rejoin(&self, run: RunId, rejoin: Rejoin) {
+        self.rejoins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((run, rejoin));
+    }
+
+    fn take_rejoins(&self) -> Vec<(RunId, Rejoin)> {
+        std::mem::take(&mut *self.rejoins.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Gives the waiter at `i`, a parent leaving a join, its slot back. False when no slot is
+    /// free (nobody behind it can go either). A parent whose sandbox no longer runs (it ended, or
+    /// was paused or suspended for budget) leaves the line with nothing; so does a told waiter
+    /// whose join went away (it left a detached one instead). A parent waiting on an approval
+    /// keeps its sandbox, so it gets its slot like a running one.
+    fn grant_rejoin(&self, i: usize, s: &mut Scheduler) -> Result<bool> {
+        let Some(w) = s.waiting.get(i) else {
+            return Ok(true);
+        };
+        let run = w.run;
+        let wanted = match &w.rejoin {
+            Some(Rejoin::Told(tx)) => !tx.is_closed(),
+            Some(Rejoin::Detached) => true,
+            None => false,
+        };
+        let running = self.store.get_run(run)?.is_some_and(|r| {
+            matches!(
+                r.status,
+                RunStatus::Running
+                    | RunStatus::Provisioning
+                    | RunStatus::Suspended(SuspendReason::Approval(_))
+            )
+        });
+        // Joins before slots, the order `enter_join` takes them in.
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        // A join of this parent waits again: it takes the slot back itself when it ends.
+        let joining = joins.get(&run).is_some_and(|j| j.waiting > 0);
+        if !(wanted && running) || joining {
+            s.waiting.remove(i);
+            if !running && !joining {
+                joins.remove(&run);
+            }
+            return Ok(true);
+        }
+        if !self.slots().reacquire(run) {
+            return Ok(false);
+        }
+        // The joins lock is still held, so no join can start until the state below is settled.
+        let handed = match s.waiting.remove(i) {
+            Some(Waiter {
+                rejoin: Some(Rejoin::Told(tx)),
+                ..
+            }) => tx.send(()).is_ok(),
+            _ => true,
+        };
+        if handed {
+            // The slot is back: nothing is on its way any more.
+            joins.remove(&run);
+        } else {
+            // The join went away just now. The slot is still owed: its detached waiter, or a join
+            // that starts meanwhile, takes it back.
+            self.slots().release(run);
+            joins.entry(run).or_default().regaining = true;
+        }
+        Ok(true)
     }
 
     /// Delivers `cmd` now, or, when it resumes a run that holds no slot, adds it to `resumes`.
@@ -1072,6 +1369,8 @@ impl Inner {
         if matches!(cmd, ControlCommand::Cancel) {
             s.waiting.retain(|w| !w.is_resume_of(run));
             resumes.retain(|w| !w.is_resume_of(run));
+            // Children first: the run's own cancel goes out once its subtree has ended.
+            return self.cancel_tree(run, s);
         }
         let needs_slot = cmd == ControlCommand::Resume || cmd.approves();
         if needs_slot && !self.slots().holds(run) && self.is_suspended(run)? {
@@ -1093,6 +1392,7 @@ impl Inner {
                     run,
                     resume: Some(cmd),
                     told: false,
+                    rejoin: None,
                 });
             }
             return Ok(());
@@ -1111,7 +1411,7 @@ impl Inner {
         let known: HashSet<RunId> = s
             .waiting
             .iter()
-            .filter(|w| w.resume.is_none())
+            .filter(|w| w.resume.is_none() && w.rejoin.is_none())
             .map(|w| w.run)
             .collect();
         let queued = self.store.list_runs(RunFilter {
@@ -1123,6 +1423,7 @@ impl Inner {
                 run: run.id,
                 resume: None,
                 told: false,
+                rejoin: None,
             });
         }
         Ok(())
@@ -1138,6 +1439,12 @@ impl Inner {
         let mut i = 0;
         let mut starved = false;
         while let Some(waiter) = s.waiting.get_mut(i) {
+            if waiter.rejoin.is_some() {
+                if self.grant_rejoin(i, s)? {
+                    continue;
+                }
+                break;
+            }
             let (run, resume) = (waiter.run, waiter.resume.is_some());
             let needs_block = self.needs_block(run);
             if starved && needs_block {
@@ -1475,6 +1782,8 @@ impl Actor {
             // Nothing more to do if the store refuses this too.
             let _ = self.set(RunStatus::Failed(self.scrub(&e.to_string())));
         }
+        // However the run ended, it leaves no child behind (a no-op when they ended already).
+        let _ = self.reap_children().await;
         if let Some(sb) = self.sandbox.take() {
             let _ = self.inner.destroy_tracked(sb.driver, &sb.handle).await;
         }
@@ -1484,6 +1793,42 @@ impl Actor {
         }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
+    }
+
+    /// Cancels the children still going and waits until they have ended, unless the spec says to
+    /// keep them (`spawn.keep_children`).
+    async fn reap_children(&mut self) -> Result<()> {
+        let keep = self
+            .spec
+            .capabilities
+            .spawn
+            .as_ref()
+            .is_some_and(|s| s.keep_children);
+        if keep {
+            return Ok(());
+        }
+        let live = self.inner.live_below(self.id)?;
+        if live.is_empty() {
+            return Ok(());
+        }
+        self.log(&format!(
+            "kestrel: cancelling {} child run(s) still going",
+            live.len()
+        ))?;
+        for child in live {
+            self.inner
+                .store
+                .push_control(child, ControlCommand::Cancel)?;
+        }
+        let period = self
+            .inner
+            .limits
+            .poll_interval
+            .max(Duration::from_millis(1));
+        while !self.inner.live_below(self.id)?.is_empty() {
+            tokio::time::sleep(period).await;
+        }
+        Ok(())
     }
 
     /// Whether the run's sandbox is running or being provisioned, which is what a slot pays for.
@@ -1741,6 +2086,9 @@ impl Actor {
                     None => {
                         // Output read to the end: the exit code is final.
                         let exit = driver.wait(&sb.handle).await?;
+                        // No orphans: children still going are cancelled first, so the run's
+                        // `RunFinished` comes after theirs.
+                        self.reap_children().await?;
                         return self.finish(finished, exit.code);
                     }
                 },

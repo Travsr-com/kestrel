@@ -193,6 +193,10 @@ pub struct SpawnPolicy {
     pub max_depth: u32,
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Leave children running when this run ends. By default a run that ends cancels the
+    /// children it still has, so none is left behind.
+    #[serde(default)]
+    pub keep_children: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
