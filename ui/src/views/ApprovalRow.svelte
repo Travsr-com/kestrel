@@ -48,13 +48,17 @@
   const long = $derived(approval.action.length > PREVIEW);
   const shown = $derived(long && !expanded ? `${approval.action.slice(0, PREVIEW)}...` : approval.action);
 
-  async function decide(kind: 'approve' | 'reject' | 'answer', call: () => Promise<void>) {
+  /**
+   * Sends a decision. `again` is what Retry runs: by default the same call (which reads the fields
+   * when it runs), or a submit that checks the fields first. On success the row keeps its form and
+   * label ("Rejecting", "Approving") until the resolved event takes it away.
+   */
+  async function decide(kind: 'approve' | 'reject' | 'answer', call: () => Promise<void>, again?: () => void) {
     sending = kind;
     error = null;
-    retry = () => void decide(kind, call);
+    retry = again ?? (() => void decide(kind, call));
     try {
       await call();
-      mode = 'idle';
     } catch (e) {
       sending = null;
       if (e instanceof ApiFailure && e.status === 409) {
@@ -76,11 +80,6 @@
     void decide('reject', () => api.reject(id, reason.trim() === '' ? undefined : reason.trim()));
   }
 
-  function startEdit() {
-    edited = approval.action;
-    mode = 'editing';
-  }
-
   function approveEdited(e: SubmitEvent) {
     e.preventDefault();
     void decide('approve', () => api.approve(id, edited));
@@ -88,17 +87,62 @@
 
   function sendAnswer(e: SubmitEvent) {
     e.preventDefault();
+    submitAnswer();
+  }
+
+  /** Also what Retry runs, so a cleared answer is not sent either. */
+  function submitAnswer() {
     const text = answer.trim();
     if (text === '') {
+      error = null;
       answerError = 'Write an answer first.';
       return;
     }
     answerError = null;
-    void decide('answer', () => api.approve(id, answer.trim()));
+    void decide('answer', () => api.approve(id, text), submitAnswer);
   }
+
+  // Focus follows the row's own changes: an opened form's field, the button that opened it after
+  // Cancel, and Dismiss (or the first button) when the buttons that had focus went away.
+  let item: HTMLLIElement | undefined = $state();
+  let reasonInput: HTMLInputElement | undefined = $state();
+  let editBox: HTMLTextAreaElement | undefined = $state();
+  let rejectButton: HTMLButtonElement | undefined = $state();
+  let editButton: HTMLButtonElement | undefined = $state();
+  let focusNext: 'reason' | 'edit' | 'reject' | 'editButton' | null = null;
+  let hadFocus = false;
+
+  function open(next: 'rejecting' | 'editing') {
+    if (next === 'editing') edited = approval.action;
+    focusNext = next === 'rejecting' ? 'reason' : 'edit';
+    mode = next;
+  }
+
+  function cancel() {
+    focusNext = mode === 'rejecting' ? 'reject' : 'editButton';
+    mode = 'idle';
+  }
+
+  $effect.pre(() => {
+    void mode;
+    void row.ended;
+    hadFocus = item?.contains(document.activeElement) ?? false;
+  });
+  $effect(() => {
+    void mode;
+    void row.ended;
+    const target = { reason: reasonInput, edit: editBox, reject: rejectButton, editButton }[focusNext ?? 'reject'];
+    if (focusNext !== null) {
+      focusNext = null;
+      target?.focus();
+      return;
+    }
+    if (hadFocus && !item?.contains(document.activeElement)) item?.querySelector<HTMLElement>('.buttons button')?.focus();
+    hadFocus = false;
+  });
 </script>
 
-<li class="row" data-id={id}>
+<li class="row" data-id={id} bind:this={item}>
   <p class="who" id="who-{id}">
     <strong>{run?.agent ?? 'agent not known yet'}</strong>
     <a href={href({ name: 'run', id: approval.run_id })} title={approval.run_id}>Run {short(approval.run_id)}</a>
@@ -125,19 +169,19 @@
   {:else if mode === 'rejecting'}
     <form class="stack" onsubmit={confirmReject}>
       <label for="reason-{id}">Reason (optional)</label>
-      <input id="reason-{id}" autocomplete="off" bind:value={reason} disabled={sending !== null} />
+      <input id="reason-{id}" autocomplete="off" bind:value={reason} bind:this={reasonInput} disabled={sending !== null} />
       <div class="buttons">
         <button type="submit" disabled={sending !== null}>{sending === 'reject' ? 'Rejecting' : 'Confirm reject'}</button>
-        <button type="button" disabled={sending !== null} onclick={() => (mode = 'idle')}>Cancel</button>
+        <button type="button" disabled={sending !== null} onclick={cancel}>Cancel</button>
       </div>
     </form>
   {:else if mode === 'editing'}
     <form class="stack" onsubmit={approveEdited}>
       <label for="edit-{id}">Edited action</label>
-      <textarea id="edit-{id}" rows="4" bind:value={edited} disabled={sending !== null}></textarea>
+      <textarea id="edit-{id}" rows="4" bind:value={edited} bind:this={editBox} disabled={sending !== null}></textarea>
       <div class="buttons">
         <button type="submit" disabled={sending !== null}>{sending === 'approve' ? 'Approving' : 'Approve edited'}</button>
-        <button type="button" disabled={sending !== null} onclick={() => (mode = 'idle')}>Cancel</button>
+        <button type="button" disabled={sending !== null} onclick={cancel}>Cancel</button>
       </div>
     </form>
   {:else if approval.question}
@@ -151,7 +195,13 @@
         <button type="submit" disabled={sending !== null} aria-describedby="who-{id}">
           {sending === 'answer' ? 'Sending answer' : 'Send answer'}
         </button>
-        <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={() => (mode = 'rejecting')}>
+        <button
+          type="button"
+          disabled={sending !== null}
+          aria-describedby="who-{id}"
+          bind:this={rejectButton}
+          onclick={() => open('rejecting')}
+        >
           Reject
         </button>
       </div>
@@ -162,10 +212,22 @@
       <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={approve}>
         {sending === 'approve' ? 'Approving' : 'Approve'}
       </button>
-      <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={() => (mode = 'rejecting')}>
+      <button
+        type="button"
+        disabled={sending !== null}
+        aria-describedby="who-{id}"
+        bind:this={rejectButton}
+        onclick={() => open('rejecting')}
+      >
         Reject
       </button>
-      <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={startEdit}>
+      <button
+        type="button"
+        disabled={sending !== null}
+        aria-describedby="who-{id}"
+        bind:this={editButton}
+        onclick={() => open('editing')}
+      >
         Edit and approve
       </button>
     </div>

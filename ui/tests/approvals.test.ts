@@ -458,6 +458,10 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     const u = user();
     await u.click(await screen.findByRole('button', { name: 'Reject' }));
     expect(posts(calls)).toEqual([]);
+    expect(document.activeElement).toBe(screen.getByLabelText('Reason (optional)'));
+    await u.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Reject' }));
+    await u.click(screen.getByRole('button', { name: 'Reject' }));
     await u.type(screen.getByLabelText('Reason (optional)'), 'ask the release manager');
     await u.click(screen.getByRole('button', { name: 'Confirm reject' }));
     expect(posts(calls)).toEqual([
@@ -492,6 +496,67 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     expect(rows()[0]).toHaveTextContent('agent not known yet');
     await vi.advanceTimersByTimeAsync(6_000);
     expect(await screen.findByText('planner')).toBeInTheDocument();
+  });
+});
+
+describe('Approvals inbox: focus inside a row', () => {
+  it('opening Reject or Edit focuses its field, and Cancel goes back to the button', async () => {
+    const r = run();
+    show([approval(r)], [r]);
+    const u = user();
+    const reject = await screen.findByRole('button', { name: 'Reject' });
+    reject.focus();
+    await u.keyboard('{Enter}');
+    expect(document.activeElement).toBe(screen.getByLabelText('Reason (optional)'));
+    await u.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Reject' }));
+    screen.getByRole('button', { name: 'Edit and approve' }).focus();
+    await u.keyboard('{Enter}');
+    expect(document.activeElement).toBe(screen.getByLabelText('Edited action'));
+    await u.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Edit and approve' }));
+  });
+
+  it('when the run ends while a button of its row is focused, focus goes to Dismiss', async () => {
+    const r = run();
+    const a = approval(r);
+    const { sockets } = show([a], [r]);
+    const approve = await screen.findByRole('button', { name: 'Approve' });
+    approve.focus();
+    const s = feed(sockets);
+    s.open();
+    s.event(3, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Cancelled' }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Dismiss' })));
+  });
+
+  it('Retry does not send an answer that was cleared', async () => {
+    const r = run();
+    const q = approval(r, { question: true, action: 'Which branch?' });
+    let fail = true;
+    const { calls } = show([q], [r], () => {
+      if (fail) {
+        fail = false;
+        throw new TypeError('Failed to fetch');
+      }
+      return new Response(null, { status: 202 });
+    });
+    const u = user();
+    await u.type(await screen.findByLabelText('Answer'), 'main');
+    await u.click(screen.getByRole('button', { name: 'Send answer' }));
+    await screen.findByText('Failed to fetch');
+    await u.clear(screen.getByLabelText('Answer'));
+    await u.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(posts(calls)).toHaveLength(1);
+    expect(screen.getByText('Write an answer first.')).toBeInTheDocument();
+  });
+
+  it('says "Rejecting" until the rejection is seen', async () => {
+    const r = run();
+    show([approval(r)], [r]);
+    const u = user();
+    await u.click(await screen.findByRole('button', { name: 'Reject' }));
+    await u.click(screen.getByRole('button', { name: 'Confirm reject' }));
+    expect(screen.getByRole('button', { name: 'Rejecting' })).toBeDisabled();
   });
 });
 
