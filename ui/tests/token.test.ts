@@ -32,6 +32,9 @@ describe('token store', () => {
 });
 
 describe('late answers', () => {
+  // Today the view that sent the old request is always gone by the time a token is entered, so
+  // `whileMounted` drops the answer; `isCurrent` (tested above) is the second line of defence for
+  // requests that outlive a token change, such as future command buttons.
   it('a 401 for a request sent before the token was entered does not undo the token', async () => {
     const server = createMockServer('s3cret');
     let release = () => {};

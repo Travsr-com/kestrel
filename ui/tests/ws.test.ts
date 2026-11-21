@@ -171,18 +171,39 @@ describe('connectEvents', () => {
     expect(sockets).toHaveLength(2);
   });
 
-  it('treats a socket that cannot be created as a drop, and tries again', () => {
+  it('stops as unauthorized when the token cannot be sent as a subprotocol', () => {
+    // Retrying cannot help: the same token would be refused by `new WebSocket` again. The app
+    // asks for a new token instead.
+    let attempts = 0;
+    connectEvents({
+      base: 'ws://kestrel.test',
+      path: '/ws/runs/abc',
+      after: 0,
+      getToken: () => 'has space',
+      onEvent: () => {},
+      onState: (s) => states.push(s),
+      socketFactory: () => {
+        attempts += 1;
+        throw new SyntaxError('invalid subprotocol');
+      },
+    });
+    expect(states).toEqual(['connecting', 'unauthorized']);
+    vi.advanceTimersByTime(60_000);
+    expect(attempts).toBe(1);
+  });
+
+  it('treats a socket that cannot be created without a token as a drop, and tries again', () => {
     let fail = true;
     const created: string[] = [];
     connectEvents({
       base: 'ws://kestrel.test',
       path: '/ws/runs/abc',
       after: 0,
-      getToken: () => (fail ? 'has space' : 'ok'),
+      getToken: () => null,
       onEvent: () => {},
       onState: (s) => states.push(s),
       socketFactory: (url, protocols) => {
-        if (protocols.some((p) => p.includes(' '))) throw new SyntaxError('invalid subprotocol');
+        if (fail) throw new Error('network down');
         created.push(url);
         return new FakeSocket(url, protocols);
       },
@@ -194,6 +215,58 @@ describe('connectEvents', () => {
     vi.advanceTimersByTime(1000);
     expect(created).toEqual(['ws://kestrel.test/ws/runs/abc?after=0']);
     expect(states.at(-1)).toBe('connecting');
+  });
+
+  it('close() from inside onState("reconnecting") stops for good', () => {
+    const conn = connectEvents({
+      base: 'ws://kestrel.test',
+      path: '/ws/runs/abc',
+      after: 0,
+      getToken: () => null,
+      onEvent: () => {},
+      onState: (s) => {
+        states.push(s);
+        if (s === 'reconnecting') conn.close();
+      },
+      socketFactory: (url, protocols) => {
+        const s = new FakeSocket(url, protocols);
+        sockets.push(s);
+        return s;
+      },
+    });
+    last().open();
+    last().drop();
+    vi.advanceTimersByTime(120_000);
+    expect(sockets).toHaveLength(1);
+    expect(states.at(-1)).toBe('closed');
+  });
+
+  it('close() from inside onState("connecting") leaves no live socket', () => {
+    let first = true;
+    const conn = connectEvents({
+      base: 'ws://kestrel.test',
+      path: '/ws/runs/abc',
+      after: 0,
+      getToken: () => null,
+      onEvent: (_e, cursor) => seen.push(cursor),
+      onState: (s) => {
+        states.push(s);
+        if (s === 'connecting' && !first) conn.close();
+      },
+      socketFactory: (url, protocols) => {
+        const s = new FakeSocket(url, protocols);
+        sockets.push(s);
+        return s;
+      },
+    });
+    first = false;
+    last().drop();
+    vi.advanceTimersByTime(500);
+    // The reconnect saw close() before it made a socket, so none was made.
+    expect(sockets).toHaveLength(1);
+    vi.advanceTimersByTime(120_000);
+    expect(sockets).toHaveLength(1);
+    expect(states.at(-1)).toBe('closed');
   });
 
   it('cancels a pending reconnect on close()', () => {

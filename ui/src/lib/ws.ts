@@ -108,27 +108,31 @@ export function connectEvents(opts: EventStreamOptions): EventStream {
       socket.onopen = socket.onmessage = socket.onclose = null;
     }
     clearIdle();
-    state('reconnecting');
     const wait = delay;
     delay = Math.min(delay * 2, MAX_DELAY_MS);
+    // Scheduled before the state is reported, so a `close()` from `onState` cancels it.
     retry = setTimeout(() => {
       retry = null;
       open();
     }, wait);
+    state('reconnecting');
   }
 
   function open() {
     const token = opts.getToken();
     const protocols = token === null ? [WS_PROTOCOL] : [WS_PROTOCOL, `${WS_TOKEN_PREFIX}${token}`];
     state('connecting');
+    // `onState` may have called `close()`.
+    if (stopped) return;
     let s: SocketLike;
     try {
       s = factory(`${opts.base}${opts.path}?after=${cursor}`, protocols);
     } catch {
-      // `new WebSocket` throws on a malformed URL or subprotocol (a token with a space, say).
-      // Try again later: the token is read afresh on each attempt.
       socket = null;
-      drop();
+      // `new WebSocket` throws on a malformed subprotocol. With a token, the token is what is
+      // malformed and retrying would send it again, so stop and let the app ask for a new one.
+      if (token !== null) stop('unauthorized');
+      else drop();
       return;
     }
     socket = s;
