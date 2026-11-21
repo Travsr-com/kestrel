@@ -464,12 +464,19 @@ describe('Run view', () => {
     expect(screen.getByRole('link', { name: 'Back to Fleet' })).toHaveAttribute('href', '#/fleet');
   });
 
-  it('shows a load error as an alert', async () => {
+  it('shows a load error as an alert, and Retry loads again', async () => {
     const sockets = fakeSockets();
-    const fetch: typeof globalThis.fetch = async () =>
-      new Response(JSON.stringify({ error: 'database is locked' }), { status: 500 });
-    render(Run, { id: 'x', api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+    const r = run({ agent: 'lead' });
+    let fails = 1;
+    const fetch: typeof globalThis.fetch = async (input) => {
+      if (fails-- > 0) return new Response(JSON.stringify({ error: 'database is locked' }), { status: 500 });
+      const url = new URL(String(input), 'http://kestrel.test');
+      return new Response(JSON.stringify(url.pathname === '/api/runs' ? [r] : r));
+    };
+    render(Run, { id: r.id, api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
     expect(await screen.findByRole('alert')).toHaveTextContent('database is locked');
+    await user().click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByRole('heading', { level: 1, name: 'lead' })).toBeInTheDocument();
   });
 
   // 14
@@ -675,6 +682,8 @@ describe('Run view: moving between runs, the dialog and budgets', () => {
     await u.click(screen.getByRole('button', { name: 'Set budget' }));
     await vi.advanceTimersByTimeAsync(2_000);
     expect(screen.getByText('$0.00 of $3.50, $0.00 carved to children')).toBeInTheDocument();
+    // The box is ready for the next amount.
+    expect(screen.getByLabelText('New budget (USD)')).toHaveValue('');
   });
 
   it('keeps focus in the dialog after a click on its text or the backdrop; Esc still closes it', async () => {

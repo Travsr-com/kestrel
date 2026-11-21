@@ -38,6 +38,8 @@
   let shown: RunId | null = $state(null);
   let missing = $state(false);
   let error: string | null = $state(null);
+  /** Bumped by Retry, so the run loads again. */
+  let attempt = $state(0);
   // Raw: events are never changed in place, so they need no deep proxy (outputs can be large).
   let events: Event[] = $state.raw([]);
   /** Events that arrived since the last render; added in one go. */
@@ -61,6 +63,7 @@
   // The run, and its tree when it is another tree than the one on screen.
   $effect(() => {
     const want = id;
+    void attempt;
     const known = untrack(() => root);
     missing = false;
     error = null;
@@ -185,8 +188,8 @@
   $effect(() => () => budgetTimers.forEach(clearTimeout));
 
   /** After a refused command, the run's status from the server: it is newer than what is shown. */
-  function reload() {
-    api.getRun(id).then(
+  function reload(rid: RunId) {
+    api.getRun(rid).then(
       (summary) => fleet.update(summary, Date.now(), true),
       () => {},
     );
@@ -203,7 +206,10 @@
 <p class:banner={reconnecting} role="status">{reconnecting ? 'Reconnecting to live updates.' : ''}</p>
 
 {#if error !== null}
-  <p class="banner error" role="alert" data-testid="ready">{error}</p>
+  <div class="banner error" role="alert" data-testid="ready">
+    <p>{error}</p>
+    <button type="button" onclick={() => (attempt += 1)}>Retry</button>
+  </div>
 {:else if missing}
   <div data-testid="ready">
     <p>Run not found.</p>
@@ -228,7 +234,7 @@
           live={liveBelow(all, run.id)}
           {api}
           {onUnauthorized}
-          onRefused={reload}
+          onRefused={() => reload(run.id)}
           onBudget={() => afterBudget(run.id)}
         />
       {/key}
@@ -265,7 +271,13 @@
     background: var(--color-surface);
   }
   .error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
     border-color: var(--color-danger);
+  }
+  .error p {
+    margin: 0;
   }
   .layout {
     display: grid;

@@ -109,7 +109,11 @@
       return;
     }
     budgetError = null;
-    void send(() => api.setBudget(run.id, budget.trim())).then((ok) => ok && onBudget());
+    void send(() => api.setBudget(run.id, budget.trim())).then((ok) => {
+      if (!ok) return;
+      budget = '';
+      onBudget();
+    });
   }
 
   async function sendMessage(e: SubmitEvent) {
@@ -207,6 +211,8 @@
   .backdrop {
     position: fixed;
     inset: 0;
+    /* Above the positioned stream and its "Jump to latest" button, which come later in the page. */
+    z-index: 10;
     display: grid;
     place-items: center;
     background: rgb(0 0 0 / 40%);
