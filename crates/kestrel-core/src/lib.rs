@@ -419,6 +419,14 @@ pub struct Engine {
     inner: Arc<Inner>,
 }
 
+/// A run config root of this engine only: a temp directory with a random name, so no other user
+/// can make it first.
+fn default_run_config_root() -> PathBuf {
+    use std::hash::BuildHasher;
+    let nonce = std::collections::hash_map::RandomState::new().hash_one(std::process::id());
+    std::env::temp_dir().join(format!("kestrel-run-config-{nonce:016x}"))
+}
+
 struct Inner {
     store: Arc<Store>,
     drivers: Vec<Box<dyn SandboxDriver>>,
@@ -438,7 +446,7 @@ struct Inner {
     /// Signs and checks capability tokens, see [`Engine::with_root_key`].
     root_key: Option<caps::RootKey>,
     /// Where each run's config directory goes, see [`Engine::with_run_config`].
-    run_config: Option<PathBuf>,
+    run_config: PathBuf,
     /// Most runs in one spawn tree, see [`Engine::with_tree_limit`].
     tree_limit: u32,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
@@ -575,7 +583,7 @@ impl Engine {
                 instance: None,
                 subnets: None,
                 root_key: None,
-                run_config: None,
+                run_config: default_run_config_root(),
                 tree_limit: DEFAULT_TREE_LIMIT,
                 live: Mutex::default(),
                 rejoins: Mutex::default(),
@@ -629,13 +637,16 @@ impl Engine {
     }
 
     /// Each run's config directory (the files of its launch plan, such as the MCP config) goes in
-    /// `root`, as `{root}/{run id}`: readable by its owner only, mounted read-only at `/kestrel`
-    /// in the sandbox, removed when the run's sandbox goes. Without this, a temp directory.
+    /// `root`, as `{root}/{run id}`, mounted read-only at `/kestrel` in the sandbox and removed
+    /// when the run's sandbox goes. `root` is made its owner's only, so no other host user reaches
+    /// a run's token; a run's directory is readable by any user, so the sandbox can read it
+    /// whichever user its image runs as. Without this, a temp directory with a random name, of
+    /// this engine only.
     pub fn with_run_config(mut self, root: PathBuf) -> Engine {
         let inner = Arc::get_mut(&mut self.inner);
         debug_assert!(inner.is_some(), "engine state is shared");
         if let Some(inner) = inner {
-            inner.run_config = Some(root);
+            inner.run_config = root;
         }
         self
     }
@@ -1036,7 +1047,12 @@ impl Engine {
         self.inner.sweep_networks().await;
         let mut report = RecoveryReport::default();
         for run in store.list_runs(RunFilter::default())? {
-            if run.status.is_terminal() || run.status == RunStatus::Queued {
+            if run.status.is_terminal() {
+                // An engine stopped between a run's end and its cleanup leaves its config behind.
+                self.inner.remove_run_config(run.id);
+                continue;
+            }
+            if run.status == RunStatus::Queued {
                 continue;
             }
             self.inner.destroy_old_sandbox(run.id).await?;
@@ -1843,17 +1859,13 @@ impl Inner {
             .unwrap_or_else(|| default_model(tier).to_string())
     }
 
-    /// Best effort: destroys the last sandbox a previous engine provisioned for `run`.
     /// The config directory of `run`.
     fn run_config_dir(&self, run: RunId) -> PathBuf {
-        self.run_config
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("kestrel-run-config"))
-            .join(run.to_string())
+        self.run_config.join(run.to_string())
     }
 
-    /// Writes `files` to `run`'s config directory, made afresh: the directory readable by its
-    /// owner only, each file too. `None` when there are no files. A name that is not a plain file
+    /// Writes `files` to `run`'s config directory, made afresh in the owner-only root (see
+    /// [`Engine::with_run_config`]). `None` when there are no files. A name that is not a plain file
     /// name is refused, so nothing is written outside the directory.
     fn write_run_config(
         &self,
@@ -1878,14 +1890,15 @@ impl Inner {
         }
         let dir = self.run_config_dir(run);
         let failed = |e: std::io::Error| EngineError::RunConfig(format!("{}: {e}", dir.display()));
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).map_err(failed)?;
-        }
+        std::fs::create_dir_all(&self.run_config).map_err(failed)?;
         #[cfg(unix)]
         let builder = {
-            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            // Also when it existed already: the root is what keeps other host users out.
+            let private = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&self.run_config, private).map_err(failed)?;
             let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
+            builder.mode(0o755);
             builder
         };
         #[cfg(not(unix))]
@@ -1897,7 +1910,7 @@ impl Inner {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                options.mode(0o644);
             }
             let path = dir.join(&file.name);
             let written = options
@@ -1913,6 +1926,8 @@ impl Inner {
         let _ = std::fs::remove_dir_all(self.run_config_dir(run));
     }
 
+    /// Best effort: destroys the last sandbox a previous engine provisioned for `run`, and its
+    /// config directory.
     async fn destroy_old_sandbox(&self, run: RunId) -> Result<()> {
         let old = self
             .store
