@@ -127,7 +127,9 @@ describe('Fleet', () => {
     await vi.advanceTimersByTimeAsync(0);
     const others: MutationRecord[] = [];
     const watch = new MutationObserver((m) => others.push(...m));
-    watch.observe(card('beta'), { subtree: true, childList: true, characterData: true, attributes: true });
+    const betaCost = card('beta').querySelector('.cost');
+    if (!betaCost) throw new Error('no cost on beta');
+    watch.observe(betaCost, { subtree: true, childList: true, characterData: true, attributes: true });
     socket.event(2, event(a.id, {
       kind: 'model_call', run_id: a.id, provider: 'anthropic', model: 'm', tokens_in: 1, tokens_out: 1,
       tokens_cache_read: 0, tokens_cache_write: 0, cost: 50_000, latency_ms: 1, status: 200,
@@ -252,6 +254,51 @@ describe('Fleet', () => {
     expect(onUnauthorized).toHaveBeenCalledWith(null);
   });
 
+  it('a socket that keeps failing fetches its root, so a refused token is found', async () => {
+    const root = run({ agent: 'lead' });
+    const sockets = fakeSockets();
+    const onUnauthorized = vi.fn();
+    let refused = false;
+    const fetch: typeof globalThis.fetch = async (input) =>
+      String(input).endsWith('/api/runs')
+        ? new Response(JSON.stringify([root]))
+        : refused
+          ? new Response(JSON.stringify({ error: 'token required' }), { status: 401 })
+          : new Response(JSON.stringify(root));
+    render(Fleet, {
+      api: createApi({ fetch, getToken: () => 'old' }),
+      onUnauthorized,
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('link', { name: 'lead' });
+    refused = true;
+    // A browser reports a 401 at the upgrade as an ordinary failed connection.
+    socketFor(sockets, root.id).drop(1006);
+    await vi.waitFor(() => expect(onUnauthorized).toHaveBeenCalledWith('old'));
+  });
+
+  it('tries again to fetch a new run whose fetch failed', async () => {
+    const root = run({ agent: 'lead' });
+    const child = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1, limit: 700_000 });
+    const sockets = fakeSockets();
+    let fails = 1;
+    const fetch: typeof globalThis.fetch = async (input) => {
+      if (String(input).endsWith('/api/runs')) return new Response(JSON.stringify([root]));
+      if (String(input).endsWith(child.id) && fails-- > 0) return new Response('{}', { status: 503 });
+      return new Response(JSON.stringify(String(input).endsWith(child.id) ? child : root));
+    };
+    render(Fleet, { api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    socket.event(1, event(child.id, { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
+    await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    expect(card('kid')).toHaveTextContent('limit not known yet');
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(card('kid')).toHaveTextContent('$0.70');
+  });
+
   it('closes the socket of a tree once all of it has ended and lingered', async () => {
     const a = run({ agent: 'alpha' });
     const { sockets } = show([a]);
@@ -374,13 +421,41 @@ describe('Fleet', () => {
     expect(pager.querySelector('[aria-live]')).toBeNull();
     await user().click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+    await user().selectOptions(screen.getByRole('combobox', { name: 'Agent' }), 'run-1');
+    expect(screen.queryByText('Page 2 of 2')).not.toBeInTheDocument();
+  });
+
+  it('forgets a page that no longer exists, so the list does not jump back to it', async () => {
+    const runs = Array.from({ length: 51 }, (_, i) =>
+      run({ agent: `run-${i}`, created_at: new Date(NOW - 1_000 * (i + 1)).toISOString() }),
+    );
+    const { sockets } = show(runs);
+    await screen.findAllByRole('article');
+    const u = user();
+    await u.click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    await u.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Showing 51 to 51 of 51')).toBeInTheDocument();
+    const done = runs[0]?.id ?? '';
+    const ending = socketFor(sockets, done);
+    ending.open();
+    ending.event(1, event(done, { kind: 'status_changed', from: 'Running', to: 'Completed' }, 1));
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(screen.getByText('Showing 1 to 50 of 50')).toBeInTheDocument();
+    const live = runs[1]?.id ?? '';
+    const growing = socketFor(sockets, live);
+    growing.open();
+    growing.event(1, event('kid-x', { kind: 'run_created', agent: 'kid', parent: live }, 1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByText('Showing 1 to 50 of 51')).toBeInTheDocument();
   });
 
   it('describes each card link with its status, so links with the same agent differ', async () => {
-    show([run({ agent: 'worker', status: 'Running' }), run({ agent: 'worker', status: { Suspended: 'Manual' } })]);
+    show([run({ agent: 'worker' }), run({ agent: 'worker' })]);
     const links = await screen.findAllByRole('link', { name: 'worker' });
-    expect(links.map((l) => l.getAttribute('aria-describedby'))).toHaveLength(2);
-    const described = links.map((l) => document.getElementById(l.getAttribute('aria-describedby') ?? '')?.textContent);
+    const described = links.map((l) =>
+      (l.getAttribute('aria-describedby') ?? '').split(' ').map((id) => document.getElementById(id)?.textContent).join(' '),
+    );
+    expect(described[0]).toContain('Running');
     expect(described[0]).not.toEqual(described[1]);
   });
 

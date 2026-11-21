@@ -24,6 +24,8 @@ export interface FleetRun extends RunSummary {
    * view loaded; `null` while it runs.
    */
   endedAt: number | null;
+  /** When the run ended by its own event (ms since the epoch), for its run time; `null` if not seen. */
+  finishedAt: number | null;
   /** The cost the server last reported. */
   reported: MicroUsd;
   /** The cost counted from this view's `model_call` events. */
@@ -50,6 +52,7 @@ export class FleetState {
       next[r.id] = {
         ...r,
         endedAt: isTerminal(r.status) ? 0 : null,
+        finishedAt: null,
         reported: r.spent,
         counted: 0,
         provisional: false,
@@ -102,6 +105,7 @@ export class FleetState {
             sandbox_tier: null,
             created_at: event.ts,
             endedAt: null,
+            finishedAt: null,
             reported: 0,
             counted: 0,
             provisional: true,
@@ -115,8 +119,10 @@ export class FleetState {
           run.status = kind.to;
           if (isTerminal(kind.to) && run.endedAt === null) {
             run.endedAt = now;
-            // A child's end gives its unspent budget back to its parent.
-            if (run.parent) refresh(run.parent);
+            run.finishedAt = Date.parse(event.ts);
+            // A child's end gives its unspent budget back to the nearest live ancestor, which may be
+            // above an ended parent: every known ancestor is asked for again.
+            for (let up = run.parent; up; up = this.runs[up]?.parent ?? null) refresh(up);
           }
         }
         break;
@@ -148,12 +154,18 @@ export class FleetState {
   }
 
   /**
-   * The roots of every tree that is not over at `now` (see `over`), including the tree of a live
-   * child under an ended root.
+   * The roots of every tree that is not over at `now`, including the tree of a live child under an
+   * ended root. A tree is over once every run in it ended at least `linger` ms ago, so its last
+   * events still arrive.
    */
   liveRoots(now: number, linger: number): RunId[] {
-    const roots = Object.values(this.runs).map((run) => run.root);
-    return roots.filter((root, i) => roots.indexOf(root) === i && !this.over(root, now, linger));
+    // One pass: this runs on every clock tick, over every run the server ever stored.
+    const live: Record<RunId, boolean> = {};
+    for (const run of Object.values(this.runs)) {
+      const done = run.endedAt !== null && now - run.endedAt >= linger;
+      live[run.root] = live[run.root] === true || !done;
+    }
+    return Object.keys(live).filter((root) => live[root]);
   }
 
   /**
@@ -168,10 +180,4 @@ export class FleetState {
     }
   }
 
-  /** Every run in the tree of `root` ended at least `linger` ms before `now`. */
-  over(root: RunId, now: number, linger: number): boolean {
-    return Object.values(this.runs).every(
-      (run) => run.root !== root || (run.endedAt !== null && now - run.endedAt >= linger),
-    );
-  }
 }

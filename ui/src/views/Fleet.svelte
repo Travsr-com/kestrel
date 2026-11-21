@@ -1,7 +1,7 @@
 <script lang="ts">
-  import type { Api } from '../lib/api';
   import { FleetState, type FleetRun } from '../lib/fleet.svelte';
   import { statusName } from '../lib/format';
+  import { Unauthorized, type Api } from '../lib/api';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { getToken } from '../lib/token';
   import type { RunId } from '../lib/types';
@@ -33,6 +33,8 @@
   /** How long a run that ended stays in the active view after it was seen to end. */
   const LINGER_MS = 5_000;
   const STATUSES = ['queued', 'provisioning', 'running', 'suspended', 'completed', 'failed', 'cancelled'];
+  /** How long before a failed fetch of a new run is tried again. */
+  const RETRY_MS = 5_000;
   /** Open tree sockets at most: each one is polled by the server. */
   const MAX_SOCKETS = 50;
 
@@ -47,6 +49,8 @@
   let rootsOnly = $state(true);
   let showFinished = $state(false);
   let page = $state(0);
+  /** What the pager last announced: a page change, never the list changing under it. */
+  let announce = $state('');
 
   /** Trees whose socket dropped and is not open again yet. */
   let down: Record<RunId, true> = $state({});
@@ -93,9 +97,14 @@
       .getRun(id)
       .then(
         (summary) => mounted && fleet.update(summary, Date.now()),
-        // A 401 here is how a refused token shows: a browser reports a socket refused at the
-        // upgrade as an ordinary failed connection, so the sockets alone would retry forever.
-        (e: unknown) => mounted && failureText(e, onUnauthorized),
+        (e: unknown) => {
+          if (!mounted) return;
+          failureText(e, onUnauthorized);
+          // A run known only from its creation still needs its limit: try again in a while.
+          if (!(e instanceof Unauthorized) && fleet.runs[id]?.provisional) {
+            setTimeout(() => mounted && refresh(id), RETRY_MS);
+          }
+        },
       )
       .finally(() => {
         asking.delete(id);
@@ -114,7 +123,12 @@
         socketFactory: sockets,
         onEvent: (event) => fleet.apply(event, Date.now(), refresh, root),
         onState: (state: ConnectionState) => {
-          if (state === 'reconnecting') down[root] = true;
+          if (state === 'reconnecting') {
+            down[root] = true;
+            // A browser reports a token refused at the upgrade as an ordinary failed connection,
+            // so a REST call is what finds the 401 (and it refreshes the root's cost and limit).
+            refresh(root);
+          }
           else if (state !== 'connecting') delete down[root];
           if (state === 'unauthorized') onUnauthorized(getToken());
         },
@@ -146,7 +160,10 @@
     return true;
   }
 
-  const firstPage = () => (page = 0);
+  function firstPage() {
+    page = 0;
+    announce = '';
+  }
 
   const visible = $derived(
     Object.values(fleet.runs)
@@ -159,11 +176,12 @@
 
   // A page that no longer exists is forgotten, so the view does not jump back to it later.
   $effect(() => {
-    if (page > current) page = current;
+    if (page > current) {
+      page = current;
+      announce = '';
+    }
   });
 
-  /** What the pager last announced: a page change, never the list changing under it. */
-  let announce = $state('');
   function goTo(next: number) {
     page = Math.min(pages - 1, Math.max(0, next));
     announce = `Page ${page + 1} of ${pages}`;
@@ -175,13 +193,19 @@
   $effect(() => {
     if (!loaded) return;
     const live = fleet.liveRoots(now, LINGER_MS);
-    const first = onPage.map((run) => run.root).filter((root) => live.includes(root));
-    const wanted = [...first, ...live].filter((root, i, all) => all.indexOf(root) === i).slice(0, MAX_SOCKETS);
+    const isLive: Record<RunId, true> = {};
+    for (const root of live) isLive[root] = true;
+    // The trees on this page first, then the rest, each once.
+    const wanted: Record<RunId, true> = {};
+    for (const root of [...onPage.map((run) => run.root), ...live]) {
+      if (Object.keys(wanted).length >= MAX_SOCKETS) break;
+      if (isLive[root]) wanted[root] = true;
+    }
     for (const root of [...streams.keys()]) {
-      if (!wanted.includes(root)) unfollow(root);
+      if (!wanted[root]) unfollow(root);
     }
     untrack(() => {
-      for (const root of wanted) {
+      for (const root of Object.keys(wanted)) {
         if (streams.has(root)) continue;
         fleet.rebuild(root);
         follow(root);

@@ -145,10 +145,10 @@ describe('FleetState', () => {
   it('a tree is over once every run in it ended at least `linger` ago', () => {
     const fleet = new FleetState();
     fleet.load([summary('r'), summary('c', { parent: 'r', root: 'r', status: 'Completed' })]);
-    expect(fleet.over('r', 100, 10)).toBe(false);
+    expect(fleet.liveRoots(100, 10)).toEqual(['r']);
     fleet.apply(ev('r', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 95, () => {}, 'r');
-    expect(fleet.over('r', 100, 10)).toBe(false);
-    expect(fleet.over('r', 105, 10)).toBe(true);
+    expect(fleet.liveRoots(100, 10)).toEqual(['r']);
+    expect(fleet.liveRoots(105, 10)).toEqual([]);
   });
 
   it('lists the roots of trees not over yet, including a live child under an ended root', () => {
@@ -163,6 +163,48 @@ describe('FleetState', () => {
     fleet.apply(ev('t', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 95, () => {}, 't');
     expect(fleet.liveRoots(100, 10).sort()).toEqual(['r', 't']);
     expect(fleet.liveRoots(105, 10).sort()).toEqual(['r']);
+  });
+
+  it('finds live roots in one pass, fast enough for every tick with thousands of runs', () => {
+    const fleet = new FleetState();
+    const list = Array.from({ length: 5_000 }, (_, i) =>
+      summary(`r${i}`, i % 100 === 0 ? {} : { status: 'Completed' }),
+    );
+    fleet.load(list);
+    const start = performance.now();
+    expect(fleet.liveRoots(100, 10)).toHaveLength(50);
+    expect(performance.now() - start).toBeLessThan(250);
+  });
+
+  it('a replay after a rebuild keeps what was shown as the floor', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('r', { spent: 0 })]);
+    fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
+    fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
+    fleet.rebuild('r');
+    // The replay has reached only the first call so far.
+    fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
+    expect(fleet.runs.r?.spent).toBe(40);
+  });
+
+  it('a child that ends asks for every ancestor, since unspent budget goes to the nearest live one', () => {
+    const fleet = new FleetState();
+    fleet.load([
+      summary('r'),
+      summary('p', { parent: 'r', root: 'r', depth: 1, status: 'Completed' }),
+      summary('c', { parent: 'p', root: 'r', depth: 2 }),
+    ]);
+    const asked: string[] = [];
+    fleet.apply(ev('c', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 0, (id) => asked.push(id), 'r');
+    expect(asked).toEqual(['p', 'r']);
+  });
+
+  it('remembers when a run ended by its event time, for the run time', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('r')]);
+    fleet.apply(ev('r', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 999_999_999_999, () => {}, 'r');
+    expect(fleet.runs.r?.finishedAt).toBe(Date.parse('2026-11-21T10:00:05Z'));
+    expect(fleet.runs.r?.endedAt).toBe(999_999_999_999);
   });
 
   it('a replay from the start counts a tree again without dropping what it shows', () => {
