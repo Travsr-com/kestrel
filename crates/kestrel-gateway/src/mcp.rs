@@ -16,7 +16,7 @@
 //! * **Limits**, so a sandbox cannot make the gateway hold much: bodies up to 1 MiB (413), ids a
 //!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
 //!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
-//!   most 256 children per join. An unknown token is 401 and a finished run 410; neither echoes it.
+//!   most 256 children and a day's timeout per join. An unknown token is 401 and a finished run 410; neither echoes it.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -59,6 +59,8 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_CHILDREN: usize = 256;
 /// Runs whose call allowance is remembered before full ones are forgotten.
 const MAX_BUCKETS: usize = 1024;
+/// Longest a join may wait.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A Kestrel tool a sandbox can call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,8 +197,9 @@ impl ToolHost for NoTools {
     async fn denied(&self, _: RunId, _: &str) {}
 }
 
-/// A call's result once it is done, shared by every request with the same run and id.
-type CallResult = watch::Receiver<Option<Value>>;
+/// A call's result and when it came, once it is done, shared by every request with the same run
+/// and id. Only the channel holds it: no task stays behind per call.
+type CallResult = watch::Receiver<Option<(Value, Instant)>>;
 
 /// One run's calls: in flight or recently finished, by id, each with its order of arrival.
 #[derive(Default)]
@@ -475,7 +478,7 @@ async fn call(
     };
     let wait = async move {
         loop {
-            if let Some(value) = result.borrow_and_update().clone() {
+            if let Some((value, _)) = result.borrow_and_update().clone() {
                 return value;
             }
             if result.changed().await.is_err() {
@@ -505,6 +508,16 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
         .calls
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    // Results older than an hour go, for every run, so ended runs leave nothing behind.
+    let now = Instant::now();
+    calls.retain(|_, runs| {
+        runs.by_id.retain(|_, (r, _)| {
+            r.borrow()
+                .as_ref()
+                .is_none_or(|(_, at)| now.duration_since(*at) < KEEP_RESULT)
+        });
+        !runs.by_id.is_empty()
+    });
     let mine = calls.entry(run).or_default();
     if let Some((existing, _)) = mine.by_id.get(&key) {
         return Ok(existing.clone());
@@ -531,32 +544,23 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
     let (tx, rx) = watch::channel(None);
     let order = mine.next;
     mine.next += 1;
-    mine.by_id.insert(key.clone(), (rx.clone(), order));
+    mine.by_id.insert(key, (rx.clone(), order));
     drop(calls);
-    let state = state.clone();
+    let host = state.deps.tools.clone();
     tokio::spawn(async move {
-        let host = &state.deps.tools;
-        let outcome = match task {
-            Task::Spawn(call) => host.spawn(run, call).await,
-            Task::Join(call) => host.join(run, call).await,
-            Task::Ask(question) => host.ask_human(run, question).await.map(Value::String),
-        };
-        let _ = tx.send(Some(tool_result(outcome)));
-        tokio::time::sleep(KEEP_RESULT).await;
-        let mut calls = state
-            .mcp
-            .calls
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(mine) = calls.get_mut(&run) {
-            // Only this call's entry: the id may have been let go and used again since.
-            if mine.by_id.get(&key).is_some_and(|(_, o)| *o == order) {
-                mine.by_id.remove(&key);
+        // In a task of its own, so a host call that panics still ends with a result: it never
+        // counts as waiting forever.
+        let work = tokio::spawn(async move {
+            match task {
+                Task::Spawn(call) => host.spawn(run, call).await,
+                Task::Join(call) => host.join(run, call).await,
+                Task::Ask(question) => host.ask_human(run, question).await.map(Value::String),
             }
-            if mine.by_id.is_empty() {
-                calls.remove(&run);
-            }
-        }
+        });
+        let outcome = work
+            .await
+            .unwrap_or_else(|_| Err("the call failed inside Kestrel; try again".into()));
+        let _ = tx.send(Some((tool_result(outcome), Instant::now())));
     });
     Ok(rx)
 }
@@ -606,11 +610,12 @@ fn check(tool: KestrelTool, args: &Value) -> Result<Task, String> {
             let timeout = match args.get("timeout_s") {
                 None | Some(Value::Null) => None,
                 Some(t) => {
-                    let secs = t
+                    let wait = t
                         .as_f64()
-                        .filter(|s| s.is_finite() && *s >= 0.0)
-                        .ok_or("timeout_s must be a number of seconds, 0 or more")?;
-                    Some(Duration::from_secs_f64(secs))
+                        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                        .filter(|d| *d <= MAX_TIMEOUT)
+                        .ok_or("timeout_s must be a number of seconds from 0 to 86400")?;
+                    Some(wait)
                 }
             };
             Ok(Task::Join(JoinCall {

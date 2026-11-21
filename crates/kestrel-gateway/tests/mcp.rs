@@ -50,6 +50,7 @@ struct FakeHost {
     tools_asked: Mutex<usize>,
     spawn_refusal: Mutex<Option<String>>,
     join_takes: Mutex<Duration>,
+    join_panics: Mutex<bool>,
 }
 
 #[async_trait]
@@ -79,6 +80,9 @@ impl ToolHost for FakeHost {
     }
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String> {
         self.joins.lock().unwrap().push((run, call));
+        if *self.join_panics.lock().unwrap() {
+            panic!("the host fell over");
+        }
         let takes = *self.join_takes.lock().unwrap();
         tokio::time::sleep(takes).await;
         Ok(json!({ "children": [{ "outcome": "completed", "summary": "done" }] }))
@@ -926,4 +930,188 @@ async fn no_tools_offers_nothing_and_does_nothing() {
     assert!(NoTools.join(run, join).await.is_err());
     assert!(NoTools.ask_human(run, "q".into()).await.is_err());
     NoTools.denied(run, "kestrel.spawn").await;
+}
+
+// Review 2 of PR 76.
+
+#[tokio::test(start_paused = true)]
+async fn a_result_older_than_an_hour_is_let_go() {
+    let s = setup(&KestrelTool::ALL);
+    let ask = |id| {
+        call(id, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes()
+    };
+    message(send(&s.app, TOKEN_A, ask(1), false).await).await;
+    message(send(&s.app, TOKEN_A, ask(1), false).await).await;
+    assert_eq!(s.host.asks.lock().unwrap().len(), 1);
+    tokio::time::advance(Duration::from_secs(3601)).await;
+    // Another call lets the old result go, so calling with its id asks again.
+    message(send(&s.app, TOKEN_A, ask(2), false).await).await;
+    message(send(&s.app, TOKEN_A, ask(1), false).await).await;
+    assert_eq!(s.host.asks.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_host_call_that_panics_is_a_failed_call_and_frees_its_place() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_panics.lock().unwrap() = true;
+    for i in 0..10 {
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i, "kestrel.join", json!({})).to_string().into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["result"]["isError"], json!(true), "{msg}");
+        assert!(content(&msg).as_str().unwrap().contains("failed"), "{msg}");
+    }
+    // None of them is left waiting.
+    *s.host.join_panics.lock().unwrap() = false;
+    let msg = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(99, "kestrel.join", json!({})).to_string().into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+}
+
+#[tokio::test]
+async fn a_join_timeout_is_at_most_a_day() {
+    let s = setup(&KestrelTool::ALL);
+    for (i, t) in [json!(1e20), json!(86_401), json!(f64::MAX)]
+        .into_iter()
+        .enumerate()
+    {
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i as u64, "kestrel.join", json!({ "timeout_s": t }))
+                    .to_string()
+                    .into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["error"]["code"], json!(-32602), "{t}: {msg}");
+    }
+    let msg = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(9, "kestrel.join", json!({ "timeout_s": 86_400 }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn eviction_never_lets_go_of_a_waiting_call() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_takes.lock().unwrap() = Duration::from_secs(600);
+    // One call waits while 260 others finish.
+    let waiting = send(
+        &s.app,
+        TOKEN_A,
+        call(10_000, "kestrel.join", json!({}))
+            .to_string()
+            .into_bytes(),
+        true,
+    )
+    .await;
+    for i in 0..260u64 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i, "kestrel.ask_human", json!({ "question": "q" }))
+                    .to_string()
+                    .into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+    }
+    drop(waiting);
+    // Called again, the waiting join is the same call: no second join.
+    tokio::time::advance(Duration::from_millis(200)).await;
+    let again = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(10_000, "kestrel.join", json!({}))
+                .to_string()
+                .into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(again["result"]["isError"], json!(false));
+    assert_eq!(s.host.joins.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_allowance_of_runs_that_went_quiet_is_forgotten() {
+    // Many runs, each calling once: the gateway keeps working, and an allowance comes back full.
+    let (tokens, runs): (Vec<String>, Vec<RunId>) = (0..1100)
+        .map(|i| (format!("rt_live_many_{i}"), RunId::new()))
+        .unzip();
+    let host = Arc::new(FakeHost::default());
+    for run in &runs {
+        host.allowed
+            .lock()
+            .unwrap()
+            .insert(*run, KestrelTool::ALL.to_vec());
+    }
+    let deps = GatewayDeps {
+        resolver: Arc::new(Tokens(
+            tokens.iter().cloned().zip(runs.iter().copied()).collect(),
+        )),
+        budget: Arc::new(FakeBudget::new(true)),
+        meter: Arc::new(FakeSink::default()),
+        tools: host.clone(),
+    };
+    let app = router(config("http://127.0.0.1:9", "http://127.0.0.1:9"), deps);
+    for token in &tokens {
+        let response = send(
+            &app,
+            token,
+            call(1, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let response = send(
+        &app,
+        &tokens[0],
+        call(2, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
