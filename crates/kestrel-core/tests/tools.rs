@@ -11,11 +11,15 @@ use kestrel_store::ControlCommand;
 use kestrel_types::{AgentSpec, ApprovalId, EventKind, RunStatus, SuspendReason};
 
 fn agent(caps: &str) -> AgentSpec {
+    agent_for(caps, "1h")
+}
+
+fn agent_for(caps: &str, wall_clock: &str) -> AgentSpec {
     let yaml = format!(
         "name: lead\nruntime: claude-code\nrole: r\n\
          capabilities: {caps}\n\
          sandbox: {{ tier: auto, image: fake-image, cpu: 1, memory: 512Mi, workspace: empty-dir }}\n\
-         budget: {{ usd: \"5\", wall_clock: 1h }}\n"
+         budget: {{ usd: \"5\", wall_clock: {wall_clock} }}\n"
     );
     AgentSpec::from_yaml(&yaml).expect("fixture spec parses")
 }
@@ -201,4 +205,89 @@ async fn a_tool_call_that_was_not_permitted_is_recorded() {
         k,
         EventKind::AgentLog { line } if line.contains("kestrel.spawn") && line.contains("not permitted")
     )));
+}
+
+// Review 1 of PR 76.
+
+#[tokio::test(start_paused = true)]
+async fn the_wall_clock_keeps_going_while_a_question_waits() {
+    // The sandbox keeps working while its question waits, so its time counts.
+    let mut h = Harness::new(4);
+    let _s = h.driver.live();
+    h.start();
+    let id = h
+        .submit(agent_for("{ mcp: [kestrel.ask_human] }", "5s"))
+        .await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let engine = h.engine.clone();
+    let ask = tokio::spawn(async move { engine.ask_human(id, "Anyone?".into()).await });
+    until("asked", || asked(&h, id, "Anyone?").is_some()).await;
+    until("out of time", || h.is_failed(id).is_some()).await;
+    assert!(h.is_failed(id).unwrap_or_default().contains("wall clock"));
+    assert!(matches!(ask.await.unwrap(), Err(AskError::Ended(_))));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_question_that_reaches_a_run_that_stopped_says_not_running_not_declined() {
+    let mut h = Harness::new(4);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    // The pause is queued before the question, so the run has stopped when the question arrives.
+    h.control(id, ControlCommand::Pause);
+    let err = h
+        .engine
+        .ask_human(id, "Too late?".into())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AskError::NotRunning), "{err:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_question_still_waiting_at_a_restart_is_declined_and_its_run_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let (asking, approving, question, action) = {
+        let first = Harness::on(&db, 4);
+        let a = first.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+        let b = first.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+        let (q, act) = (ApprovalId::new(), ApprovalId::new());
+        let st = &first.store;
+        for (run, id, is_question) in [(a, q, true), (b, act, false)] {
+            st.transition(run, &RunStatus::Queued, RunStatus::Provisioning)
+                .unwrap();
+            st.transition(run, &RunStatus::Provisioning, RunStatus::Running)
+                .unwrap();
+            st.append(
+                run,
+                EventKind::ApprovalRequested {
+                    id,
+                    action: "x".into(),
+                    question: is_question,
+                },
+            )
+            .unwrap();
+            st.transition(
+                run,
+                &RunStatus::Running,
+                RunStatus::Suspended(SuspendReason::Approval(id)),
+            )
+            .unwrap();
+        }
+        (a, b, q, act)
+    };
+    let h = Harness::on(&db, 4);
+    h.engine.recover().await.unwrap();
+    // Nobody waits for the answer any more: the question is declined and the run fails, saying why.
+    assert!(h.has_event(asking, |k| matches!(
+        k,
+        EventKind::ApprovalResolved { id, approved: false, payload: Some(p) } if *id == question && p.contains("restarted")
+    )));
+    assert!(matches!(h.status(asking), RunStatus::Failed(ref m) if m.contains("question")));
+    // An action approval still waits for its decision, as before.
+    assert!(h.is(
+        approving,
+        &RunStatus::Suspended(SuspendReason::Approval(action))
+    ));
 }
