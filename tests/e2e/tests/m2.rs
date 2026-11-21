@@ -1006,10 +1006,13 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     );
 }
 
-/// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart the
-/// parent and its children are resumed (M1: a run that was running is suspended by a restart);
-/// the parent joins again without spawning again, the children finish, and every call is counted
-/// once.
+/// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart every run
+/// is suspended (as in M1). The parent is resumed alone and waits in its join again while its
+/// children stay suspended; then the children are resumed, they finish, the join counts each once,
+/// and every model call is counted once.
+///
+/// That the parent spawns no child again is the echo agent's doing (it keeps its children in
+/// `kids.out`), not a Kestrel guarantee: spawn de-dup by JSON-RPC id is in memory only.
 #[test]
 fn m2_s14_restart_mid_join_resumes_and_counts_once() {
     let env = Env::with_max(8);
@@ -1054,18 +1057,52 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
         );
         assert_eq!(env.spent(id), ONE_CALL_MICRO_USD, "spend of {id} survives");
     }
-    // The parent first: it joins again while its children are still suspended.
-    for id in &tree {
-        env.ok(&["resume", id.as_str()]);
+    // The parent alone first. A resumed child would finish at once (its nap is done), so the
+    // children stay suspended until the parent is back in its join: a join that took a suspended
+    // child for an ended one would answer now.
+    std::fs::remove_file(&joining).expect("remove joining.out");
+    env.ok(&["resume", root.as_str()]);
+    wait_until(RUN_DEADLINE, "the resumed parent joins again", || {
+        joining.exists()
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        status_name(&env.row(&root)["status"]),
+        "Running",
+        "the parent waits in its join"
+    );
+    for kid in &kids {
+        assert_eq!(
+            status_name(&env.row(kid)["status"]),
+            "Suspended(Error(engine restarted))",
+            "child {kid} while only its parent was resumed"
+        );
+    }
+    let waiting = env.read_out(&root, "join.out");
+    assert!(
+        !waiting.contains("outcome"),
+        "the join answered while every child was suspended: {waiting}"
+    );
+
+    for kid in &kids {
+        env.ok(&["resume", kid.as_str()]);
     }
     for id in &tree {
         env.wait_status(id, "Completed");
     }
 
+    // The echo agent remembers the children it spawned (kids.out in its workspace) and spawns
+    // only the rest when it starts again. Kestrel does not guarantee this: its spawn de-dup by
+    // JSON-RPC id is kept in memory and does not survive a restart.
+    assert_eq!(
+        env.read_out(&root, "kids.out").lines().count(),
+        6,
+        "the echo agent's own list of its children"
+    );
     assert_eq!(
         env.children(&root).len(),
         6,
-        "the parent did not spawn again"
+        "the echo agent read its kids.out after the restart and spawned no child again"
     );
     let joined = env.read_out(&root, "join.out");
     for kid in &kids {
