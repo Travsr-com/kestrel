@@ -116,20 +116,28 @@ pub(crate) async fn events_socket(
 }
 
 /// The `kinds` filter: a comma-separated list of event kind names. Empty items are skipped; a name
-/// that is not lower-case letters and underscores is a 400.
+/// that is not lower-case letters and underscores, or a list that names none, is a 400. A
+/// well-formed name of no kind simply matches nothing.
 fn kinds(q: &HashMap<String, String>) -> Result<Arc<[String]>, Reject> {
     let Some(list) = q.get("kinds") else {
         return Ok(Arc::from(Vec::new()));
     };
+    let bad = || {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "kinds must be event kind names like approval_requested, separated by commas",
+        ))
+    };
     let mut kinds = Vec::new();
     for kind in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         if !kind.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-            return Err(Box::new(error(
-                StatusCode::BAD_REQUEST,
-                "kinds must be event kind names like approval_requested, separated by commas",
-            )));
+            return Err(bad());
         }
         kinds.push(kind.to_owned());
+    }
+    // `kinds=` naming nothing is a mistake, not "every kind".
+    if kinds.is_empty() {
+        return Err(bad());
     }
     Ok(Arc::from(kinds))
 }
@@ -145,24 +153,28 @@ fn upgrade(ws: WebSocketUpgrade, s: AppState, source: Source, cursor: u64) -> Re
 /// Events read from the store per step, so a socket never holds a whole history at once.
 const PAGE: usize = 256;
 
-/// Events after `cursor`, each with its cursor.
+/// Events after `cursor`, each with its cursor, and where to read from next (past events a
+/// filter skipped, so they are not scanned again).
 fn read(
     store: &Store,
     source: &Source,
     cursor: u64,
-) -> Result<Vec<(u64, kestrel_types::Event)>, StoreError> {
-    match source {
-        Source::Run(run) => Ok(store
+) -> Result<(Vec<(u64, kestrel_types::Event)>, u64), StoreError> {
+    let events = match source {
+        Source::Run(run) => store
             .events_page(*run, cursor, PAGE)?
             .into_iter()
             .map(|e| (e.seq, e))
-            .collect()),
-        Source::Tree(root) => store.events_since_global_page(*root, cursor, PAGE),
+            .collect(),
+        Source::Tree(root) => store.events_since_global_page(*root, cursor, PAGE)?,
         Source::All(kinds) => {
             let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
-            store.events_after_page(cursor, &kinds, PAGE)
+            let page = store.events_after_page(cursor, &kinds, PAGE)?;
+            return Ok((page.events, page.next));
         }
-    }
+    };
+    let next = events.last().map_or(cursor, |(at, _)| *at);
+    Ok((events, next))
 }
 
 fn text(frame: &WsFrame) -> Option<Message> {
@@ -248,8 +260,8 @@ async fn pump(
                 }
             }
             _ = poll.tick() => {
-                let events = match read(&s.store, source, *cursor) {
-                    Ok(events) => events,
+                let (events, next) = match read(&s.store, source, *cursor) {
+                    Ok(read) => read,
                     Err(_) => return End::Error,
                 };
                 let full = events.len() == PAGE;
@@ -259,6 +271,7 @@ async fn pump(
                     }
                     *cursor = at;
                 }
+                *cursor = (*cursor).max(next);
                 // A full page means more is waiting: read the next one without waiting a tick.
                 if full {
                     poll.reset_immediately();

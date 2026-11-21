@@ -45,7 +45,7 @@ fn every_run_in_commit_order_on_the_global_cursor() {
     for run in [a, b, kid, b] {
         log(&store, run, "l");
     }
-    let all = store.events_after_page(0, &[], 100).unwrap();
+    let all = store.events_after_page(0, &[], 100).unwrap().events;
     assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
     let runs: Vec<RunId> = all.iter().map(|(_, e)| e.run_id).collect();
     assert_eq!(runs, [a, b, kid, b]);
@@ -76,17 +76,21 @@ fn only_the_kinds_asked_for_and_pages_continue_from_the_cursor() {
         .unwrap();
     let second = ask(&store, b, "rm build");
     let kinds = ["approval_requested", "status_changed"];
-    let page = store.events_after_page(0, &kinds, 2).unwrap();
+    let page = store.events_after_page(0, &kinds, 2).unwrap().events;
     assert_eq!(page.len(), 2);
     assert!(matches!(page[0].1.kind, EventKind::ApprovalRequested { id, .. } if id == first));
     assert!(matches!(page[1].1.kind, EventKind::StatusChanged { .. }));
-    let rest = store.events_after_page(page[1].0, &kinds, 2).unwrap();
+    let rest = store
+        .events_after_page(page[1].0, &kinds, 2)
+        .unwrap()
+        .events;
     assert_eq!(rest.len(), 1);
     assert!(matches!(rest[0].1.kind, EventKind::ApprovalRequested { id, .. } if id == second));
     assert!(
         store
             .events_after_page(rest[0].0, &kinds, 2)
             .unwrap()
+            .events
             .is_empty()
     );
     // A kind no event has matches nothing.
@@ -94,6 +98,7 @@ fn only_the_kinds_asked_for_and_pages_continue_from_the_cursor() {
         store
             .events_after_page(0, &["no_such_kind"], 10)
             .unwrap()
+            .events
             .is_empty()
     );
 }
@@ -105,16 +110,17 @@ fn the_latest_cursor_is_where_only_new_events_start() {
     let a = store.create_run(&agent("a"), "x").unwrap();
     log(&store, a, "old");
     let latest = store.latest_cursor().unwrap();
-    let all = store.events_after_page(0, &[], 100).unwrap();
+    let all = store.events_after_page(0, &[], 100).unwrap().events;
     assert_eq!(all.last().map(|(c, _)| *c), Some(latest));
     assert!(
         store
             .events_after_page(latest, &[], 100)
             .unwrap()
+            .events
             .is_empty()
     );
     log(&store, a, "new");
-    let next = store.events_after_page(latest, &[], 100).unwrap();
+    let next = store.events_after_page(latest, &[], 100).unwrap().events;
     assert_eq!(next.len(), 1);
     assert!(matches!(&next[0].1.kind, EventKind::AgentLog { line } if line == "new"));
 }
@@ -139,4 +145,32 @@ fn a_question_is_marked_as_one_in_the_approvals() {
     assert_eq!(records.len(), 2);
     assert_eq!((records[0].id, records[0].question), (action, false));
     assert_eq!((records[1].id, records[1].question), (question, true));
+}
+
+#[test]
+fn a_filtered_read_moves_past_the_events_it_skipped() {
+    let store = Store::open_in_memory().unwrap();
+    let a = store.create_run(&agent("a"), "x").unwrap();
+    for i in 0..50 {
+        log(&store, a, &format!("{i}"));
+    }
+    let kinds = ["approval_requested"];
+    let page = store.events_after_page(0, &kinds, 10).unwrap();
+    // Nothing matched, and the next read starts after all fifty: they are not scanned again.
+    assert!(page.events.is_empty());
+    assert_eq!(page.next, store.latest_cursor().unwrap());
+    let id = ask(&store, a, "git push");
+    let later = store.events_after_page(page.next, &kinds, 10).unwrap();
+    assert_eq!(later.events.len(), 1);
+    assert!(
+        matches!(later.events[0].1.kind, EventKind::ApprovalRequested { id: got, .. } if got == id)
+    );
+    assert_eq!(later.next, later.events[0].0);
+    // A full page says to continue right after its last event.
+    for _ in 0..3 {
+        ask(&store, a, "again");
+    }
+    let full = store.events_after_page(later.next, &kinds, 2).unwrap();
+    assert_eq!(full.events.len(), 2);
+    assert_eq!(full.next, full.events[1].0);
 }

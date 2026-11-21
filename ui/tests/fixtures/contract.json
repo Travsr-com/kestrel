@@ -131,6 +131,8 @@
     },
     { "kind": "budget_warning", "spent": 1600000, "limit": 2000000 },
     { "kind": "approval_requested", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "action": "git push" },
+    { "kind": "approval_requested", "id": "8e9f0a1b-2c3d-4e4f-9a5b-6c7d8e9f0a1b", "action": "Which branch should I release from?",
+      "question": true },
     {
       "kind": "approval_resolved",
       "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a",

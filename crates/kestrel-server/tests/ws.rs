@@ -489,7 +489,11 @@ async fn the_events_socket_resumes_after_its_cursor() {
 #[tokio::test]
 async fn the_events_socket_refuses_a_bad_cursor_or_kind() {
     let server = start(store(), |_| {}).await;
-    for query in ["after=soon", "kinds=approval_requested,DROP%20TABLE"] {
+    for query in [
+        "after=soon",
+        "kinds=approval_requested,DROP%20TABLE",
+        "kinds=,,",
+    ] {
         let mut request = format!("ws://{}/ws/events?{query}", server.addr)
             .into_client_request()
             .unwrap();
