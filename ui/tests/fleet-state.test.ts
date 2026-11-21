@@ -82,6 +82,27 @@ describe('FleetState', () => {
     expect(fleet.runs.c?.fetched).toBe(true);
   });
 
+  it('a spawn shows the child at once with its budget, and asks for it and its parent', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p', { root: 'p' })]);
+    const asked: string[] = [];
+    fleet.apply(ev('p', { kind: 'child_spawned', child: 'c', agent: 'kid', budget: 300 }), 0, (id) => asked.push(id), 'p');
+    expect(asked).toEqual(['c', 'p']);
+    expect(fleet.runs.c).toMatchObject({ parent: 'p', root: 'p', depth: 1, limit: 300, provisional: true, fetched: false });
+    // Its own creation event later changes nothing.
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, (id) => asked.push(id), 'p');
+    expect(asked).toEqual(['c', 'p']);
+  });
+
+  it('takes the status from a fetch when told the answer is newer', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p')]);
+    fleet.update(summary('p', { status: 'Completed' }), 4);
+    expect(fleet.runs.p?.status).toBe('Running');
+    fleet.update(summary('p', { status: 'Completed' }), 4, true);
+    expect(fleet.runs.p).toMatchObject({ status: 'Completed', endedAt: 4 });
+  });
+
   it('a fetch fills in limit, tier and start time, and never lowers the cost', () => {
     const fleet = new FleetState();
     fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
