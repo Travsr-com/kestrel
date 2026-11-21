@@ -69,7 +69,8 @@ fn approvals_decode_and_encode_unchanged() {
         [
             ApprovalStatus::Pending,
             ApprovalStatus::Approved,
-            ApprovalStatus::Rejected
+            ApprovalStatus::Rejected,
+            ApprovalStatus::Expired
         ]
     );
 }

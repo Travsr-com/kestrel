@@ -125,9 +125,16 @@ fn describe(kind: &EventKind) -> String {
         EventKind::ApprovalRequested { id, action } => {
             format!("approval needed for {action}: kestrel approve {id}")
         }
-        EventKind::ApprovalResolved { id, approved } => {
+        EventKind::ApprovalResolved {
+            id,
+            approved,
+            payload,
+        } => {
             let how = if *approved { "approved" } else { "rejected" };
-            format!("approval {id} {how}")
+            match payload {
+                Some(text) => format!("approval {id} {how}: {text}"),
+                None => format!("approval {id} {how}"),
+            }
         }
         EventKind::AgentLog { line } => format!("log: {line}"),
         EventKind::RunFinished { summary } => match summary {
@@ -276,8 +283,8 @@ fn send(store: &Store, id: RunId, cmd: ControlCommand, out: Output) -> Result<()
         ControlCommand::Pause => "pause".to_string(),
         ControlCommand::Resume => "resume".to_string(),
         ControlCommand::Cancel => "cancel".to_string(),
-        ControlCommand::Approve(_) => "approve".to_string(),
-        ControlCommand::Reject(_) => "reject".to_string(),
+        ControlCommand::Approve(_) | ControlCommand::ApproveWith { .. } => "approve".to_string(),
+        ControlCommand::Reject(_) | ControlCommand::RejectWith { .. } => "reject".to_string(),
         ControlCommand::SetBudget(usd) => format!("budget {usd}"),
     };
     store.push_control(id, cmd)?;
@@ -361,6 +368,7 @@ mod tests {
                 EventKind::ApprovalResolved {
                     id: aid,
                     approved: true,
+                    payload: None,
                 },
                 "approved",
             ),
@@ -368,8 +376,9 @@ mod tests {
                 EventKind::ApprovalResolved {
                     id: aid,
                     approved: false,
+                    payload: Some("no".into()),
                 },
-                "rejected",
+                "rejected: no",
             ),
             (EventKind::AgentLog { line: "l".into() }, "log: l"),
             (EventKind::RunFinished { summary: None }, "finished"),

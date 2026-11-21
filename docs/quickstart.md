@@ -135,6 +135,11 @@ kestrel serve
 Leave it running. It runs the engine and the gateway, and picks up runs that you submit. Press
 Ctrl-C to stop it.
 
+For the web UI, start `kestrel up` instead. It runs the same, plus the API server on
+`127.0.0.1:7171`, and opens the UI in your browser (`--no-open` only prints the address). The UI
+shows only a "how to build" page until it is built: `cd ui && npm ci && npm run build`, then
+rebuild Kestrel. The API is described in [api.md](api.md).
+
 ## 5. Submit a run
 
 In another terminal, from inside your git repository:

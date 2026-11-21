@@ -42,7 +42,8 @@ export interface TreeNode {
   limit: MicroUsd | null;
 }
 
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+/** `expired`: undecided, and its run is not waiting on it, so it cannot be decided now. */
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 
 export interface Approval {
   id: ApprovalId;
@@ -76,7 +77,7 @@ export type EventKind =
   | ({ kind: 'model_call' } & ModelCallFields)
   | { kind: 'budget_warning'; spent: MicroUsd; limit: MicroUsd }
   | { kind: 'approval_requested'; id: ApprovalId; action: string }
-  | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean }
+  | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean; payload?: string }
   | { kind: 'agent_log'; line: string }
   | { kind: 'run_finished'; summary: string | null }
   | { kind: 'child_spawned'; child: RunId; agent: string; budget: MicroUsd }

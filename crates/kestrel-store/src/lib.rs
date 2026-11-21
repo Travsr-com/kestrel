@@ -144,6 +144,49 @@ pub enum ControlCommand {
     Approve(ApprovalId),
     Reject(ApprovalId),
     SetBudget(MicroUsd),
+    /// Approve with an edited action ("edit and approve"), recorded on `ApprovalResolved`.
+    ApproveWith {
+        id: ApprovalId,
+        payload: String,
+    },
+    /// Reject with a reason, recorded on `ApprovalResolved` and in the failure message.
+    RejectWith {
+        id: ApprovalId,
+        reason: String,
+    },
+}
+
+impl ControlCommand {
+    /// The approval this command resolves, if it resolves one.
+    pub fn approval(&self) -> Option<ApprovalId> {
+        match self {
+            ControlCommand::Approve(id)
+            | ControlCommand::Reject(id)
+            | ControlCommand::ApproveWith { id, .. }
+            | ControlCommand::RejectWith { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// True for the commands that approve (and so may resume a run).
+    pub fn approves(&self) -> bool {
+        matches!(
+            self,
+            ControlCommand::Approve(_) | ControlCommand::ApproveWith { .. }
+        )
+    }
+}
+
+/// An approval as the event log records it: the request and, once resolved, the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRecord {
+    pub id: ApprovalId,
+    pub run_id: RunId,
+    /// What the agent wants to do, in its own words.
+    pub action: String,
+    pub requested_at: OffsetDateTime,
+    /// `None` while pending, else whether it was approved.
+    pub resolved: Option<bool>,
 }
 
 /// Handle on the SQLite store. Shareable across threads (`Send + Sync`).
@@ -711,12 +754,21 @@ impl Store {
 
     /// Events of `run` with `seq > after_seq`, in `seq` order.
     pub fn events_since(&self, run: RunId, after_seq: u64) -> Result<Vec<Event>> {
+        self.events_page(run, after_seq, usize::MAX)
+    }
+
+    /// Like [`Store::events_since`], at most `limit` events.
+    pub fn events_page(&self, run: RunId, after_seq: u64, limit: usize) -> Result<Vec<Event>> {
         let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT body FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq")?;
+        let mut stmt = conn.prepare(
+            "SELECT body FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
         let bodies = stmt
-            .query_map(params![run.to_string(), after], |r| r.get::<_, String>(0))?
+            .query_map(params![run.to_string(), after, limit], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         bodies
             .iter()
@@ -730,15 +782,26 @@ impl Store {
     /// rowid only grows. `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
     /// id of a run that is not a root, reads nothing.
     pub fn events_since_global(&self, root: RunId, after_cursor: u64) -> Result<Vec<(u64, Event)>> {
+        self.events_since_global_page(root, after_cursor, usize::MAX)
+    }
+
+    /// Like [`Store::events_since_global`], at most `limit` events.
+    pub fn events_since_global_page(
+        &self,
+        root: RunId,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Event)>> {
         let after = i64::try_from(after_cursor).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT rowid, body FROM events
              WHERE rowid > ?2 AND run_id IN (SELECT id FROM runs WHERE root_run_id = ?1)
-             ORDER BY rowid",
+             ORDER BY rowid LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![root.to_string(), after], |r| {
+            .query_map(params![root.to_string(), after, limit], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -746,6 +809,47 @@ impl Store {
             // Rowids start at 1, so the u64 view is exact.
             .map(|(rowid, body)| Ok((rowid.unsigned_abs(), serde_json::from_str(body)?)))
             .collect()
+    }
+
+    // approvals
+
+    /// Every approval ever requested, in request order, each with its outcome. Read from the
+    /// `ApprovalRequested` and `ApprovalResolved` events.
+    pub fn approvals(&self) -> Result<Vec<ApprovalRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT body FROM events
+             WHERE json_extract(body, '$.kind.kind') IN ('approval_requested', 'approval_resolved')
+             ORDER BY rowid",
+        )?;
+        let bodies = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut records: Vec<ApprovalRecord> = Vec::new();
+        for body in bodies {
+            let event: Event = serde_json::from_str(&body)?;
+            match event.kind {
+                EventKind::ApprovalRequested { id, action } => records.push(ApprovalRecord {
+                    id,
+                    run_id: event.run_id,
+                    action,
+                    requested_at: event.ts,
+                    resolved: None,
+                }),
+                EventKind::ApprovalResolved { id, approved, .. } => {
+                    if let Some(r) = records.iter_mut().find(|r| r.id == id) {
+                        r.resolved = Some(approved);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(records)
+    }
+
+    /// One approval by id, see [`Store::approvals`].
+    pub fn approval(&self, id: ApprovalId) -> Result<Option<ApprovalRecord>> {
+        Ok(self.approvals()?.into_iter().find(|r| r.id == id))
     }
 
     // model calls and spend

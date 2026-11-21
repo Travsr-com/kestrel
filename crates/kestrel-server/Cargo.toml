@@ -1,0 +1,32 @@
+[package]
+name = "kestrel-server"
+description = "HTTP and WebSocket API for the UI and the CLI, and the embedded UI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kestrel-types.workspace = true
+kestrel-store.workspace = true
+axum = { workspace = true, features = ["ws"] }
+futures.workspace = true
+getrandom.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true
+tower.workspace = true

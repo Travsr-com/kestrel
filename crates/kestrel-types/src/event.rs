@@ -61,6 +61,10 @@ pub enum EventKind {
     ApprovalResolved {
         id: ApprovalId,
         approved: bool,
+        /// Text given with the decision: the edited action for "edit and approve", or the
+        /// reason for a rejection. Left out of the JSON when `None`, so older events decode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<String>,
     },
     AgentLog {
         line: String,

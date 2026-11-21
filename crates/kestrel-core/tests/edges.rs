@@ -82,7 +82,8 @@ async fn recovery_fails_provisioning_runs_and_restarts_approved_runs() {
     assert!(h.has_event(approval, |k| *k
         == EventKind::ApprovalResolved {
             id: aid,
-            approved: true
+            approved: true,
+            payload: None,
         }));
 }
 

@@ -1,7 +1,7 @@
 //! `kestrel serve`: the engine and the LLM gateway in one process, until SIGINT.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::commands::say;
-use crate::{Failure, Output, ServeArgs, db_path, open, paths};
+use crate::{Failure, Output, ServeArgs, UpArgs, db_path, open, paths};
 
 /// The config file, as written. The raw structs have no `Debug`, so a key can never be printed
 /// from them. See `tests/s9_s10_serve.rs` for an example.
@@ -687,7 +687,167 @@ fn test_drivers(_args: &ServeArgs) -> Result<Option<Vec<Box<dyn SandboxDriver>>>
     Ok(None)
 }
 
+/// Where `kestrel up` puts the API server unless `--listen` says otherwise.
+const DEFAULT_API_LISTEN: &str = "127.0.0.1:7171";
+
+/// What `kestrel up` adds to `kestrel serve`: the API server with the UI.
+pub(crate) struct ApiOptions {
+    listen: Option<String>,
+    open: bool,
+}
+
 pub(crate) fn serve(db: Option<PathBuf>, args: ServeArgs, out: Output) -> Result<(), Failure> {
+    start(db, args, out, None)
+}
+
+pub(crate) fn up(db: Option<PathBuf>, args: UpArgs, out: Output) -> Result<(), Failure> {
+    let api = ApiOptions {
+        listen: args.listen,
+        open: !args.no_open,
+    };
+    start(db, args.serve, out, Some(api))
+}
+
+/// The API server's address and a warning when it is not loopback.
+fn api_listen(listen: Option<&str>) -> Result<(SocketAddr, Option<String>), Failure> {
+    let text = listen.unwrap_or(DEFAULT_API_LISTEN);
+    let addr: SocketAddr = text.parse().map_err(|_| {
+        Failure::usage(format!(
+            "--listen `{text}` is not an address like {DEFAULT_API_LISTEN}"
+        ))
+    })?;
+    let warning = (!addr.ip().is_loopback()).then(|| {
+        format!(
+            "the API server listens on {addr}, which is not loopback: anyone who can reach it and has the token can read and steer every run"
+        )
+    });
+    Ok((addr, warning))
+}
+
+/// The address to open the UI at, with the token for the UI to pick up. An unspecified bind
+/// (0.0.0.0 or ::) is opened on loopback.
+fn ui_url(addr: SocketAddr, token: &str) -> String {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()))
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()))
+        }
+        _ => addr,
+    };
+    format!("http://{host}/?token={token}")
+}
+
+/// The API token's file: next to the database, so a temp `--db` keeps everything together.
+fn token_path(db: &Path) -> PathBuf {
+    db.with_file_name("server.token")
+}
+
+/// The command that opens `url` in the default browser on `os` (`std::env::consts::OS`).
+fn browser_command(os: &str, url: &str) -> Option<(String, Vec<String>)> {
+    let program = match os {
+        "macos" => "open",
+        "windows" => "explorer",
+        "linux" | "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "xdg-open",
+        _ => return None,
+    };
+    Some((program.to_string(), vec![url.to_string()]))
+}
+
+/// Opens `url` in a browser, or says to when that is not possible.
+fn open_browser(url: &str) {
+    let opened = browser_command(std::env::consts::OS, url).is_some_and(|(program, args)| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    });
+    if !opened {
+        eprintln!("kestrel: open {url} in a browser");
+    }
+}
+
+/// An error of the API server, so `supervise` names it rather than the gateway.
+#[derive(Debug)]
+struct ApiServerError(std::io::Error);
+
+impl std::fmt::Display for ApiServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ApiServerError {}
+
+/// The message for a server that failed: the API server's errors say so, any other is the
+/// gateway's.
+fn server_error(e: &std::io::Error) -> String {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ApiServerError>())
+    {
+        Some(api) => format!("API server: {api}"),
+        None => format!("gateway: {e}"),
+    }
+}
+
+/// The API server, bound and ready to serve.
+struct Api {
+    addr: SocketAddr,
+    url: String,
+    open: bool,
+    serve: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
+}
+
+async fn bind_api(
+    store: Arc<Store>,
+    db: &Path,
+    options: ApiOptions,
+    shutdown: CancellationToken,
+) -> Result<Api, Failure> {
+    let (addr, warning) = api_listen(options.listen.as_deref())?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| Failure::runtime(format!("--listen {addr}: cannot listen there: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Failure::runtime(e.to_string()))?;
+    let path = token_path(db);
+    let token =
+        kestrel_server::load_or_create_token(&path).map_err(|e| Failure::runtime(e.to_string()))?;
+    let config = kestrel_server::Config::new(token.clone(), addr);
+    let sockets = config.sockets.clone();
+    let app = kestrel_server::router(
+        store,
+        config,
+        Arc::new(kestrel_server::EmbeddedUi),
+        shutdown.clone(),
+    );
+    let serve = kestrel_server::serve(listener, app, shutdown, sockets);
+    Ok(Api {
+        addr,
+        url: ui_url(addr, &token),
+        open: options.open,
+        serve: Box::pin(async move {
+            serve
+                .await
+                .map_err(|e| std::io::Error::other(ApiServerError(e)))
+        }),
+    })
+}
+
+fn start(
+    db: Option<PathBuf>,
+    args: ServeArgs,
+    out: Output,
+    api: Option<ApiOptions>,
+) -> Result<(), Failure> {
     let path = match &args.config {
         Some(p) => p.clone(),
         None => paths::config_dir()?.join("kestrel").join("config.toml"),
@@ -703,7 +863,7 @@ pub(crate) fn serve(db: Option<PathBuf>, args: ServeArgs, out: Output) -> Result
     // bridge or socket exists.
     let db = db_path(db)?;
     let _lock = acquire_serve_lock(&db)?;
-    rt.block_on(run(db, config, drivers, out))
+    rt.block_on(run(db, config, drivers, out, api))
 }
 
 async fn run(
@@ -711,6 +871,7 @@ async fn run(
     config: Config,
     drivers: Option<Vec<Box<dyn SandboxDriver>>>,
     out: Output,
+    api: Option<ApiOptions>,
 ) -> Result<(), Failure> {
     // Catch SIGINT before anything else, so Ctrl-C always means a clean stop.
     let shutdown = CancellationToken::new();
@@ -799,7 +960,7 @@ async fn run(
                 shutdown,
                 subnets,
             };
-            serve_bound(&db, config, drivers, bound, out).await
+            serve_bound(&db, config, drivers, bound, out, api).await
         }
         Err(e) => Err(e),
     };
@@ -826,6 +987,7 @@ async fn serve_bound(
     drivers: Vec<Box<dyn SandboxDriver>>,
     bound: Bound,
     out: Output,
+    api: Option<ApiOptions>,
 ) -> Result<(), Failure> {
     let Bound {
         listener,
@@ -862,6 +1024,10 @@ async fn serve_bound(
         .await
         .map_err(|e| Failure::runtime(e.to_string()))?;
 
+    let api = match api {
+        Some(options) => Some(bind_api(store.clone(), db, options, shutdown.clone()).await?),
+        None => None,
+    };
     let deps = Arc::new(StoreDeps(store));
     let app = kestrel_gateway::router(
         config.gateway,
@@ -871,16 +1037,35 @@ async fn serve_bound(
             meter: deps,
         },
     );
-    let server =
+    let gateway =
         axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
-    let server = tokio::spawn(async move { server.await });
+    let (shown, serve_api) = match api {
+        Some(api) => ((api.addr, api.url, api.open).into(), Some(api.serve)),
+        None => (None, None),
+    };
+    let server = tokio::spawn(async move {
+        match serve_api {
+            // Both stop on `shutdown`; the first error stops the pair.
+            Some(serve_api) => tokio::try_join!(async { gateway.await }, serve_api).map(|_| ()),
+            None => gateway.await,
+        }
+    });
 
-    if out.json {
-        say(&json!({ "gateway": addr.to_string() }).to_string())?;
-    } else {
-        say(&format!(
+    match (&shown, out.json) {
+        (Some((api_addr, url, _)), true) => say(
+            &json!({ "gateway": addr.to_string(), "api": api_addr.to_string(), "url": url })
+                .to_string(),
+        )?,
+        (None, true) => say(&json!({ "gateway": addr.to_string() }).to_string())?,
+        (Some((_, url, _)), false) => say(&format!(
+            "kestrel is running, gateway on http://{addr}/. Open the UI at {url} . Ctrl-C stops it."
+        ))?,
+        (None, false) => say(&format!(
             "kestrel is running, gateway on http://{addr}/. Ctrl-C stops it."
-        ))?;
+        ))?,
+    }
+    if let Some((_, url, true)) = &shown {
+        open_browser(url);
     }
     supervise(engine.run_forever(shutdown.clone()), server, shutdown).await
 }
@@ -895,7 +1080,7 @@ async fn supervise<E: std::fmt::Display>(
     let gateway = |r: Result<std::io::Result<()>, tokio::task::JoinError>, expected: bool| match r {
         Ok(Ok(())) if expected => Ok(()),
         Ok(Ok(())) => Err(Failure::runtime("gateway stopped unexpectedly")),
-        Ok(Err(e)) => Err(Failure::runtime(format!("gateway: {e}"))),
+        Ok(Err(e)) => Err(Failure::runtime(server_error(&e))),
         Err(e) => Err(Failure::runtime(format!("gateway: {e}"))),
     };
     tokio::pin!(engine);
@@ -980,6 +1165,71 @@ impl MeterSink for StoreDeps {
 mod tests {
     use super::*;
     use kestrel_types::AgentSpec;
+
+    // #37 scenario 2: the API server binds 127.0.0.1 by default; another address starts it and
+    // warns.
+    #[test]
+    fn api_listen_defaults_to_loopback_without_a_warning() {
+        let (addr, warning) = api_listen(None).unwrap();
+        assert_eq!(addr, "127.0.0.1:7171".parse::<SocketAddr>().unwrap());
+        assert_eq!(warning, None);
+        let (addr, warning) = api_listen(Some("127.0.0.1:9000")).unwrap();
+        assert_eq!(addr.port(), 9000);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn api_listen_off_loopback_warns() {
+        let (addr, warning) = api_listen(Some("0.0.0.0:7171")).unwrap();
+        assert!(addr.ip().is_unspecified());
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("0.0.0.0:7171") && warning.contains("not loopback"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn api_listen_rejects_a_bad_address() {
+        let err = api_listen(Some("localhost")).unwrap_err();
+        assert!(err.message.contains("--listen"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_ui_url_carries_the_token_and_names_a_reachable_host() {
+        let loopback: SocketAddr = "127.0.0.1:7171".parse().unwrap();
+        assert_eq!(ui_url(loopback, "abc"), "http://127.0.0.1:7171/?token=abc");
+        let any: SocketAddr = "0.0.0.0:7171".parse().unwrap();
+        assert_eq!(ui_url(any, "abc"), "http://127.0.0.1:7171/?token=abc");
+        let any6: SocketAddr = "[::]:7171".parse().unwrap();
+        assert_eq!(ui_url(any6, "abc"), "http://[::1]:7171/?token=abc");
+        let lan: SocketAddr = "192.168.1.20:7171".parse().unwrap();
+        assert_eq!(ui_url(lan, "abc"), "http://192.168.1.20:7171/?token=abc");
+    }
+
+    #[test]
+    fn the_browser_is_opened_with_the_platform_command() {
+        let url = "http://127.0.0.1:7171/?token=abc";
+        assert_eq!(
+            browser_command("macos", url),
+            Some(("open".into(), vec![url.into()]))
+        );
+        assert_eq!(
+            browser_command("linux", url),
+            Some(("xdg-open".into(), vec![url.into()]))
+        );
+        assert_eq!(
+            browser_command("windows", url),
+            Some(("explorer".into(), vec![url.into()]))
+        );
+        assert_eq!(browser_command("plan9", url), None);
+    }
+
+    #[test]
+    fn the_token_file_lives_next_to_the_database() {
+        let db = Path::new("/data/kestrel/kestrel.db");
+        assert_eq!(token_path(db), Path::new("/data/kestrel/server.token"));
+    }
 
     const YAML: &str = "
 name: t
@@ -1176,6 +1426,18 @@ budget: { usd: 0.000010, wall_clock: 10m }
             .await
             .expect_err("panic");
         assert!(e.message.starts_with("gateway:"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn a_dead_api_server_is_named_in_the_error() {
+        let engine = std::future::pending::<Result<(), String>>();
+        let failed = server(Err(std::io::Error::other(ApiServerError(
+            std::io::Error::other("accept failed"),
+        ))));
+        let e = supervise(engine, failed, CancellationToken::new())
+            .await
+            .expect_err("api server error");
+        assert_eq!(e.message, "API server: accept failed");
     }
 
     #[tokio::test]
