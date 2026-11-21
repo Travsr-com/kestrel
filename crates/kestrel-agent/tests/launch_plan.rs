@@ -52,6 +52,8 @@ fn s1_claude_code_plan_matches_snapshot() {
             MODEL,
             "--permission-mode",
             "bypassPermissions",
+            // Even without Kestrel servers: none from an `.mcp.json` in the cloned repo either.
+            "--strict-mcp-config",
             "--",
             TASK,
         ])

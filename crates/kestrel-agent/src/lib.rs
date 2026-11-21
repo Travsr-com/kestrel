@@ -64,22 +64,28 @@ pub struct PlanFile {
 /// Where a sandbox finds the files of its plan: read-only, outside `/workspace`.
 pub const CONFIG_DIR: &str = "/kestrel";
 
-/// The part of the agent note for a run that may spawn: `kestrel.spawn` and `kestrel.join`.
+/// The part of the agent note for a run that may spawn (`kestrel.spawn`).
 const SPAWN_NOTE: &str = "\
-You can hand parts of your task to other agents and wait for them. Do it only when the work splits
-into parts that can go on at the same time.
+You can hand parts of your task to other agents. Do it only when the work splits into parts that
+can go on at the same time.
 
 * kestrel.spawn(agent, input, budget_usd?, wait?) starts a child run of another agent. Its budget
   comes out of yours: what you give it you cannot spend, and what it does not spend comes back
   when it ends. Without budget_usd it gets half of what you have left, at most its own budget.
+  With wait set, it also waits for the child and returns how it ended.
 * A child starts from nothing: give it a complete, self-contained task.
-* Each child works in its own clone of the original repository. It sees none of your changes,
-  committed or not, and its changes do not reach yours: put what it needs in its input, and ask
-  for what you need back in its summary.
+* Each child works in its own workspace, set by its agent spec: usually a fresh clone of the
+  original repository, never your copy. It sees none of your changes, committed or not, and its
+  changes do not reach yours: put what it needs in its input, and ask for what you need back in
+  its summary.
+* Few well-scoped children beat many small ones: each one costs a sandbox and its own model calls.
+";
+
+/// The part of the agent note for a run that may spawn and also holds `kestrel.join`.
+const JOIN_NOTE: &str = "\
 * kestrel.join(children?, mode?, timeout_s?) waits for children and returns how each ended:
   completed with its summary, failed with a reason, cancelled, or timed out. Waiting costs no
-  model calls. With wait set, kestrel.spawn waits for its child the same way.
-* Few well-scoped children beat many small ones: each one costs a sandbox and its own model calls.
+  model calls.
 ";
 
 /// The part of the agent note for a run granted `kestrel.ask_human`.
@@ -88,16 +94,19 @@ const ASK_NOTE: &str = "\
   find out yourself.
 ";
 
-/// What an agent is told about the Kestrel tools it was offered: spawning (with joining) when it
-/// may spawn, asking a person when it may ask. `None` when neither, since `kestrel.join` alone has
-/// no children to wait for. No token, URL or path.
-pub fn agent_note(spawn: bool, ask: bool) -> Option<String> {
+/// What an agent is told about the Kestrel tools it was offered: spawning when it may spawn,
+/// joining when it may also join, asking a person when it may ask. `None` when it may neither
+/// spawn nor ask, since `kestrel.join` alone has no children to wait for. No token, URL or path.
+pub fn agent_note(spawn: bool, join: bool, ask: bool) -> Option<String> {
     if !spawn && !ask {
         return None;
     }
     let mut note = String::from("# Kestrel tools\n\n");
     if spawn {
         note.push_str(SPAWN_NOTE);
+        if join {
+            note.push_str(JOIN_NOTE);
+        }
     }
     if ask {
         note.push_str(ASK_NOTE);
@@ -139,6 +148,8 @@ struct Servers {
     tools: Vec<String>,
     /// `kestrel.spawn` is offered.
     spawn: bool,
+    /// `kestrel.join` is offered.
+    join: bool,
     /// `kestrel.ask_human` is offered.
     ask: bool,
 }
@@ -147,20 +158,24 @@ impl Servers {
     fn of(spec: &AgentSpec, ctx: &RunContext) -> Servers {
         let caps = &spec.capabilities;
         let mut tools: Vec<String> = Vec::new();
-        let (mut kestrel, mut travsr, mut spawn, mut ask) = (false, false, false, false);
+        let (mut kestrel, mut travsr) = (false, false);
+        let (mut spawn, mut join, mut ask) = (false, false, false);
         for name in &caps.mcp {
             let tool = if let Some(tool) = name.strip_prefix("kestrel.") {
                 match tool {
                     // Spawning also needs spawn rights, as the gateway checks.
                     "spawn" if caps.spawn.as_ref().is_some_and(|s| s.may_spawn()) => spawn = true,
                     "ask_human" => ask = true,
-                    "join" => {}
+                    "join" => join = true,
                     // The gateway has no other Kestrel tool, so it would never list this one.
                     _ => continue,
                 }
                 kestrel = true;
                 format!("mcp__kestrel__{}", claude_name(name))
             } else if let Some(tool) = name.strip_prefix("travsr.") {
+                // Named without the `travsr.` prefix, on the assumption that the Travsr route
+                // (#44) lists its tools as Travsr names them. Only a name: the flag it goes in
+                // restricts nothing, so a mismatch hides no tool.
                 travsr = true;
                 format!("mcp__travsr__{}", claude_name(tool))
             } else {
@@ -175,6 +190,7 @@ impl Servers {
             travsr: travsr.then(|| endpoint(&ctx.gateway_url, "travsr")),
             tools,
             spawn,
+            join,
             ask,
         }
     }
@@ -185,7 +201,7 @@ impl Servers {
 
     /// The agent note for the Kestrel tools offered, see [`agent_note`].
     fn note(&self) -> Option<String> {
-        agent_note(self.spawn, self.ask)
+        agent_note(self.spawn, self.join, self.ask)
     }
 
     /// The servers by name, each to `entry(url)`.
