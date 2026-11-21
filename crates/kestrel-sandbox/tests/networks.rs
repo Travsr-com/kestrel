@@ -168,7 +168,7 @@ async fn s1_the_instance_label_is_added_when_the_driver_has_an_instance() {
         .expect("prepare");
     let mut want = create_net(NET, RUN);
     want.splice(
-        5..5,
+        6..6,
         s(&["--label", "kestrel.instance=1a2b3c4d"]).into_iter(),
     );
     assert_eq!(runner.runs()[0], want);
