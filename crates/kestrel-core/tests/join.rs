@@ -716,26 +716,73 @@ async fn cancel_reaches_runs_below_a_finished_child_that_kept_its_children() {
     until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
 }
 
-// A run that ends cancels runs below a child that ended and kept its children.
+// A join that times out leaves its slot to come back later. A second join started before that
+// happens must not let the parent take the only slot its new child needs.
 #[tokio::test(start_paused = true)]
-async fn a_finishing_parent_reaps_below_a_finished_child_that_kept_its_children() {
-    let mut h = harness(8);
-    let (root, session) = parent(&mut h, false).await;
-    let mid_session = h.driver.live();
-    let mid = h
+async fn a_join_after_a_timed_out_join_does_not_deadlock() {
+    let mut h = harness(1);
+    let (lead, _s) = parent(&mut h, false).await;
+    let first_session = h.driver.live();
+    let first = spawn(&h, lead).await;
+    let timed = h
         .engine
-        .spawn_child(root, &agent("lead", true), "mid", Some(MicroUsd(DOLLAR)))
+        .join(lead, &[first], JoinMode::All, Some(Duration::from_secs(1)))
         .await
         .unwrap();
-    until("mid running", || h.is(mid, &RunStatus::Running)).await;
-    let _g = h.driver.live();
-    let grand = spawn(&h, mid).await;
-    until("grandchild running", || h.is(grand, &RunStatus::Running)).await;
-    mid_session.exit(0);
-    until("mid completed", || h.is(mid, &RunStatus::Completed)).await;
-    session.exit(0);
-    until("root completed", || h.is(root, &RunStatus::Completed)).await;
-    assert!(h.is(grand, &RunStatus::Cancelled));
+    assert_eq!(outcome(&timed, first), JoinOutcome::TimedOut);
+    // The timed-out join's way back is in line before the second child is spawned.
+    settle().await;
+    let second_session = h.driver.live();
+    let second = spawn(&h, lead).await;
+    let join = join_in_background(&h, lead, vec![first, second], JoinMode::All, None);
+    settle().await;
+    first_session.exit(0);
+    until("second running", || h.is(second, &RunStatus::Running)).await;
+    assert!(
+        !h.engine.holds_slot(lead),
+        "the waiting parent holds no slot"
+    );
+    second_session.exit(0);
+    let results = join.await.unwrap().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(h.engine.holds_slot(lead));
+}
+
+// A join that starts while another of the same parent is still taking the slot back: the parent
+// must not hold the slot while the new join waits.
+#[tokio::test(start_paused = true)]
+async fn a_join_that_starts_while_the_slot_comes_back_holds_no_slot() {
+    let mut h = harness(2);
+    let (lead, _s) = parent(&mut h, false).await;
+    let a_session = h.driver.live();
+    let a = spawn(&h, lead).await;
+    until("a running", || h.is(a, &RunStatus::Running)).await;
+    let join_a = join_in_background(&h, lead, vec![a], JoinMode::All, None);
+    settle().await;
+    // A queued run takes the slot the parent gave up, then one more waits in line, so when `a`
+    // ends its slot goes to that run and join A waits behind it for the parent's slot.
+    let other_session = h.driver.live();
+    let other = h.submit(spec()).await;
+    until("other running", || h.is(other, &RunStatus::Running)).await;
+    let queued_session = h.driver.live();
+    let queued = h.submit(spec()).await;
+    settle().await;
+    a_session.exit(0);
+    until("queued running", || h.is(queued, &RunStatus::Running)).await;
+    // Join B starts while join A still waits for the slot.
+    let b_session = h.driver.live();
+    let b = spawn(&h, lead).await;
+    let join_b = join_in_background(&h, lead, vec![b], JoinMode::All, None);
+    settle().await;
+    other_session.exit(0);
+    until("b running", || h.is(b, &RunStatus::Running)).await;
+    assert!(!h.engine.holds_slot(lead), "join B still waits");
+    join_a.await.unwrap().unwrap();
+    assert!(!join_b.is_finished());
+    queued_session.exit(0);
+    b_session.exit(0);
+    join_b.await.unwrap().unwrap();
+    until("parent has its slot", || h.engine.holds_slot(lead)).await;
 }
 
 // A child may keep its children only when its parent keeps its own.

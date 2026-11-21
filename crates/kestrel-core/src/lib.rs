@@ -458,6 +458,17 @@ struct Scheduler {
     waiting: VecDeque<Waiter>,
     /// Cancels held back until the runs below have ended, deepest runs first.
     pending_cancels: Vec<RunId>,
+    /// Set by `run_forever`: when the scheduler goes (the loop ended, or its future was
+    /// dropped), the held-back cancels go back into the store for the next start.
+    requeue: Option<Arc<Inner>>,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if let Some(inner) = &self.requeue {
+            inner.requeue_cancels(&self.pending_cancels);
+        }
+    }
 }
 
 /// A queued run, a resume command that needs a slot, or a parent leaving a join.
@@ -485,6 +496,10 @@ struct JoinState {
     waiting: usize,
     /// Whether the first join gave the parent's slot back, so the last one takes it again.
     released: bool,
+    /// The last join left and the slot is on its way back. A join that starts now takes that
+    /// over (it will take the slot back when it ends), and the scheduler grants no slot to a
+    /// parent while one of its joins waits.
+    regaining: bool,
 }
 
 impl Waiter {
@@ -767,6 +782,7 @@ impl Engine {
         let _active = self.inner.activate(&stop)?;
         // Dropping the scheduler on return aborts every run actor, before `_active` resets slots.
         let mut scheduler = Scheduler::default();
+        scheduler.requeue = Some(self.inner.clone());
         let mut tick = self.inner.ticker();
         let result = loop {
             tokio::select! {
@@ -779,8 +795,7 @@ impl Engine {
                 }
             }
         };
-        // A cancel still held back goes back into the store, so the next engine delivers it.
-        self.inner.requeue_cancels(&scheduler);
+        // Dropping the scheduler puts a cancel still held back into the store again.
         result
     }
 
@@ -903,6 +918,19 @@ impl Inner {
         live.active = Some(stop.clone());
         drop(live);
         self.reset_slots();
+        // Every slot is free again, so no parent is owed one: a request from before is stale (it
+        // could hand a slot to a run whose sandbox the restart removed).
+        self.rejoins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        joins.retain(|_, j| j.waiting > 0);
+        for j in joins.values_mut() {
+            j.released = false;
+            j.regaining = false;
+        }
+        drop(joins);
         Ok(Active(self))
     }
 
@@ -1141,11 +1169,14 @@ impl Inner {
     /// until its children have ended, so a tree is cancelled from the leaves up and every child's
     /// `Cancelled` is committed before its parent's.
     fn cancel_tree(self: &Arc<Self>, run: RunId, s: &mut Scheduler) -> Result<()> {
-        if !self.cancelling_insert(run) {
+        if self.is_cancelling(run) {
             return Ok(());
         }
-        for below in self.live_below(run)? {
-            self.cancel_tree(below, s)?;
+        // Read first, so a store error leaves no run marked as cancelling for good.
+        let below = self.live_below(run)?;
+        self.cancelling_insert(run);
+        for run_below in below {
+            self.cancel_tree(run_below, s)?;
         }
         s.pending_cancels.push(run);
         Ok(())
@@ -1211,9 +1242,9 @@ impl Inner {
         self.cancelling().contains(&run)
     }
 
-    /// Puts the held-back cancels back into the store when the scheduler stops.
-    fn requeue_cancels(&self, s: &Scheduler) {
-        for run in &s.pending_cancels {
+    /// Puts held-back cancels back into the store when the scheduler stops.
+    fn requeue_cancels(&self, pending: &[RunId]) {
+        for run in pending {
             self.cancelling_remove(*run);
             let _ = self.store.push_control(*run, ControlCommand::Cancel);
         }
@@ -1225,7 +1256,13 @@ impl Inner {
         let state = joins.entry(parent).or_default();
         state.waiting += 1;
         if state.waiting == 1 {
-            state.released = self.slots().release(parent);
+            if state.regaining {
+                // The slot is still on its way back from an earlier join: this one takes it back.
+                state.regaining = false;
+                state.released = true;
+            } else {
+                state.released = self.slots().release(parent);
+            }
         }
     }
 
@@ -1240,9 +1277,14 @@ impl Inner {
         if state.waiting > 0 {
             return false;
         }
-        let released = state.released;
+        if state.released {
+            // Kept until the slot is back, so a join that starts meanwhile knows.
+            state.released = false;
+            state.regaining = true;
+            return true;
+        }
         joins.remove(&parent);
-        released
+        false
     }
 
     /// Lines `run` up for its slot back after a join.
@@ -1280,13 +1322,23 @@ impl Inner {
                     | RunStatus::Suspended(SuspendReason::Approval(_))
             )
         });
-        if !(wanted && running) {
+        // Joins before slots, the order `enter_join` takes them in.
+        let mut joins = self.joins.lock().unwrap_or_else(PoisonError::into_inner);
+        // A join of this parent waits again: it takes the slot back itself when it ends.
+        let joining = joins.get(&run).is_some_and(|j| j.waiting > 0);
+        if !(wanted && running) || joining {
             s.waiting.remove(i);
+            if !running && !joining {
+                joins.remove(&run);
+            }
             return Ok(true);
         }
         if !self.slots().reacquire(run) {
             return Ok(false);
         }
+        // The slot is back: nothing is on its way any more.
+        joins.remove(&run);
+        drop(joins);
         if let Some(Waiter {
             rejoin: Some(Rejoin::Told(tx)),
             ..
