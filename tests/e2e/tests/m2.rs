@@ -416,14 +416,27 @@ fn m2_s04_child_cannot_reach_a_host_its_parent_lacks() {
     let _up = env.up();
     let (_root, child) = probe_tree(&env, "c.hosts=1");
 
+    // The proof that the child does not get `evil.example` is its grant: the host is dropped.
     assert_eq!(granted(&env, &child).network, ["api.github.com"]);
     assert_eq!(strings(&dropped(&env, &child)["hosts"]), ["evil.example"]);
 
+    // `evil.example` is under the reserved `.example` domain and never resolves anywhere, so its
+    // failed probe proves nothing. The network is shown closed by the probes that answer on an open
+    // network: 1.1.1.1 (no DNS needed) and api.github.com (a host the child was granted).
     let egress = env.read_out(&child, "egress.txt");
     let lines: Vec<&str> = egress.lines().collect();
     assert_eq!(lines.len(), 4, "four hosts tried: {egress:?}");
     assert!(egress.contains("https://evil.example"), "{egress}");
     assert!(egress.contains("https://api.github.com"), "{egress}");
+    // An address needs no DNS, so its probe can only fail on the connection itself.
+    let by_address = lines
+        .iter()
+        .find(|l| l.ends_with(" https://1.1.1.1"))
+        .unwrap_or_else(|| panic!("no probe of 1.1.1.1: {egress:?}"));
+    assert!(
+        by_address.starts_with("blocked 7 ") || by_address.starts_with("blocked 28 "),
+        "1.1.1.1 should fail to connect or time out: {by_address}"
+    );
     for line in lines {
         // As in M1 scenario 3: only a DNS failure (6), a refused connection (7) or a timeout (28)
         // proves the network is closed.
