@@ -5,12 +5,17 @@
 //! * `EmptyDir`: a fresh, empty directory.
 //! * `GitClone { repo, depth }`: a full, self-contained `git clone --local --no-hardlinks` of
 //!   `repo`, on its own branch (`kestrel/run-<short id>`, see [`Workspaces::branch_for`]).
-//!   `depth` makes it shallow. The clone is the agent's to rewrite, so the host never runs git
-//!   inside it; [`Workspaces::fetch_back`] pulls the branch home from the source repo instead.
+//!   `depth` makes it shallow. The clone is the agent's to rewrite, so the host runs git inside
+//!   it only before its sandbox exists (the checkout, and [`Workspaces::head`]);
+//!   [`Workspaces::fetch_back`] pulls the branch home from the source repo instead.
 //!
 //! `prepare` is idempotent: if the run's directory already exists (for example after an engine
 //! restart), it is reused as is and no git command runs. Workspaces are kept after the run
 //! ends; cleanup is a separate command.
+//!
+//! [`Workspaces::head`] reads the commit a fresh clone is at, before its sandbox exists, and
+//! [`clone_at`] makes a host-only copy of a repo at a commit (Travsr indexes such a copy, never
+//! the workspace).
 //!
 //! All git calls go through a [`CommandRunner`], so unit tests use a fake and never spawn git.
 
@@ -64,6 +69,9 @@ pub enum WorkspaceError {
     /// the fetch read objects from another repository, so `fetch_back` refuses.
     #[error("clone `{}` has object alternates; refusing to fetch from it", clone.display())]
     AlternatesPresent { clone: PathBuf },
+    /// Not a full commit id (40 or 64 lowercase hex characters). `text` is cut to 80 bytes.
+    #[error("`{text}` is not a commit id")]
+    BadCommit { text: String },
 }
 
 /// The environment every host git call runs with: removes `GIT_DIR`, `GIT_WORK_TREE`,
@@ -280,17 +288,33 @@ impl Workspaces {
         self.run_git(command, repo).await
     }
 
+    /// The commit `run`'s workspace is at, a full commit id.
+    ///
+    /// Only for a workspace [`Workspaces::prepare`] has just cloned, before its sandbox exists:
+    /// git runs inside the clone, which is safe only while its config and hooks are still ours.
+    /// Never call it on a workspace an agent has had.
+    pub async fn head(&self, run: RunId) -> Result<String, WorkspaceError> {
+        let path = self.path_for(run);
+        let text = path.to_string_lossy().into_owned();
+        let command = argv(&[
+            "git",
+            "-C",
+            &text,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]);
+        let out = run_git(self.runner.as_ref(), command, &path).await?;
+        commit_id(out.trim())
+    }
+
     /// Runs one git command and turns a non-zero exit into [`WorkspaceError::Git`].
     async fn run_git(&self, command: Vec<String>, repo: &Path) -> Result<(), WorkspaceError> {
-        let out = self.git(&command, repo).await?;
-        if out.status != 0 {
-            return Err(WorkspaceError::Git {
-                argv: command,
-                status: out.status,
-                stderr: out.stderr.trim_end().to_string(),
-            });
-        }
-        Ok(())
+        run_git(self.runner.as_ref(), command, repo)
+            .await
+            .map(|_| ())
     }
 
     /// Runs one git command; failing to start git is an `Io` error at `repo`.
@@ -299,11 +323,106 @@ impl Workspaces {
         argv: &[String],
         repo: &Path,
     ) -> Result<kestrel_sandbox::CommandOutput, WorkspaceError> {
-        self.runner
-            .run_with_env(argv, &git_env_scrub())
-            .await
-            .map_err(io(repo))
+        git(self.runner.as_ref(), argv, repo).await
     }
+}
+
+/// Clones `repo` into `dest` and checks out `commit`, detached, the way a workspace is cloned
+/// (`--local --no-hardlinks`, hooks off, the environment of [`git_env_scrub`]).
+///
+/// For copies the host keeps to itself, such as the one Travsr indexes for a run: `dest` must
+/// not exist, and no agent ever gets it. `commit` must be a full commit id, so it can never be
+/// read as an option. A copy that fails halfway is removed.
+pub async fn clone_at(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    commit: &str,
+    dest: &Path,
+) -> Result<(), WorkspaceError> {
+    let commit = commit_id(commit)?;
+    if repo.is_relative() {
+        return Err(WorkspaceError::RelativeRepo {
+            repo: repo.to_path_buf(),
+        });
+    }
+    let repo_text = repo.to_str().ok_or_else(|| WorkspaceError::NonUtf8Repo {
+        repo: repo.to_path_buf(),
+    })?;
+    let dest_text = dest.to_string_lossy();
+    let clone = argv(&[
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        "--no-checkout",
+        "--",
+        repo_text,
+        &dest_text,
+    ]);
+    let checkout = argv(&[
+        "git",
+        "-C",
+        &dest_text,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "checkout",
+        "--detach",
+        &commit,
+    ]);
+    for command in [clone, checkout] {
+        if let Err(e) = run_git(runner, command, repo).await {
+            // Best effort: a half-made copy must not be mistaken for a whole one.
+            let _ = tokio::fs::remove_dir_all(dest).await;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// `text` when it is a full commit id: 40 (sha-1) or 64 (sha-256) lowercase hex characters.
+fn commit_id(text: &str) -> Result<String, WorkspaceError> {
+    let hex = text
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex && matches!(text.len(), 40 | 64) {
+        return Ok(text.to_string());
+    }
+    let mut cut = text.len().min(80);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Err(WorkspaceError::BadCommit {
+        text: text[..cut].to_string(),
+    })
+}
+
+/// Runs one git command and returns its stdout; a non-zero exit is [`WorkspaceError::Git`].
+async fn run_git(
+    runner: &dyn CommandRunner,
+    command: Vec<String>,
+    repo: &Path,
+) -> Result<String, WorkspaceError> {
+    let out = git(runner, &command, repo).await?;
+    if out.status != 0 {
+        return Err(WorkspaceError::Git {
+            argv: command,
+            status: out.status,
+            stderr: out.stderr.trim_end().to_string(),
+        });
+    }
+    Ok(out.stdout)
+}
+
+/// Runs one git command with [`git_env_scrub`]; failing to start git is an `Io` error at `repo`.
+async fn git(
+    runner: &dyn CommandRunner,
+    argv: &[String],
+    repo: &Path,
+) -> Result<kestrel_sandbox::CommandOutput, WorkspaceError> {
+    runner
+        .run_with_env(argv, &git_env_scrub())
+        .await
+        .map_err(io(repo))
 }
 
 async fn create_dir(path: &Path) -> Result<(), WorkspaceError> {

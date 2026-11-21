@@ -1,24 +1,29 @@
-//! Issue #44: the engine has each run's clone indexed for Travsr before its agent starts, and
-//! forgotten when its sandbox goes, through a fake `RunIndexer`.
+//! Issue #44: the engine has each run's code indexed for Travsr before its agent starts, and
+//! forgotten when the run ends, through a fake `RunIndexer`.
+//!
+//! Travsr runs on the host, so the indexer is never given the run's workspace: it gets the source
+//! repo and the commit the workspace was cloned at (read before the sandbox exists), and keeps its
+//! own copy.
 //!
 //! Every test runs on a paused clock with the fake driver and adapter from `common`, and a fake
-//! git that makes a clone directory. Test names start with the scenario number of the issue they
-//! cover (`s1_...`); rules the engine adds on top have no number.
+//! git that makes a clone directory and answers `rev-parse` with a commit id. Test names start
+//! with the scenario number of the issue they cover (`s1_...`); rules the engine adds on top have
+//! no number.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use common::*;
 use kestrel_core::caps::RootKey;
-use kestrel_core::{IndexLimits, RunIndexer, Workspaces};
+use kestrel_core::{IndexLimits, IndexSource, RunIndexer, Workspaces};
 use kestrel_sandbox::{CommandOutput, CommandRunner, SpawnedProcess};
 use kestrel_store::ControlCommand;
 use kestrel_types::{AgentSpec, EventKind, RunId, RunStatus, WorkspaceSpec};
@@ -27,23 +32,55 @@ use tokio::sync::Semaphore;
 
 use RunStatus::{Completed, Running, Suspended};
 
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Git that succeeds; `clone` makes the target directory with a `.git` entry.
-struct FakeGit;
+/// Git that succeeds: `clone` makes the target directory with a `.git` entry, and `rev-parse
+/// HEAD^{commit}` answers [`SHA`] (or fails, when `head_fails`). Records every argv.
+#[derive(Default)]
+struct FakeGit {
+    head_fails: AtomicBool,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl FakeGit {
+    /// Calls that ran inside `dir` (`git -C <dir> ...`).
+    fn inside(&self, dir: &Path) -> Vec<Vec<String>> {
+        let dir = dir.to_string_lossy();
+        lock(&self.calls)
+            .iter()
+            .filter(|argv| argv.get(1).is_some_and(|a| a == "-C") && argv[2] == dir)
+            .cloned()
+            .collect()
+    }
+}
 
 #[async_trait]
 impl CommandRunner for FakeGit {
     async fn run(&self, argv: &[String]) -> std::io::Result<CommandOutput> {
+        lock(&self.calls).push(argv.to_vec());
         if argv.get(1).is_some_and(|a| a == "clone") {
             let path = PathBuf::from(argv.last().expect("clone target"));
             std::fs::create_dir_all(path.join(".git"))?;
         }
+        if argv.iter().any(|a| a == "HEAD^{commit}") && self.head_fails.load(Ordering::SeqCst) {
+            return Ok(CommandOutput {
+                status: 128,
+                stdout: String::new(),
+                stderr: "fatal: Needed a single revision".into(),
+            });
+        }
+        let stdout = if argv.iter().any(|a| a == "HEAD^{commit}") {
+            format!("{SHA}\n")
+        } else {
+            ".git\n".into()
+        };
         Ok(CommandOutput {
             status: 0,
-            stdout: ".git\n".into(),
+            stdout,
             stderr: String::new(),
         })
     }
@@ -56,31 +93,42 @@ impl CommandRunner for FakeGit {
 /// A fake Travsr indexer: records every call, and can wait, fail or take time.
 #[derive(Default)]
 struct FakeIndexer {
-    indexed: Mutex<Vec<(RunId, PathBuf)>>,
-    forgotten: Mutex<Vec<(RunId, PathBuf)>>,
+    indexed: Mutex<Vec<(RunId, IndexSource)>>,
+    released: Mutex<Vec<RunId>>,
+    forgotten: Mutex<Vec<RunId>>,
+    /// The runs it keeps a copy for: indexed and not forgotten yet.
+    disk: Mutex<HashSet<RunId>>,
     /// When set, `index` waits for a permit of it (one per call).
     gate: Mutex<Option<Arc<Semaphore>>>,
+    /// When set, `forget` waits for a permit of it (one per call).
+    forget_gate: Mutex<Option<Arc<Semaphore>>>,
     /// How long `index` takes.
     takes: Mutex<Duration>,
     /// When set, `index` fails with this.
     fails: Mutex<Option<String>>,
     /// How many of the next `forget` calls fail.
     forget_failures: AtomicUsize,
+    /// `kept` fails.
+    kept_fails: AtomicBool,
     running: AtomicUsize,
     most_running: AtomicUsize,
     finished: AtomicUsize,
 }
 
 impl FakeIndexer {
-    fn indexed(&self) -> Vec<(RunId, PathBuf)> {
+    fn indexed(&self) -> Vec<(RunId, IndexSource)> {
         lock(&self.indexed).clone()
     }
 
-    fn forgotten(&self) -> Vec<(RunId, PathBuf)> {
+    fn forgotten(&self) -> Vec<RunId> {
         lock(&self.forgotten).clone()
     }
 
-    /// Makes `index` wait until [`FakeIndexer::open`].
+    fn released(&self) -> Vec<RunId> {
+        lock(&self.released).clone()
+    }
+
+    /// Makes `index` wait until a permit is added.
     fn close(&self) -> Arc<Semaphore> {
         let gate = Arc::new(Semaphore::new(0));
         *lock(&self.gate) = Some(gate.clone());
@@ -88,10 +136,26 @@ impl FakeIndexer {
     }
 }
 
+/// Takes one from `left`, if any are left. A loop rather than `fetch_update`, which newer
+/// toolchains deprecate, and its replacement is past the MSRV.
+fn take_one(left: &AtomicUsize) -> bool {
+    let mut now = left.load(Ordering::SeqCst);
+    loop {
+        if now == 0 {
+            return false;
+        }
+        match left.compare_exchange(now, now - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => now = seen,
+        }
+    }
+}
+
 #[async_trait]
 impl RunIndexer for FakeIndexer {
-    async fn index(&self, run: RunId, clone: &Path) -> Result<(), String> {
-        lock(&self.indexed).push((run, clone.to_path_buf()));
+    async fn index(&self, run: RunId, source: &IndexSource) -> Result<(), String> {
+        lock(&self.indexed).push((run, source.clone()));
+        lock(&self.disk).insert(run);
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most_running.fetch_max(now, Ordering::SeqCst);
         // Counted down however this ends, a timeout included.
@@ -115,30 +179,28 @@ impl RunIndexer for FakeIndexer {
         }
     }
 
-    async fn forget(&self, run: RunId, clone: &Path) -> Result<(), String> {
-        lock(&self.forgotten).push((run, clone.to_path_buf()));
-        // Takes one failure, if any are left. A loop rather than `fetch_update`, which newer
-        // toolchains deprecate, and its replacement is past the MSRV.
-        let mut left = self.forget_failures.load(Ordering::SeqCst);
-        let failing = loop {
-            if left == 0 {
-                break false;
-            }
-            match self.forget_failures.compare_exchange(
-                left,
-                left - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break true,
-                Err(now) => left = now,
-            }
-        };
-        if failing {
-            Err("travsr repos --remove exited with code 1".into())
-        } else {
-            Ok(())
+    async fn release(&self, run: RunId) {
+        lock(&self.released).push(run);
+    }
+
+    async fn forget(&self, run: RunId) -> Result<(), String> {
+        lock(&self.forgotten).push(run);
+        let gate = lock(&self.forget_gate).clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
         }
+        if take_one(&self.forget_failures) {
+            return Err("travsr repos --remove exited with code 1".into());
+        }
+        lock(&self.disk).remove(&run);
+        Ok(())
+    }
+
+    async fn kept(&self) -> Result<Vec<RunId>, String> {
+        if self.kept_fails.load(Ordering::SeqCst) {
+            return Err("permission denied".into());
+        }
+        Ok(lock(&self.disk).iter().copied().collect())
     }
 }
 
@@ -146,15 +208,32 @@ const LIMITS: IndexLimits = IndexLimits {
     timeout: Duration::from_secs(5),
     max_jobs: 2,
     retry_every: Duration::from_secs(10),
+    forget_timeout: Duration::from_secs(3),
 };
 
 struct Setup {
     h: Harness,
     ix: Arc<FakeIndexer>,
+    git: Arc<FakeGit>,
     /// The source repo every clone is made from, and the workspaces root.
     repo: PathBuf,
     root: PathBuf,
     _dir: TempDir,
+}
+
+impl Setup {
+    /// A new engine on the same database and workspaces, with a new indexer and git, as after
+    /// a restart. Call after the old engine stopped.
+    fn restart(&mut self, ix: Arc<FakeIndexer>) {
+        let (root, indexer, git) = (self.root.clone(), ix.clone(), self.git.clone());
+        self.h.shutdown = tokio_util::sync::CancellationToken::new();
+        self.h.rebuild(move |e| {
+            e.with_workspaces(Workspaces::new(root, git))
+                .with_root_key(RootKey::generate())
+                .with_indexer(indexer, LIMITS)
+        });
+        self.ix = ix;
+    }
 }
 
 /// A harness whose engine has workspaces (fake git), the fake indexer with `limits` and a root key.
@@ -165,15 +244,17 @@ fn setup(max: usize, limits: IndexLimits) -> Setup {
     std::fs::create_dir_all(&repo).unwrap();
     let mut h = Harness::new(max);
     let ix = Arc::new(FakeIndexer::default());
-    let (ws_root, indexer) = (root.clone(), ix.clone());
+    let git = Arc::new(FakeGit::default());
+    let (ws_root, indexer, runner) = (root.clone(), ix.clone(), git.clone());
     h.rebuild(move |e| {
-        e.with_workspaces(Workspaces::new(ws_root, Arc::new(FakeGit)))
+        e.with_workspaces(Workspaces::new(ws_root, runner))
             .with_root_key(RootKey::generate())
             .with_indexer(indexer, limits)
     });
     Setup {
         h,
         ix,
+        git,
         repo,
         root,
         _dir: dir,
@@ -201,8 +282,15 @@ fn travsr_logs(h: &Harness, id: RunId) -> Vec<String> {
         .collect()
 }
 
+fn at_start(repo: &Path) -> IndexSource {
+    IndexSource {
+        repo: repo.to_path_buf(),
+        commit: Some(SHA.to_string()),
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn s1_the_clone_is_indexed_before_the_agent_starts() {
+async fn s1_the_run_s_code_is_indexed_from_its_source_at_its_commit_before_the_agent_starts() {
     let mut s = setup(4, LIMITS);
     let gate = s.ix.close();
     let session = s.h.driver.live();
@@ -213,15 +301,19 @@ async fn s1_the_clone_is_indexed_before_the_agent_starts() {
             &["travsr.get_callers", "travsr.search_symbol"],
         ))
         .await;
-    let clone = s.root.join(id.to_string());
     until("indexing started", || s.ix.indexed().len() == 1).await;
-    assert_eq!(s.ix.indexed(), [(id, clone.clone())]);
+    // The source repo and the commit its workspace was cloned at: never the workspace.
+    assert_eq!(s.ix.indexed(), [(id, at_start(&s.repo))]);
+    let workspace = s.root.join(id.to_string());
+    let read = s.git.inside(&workspace);
+    assert_eq!(read.len(), 2, "the checkout and the commit read: {read:?}");
+    assert!(read[1].iter().any(|a| a == "rev-parse"), "{read:?}");
     // The sandbox may be made meanwhile, but the agent waits for the index.
     settle().await;
     assert_eq!(s.h.driver.starts(), 0);
     assert!(!s.h.is(id, &Running));
     assert_eq!(s.h.engine.travsr_tools(id).unwrap(), Some(Vec::new()));
-    assert_eq!(s.h.engine.travsr_clone(id), None);
+    assert!(!s.h.engine.travsr_ready(id));
 
     gate.add_permits(1);
     until("running", || s.h.is(id, &Running)).await;
@@ -230,21 +322,24 @@ async fn s1_the_clone_is_indexed_before_the_agent_starts() {
         s.h.engine.travsr_tools(id).unwrap(),
         Some(vec!["get_callers".to_string(), "search_symbol".to_string()])
     );
-    assert_eq!(s.h.engine.travsr_clone(id), Some(clone.clone()));
+    assert!(s.h.engine.travsr_ready(id));
     assert!(
         travsr_logs(&s.h, id).is_empty(),
         "{:?}",
         travsr_logs(&s.h, id)
     );
+    // No git ran in the workspace once its sandbox existed.
+    assert_eq!(s.git.inside(&workspace).len(), 2);
 
-    // Scenario 8: the run finishes, its clone is forgotten.
+    // Scenario 8: the run finishes, its copy is forgotten.
     session.line("ok:done");
     session.exit(0);
     until("completed", || s.h.is(id, &Completed)).await;
     until("forgotten", || !s.ix.forgotten().is_empty()).await;
-    assert_eq!(s.ix.forgotten(), [(id, clone)]);
+    assert_eq!(s.ix.forgotten(), [id]);
+    assert!(s.ix.released().is_empty());
     assert_eq!(s.h.engine.travsr_tools(id).unwrap(), None);
-    assert_eq!(s.h.engine.travsr_clone(id), None);
+    assert!(!s.h.engine.travsr_ready(id));
 }
 
 #[tokio::test(start_paused = true)]
@@ -264,7 +359,7 @@ async fn s2_indexing_past_the_timeout_starts_the_run_without_travsr() {
         "{logs:?}"
     );
     assert_eq!(s.h.engine.travsr_tools(id).unwrap(), Some(Vec::new()));
-    assert_eq!(s.h.engine.travsr_clone(id), None);
+    assert!(!s.h.engine.travsr_ready(id));
     // The job was given up: nothing is left indexing.
     assert_eq!(s.ix.running.load(Ordering::SeqCst), 0);
 }
@@ -288,6 +383,25 @@ async fn s2_an_indexing_error_starts_the_run_without_travsr_saying_why() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn s2_a_workspace_whose_commit_cannot_be_read_starts_without_travsr() {
+    let mut s = setup(4, LIMITS);
+    s.git.head_fails.store(true, Ordering::SeqCst);
+    let _session = s.h.driver.live();
+    s.h.start();
+    let id =
+        s.h.submit(clone_spec(&s.repo, &["travsr.get_callers"]))
+            .await;
+    until("running", || s.h.is(id, &Running)).await;
+    let logs = travsr_logs(&s.h, id);
+    assert!(
+        logs.len() == 1 && logs[0].contains("Needed a single revision"),
+        "{logs:?}"
+    );
+    assert!(s.ix.indexed().is_empty());
+    assert_eq!(s.h.engine.travsr_tools(id).unwrap(), Some(Vec::new()));
+}
+
+#[tokio::test(start_paused = true)]
 async fn s8_a_failed_forget_is_logged_retried_and_never_fails_the_run() {
     let mut s = setup(4, LIMITS);
     s.ix.forget_failures.store(1, Ordering::SeqCst);
@@ -307,8 +421,7 @@ async fn s8_a_failed_forget_is_logged_retried_and_never_fails_the_run() {
     assert_eq!(s.h.status(id), Completed);
     // Retried after `retry_every`, once: it works the second time.
     until("retried", || s.ix.forgotten().len() == 2).await;
-    let clone = s.root.join(id.to_string());
-    assert_eq!(s.ix.forgotten(), [(id, clone.clone()), (id, clone)]);
+    assert_eq!(s.ix.forgotten(), [id, id]);
     settle_for(400).await;
     assert_eq!(s.ix.forgotten().len(), 2);
     assert_eq!(travsr_logs(&s.h, id).len(), 1);
@@ -330,6 +443,69 @@ async fn s8_a_forget_that_keeps_failing_is_retried_again() {
     settle_for(400).await;
     assert_eq!(s.ix.forgotten().len(), 4);
     assert_eq!(s.h.status(id), Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn s8_a_forget_that_hangs_never_holds_the_run_s_slot() {
+    // One slot: the second run starts only once the first gave it back. The forget timeout is
+    // far away, so only a slot given back before the forget lets the second run start.
+    let limits = IndexLimits {
+        forget_timeout: Duration::from_secs(3600),
+        ..LIMITS
+    };
+    let mut s = setup(1, limits);
+    let stuck = Arc::new(Semaphore::new(0));
+    *lock(&s.ix.forget_gate) = Some(stuck.clone());
+    s.h.driver.script(&["ok:done"], 0);
+    let _second_session = s.h.driver.live();
+    s.h.start();
+    let first =
+        s.h.submit(clone_spec(&s.repo, &["travsr.get_callers"]))
+            .await;
+    let second = s.h.submit(clone_spec(&s.repo, &["kestrel.join"])).await;
+    until("first completed", || s.h.is(first, &Completed)).await;
+    until("its forget began", || s.ix.forgotten().len() == 1).await;
+    until("second running", || s.h.is(second, &Running)).await;
+    assert!(
+        travsr_logs(&s.h, first).is_empty(),
+        "the forget is still under way"
+    );
+    stuck.add_permits(1);
+    until("forgotten", || !lock(&s.ix.disk).contains(&first)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn s8_a_forget_that_hangs_is_given_up_logged_and_retried() {
+    let mut s = setup(4, LIMITS);
+    let stuck = Arc::new(Semaphore::new(0));
+    *lock(&s.ix.forget_gate) = Some(stuck.clone());
+    s.h.driver.script(&["ok:done"], 0);
+    s.h.start();
+    let id =
+        s.h.submit(clone_spec(&s.repo, &["travsr.get_callers"]))
+            .await;
+    until("completed", || s.h.is(id, &Completed)).await;
+    // Given up after `forget_timeout` (3 s), logged, and retried later.
+    until("logged", || !travsr_logs(&s.h, id).is_empty()).await;
+    let logs = travsr_logs(&s.h, id);
+    assert!(logs[0].contains("within 3 s"), "{logs:?}");
+    stuck.add_permits(100);
+    until("retried", || s.ix.forgotten().len() >= 2).await;
+    until("forgotten", || !lock(&s.ix.disk).contains(&id)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_says_when_the_kept_copies_cannot_be_listed() {
+    let mut s = setup(4, LIMITS);
+    let ix = Arc::new(FakeIndexer::default());
+    ix.kept_fails.store(true, Ordering::SeqCst);
+    s.restart(ix);
+    let report = s.h.engine.recover().await.unwrap();
+    assert_eq!(report.travsr_unlisted.as_deref(), Some("permission denied"));
+    // Without an indexer there is nothing to list.
+    let mut h = Harness::new(1);
+    h.rebuild(|e| e);
+    assert_eq!(h.engine.recover().await.unwrap().travsr_unlisted, None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -373,10 +549,10 @@ async fn s10_ten_children_are_indexed_at_most_two_at_a_time_and_all_get_travsr()
     .await;
     assert_eq!(s.ix.most_running.load(Ordering::SeqCst), 2);
     assert_eq!(s.ix.finished.load(Ordering::SeqCst), 11);
-    let indexed: HashMap<RunId, PathBuf> = s.ix.indexed().into_iter().collect();
+    let indexed: HashMap<RunId, IndexSource> = s.ix.indexed().into_iter().collect();
     for child in &children {
-        // Each child's own clone, not its parent's.
-        assert_eq!(indexed[child], s.root.join(child.to_string()));
+        // Each child on its own, from its parent's source repo at its own clone's commit.
+        assert_eq!(indexed[child], at_start(&s.repo));
         assert_eq!(
             s.h.engine.travsr_tools(*child).unwrap(),
             Some(vec!["get_callers".to_string()])
@@ -403,6 +579,8 @@ async fn an_empty_dir_or_a_run_without_travsr_tools_is_not_indexed() {
     assert!(s.ix.indexed().is_empty());
     assert_eq!(s.h.engine.travsr_tools(empty).unwrap(), Some(Vec::new()));
     assert_eq!(s.h.engine.travsr_tools(no_tools).unwrap(), Some(Vec::new()));
+    // Nor is the commit of their workspace read.
+    assert!(s.git.inside(&s.root.join(no_tools.to_string())).len() == 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -412,18 +590,18 @@ async fn without_an_indexer_nothing_is_indexed_and_no_travsr_tool_is_listed() {
     std::fs::create_dir_all(&repo).unwrap();
     let mut h = Harness::new(4);
     let root = dir.path().join("workspaces");
-    h.rebuild(move |e| e.with_workspaces(Workspaces::new(root, Arc::new(FakeGit))));
+    h.rebuild(move |e| e.with_workspaces(Workspaces::new(root, Arc::new(FakeGit::default()))));
     let _session = h.driver.live();
     h.start();
     let id = h.submit(clone_spec(&repo, &["travsr.get_callers"])).await;
     until("running", || h.is(id, &Running)).await;
     assert_eq!(h.engine.travsr_tools(id).unwrap(), Some(Vec::new()));
-    assert_eq!(h.engine.travsr_clone(id), None);
+    assert!(!h.engine.travsr_ready(id));
     assert_eq!(h.engine.travsr_tools(RunId::new()).unwrap(), None);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_run_cancelled_while_indexing_never_starts_and_its_clone_is_forgotten() {
+async fn a_run_cancelled_while_indexing_never_starts_and_its_copy_is_forgotten() {
     let mut s = setup(4, LIMITS);
     let _gate = s.ix.close();
     s.h.start();
@@ -436,12 +614,12 @@ async fn a_run_cancelled_while_indexing_never_starts_and_its_clone_is_forgotten(
     assert_eq!(s.h.status(id), RunStatus::Cancelled);
     assert_eq!(s.h.driver.starts(), 0);
     until("forgotten", || s.ix.forgotten().len() == 1).await;
-    assert_eq!(s.ix.forgotten()[0].1, s.root.join(id.to_string()));
+    assert_eq!(s.ix.forgotten(), [id]);
     assert!(s.h.driver.leaked().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_run_resumed_after_a_restart_is_forgotten_by_recovery_and_indexed_again() {
+async fn a_run_resumed_after_a_restart_keeps_its_copy_and_is_never_indexed_from_its_workspace() {
     let mut s = setup(4, LIMITS);
     let _first = s.h.driver.live();
     s.h.start();
@@ -452,30 +630,83 @@ async fn a_run_resumed_after_a_restart_is_forgotten_by_recovery_and_indexed_agai
     // The engine stops without cleaning up.
     s.h.shutdown.cancel();
     s.h.task.take().unwrap().await.unwrap().unwrap();
+    let workspace = s.root.join(id.to_string());
+    let git_before = s.git.inside(&workspace).len();
 
-    // A new engine on the same database, workspaces and Travsr.
+    // A new engine on the same database, workspaces and Travsr copies.
     let ix = Arc::new(FakeIndexer::default());
-    let (root, indexer) = (s.root.clone(), ix.clone());
-    s.h.shutdown = tokio_util::sync::CancellationToken::new();
-    s.h.rebuild(move |e| {
-        e.with_workspaces(Workspaces::new(root, Arc::new(FakeGit)))
-            .with_root_key(RootKey::generate())
-            .with_indexer(indexer, LIMITS)
-    });
+    lock(&ix.disk).insert(id);
+    s.restart(ix);
     s.h.engine.recover().await.unwrap();
-    let clone = s.root.join(id.to_string());
-    assert_eq!(ix.forgotten(), [(id, clone.clone())]);
     assert!(matches!(s.h.status(id), Suspended(_)));
+    // Unfinished: its copy is kept for the resume.
+    assert!(s.ix.forgotten().is_empty(), "{:?}", s.ix.forgotten());
     let _second = s.h.driver.live();
     s.h.start();
     s.h.control(id, ControlCommand::Resume);
     until("running again", || s.h.is(id, &Running)).await;
-    assert_eq!(ix.indexed(), [(id, clone.clone())]);
-    assert_eq!(s.h.engine.travsr_clone(id), Some(clone));
+    // Indexed again from its source, with no commit: the indexer uses the one it recorded.
+    let resumed = IndexSource {
+        repo: s.repo.clone(),
+        commit: None,
+    };
+    assert_eq!(s.ix.indexed(), [(id, resumed)]);
+    assert!(s.h.engine.travsr_ready(id));
+    // No git ran in the workspace the agent had.
+    assert_eq!(s.git.inside(&workspace).len(), git_before);
 }
 
 #[tokio::test(start_paused = true)]
-async fn shutdown_forgets_the_clones_of_the_sandboxes_it_destroys() {
+async fn recovery_forgets_the_copies_of_finished_and_unknown_runs_and_keeps_the_others() {
+    let mut s = setup(4, LIMITS);
+    let store = s.h.store.clone();
+    let spec = clone_spec(&s.repo, &["travsr.get_callers"]);
+    let step = |id: RunId, from: RunStatus, to: RunStatus| store.transition(id, &from, to).unwrap();
+    let done = store.create_run(&spec, "x").unwrap();
+    step(done, RunStatus::Queued, RunStatus::Provisioning);
+    step(done, RunStatus::Provisioning, Running);
+    step(done, Running, Completed);
+    // A run cut off while provisioning fails on recovery.
+    let provisioning = store.create_run(&spec, "x").unwrap();
+    step(provisioning, RunStatus::Queued, RunStatus::Provisioning);
+    let running = store.create_run(&spec, "x").unwrap();
+    step(running, RunStatus::Queued, RunStatus::Provisioning);
+    step(running, RunStatus::Provisioning, Running);
+    let unknown = RunId::new();
+    // A fresh engine, whose indexer keeps copies from before the restart.
+    let ix = Arc::new(FakeIndexer::default());
+    lock(&ix.disk).extend([done, provisioning, running, unknown]);
+    s.restart(ix);
+    s.h.engine.recover().await.unwrap();
+    let forgotten: HashSet<RunId> = s.ix.forgotten().into_iter().collect();
+    assert_eq!(forgotten, HashSet::from([done, provisioning, unknown]));
+    assert_eq!(*lock(&s.ix.disk), HashSet::from([running]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_retries_a_forget_that_fails_while_the_engine_runs() {
+    let mut s = setup(4, LIMITS);
+    let store = s.h.store.clone();
+    let done = store
+        .create_run(&clone_spec(&s.repo, &["travsr.get_callers"]), "x")
+        .unwrap();
+    store
+        .transition(done, &RunStatus::Queued, RunStatus::Cancelled)
+        .unwrap();
+    let ix = Arc::new(FakeIndexer::default());
+    lock(&ix.disk).insert(done);
+    ix.forget_failures.store(1, Ordering::SeqCst);
+    s.restart(ix);
+    s.h.engine.recover().await.unwrap();
+    let logs = travsr_logs(&s.h, done);
+    assert!(logs[0].contains("could not forget"), "{logs:?}");
+    s.h.start();
+    until("retried", || s.ix.forgotten().len() == 2).await;
+    assert!(lock(&s.ix.disk).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_releases_the_runs_it_stops_and_keeps_their_copies() {
     let mut s = setup(4, LIMITS);
     let _session = s.h.driver.live();
     s.h.start();
@@ -485,8 +716,9 @@ async fn shutdown_forgets_the_clones_of_the_sandboxes_it_destroys() {
     until("running", || s.h.is(id, &Running)).await;
     let report = s.h.engine.shutdown(Duration::from_secs(5)).await;
     assert_eq!(report.destroyed, [id]);
-    assert_eq!(s.ix.forgotten(), [(id, s.root.join(id.to_string()))]);
-    assert_eq!(s.h.engine.travsr_clone(id), None);
+    assert_eq!(s.ix.released(), [id]);
+    assert!(s.ix.forgotten().is_empty());
+    assert!(!s.h.engine.travsr_ready(id));
 }
 
 #[tokio::test(start_paused = true)]
@@ -528,9 +760,10 @@ async fn the_wall_clock_still_runs_while_the_agent_waits_for_its_index() {
 }
 
 #[test]
-fn the_default_limits_are_five_minutes_two_jobs_and_a_retry_a_minute() {
+fn the_default_limits_are_five_minutes_two_jobs_a_retry_a_minute_and_a_minute_to_forget() {
     let limits = IndexLimits::default();
     assert_eq!(limits.timeout, Duration::from_secs(300));
     assert_eq!(limits.max_jobs, 2);
     assert_eq!(limits.retry_every, Duration::from_secs(60));
+    assert_eq!(limits.forget_timeout, Duration::from_secs(60));
 }
