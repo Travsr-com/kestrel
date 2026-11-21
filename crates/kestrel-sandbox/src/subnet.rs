@@ -293,7 +293,24 @@ impl SubnetPool {
 
     /// Blocks that can still be handed out.
     pub fn available(&self) -> usize {
+        self.available_in(&self.state())
+    }
+
+    /// Blocks handed out that come back to the pool when released: not excluded, and not found
+    /// taken while held.
+    pub fn in_use(&self) -> usize {
+        Self::in_use_in(&self.state())
+    }
+
+    /// True when no block is free and no block in use will come back, so nothing can be reserved
+    /// until the pool is built again (the next start). Both counts are read under one lock, so a
+    /// block released by another thread between them cannot make a usable pool look exhausted.
+    pub fn exhausted(&self) -> bool {
         let state = self.state();
+        self.available_in(&state) == 0 && Self::in_use_in(&state) == 0
+    }
+
+    fn available_in(&self, state: &PoolState) -> usize {
         let used = state
             .used
             .iter()
@@ -303,10 +320,7 @@ impl SubnetPool {
             .unwrap_or(usize::MAX)
     }
 
-    /// Blocks handed out that come back to the pool when released: not excluded, and not found
-    /// taken while held.
-    pub fn in_use(&self) -> usize {
-        let state = self.state();
+    fn in_use_in(state: &PoolState) -> usize {
         state
             .used
             .iter()

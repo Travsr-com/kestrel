@@ -6,7 +6,8 @@
 //! * `reserve` hands out the lowest block that is neither held nor covered by a foreign subnet, so
 //!   no block is handed out twice and none is lost unless a foreign subnet covers it;
 //! * `available` is the free, uncovered blocks; `in_use` is the held, uncovered blocks;
-//! * the count `exclude` and `exclude_except` return is never below the blocks newly covered.
+//! * the count `exclude` and `exclude_except` return is never below the blocks newly covered;
+//! * `exhausted` is true exactly when no block is free and none held will come back.
 //!
 //! Deterministic: the same seeds run every time, and a failure prints the operations that led to it.
 
@@ -201,6 +202,11 @@ fn run_seed(seed: u64) {
             "seed {seed}: available. {log}"
         );
         assert_eq!(pool.in_use(), m.in_use(), "seed {seed}: in_use. {log}");
+        assert_eq!(
+            pool.exhausted(),
+            m.available() == 0 && m.in_use() == 0,
+            "seed {seed}: exhausted. {log}"
+        );
         assert_eq!(pool.capacity(), BLOCKS as usize, "seed {seed}: capacity");
     }
 }
