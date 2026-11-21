@@ -10,6 +10,7 @@ mod common;
 
 use common::{Harness, spec, until};
 use kestrel_agent::PlanFile;
+use kestrel_store::ControlCommand;
 use kestrel_types::RunId;
 use kestrel_types::RunStatus;
 
@@ -143,4 +144,72 @@ async fn the_default_root_is_private_to_the_engine() {
     s.exit(0);
     until("completed", || h.is(id, &RunStatus::Completed)).await;
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// A cancelled run leaves no config behind either.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_run_removes_its_config() {
+    let root = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(4);
+    let path = root.path().to_path_buf();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let dir = root.path().join(id.to_string());
+    assert!(dir.exists());
+    h.control(id, ControlCommand::Cancel);
+    until("cancelled", || h.is(id, &RunStatus::Cancelled)).await;
+    until("cleaned up", || !dir.exists()).await;
+}
+
+// An engine that stops while a run is going leaves the run to recovery, which removes the
+// config with the old sandbox; the resumed run writes it afresh.
+#[tokio::test(start_paused = true)]
+async fn recovery_removes_the_config_of_an_interrupted_run() {
+    let root = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(4);
+    let path = root.path().to_path_buf();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    h.shutdown.cancel();
+    if let Some(task) = h.task.take() {
+        task.await.unwrap().unwrap();
+    }
+    let dir = root.path().join(id.to_string());
+    // As if the engine had been killed: whatever it left, recovery removes.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mcp.json"), "{}").unwrap();
+
+    let path = root.path().to_path_buf();
+    h.rebuild(|e| e.with_run_config(path));
+    let report = h.engine.recover().await.expect("recover");
+    assert_eq!(report.interrupted, [id]);
+    assert!(!dir.exists());
+}
+
+// The root keeps other host users out, so a root that is a link (to a directory someone else
+// chose) is refused and nothing is written through it.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_root_that_is_a_link_fails_the_run() {
+    let target = tempfile::tempdir().unwrap();
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("run-config");
+    std::os::unix::fs::symlink(target.path(), &link).unwrap();
+    let mut h = Harness::new(4);
+    h.rebuild(|e| e.with_run_config(link));
+    h.adapters.set_files(vec![mcp_file()]);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("failed", || h.is_failed(id).is_some()).await;
+    assert!(h.is_failed(id).unwrap_or_default().contains("link"));
+    assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
 }

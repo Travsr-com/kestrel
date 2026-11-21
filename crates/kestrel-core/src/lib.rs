@@ -419,6 +419,18 @@ pub struct Engine {
     inner: Arc<Inner>,
 }
 
+/// Sets the permission bits of `path` to `mode`, whatever the umask. Nothing to set off unix.
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A run config root of this engine only: a temp directory with a random name, so no other user
 /// can make it first.
 fn default_run_config_root() -> PathBuf {
@@ -640,8 +652,10 @@ impl Engine {
     /// `root`, as `{root}/{run id}`, mounted read-only at `/kestrel` in the sandbox and removed
     /// when the run's sandbox goes. `root` is made its owner's only, so no other host user reaches
     /// a run's token; a run's directory is readable by any user, so the sandbox can read it
-    /// whichever user its image runs as. Without this, a temp directory with a random name, of
-    /// this engine only.
+    /// whichever user its image runs as. A `root` that is a link, or not a directory, fails the
+    /// run. Without this, a temp directory with a random name, of this engine only: it is left
+    /// behind when the engine goes, and a later engine's [`Engine::recover`] cannot find what a
+    /// killed one left in it, so set a fixed root (as `kestrel serve` does) for anything long-lived.
     pub fn with_run_config(mut self, root: PathBuf) -> Engine {
         let inner = Arc::get_mut(&mut self.inner);
         debug_assert!(inner.is_some(), "engine state is shared");
@@ -1891,33 +1905,32 @@ impl Inner {
         let dir = self.run_config_dir(run);
         let failed = |e: std::io::Error| EngineError::RunConfig(format!("{}: {e}", dir.display()));
         std::fs::create_dir_all(&self.run_config).map_err(failed)?;
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            // Also when it existed already: the root is what keeps other host users out.
-            let private = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&self.run_config, private).map_err(failed)?;
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o755);
-            builder
-        };
-        #[cfg(not(unix))]
-        let builder = std::fs::DirBuilder::new();
-        builder.create(&dir).map_err(failed)?;
+        // Never through a link: the root is what keeps other host users out, so it must be the
+        // directory itself.
+        let root = std::fs::symlink_metadata(&self.run_config).map_err(failed)?;
+        if !root.is_dir() {
+            return Err(EngineError::RunConfig(format!(
+                "{}: not a directory (a link is refused)",
+                self.run_config.display()
+            )));
+        }
+        // Also when it existed already.
+        set_mode(&self.run_config, 0o700).map_err(failed)?;
+        // Made private, written, then opened to any user. Each mode is set explicitly, so a
+        // strict umask cannot leave the files unreadable to the sandbox's user.
+        std::fs::create_dir(&dir).map_err(failed)?;
+        set_mode(&dir, 0o700).map_err(failed)?;
         for file in files {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o644);
-            }
             let path = dir.join(&file.name);
-            let written = options
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
                 .open(&path)
                 .and_then(|mut f| std::io::Write::write_all(&mut f, file.contents.as_bytes()));
             written.map_err(failed)?;
+            set_mode(&path, 0o644).map_err(failed)?;
         }
+        set_mode(&dir, 0o755).map_err(failed)?;
         Ok(Some(dir))
     }
 
