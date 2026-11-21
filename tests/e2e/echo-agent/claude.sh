@@ -271,14 +271,15 @@ if marker dump > /dev/null; then
     done
     echo "== /proc/mounts"
     cat /proc/mounts 2>&1
-    # Every other mount, read in full: all but the root, the kernel's own file systems, /kestrel
-    # (read above) and /workspace (this file is written there; the test reads it on the host).
+    # Every other mount, read in full: all but the root, /dev (the runtime's emulated devices, no
+    # host files), the kernel's own file systems, /kestrel (read above) and /workspace (this file is
+    # written there; the test reads it on the host).
     while read -r device point fstype rest; do
       case "$fstype" in
         proc | sysfs | tmpfs | devtmpfs | devpts | mqueue | cgroup | cgroup2 | securityfs | debugfs | tracefs | bpf) continue ;;
       esac
       case "$point" in
-        / | /kestrel | /workspace) continue ;;
+        / | /dev | /kestrel | /workspace) continue ;;
       esac
       echo "== mount $point"
       if [ -d "$point" ]; then
