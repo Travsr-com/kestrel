@@ -19,9 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
 
 mod bridge;
+mod roots;
 mod subnet;
 use bridge::is_container_name;
 pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
+pub use roots::{RootsError, resolve_workspace};
 pub use subnet::{
     DEFAULT_SUBNET_POOL, Ipv4Cidr, SUBNET_BLOCK_PREFIX, Subnet, SubnetError, SubnetPool,
     docker_subnets, docker_subnets_except_instance, host_routes,
@@ -92,6 +94,15 @@ pub enum SandboxError {
         #[source]
         source: std::io::Error,
     },
+    /// The workspace is not inside an allowed root (or cannot be resolved).
+    #[error(transparent)]
+    Roots(RootsError),
+}
+
+impl From<RootsError> for SandboxError {
+    fn from(e: RootsError) -> Self {
+        SandboxError::Roots(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -591,11 +602,22 @@ impl Cli {
         &self,
         runner: &dyn CommandRunner,
         owner: &OwnerLookup,
+        roots: Option<&[PathBuf]>,
         spec: &LaunchSpec,
     ) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
         let mut user = None;
+        let mut resolved;
+        let mut spec = spec;
+        if let (Some(roots), Some(ws)) = (roots, &spec.workspace) {
+            validate_workspace_path(ws)?;
+            let canonical = resolve_workspace(ws, roots)?;
+            validate_workspace_path(&canonical)?;
+            resolved = spec.clone();
+            resolved.workspace = Some(canonical);
+            spec = &resolved;
+        }
         if let Some(ws) = &spec.workspace {
             validate_workspace_path(ws)?;
             let ids = owner(ws).map_err(|source| SandboxError::WorkspaceUnreadable {
@@ -1059,6 +1081,7 @@ macro_rules! cli_driver {
                     owner: default_owner(),
                     instance: None,
                     bridge: None,
+                    roots: None,
                 }
             }
 
@@ -1084,11 +1107,26 @@ macro_rules! cli_driver {
                 }
             }
 
+            /// Only mounts workspaces that resolve (symlinks and `..` followed) inside one of
+            /// `roots`, and mounts the resolved path. Without this call any absolute path is
+            /// accepted, as before.
+            pub fn with_allowed_roots(mut self, roots: Vec<PathBuf>) -> Self {
+                self.roots = Some(roots);
+                self
+            }
+
             /// Limits [`SandboxDriver::leftovers`] to sandboxes labelled with this instance id
             /// ([`INSTANCE_LABEL`]). The id must be `[A-Za-z0-9_.-]`, else `leftovers` fails.
             pub fn with_instance(mut self, id: impl Into<String>) -> Self {
                 self.instance = Some(id.into());
                 self
+            }
+
+            fn tag_roots(self, roots: Option<Vec<PathBuf>>) -> Self {
+                match roots {
+                    Some(r) => self.with_allowed_roots(r),
+                    None => self,
+                }
             }
 
             fn tag(self, instance: Option<&str>) -> Self {
@@ -1117,7 +1155,13 @@ macro_rules! cli_driver {
                 $cli.strong
             }
             async fn create(&self, spec: &LaunchSpec) -> Result<SandboxHandle> {
-                $cli.create(self.runner.as_ref(), &self.owner, spec).await
+                $cli.create(
+                    self.runner.as_ref(),
+                    &self.owner,
+                    self.roots.as_deref(),
+                    spec,
+                )
+                .await
             }
             async fn start(&self, h: &SandboxHandle) -> Result<OutputStream> {
                 $cli.start(self.runner.as_ref(), &self.exits, h).await
@@ -1166,6 +1210,7 @@ pub struct GvisorDriver {
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
+    roots: Option<Vec<PathBuf>>,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
@@ -1179,6 +1224,7 @@ pub struct AppleContainerDriver {
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
+    roots: Option<Vec<PathBuf>>,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
@@ -1188,6 +1234,7 @@ pub struct DockerRuncDriver {
     owner: OwnerLookup,
     instance: Option<String>,
     bridge: Option<String>,
+    roots: Option<Vec<PathBuf>>,
 }
 
 cli_driver!(GvisorDriver, GVISOR);
@@ -1307,6 +1354,18 @@ pub fn detect_with(
     instance: Option<&str>,
     bridge: Option<&str>,
 ) -> Result<Vec<Box<dyn SandboxDriver>>> {
+    detect_with_roots(host, allow_weak, instance, bridge, None)
+}
+
+/// Like [`detect_with`], and every driver only mounts workspaces inside `roots` (see
+/// `with_allowed_roots`). `None` keeps the old behaviour.
+pub fn detect_with_roots(
+    host: &HostInfo,
+    allow_weak: bool,
+    instance: Option<&str>,
+    bridge: Option<&str>,
+    roots: Option<Vec<PathBuf>>,
+) -> Result<Vec<Box<dyn SandboxDriver>>> {
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessRunner);
     let has_docker_runtime = |name: &str| host.docker_runtimes.iter().any(|r| r == name);
     let mut drivers: Vec<Box<dyn SandboxDriver>> = Vec::new();
@@ -1314,7 +1373,8 @@ pub fn detect_with(
         drivers.push(Box::new(
             GvisorDriver::new(runner.clone())
                 .tag(instance)
-                .bridged(bridge),
+                .bridged(bridge)
+                .tag_roots(roots.clone()),
         ));
     }
     if matches!(host.os, Os::MacOs { major } if major >= 26)
@@ -1325,12 +1385,16 @@ pub fn detect_with(
         drivers.push(Box::new(
             AppleContainerDriver::new(runner.clone())
                 .tag(instance)
-                .bridged(bridge),
+                .bridged(bridge)
+                .tag_roots(roots.clone()),
         ));
     }
     if allow_weak && has_docker_runtime("runc") {
         drivers.push(Box::new(
-            DockerRuncDriver::new(runner).tag(instance).bridged(bridge),
+            DockerRuncDriver::new(runner)
+                .tag(instance)
+                .bridged(bridge)
+                .tag_roots(roots),
         ));
     }
     if drivers.is_empty() {

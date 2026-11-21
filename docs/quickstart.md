@@ -70,6 +70,15 @@ cache_write_per_mtok = "3.75"
 > bridge network, so the default bind may not work. Set `listen` and `gateway.advertise_url`
 > yourself there.
 
+> **Workspace roots.** Kestrel mounts a workspace into a sandbox only if its real path (symlinks and
+> `..` followed) is inside an allowed root. The default root is the `workspaces` directory next to the
+> database. To allow other places, list absolute paths:
+>
+> ```toml
+> [sandbox]
+> allowed_roots = ["/data/kestrel/workspaces"]
+> ```
+
 > **Docker in a VM (Rancher Desktop, Docker Desktop, Colima).** Set `gateway.docker_host` to tell
 > Kestrel where the Docker daemon runs:
 >
