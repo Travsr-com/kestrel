@@ -51,7 +51,7 @@ describe('Run view', () => {
     show(`#/runs/${CHILD}`, createMockServer().fetch);
     expect(await screen.findByText('fixer')).toBeInTheDocument();
     expect(screen.getByText('Suspended: waiting for approval')).toBeInTheDocument();
-    expect(screen.getByText('$0.12 of $0.50')).toBeInTheDocument();
+    expect(screen.getByText('$0.125 of $0.50')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: ROOT })).toHaveAttribute('href', `#/runs/${ROOT}`);
   });
 

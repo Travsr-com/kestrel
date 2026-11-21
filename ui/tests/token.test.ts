@@ -102,7 +102,7 @@ describe('Token required screen', () => {
     await user.click(screen.getByRole('button', { name: 'Continue' }));
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Fleet' })).toBeInTheDocument();
-    expect(await screen.findByText('planner')).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: 'planner' })).toBeInTheDocument();
     expect(server.calls.at(-1)?.auth).toBe('Bearer s3cret');
     expect(getToken()).toBe('s3cret');
     expect(setItem).not.toHaveBeenCalled();
