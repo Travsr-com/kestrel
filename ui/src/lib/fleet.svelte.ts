@@ -120,8 +120,10 @@ export class FleetState {
           if (isTerminal(kind.to) && run.endedAt === null) {
             run.endedAt = now;
             run.finishedAt = Date.parse(event.ts);
-            // A child's end gives its unspent budget back to the nearest live ancestor, which may be
-            // above an ended parent: every known ancestor is asked for again.
+            // A child's end shrinks its own limit to what it spent and gives the rest to the nearest
+            // live ancestor, which may be above an ended parent: it and every known ancestor are
+            // asked for again.
+            if (run.parent) refresh(run.id);
             for (let up = run.parent; up; up = this.runs[up]?.parent ?? null) refresh(up);
           }
         }
@@ -131,6 +133,10 @@ export class FleetState {
           run.counted += kind.cost;
           run.spent = Math.max(run.reported, run.counted);
         }
+        break;
+      case 'budget_warning':
+        // The only event that carries a limit: a budget set by hand writes none.
+        if (run) run.limit = kind.limit;
         break;
       case 'child_spawned':
         // The parent's limit went down by the child's budget.
@@ -169,12 +175,15 @@ export class FleetState {
   }
 
   /**
-   * A tree socket is about to replay `root`'s tree from the start: its runs count their events
-   * again from zero. What a card shows becomes the reported floor, so it never drops meanwhile.
+   * Tree sockets are about to replay the trees of `roots` from the start: their runs count their
+   * events again from zero. What a card shows becomes the reported floor, so it never drops
+   * meanwhile. One pass for all of them.
    */
-  rebuild(root: RunId): void {
+  rebuild(roots: RunId[]): void {
+    const replay: Record<RunId, true> = {};
+    for (const root of roots) replay[root] = true;
     for (const run of Object.values(this.runs)) {
-      if (run.root !== root) continue;
+      if (!replay[run.root]) continue;
       run.reported = run.spent;
       run.counted = 0;
     }

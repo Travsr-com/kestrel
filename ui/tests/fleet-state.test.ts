@@ -36,7 +36,8 @@ describe('FleetState', () => {
     const asked: string[] = [];
     fleet.apply(ev('p', { kind: 'child_spawned', child: 'c', agent: 'a', budget: 10 }), 0, (id) => asked.push(id), 'p');
     fleet.apply(ev('c', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 5, (id) => asked.push(id), 'p');
-    expect(asked).toEqual(['p', 'p']);
+    // The child's own limit shrinks to what it spent when it ends.
+    expect(asked).toEqual(['p', 'c', 'p']);
     expect(fleet.runs.c?.endedAt).toBe(5);
   });
 
@@ -176,12 +177,30 @@ describe('FleetState', () => {
     expect(performance.now() - start).toBeLessThan(250);
   });
 
+  it('rebuilds many trees in one pass', () => {
+    const fleet = new FleetState();
+    fleet.load(Array.from({ length: 5_000 }, (_, i) => summary(`r${i}`)));
+    const roots = Array.from({ length: 50 }, (_, i) => `r${i}`);
+    const start = performance.now();
+    fleet.rebuild(roots);
+    expect(performance.now() - start).toBeLessThan(150);
+    expect(fleet.runs.r0).toMatchObject({ reported: 100, counted: 0 });
+  });
+
+  it('a budget warning carries the current limit', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('r')]);
+    fleet.apply(ev('r', { kind: 'budget_warning', spent: 800, limit: 900 }), 0, () => {}, 'r');
+    fleet.apply(ev('ghost', { kind: 'budget_warning', spent: 1, limit: 2 }), 0, () => {}, 'r');
+    expect(fleet.runs.r?.limit).toBe(900);
+  });
+
   it('a replay after a rebuild keeps what was shown as the floor', () => {
     const fleet = new FleetState();
     fleet.load([summary('r', { spent: 0 })]);
     fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
     fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
-    fleet.rebuild('r');
+    fleet.rebuild(['r']);
     // The replay has reached only the first call so far.
     fleet.apply(ev('r', call('r', 20)), 0, () => {}, 'r');
     expect(fleet.runs.r?.spent).toBe(40);
@@ -196,7 +215,7 @@ describe('FleetState', () => {
     ]);
     const asked: string[] = [];
     fleet.apply(ev('c', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 0, (id) => asked.push(id), 'r');
-    expect(asked).toEqual(['p', 'r']);
+    expect(asked).toEqual(['c', 'p', 'r']);
   });
 
   it('remembers when a run ended by its event time, for the run time', () => {
@@ -212,7 +231,7 @@ describe('FleetState', () => {
     fleet.load([summary('r', { spent: 0 }), summary('x', { spent: 0 })]);
     fleet.apply(ev('r', call('r', 40)), 0, () => {}, 'r');
     fleet.apply(ev('x', call('x', 40)), 0, () => {}, 'x');
-    fleet.rebuild('r');
+    fleet.rebuild(['r']);
     expect(fleet.runs.r?.spent).toBe(40);
     fleet.apply(ev('r', call('r', 40)), 0, () => {}, 'r');
     expect(fleet.runs.r?.spent).toBe(40);

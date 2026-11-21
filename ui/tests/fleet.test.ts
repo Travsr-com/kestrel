@@ -125,6 +125,7 @@ describe('Fleet', () => {
     socket.open();
     socket.event(1, event(a.id, { kind: 'run_created', agent: 'alpha' }, 1));
     await vi.advanceTimersByTimeAsync(0);
+    const before = { alpha: card('alpha'), beta: card('beta') };
     const others: MutationRecord[] = [];
     const watch = new MutationObserver((m) => others.push(...m));
     const betaCost = card('beta').querySelector('.cost');
@@ -136,6 +137,9 @@ describe('Fleet', () => {
     }, 2));
     await vi.advanceTimersByTimeAsync(0);
     expect(card('alpha')).toHaveTextContent('$0.05 / $2.00');
+    // Neither card was rendered again: both are the same nodes, and beta's cost did not change.
+    expect(card('alpha')).toBe(before.alpha);
+    expect(card('beta')).toBe(before.beta);
     expect(others).toEqual([]);
     watch.disconnect();
   });
@@ -299,6 +303,47 @@ describe('Fleet', () => {
     expect(card('kid')).toHaveTextContent('$0.70');
   });
 
+  it('backs off retrying a failing fetch, and asks in between do not add requests', async () => {
+    const root = run({ agent: 'lead' });
+    const child = 'kid-1';
+    const sockets = fakeSockets();
+    const asked: string[] = [];
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = String(input);
+      asked.push(url);
+      if (url.endsWith('/api/runs')) return new Response(JSON.stringify([root]));
+      if (url.endsWith(child)) return new Response('{}', { status: 503 });
+      return new Response(JSON.stringify(root));
+    };
+    render(Fleet, { api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    socket.event(1, event(child, { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
+    for (let i = 0; i < 12; i++) {
+      socket.event(2 + i, event(child, { kind: 'child_spawned', child: `g${i}`, agent: 'g', budget: 1 }, 2 + i));
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    // 120 s: the first fetch, then retries after 5, 10, 20, 40 and 60 s at most.
+    expect(asked.filter((u) => u.endsWith(child)).length).toBeLessThanOrEqual(6);
+  });
+
+  it('fetches a root once per outage, however many times its socket retries', async () => {
+    const root = run({ agent: 'lead' });
+    const { sockets, calls } = show([root]);
+    await screen.findByRole('link', { name: 'lead' });
+    const fetched = () => calls.filter((c) => c === `/api/runs/${root.id}`).length;
+    for (let i = 0; i < 4; i++) {
+      sockets.made.at(-1)?.drop();
+      await vi.advanceTimersByTimeAsync(11_000);
+    }
+    expect(fetched()).toBe(1);
+    sockets.made.at(-1)?.open();
+    sockets.made.at(-1)?.drop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetched()).toBe(2);
+  });
+
   it('closes the socket of a tree once all of it has ended and lingered', async () => {
     const a = run({ agent: 'alpha' });
     const { sockets } = show([a]);
@@ -421,6 +466,13 @@ describe('Fleet', () => {
     expect(pager.querySelector('[aria-live]')).toBeNull();
     await user().click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+    // Next on the last page changes nothing, so it says nothing new.
+    await user().click(screen.getByRole('button', { name: 'Next' }));
+    await user().click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+    await user().click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+    await user().click(screen.getByRole('button', { name: 'Next' }));
     await user().selectOptions(screen.getByRole('combobox', { name: 'Agent' }), 'run-1');
     expect(screen.queryByText('Page 2 of 2')).not.toBeInTheDocument();
   });
@@ -505,7 +557,10 @@ describe('Fleet', () => {
     const socket = sockets.made.find((s) => s.url.includes(a.id));
     if (!socket) throw new Error('no socket');
     socket.open();
-    socket.event(1, event(a.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }, 1));
+    socket.event(1, {
+      ...event(a.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }, 1),
+      ts: new Date(NOW - 60_000).toISOString(),
+    });
     await vi.advanceTimersByTimeAsync(0);
     expect(card('alpha')).toHaveTextContent('Completed');
     await vi.advanceTimersByTimeAsync(4_000);
