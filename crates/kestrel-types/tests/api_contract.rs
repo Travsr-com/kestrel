@@ -81,18 +81,31 @@ fn events_decode_and_encode_unchanged() {
     assert_eq!(seqs, [1, 2, 3]);
 }
 
+/// The position of each variant. No wildcard arm: a new `EventKind` variant does not compile here
+/// until it is added, and then the fixture must gain a sample for the test below to pass.
+fn variant_index(kind: &EventKind) -> usize {
+    match kind {
+        EventKind::RunCreated { .. } => 0,
+        EventKind::StatusChanged { .. } => 1,
+        EventKind::SandboxProvisioned { .. } => 2,
+        EventKind::AgentMessage { .. } => 3,
+        EventKind::ToolCall { .. } => 4,
+        EventKind::ToolResult { .. } => 5,
+        EventKind::ModelCall(_) => 6,
+        EventKind::BudgetWarning { .. } => 7,
+        EventKind::ApprovalRequested { .. } => 8,
+        EventKind::ApprovalResolved { .. } => 9,
+        EventKind::AgentLog { .. } => 10,
+        EventKind::RunFinished { .. } => 11,
+    }
+}
+const VARIANTS: usize = 12;
+
 #[test]
 fn every_event_kind_decodes_and_encodes_unchanged() {
     let kinds: Vec<EventKind> = round_trip(&contract()["event_kinds"]);
-    let names: BTreeSet<String> = contract()["event_kinds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k["kind"].as_str().unwrap().to_owned())
-        .collect();
-    // One sample of each of the 12 variants, so a new variant shows up here first.
-    assert_eq!(kinds.len(), 12);
-    assert_eq!(names.len(), 12);
+    let covered: BTreeSet<usize> = kinds.iter().map(variant_index).collect();
+    assert_eq!(covered, (0..VARIANTS).collect::<BTreeSet<_>>());
     assert!(matches!(
         &kinds[0],
         EventKind::RunCreated {
