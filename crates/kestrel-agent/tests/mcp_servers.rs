@@ -43,6 +43,11 @@ fn plan_for(runtime: Runtime, caps: &str, ctx: &RunContext) -> LaunchPlan {
 const SPAWNER: &str = "{ mcp: [kestrel.spawn, kestrel.join, kestrel.ask_human, fs.read], \
     spawn: { max_children: 2, max_depth: 1, agents: [worker] } }";
 
+/// The agents `SPAWNER` (and the other spawning specs here) may spawn.
+fn worker() -> Vec<String> {
+    vec!["worker".to_string()]
+}
+
 /// The value after `flag` in `argv`.
 fn after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
     argv.iter()
@@ -88,7 +93,7 @@ fn claude_code_gets_the_kestrel_server_and_only_the_granted_tools() {
     );
     assert_eq!(
         after(&plan.argv, "--append-system-prompt"),
-        agent_note(true, true, true).as_deref()
+        agent_note(&worker(), true, true).as_deref()
     );
     // The task still comes last, after the end of the options.
     assert_eq!(
@@ -131,17 +136,21 @@ fn spawn_is_not_offered_without_depth_left_or_an_agent_to_spawn() {
 // A run that cannot spawn is not told how to: a leaf child, or one that may only ask a person.
 #[test]
 fn the_note_covers_only_the_tools_the_run_was_offered() {
-    let ask_only = agent_note(false, true, true).expect("a note for ask_human");
+    let ask_only = agent_note(&[], true, true).expect("a note for ask_human");
     assert!(ask_only.contains("kestrel.ask_human"), "{ask_only}");
     assert!(!ask_only.contains("kestrel.spawn"), "{ask_only}");
     assert!(!ask_only.contains("kestrel.join"), "{ask_only}");
-    let spawn_only = agent_note(true, false, false).expect("a note for spawn");
+    let spawn_only = agent_note(&worker(), false, false).expect("a note for spawn");
     assert!(!spawn_only.contains("kestrel.ask_human"), "{spawn_only}");
-    // A grant may hold spawn without join; then join is not described.
+    // A grant may hold spawn without join; then join is not described, and the only way to a
+    // child's result is to wait for it.
     assert!(!spawn_only.contains("kestrel.join"), "{spawn_only}");
+    assert!(spawn_only.contains("set wait"), "{spawn_only}");
+    let with_join = agent_note(&worker(), true, false).expect("a note");
+    assert!(!with_join.contains("set wait"), "{with_join}");
     assert!(spawn_only.contains("kestrel.spawn"), "{spawn_only}");
-    assert_eq!(agent_note(false, true, false), None);
-    assert_eq!(agent_note(false, false, false), None);
+    assert_eq!(agent_note(&[], true, false), None);
+    assert_eq!(agent_note(&[], false, false), None);
     let spawner = plan_for(
         Runtime::ClaudeCode,
         "{ mcp: [kestrel.spawn], spawn: { max_children: 1, max_depth: 1, agents: [worker] } }",
@@ -201,6 +210,9 @@ fn no_kestrel_or_travsr_tools_means_no_server_entry_and_no_file() {
         let config = plan.env.get("OPENCODE_CONFIG_CONTENT").map(|c| json_of(c));
         assert!(config.is_none_or(|c| c.get("mcp").is_none()), "{runtime}");
     }
+    // Still no server from the cloned repo's `.mcp.json`.
+    let claude = plan_for(Runtime::ClaudeCode, "{ mcp: [fs.read] }", &ctx());
+    assert!(claude.argv.iter().any(|a| a == "--strict-mcp-config"));
 }
 
 // 3
@@ -257,7 +269,7 @@ fn opencode_gets_the_same_servers_as_remote_mcp_and_the_note_as_instructions() {
     );
     assert_eq!(
         file(&plan, "kestrel.md"),
-        agent_note(true, true, false).as_deref()
+        agent_note(&worker(), true, false).as_deref()
     );
 }
 
@@ -320,17 +332,21 @@ fn server_urls_are_built_as_urls_not_strings() {
 // 8
 #[test]
 fn the_agent_note_is_short_and_holds_no_token_or_path() {
-    let full = agent_note(true, true, true).expect("a note");
+    let full = agent_note(&worker(), true, true).expect("a note");
     assert!(full.lines().count() <= 30, "{} lines", full.lines().count());
     assert!(full.contains("kestrel.spawn") && full.contains("kestrel.join"));
     // What a child sees is what the engine does: a clone of the original repository, and no
     // branch handed back, so the summary is how its work returns.
     assert!(full.contains("original repository"), "{full}");
+    // The model learns which agents it may name in kestrel.spawn.
+    let two =
+        agent_note(&["worker".to_string(), "reviewer".to_string()], true, false).expect("a note");
+    assert!(two.contains("You may spawn: worker, reviewer."), "{two}");
     // Not every child gets a clone: its own spec sets its workspace.
     assert!(full.contains("agent spec"), "{full}");
     assert!(full.contains("summary"), "{full}");
     assert!(!full.contains("branch"), "{full}");
-    for note in [full.clone(), agent_note(false, true, true).expect("a note")] {
+    for note in [full.clone(), agent_note(&[], true, true).expect("a note")] {
         for leak in [
             "tok_",
             "/r/",

@@ -4,10 +4,11 @@
 //! each line of the runtime's streaming JSON output into a [`ParsedLine`].
 //!
 //! A runtime gets the run's MCP servers on the gateway when its capability grants their tools:
-//! `kestrel` at `{run root}/mcp` for `kestrel.*` tools (#42) and `travsr` at `{run root}/travsr` for
-//! `travsr.*` tools (#44). The run token in the path is their only credential. Config the runtime
-//! reads from a file goes in [`LaunchPlan::files`], which the engine mounts read-only at
-//! [`CONFIG_DIR`], outside the workspace, so nothing of it is committed.
+//! `kestrel` at `{run root}/mcp` for `kestrel.*` tools (#42) and `travsr` at
+//! `{run root}/travsr` for `travsr.*` tools (#44). The run token in the path is their only
+//! credential. Config the runtime reads from a file goes in [`LaunchPlan::files`], which the
+//! engine mounts read-only at [`CONFIG_DIR`], outside the workspace, so nothing of it is
+//! committed.
 
 use std::collections::BTreeMap;
 
@@ -94,18 +95,24 @@ const ASK_NOTE: &str = "\
   find out yourself.
 ";
 
-/// What an agent is told about the Kestrel tools it was offered: spawning when it may spawn,
-/// joining when it may also join, asking a person when it may ask. `None` when it may neither
-/// spawn nor ask, since `kestrel.join` alone has no children to wait for. No token, URL or path.
-pub fn agent_note(spawn: bool, join: bool, ask: bool) -> Option<String> {
+/// What an agent is told about the Kestrel tools it was offered: spawning when it may spawn one of
+/// `spawnable` (named, so it knows what to pass), joining when it may also join, asking a person
+/// when it may ask. `None` when it may neither spawn nor ask, since `kestrel.join` alone has no
+/// children to wait for. No token, URL or path.
+pub fn agent_note(spawnable: &[String], join: bool, ask: bool) -> Option<String> {
+    let spawn = !spawnable.is_empty();
     if !spawn && !ask {
         return None;
     }
     let mut note = String::from("# Kestrel tools\n\n");
     if spawn {
         note.push_str(SPAWN_NOTE);
+        note.push_str(&format!("* You may spawn: {}.\n", spawnable.join(", ")));
         if join {
             note.push_str(JOIN_NOTE);
+        } else {
+            // Without join, a child spawned without wait could never be heard from again.
+            note.push_str("* You cannot join a child later: set wait to get its result.\n");
         }
     }
     if ask {
@@ -146,8 +153,8 @@ struct Servers {
     /// The granted tools as Claude Code names MCP tools: `mcp__{server}__{tool}`, with every
     /// character other than a letter, digit, `_` or `-` made `_`. Each once.
     tools: Vec<String>,
-    /// `kestrel.spawn` is offered.
-    spawn: bool,
+    /// The agents `kestrel.spawn` may start; empty when it is not offered.
+    spawnable: Vec<String>,
     /// `kestrel.join` is offered.
     join: bool,
     /// `kestrel.ask_human` is offered.
@@ -159,14 +166,16 @@ impl Servers {
         let caps = &spec.capabilities;
         let mut tools: Vec<String> = Vec::new();
         let (mut kestrel, mut travsr) = (false, false);
-        let (mut spawn, mut join, mut ask) = (false, false, false);
+        let (mut spawnable, mut join, mut ask) = (Vec::new(), false, false);
         for name in &caps.mcp {
             let tool = if let Some(tool) = name.strip_prefix("kestrel.") {
-                match tool {
+                match (tool, &caps.spawn) {
                     // Spawning also needs spawn rights, as the gateway checks.
-                    "spawn" if caps.spawn.as_ref().is_some_and(|s| s.may_spawn()) => spawn = true,
-                    "ask_human" => ask = true,
-                    "join" => join = true,
+                    ("spawn", Some(rights)) if rights.may_spawn() => {
+                        spawnable.clone_from(&rights.agents)
+                    }
+                    ("ask_human", _) => ask = true,
+                    ("join", _) => join = true,
                     // The gateway has no other Kestrel tool, so it would never list this one.
                     _ => continue,
                 }
@@ -189,7 +198,7 @@ impl Servers {
             kestrel: kestrel.then(|| endpoint(&ctx.gateway_url, "mcp")),
             travsr: travsr.then(|| endpoint(&ctx.gateway_url, "travsr")),
             tools,
-            spawn,
+            spawnable,
             join,
             ask,
         }
@@ -201,7 +210,7 @@ impl Servers {
 
     /// The agent note for the Kestrel tools offered, see [`agent_note`].
     fn note(&self) -> Option<String> {
-        agent_note(self.spawn, self.join, self.ask)
+        agent_note(&self.spawnable, self.join, self.ask)
     }
 
     /// The servers by name, each to `entry(url)`.
