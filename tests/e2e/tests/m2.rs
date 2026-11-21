@@ -950,7 +950,8 @@ fn assert_own_networks(samples: &[(Instant, NetSample)], runs: &[String]) -> usi
 
 /// Scenario 10: in the 6-way fan-out every run gets its own network from the Kestrel pool, and a
 /// separate group of 20 short sandboxes starts without "address pools exhausted", with the CI
-/// host's default Docker pools as they are.
+/// host's default Docker pools as they are. Both groups have every network up at once: 7 for the
+/// fan-out, 20 for the group.
 #[test]
 fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     let env = Env::with_max(20);
@@ -972,6 +973,13 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     assert_eq!(tree.len(), 7);
     let most = assert_own_networks(&samples, &tree);
     eprintln!("m2-result: fan-out of 6, 7 runs on 7 networks, at most {most} at once");
+    // The parent spawns its 6 children back to back and waits in its join (its sandbox keeps
+    // running), and each child naps 6 s after its model call, under a cap of 20. So all 7 networks
+    // are up at once.
+    assert_eq!(
+        most, 7,
+        "the parent and its 6 children had their networks at once"
+    );
 
     let sampler = network_sampler(env.instance());
     let group: Vec<String> = (0..20).map(|_| env.submit_file(&short, "nap=4")).collect();
@@ -989,6 +997,13 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
     let samples = sampler.finish();
     let most = assert_own_networks(&samples, &group);
     eprintln!("m2-result: 20 short sandboxes on 20 networks, at most {most} at once");
+    // The point of the group: 20 run networks exist at once on the default Docker pools. The 20
+    // are submitted back to back under a cap of 20 and each naps 4 s, so all 20 overlap (CI run
+    // 44936723548 saw 20). Each run has one network of its own, so 20 is also the most possible.
+    assert_eq!(
+        most, 20,
+        "the 20 short sandboxes had their networks at once"
+    );
 }
 
 /// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart the
