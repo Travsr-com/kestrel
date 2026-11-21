@@ -333,6 +333,12 @@ impl Workspaces {
 /// For copies the host keeps to itself, such as the one Travsr indexes for a run: `dest` must
 /// not exist, and no agent ever gets it. `commit` must be a full commit id, so it can never be
 /// read as an option. A copy that fails halfway is removed.
+///
+/// The copy holds no link: a link the commit holds is checked out as a plain file with its
+/// target's path as text (`core.symlinks=false`), so a tool that writes files in the copy (such as
+/// `travsr init`, which rewrites `.gitignore`) cannot write through one to the host. The clone
+/// itself writes no working-tree file (`--no-checkout`); the checkout writes them all, and the
+/// setting is also kept in the copy's config for any later git call there.
 pub async fn clone_at(
     runner: &dyn CommandRunner,
     repo: &Path,
@@ -355,6 +361,8 @@ pub async fn clone_at(
         "--local",
         "--no-hardlinks",
         "--no-checkout",
+        "--config",
+        "core.symlinks=false",
         "--",
         repo_text,
         &dest_text,
@@ -365,6 +373,8 @@ pub async fn clone_at(
         &dest_text,
         "-c",
         "core.hooksPath=/dev/null",
+        "-c",
+        "core.symlinks=false",
         "checkout",
         "--detach",
         &commit,

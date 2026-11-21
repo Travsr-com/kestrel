@@ -164,6 +164,8 @@ async fn clone_at_copies_the_source_and_checks_out_the_commit_detached() {
                 "--local",
                 "--no-hardlinks",
                 "--no-checkout",
+                "--config",
+                "core.symlinks=false",
                 "--",
                 &repo,
                 &dest,
@@ -174,6 +176,8 @@ async fn clone_at_copies_the_source_and_checks_out_the_commit_detached() {
                 &dest,
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "core.symlinks=false",
                 "checkout",
                 "--detach",
                 SHA,
@@ -295,5 +299,96 @@ async fn the_private_copy_is_at_the_workspace_s_commit_even_after_the_source_mov
     assert_eq!(
         std::fs::read_to_string(copy.join("lib.rs")).unwrap(),
         "pub fn first() {}\n"
+    );
+}
+
+/// Commits a link at `name` in `repo` pointing at `target`, the way git stores one (mode
+/// 120000, the target as the blob), so no link has to be made on disk.
+fn commit_link(repo: &Path, name: &str, target: &Path) {
+    let blob = repo.parent().unwrap().join(format!("{name}.target"));
+    std::fs::write(&blob, target.to_str().unwrap()).unwrap();
+    let sha = git(
+        repo,
+        &["hash-object", "-w", "--no-filters", blob.to_str().unwrap()],
+    );
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{sha},{name}"),
+        ],
+    );
+}
+
+/// Travsr's `init` rewrites `<repo>/.gitignore` and writes `<repo>/.travsrignore` when there is
+/// none, following links. So the copy never holds a link from the commit: each is checked out as
+/// a plain file holding its target's path, and the copy's config keeps it so for later git calls.
+#[tokio::test]
+async fn committed_links_are_plain_files_in_the_copy_so_nothing_is_written_through_them() {
+    if !git_available() {
+        eprintln!("SKIPPED: `git` is not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "pub fn first() {}\n");
+    // A host file and directory the links point at, and a path that does not exist.
+    let host = dir.path().join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    let gitignore = host.join("gitignore");
+    std::fs::write(&gitignore, "host\n").unwrap();
+    let dangling = host.join("travsrignore");
+    let links = [
+        (".gitignore", gitignore.clone()),
+        (".travsrignore", dangling.clone()),
+        (".travsr", host.clone()),
+    ];
+    for (name, target) in &links {
+        commit_link(&repo, name, target);
+    }
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "links",
+        ],
+    );
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let copy = dir.path().join("copy");
+    clone_at(&ProcessRunner, &repo, &head, &copy).await.unwrap();
+    for (name, target) in &links {
+        let meta = std::fs::symlink_metadata(copy.join(name)).unwrap();
+        assert!(meta.is_file(), "{name} is not a plain file: {meta:?}");
+        assert_eq!(
+            std::fs::read_to_string(copy.join(name)).unwrap(),
+            target.to_str().unwrap()
+        );
+    }
+    // Written as `travsr init` writes them: the host's files are untouched.
+    std::fs::write(copy.join(".gitignore"), "copy\n").unwrap();
+    std::fs::write(copy.join(".travsrignore"), "copy\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "host\n");
+    assert!(!dangling.exists());
+    let mut left: Vec<_> = std::fs::read_dir(&host)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["gitignore"]);
+    // Later git calls in the copy check out links as plain files too.
+    let values = git(&copy, &["config", "--get-all", "core.symlinks"]);
+    assert!(
+        !values.is_empty() && values.lines().all(|v| v == "false"),
+        "{values}"
     );
 }
