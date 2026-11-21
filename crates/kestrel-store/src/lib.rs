@@ -830,6 +830,48 @@ impl Store {
             .collect()
     }
 
+    /// Events of every run with a cursor greater than `after_cursor`, in commit order, at most
+    /// `limit`. With `kinds` not empty, only events of those kinds (`"approval_requested"`, ...):
+    /// a page then holds only those, so a reader that filters never stalls on a page of others.
+    pub fn events_after_page(
+        &self,
+        after_cursor: u64,
+        kinds: &[&str],
+        limit: usize,
+    ) -> Result<Vec<(u64, Event)>> {
+        let after = i64::try_from(after_cursor).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // The kinds go in as a JSON array bound like any other value, never into the SQL text.
+        let wanted = serde_json::to_string(kinds)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, body FROM events
+             WHERE rowid > ?1
+               AND (json_array_length(?2) = 0
+                    OR json_extract(body, '$.kind.kind') IN (SELECT value FROM json_each(?2)))
+             ORDER BY rowid LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![after, wanted, limit], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            // Rowids start at 1, so the u64 view is exact.
+            .map(|(rowid, body)| Ok((rowid.unsigned_abs(), serde_json::from_str(body)?)))
+            .collect()
+    }
+
+    /// The cursor of the newest event, 0 when there is none. Reading after it gives only events
+    /// committed from now on.
+    pub fn latest_cursor(&self) -> Result<u64> {
+        let conn = self.conn();
+        let max: i64 = conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+            r.get(0)
+        })?;
+        Ok(max.unsigned_abs())
+    }
+
     // approvals
 
     /// Every approval ever requested, in request order, each with its outcome. Read from the
