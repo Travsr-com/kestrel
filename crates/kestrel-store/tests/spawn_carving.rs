@@ -530,6 +530,18 @@ fn set_budget_lowering_a_run_that_overspent_changes_nothing() {
         usd(DOLLAR / 2)
     );
     assert_eq!(store.remaining(parent).unwrap(), usd(3 * DOLLAR / 2));
+    // Asking for its current limit changes nothing either, though it is below what it spent.
+    assert_eq!(
+        store.set_budget(child, usd(DOLLAR / 2)).unwrap(),
+        usd(DOLLAR / 2)
+    );
+    assert_eq!(store.remaining(parent).unwrap(), usd(3 * DOLLAR / 2));
+    // A raise gets what was asked, no more: $0.52 takes $0.02 from the parent.
+    assert_eq!(
+        store.set_budget(child, usd(52 * DOLLAR / 100)).unwrap(),
+        usd(52 * DOLLAR / 100)
+    );
+    assert_eq!(store.remaining(parent).unwrap(), usd(148 * DOLLAR / 100));
 }
 
 #[test]

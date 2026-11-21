@@ -329,7 +329,8 @@ impl Store {
     /// * A spawned run's raise is taken from its parent, refused with
     ///   [`StoreError::ParentBudget`] when the parent has less than that left. Lowering one gives
     ///   the difference back to its parent (or further up, like an ended run's unspent budget).
-    /// * No run is set below what it already spent.
+    /// * No run is lowered below what it already spent. A run that already spent more than its
+    ///   limit keeps that limit when lowered, and gets exactly what was asked when raised.
     ///
     /// [`StoreError::NotFound`] when the run has no stored spec.
     pub fn set_budget(&self, id: RunId, limit: MicroUsd) -> Result<MicroUsd> {
@@ -337,13 +338,9 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = read_limit(&tx, id)?;
         let spent = spent_in(&tx, id)?;
-        // Not below what it spent; and lowering a run that already went past its limit leaves it
-        // where it is, so a lowering never takes money from the parent.
-        let new = if limit >= old {
-            limit.max(spent)
-        } else {
-            limit.max(spent.min(old))
-        };
+        // What was asked, raised only to what it spent and never past its old limit that way: a
+        // lowering never takes money from the parent, and a raise gets no more than asked.
+        let new = limit.max(spent.min(old));
         if let Some(parent) = parent_of(&tx, id)? {
             if new > old {
                 let asked = MicroUsd(new.0 - old.0);
