@@ -1,0 +1,110 @@
+# API reference
+
+The HTTP and WebSocket API that the web UI and scripts use. `kestrel up` starts it next to the
+engine and the gateway, on `127.0.0.1:7171` by default.
+
+```sh
+kestrel up            # prints: Open the UI at http://127.0.0.1:7171/?token=<token>
+kestrel up --no-open  # the same, without opening a browser
+```
+
+## Access
+
+* **Token.** Every `/api` and `/ws` request needs the token: `Authorization: Bearer <token>`. It is
+  made on first start and kept in `server.token` next to the database (mode 0600). Without it the
+  answer is `401`.
+* **Host and Origin.** `Host` must be the address the server listens on (`127.0.0.1:7171` or
+  `localhost:7171` by default), and a browser's `Origin` must be that same address. Anything else
+  gets `403`. This stops other web pages, and DNS names pointed at 127.0.0.1, from calling it.
+  There is no CORS.
+* **Listen address.** `--listen 0.0.0.0:7171` works, with a warning: the token is then all that
+  protects it. On such a bind, `Host` must be an IP address, not a name.
+* **The UI** (`/`, `/fleet`, `/runs/<id>`, and its files) needs no token: it holds no data. Any
+  path that is not under `/api` or `/ws` and has no file extension gets the UI's `index.html`.
+
+The examples set the token once:
+
+```sh
+export T=$(cat ~/.local/share/kestrel/server.token)
+export K=http://127.0.0.1:7171
+```
+
+Errors are JSON: `{"error": "no run 0193..."}`. Ids are run and approval UUIDs. Amounts are
+micro-dollars (`420000` is $0.42). The shapes are the types in `crates/kestrel-types/src/api.rs`.
+
+## Runs
+
+| Route | What it returns |
+| :--- | :--- |
+| `GET /api/runs?status=&agent=&root=` | Runs, newest first. `status` is `queued`, `provisioning`, `running`, `suspended`, `completed`, `failed` or `cancelled`. Filters combine. |
+| `GET /api/runs/{id}` | One run: status, agent, parent, root, depth, spent, limit, sandbox tier, created time. |
+| `GET /api/runs/{id}/tree` | Every run in the tree of `{id}`'s root, each parent before its children. |
+| `GET /api/runs/{id}/events?after=<seq>` | The run's events after `seq` (0 for all). |
+
+```sh
+curl -H "Authorization: Bearer $T" "$K/api/runs?status=running"
+curl -H "Authorization: Bearer $T" "$K/api/runs/$RUN"
+curl -H "Authorization: Bearer $T" "$K/api/runs/$RUN/tree"
+curl -H "Authorization: Bearer $T" "$K/api/runs/$RUN/events?after=4"
+```
+
+## Run commands
+
+Each answers `202` with no body once the command is in the store's control channel. The engine
+applies it like the same CLI command.
+
+| Route | Same as |
+| :--- | :--- |
+| `POST /api/runs/{id}/pause` | `kestrel pause` |
+| `POST /api/runs/{id}/resume` | `kestrel resume` |
+| `POST /api/runs/{id}/cancel` | `kestrel cancel` |
+| `POST /api/runs/{id}/budget` with `{"usd": "5.00"}` | `kestrel budget`. A negative or non-decimal amount is `400`. |
+| `POST /api/runs/{id}/message` with `{"text": "..."}` | Not supported by any runtime yet: `409`. |
+
+```sh
+curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/pause"
+curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/resume"
+curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/cancel"
+curl -X POST -H "Authorization: Bearer $T" -d '{"usd":"5.00"}' "$K/api/runs/$RUN/budget"
+curl -X POST -H "Authorization: Bearer $T" -d '{"text":"also fix the docs"}' "$K/api/runs/$RUN/message"
+```
+
+## Approvals
+
+| Route | What it does |
+| :--- | :--- |
+| `GET /api/approvals?status=pending` | Approvals in request order. `status` is `pending`, `approved` or `rejected`; leave it out for all. |
+| `POST /api/approvals/{id}/approve` | Approves. Optional body `{"payload": "<edited action>"}` for "edit and approve"; it is stored on the `approval_resolved` event. |
+| `POST /api/approvals/{id}/reject` | Rejects. Optional body `{"reason": "..."}`, stored on the event and in the run's failure message. |
+
+Approve and reject answer `202`, `404` for an unknown approval, and `409` when it is resolved
+already or its run no longer waits on it.
+
+```sh
+curl -H "Authorization: Bearer $T" "$K/api/approvals?status=pending"
+curl -X POST -H "Authorization: Bearer $T" -d '{"payload":"git push origin fix"}' "$K/api/approvals/$APPROVAL/approve"
+curl -X POST -H "Authorization: Bearer $T" -d '{"reason":"not on main"}' "$K/api/approvals/$APPROVAL/reject"
+```
+
+## Event sockets
+
+| Route | What it streams |
+| :--- | :--- |
+| `GET /ws/runs/{id}?after=<seq>` | One run's events after `seq`, then live ones. |
+| `GET /ws/tree/{id}?after=<cursor>` | Events of every run in the tree of `{id}`'s root, after the global `cursor`, then live ones, in commit order. |
+
+* **Frames** are JSON: `{"type": "event", "cursor": 17, "event": {...}}`, and
+  `{"type": "heartbeat"}` every 15 s.
+* **Reconnecting.** Send the last `cursor` back as `after=`. Nothing is skipped and nothing comes
+  twice.
+* **Token.** Browsers cannot set headers on a WebSocket, so the token travels as subprotocols:
+  `kestrel.v1, kestrel.token.<token>` (the server answers `kestrel.v1`), or as `?token=`.
+* **Refusals and close frames.** A missing or wrong token is refused before the socket opens
+  (`401`). Close code 4401 is reserved for a token refused after it opens. A client that stops
+  reading is dropped with a close frame once its queue stays full for 10 s. When the server stops,
+  every socket gets a close frame.
+
+```sh
+websocat -H "Authorization: Bearer $T" "ws://127.0.0.1:7171/ws/runs/$RUN?after=0"
+websocat -H "Authorization: Bearer $T" "ws://127.0.0.1:7171/ws/tree/$RUN?after=0"
+```

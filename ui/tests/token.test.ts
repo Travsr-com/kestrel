@@ -5,7 +5,7 @@ import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
-import { clearToken, getToken, isCurrent, setToken } from '../src/lib/token';
+import { clearToken, getToken, isCurrent, setToken, takeTokenFromUrl } from '../src/lib/token';
 import { createMockServer } from './mock-server';
 
 afterEach(() => {
@@ -128,5 +128,33 @@ describe('Token required screen', () => {
     await user.click(await screen.findByRole('button', { name: 'Continue' }));
     expect(screen.getByRole('heading', { level: 1, name: 'Token required' })).toBeInTheDocument();
     expect(server.calls).toHaveLength(1);
+  });
+});
+
+describe('token from the URL', () => {
+  it('takes ?token= from the address kestrel up prints and removes it from the URL', () => {
+    const replaced: string[] = [];
+    const took = takeTokenFromUrl(
+      { search: '?token=abc123', pathname: '/', hash: '#/fleet' },
+      (url) => replaced.push(url),
+    );
+    expect(took).toBe(true);
+    expect(getToken()).toBe('abc123');
+    expect(replaced).toEqual(['/#/fleet']);
+  });
+
+  it('keeps other query parameters', () => {
+    const replaced: string[] = [];
+    takeTokenFromUrl({ search: '?a=1&token=t&b=2', pathname: '/ui', hash: '' }, (url) => replaced.push(url));
+    expect(getToken()).toBe('t');
+    expect(replaced).toEqual(['/ui?a=1&b=2']);
+  });
+
+  it('does nothing without a token', () => {
+    const replaced: string[] = [];
+    expect(takeTokenFromUrl({ search: '', pathname: '/', hash: '' }, (url) => replaced.push(url))).toBe(false);
+    expect(takeTokenFromUrl({ search: '?token=', pathname: '/', hash: '' }, (url) => replaced.push(url))).toBe(false);
+    expect(getToken()).toBeNull();
+    expect(replaced).toEqual([]);
   });
 });

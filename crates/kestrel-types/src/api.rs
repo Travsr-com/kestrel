@@ -77,8 +77,8 @@ pub const WS_PROTOCOL: &str = "kestrel.v1";
 /// Prefix of the subprotocol that carries the API token. See [`WS_PROTOCOL`].
 pub const WS_TOKEN_PREFIX: &str = "kestrel.token.";
 
-/// The close code the server sends when a socket's token is missing or wrong. The client stops
-/// reconnecting and asks for a token instead.
+/// The close code for a token refused after a socket opened. The client stops reconnecting and
+/// asks for a token instead. (A missing or wrong token at the upgrade is an HTTP 401.)
 pub const WS_CLOSE_UNAUTHORIZED: u16 = 4401;
 
 /// One message on an event socket (`/ws/runs/{id}` or `/ws/tree/{root}`).

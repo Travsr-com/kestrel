@@ -2,10 +2,9 @@
 
 The web UI for Kestrel: Fleet, Run and Approvals views. A static Svelte 5 app with no server code.
 
-> **Status:** the API server that serves this UI is `kestrel-server`, which issue #37 adds. Until it
-> lands, the UI runs only in tests (`npm test`) and against a server you provide. Once #37 is in,
-> `kestrel up` embeds `ui/dist` in the binary, and serves a page saying how to build the UI when
-> `ui/dist` is missing. `cargo build` never needs Node.
+`kestrel up` serves it: the binary embeds `ui/dist` when it is built, and serves a page saying how
+to build the UI when `ui/dist` is missing. `cargo build` never needs Node. The API is in
+[docs/api.md](../docs/api.md).
 
 ## Develop
 
@@ -17,7 +16,7 @@ npm ci
 npm test
 ```
 
-To run the UI against an API server, start the server, then:
+To run the UI against a live Kestrel, start `kestrel up --no-open` in another terminal, then:
 
 ```sh
 npm run dev
@@ -31,8 +30,9 @@ when the server is elsewhere:
 KESTREL_URL=http://127.0.0.1:8080 npm run dev
 ```
 
-The UI asks for the API token on the first request. It keeps the token in memory only, so a new tab
-asks again.
+The UI takes the API token from `?token=` in the address `kestrel up` prints, then removes it from
+the address bar. Without one it asks on the first request. It keeps the token in memory only, so a
+new tab asks again.
 
 ## Checks
 
