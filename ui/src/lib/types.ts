@@ -78,7 +78,9 @@ export type EventKind =
   | { kind: 'approval_requested'; id: ApprovalId; action: string }
   | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean }
   | { kind: 'agent_log'; line: string }
-  | { kind: 'run_finished'; summary: string | null };
+  | { kind: 'run_finished'; summary: string | null }
+  | { kind: 'child_spawned'; child: RunId; agent: string; budget: MicroUsd }
+  | { kind: 'capabilities_dropped'; tools: string[]; hosts: string[]; secrets: string[]; agents: string[] };
 
 export interface Event {
   run_id: RunId;

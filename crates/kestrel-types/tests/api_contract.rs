@@ -97,9 +97,11 @@ fn variant_index(kind: &EventKind) -> usize {
         EventKind::ApprovalResolved { .. } => 9,
         EventKind::AgentLog { .. } => 10,
         EventKind::RunFinished { .. } => 11,
+        EventKind::ChildSpawned { .. } => 12,
+        EventKind::CapabilitiesDropped { .. } => 13,
     }
 }
-const VARIANTS: usize = 12;
+const VARIANTS: usize = 14;
 
 #[test]
 fn every_event_kind_decodes_and_encodes_unchanged() {

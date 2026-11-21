@@ -68,6 +68,24 @@ pub enum EventKind {
     RunFinished {
         summary: Option<String>,
     },
+    /// On the parent: it spawned `child`, which got `budget` carved out of the parent's.
+    ChildSpawned {
+        child: RunId,
+        agent: String,
+        budget: MicroUsd,
+    },
+    /// On a spawned child: what its spec asked for that its parent could not pass on. A child
+    /// holds at most its parent's capabilities, so these were left out of its token.
+    CapabilitiesDropped {
+        #[serde(default)]
+        tools: Vec<String>,
+        #[serde(default)]
+        hosts: Vec<String>,
+        #[serde(default)]
+        secrets: Vec<String>,
+        #[serde(default)]
+        agents: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
