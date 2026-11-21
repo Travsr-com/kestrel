@@ -168,7 +168,7 @@ describe('Run view', () => {
     const alphaItem = within(nav).getByRole('link', { name: /alpha/ }).closest('li');
     expect(alphaItem).not.toBeNull();
     expect(within(alphaItem as HTMLElement).getByRole('link', { name: /gamma/ })).toBeInTheDocument();
-    const toggle = within(alphaItem as HTMLElement).getByRole('button', { name: 'Collapse alpha' });
+    const toggle = within(alphaItem as HTMLElement).getByRole('button', { name: 'Children of alpha' });
     await user().click(toggle);
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(within(nav).queryByRole('link', { name: /gamma/ })).not.toBeInTheDocument();
@@ -210,6 +210,10 @@ describe('Run view', () => {
     window.location.hash = `#/runs/${root.id}`;
     render(App, { fetch: served, sockets: sockets.factory });
     const nav = await screen.findByRole('navigation', { name: 'Spawn tree' });
+    const rootStream = stream(sockets, root.id);
+    rootStream.open();
+    rootStream.event(1, event(root.id, 1, log('root says hi')));
+    expect(await screen.findByText('root says hi')).toBeInTheDocument();
     await user().click(await within(nav).findByRole('link', { name: /kid/ }));
     expect(window.location.hash).toBe(`#/runs/${kid.id}`);
     window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -218,6 +222,10 @@ describe('Run view', () => {
     s.open();
     s.event(1, event(kid.id, 1, log('kid says hi')));
     expect(await screen.findByText('kid says hi')).toBeInTheDocument();
+    expect(screen.queryByText('root says hi')).not.toBeInTheDocument();
+    expect(rootStream.closed).toBe(true);
+    // The tree socket stays: it is the same tree.
+    expect(tree(sockets, root.id).closed).toBe(false);
     expect(within(nav).getByRole('link', { name: /kid/ })).toHaveAttribute('aria-current', 'page');
   });
 
@@ -243,10 +251,10 @@ describe('Run view', () => {
     await user().click(jump);
     expect(box.scrollTop).toBe(1000);
     expect(screen.queryByRole('button', { name: 'Jump to latest' })).not.toBeInTheDocument();
+    Object.defineProperty(box, 'scrollHeight', { configurable: true, get: () => 1500 });
     s.event(3, event(r.id, 3, log('c')));
-    box.scrollTop = 1000;
     await settle();
-    expect(box.scrollTop).toBe(1000);
+    expect(box.scrollTop).toBe(1500);
   });
 
   // 7
@@ -507,21 +515,25 @@ describe('Run view', () => {
     s.event(1, event(root.id, 1, { kind: 'tool_call', name: 'shell', input: { cmd: 'ls' } }));
     await settle();
     const u = user();
-    const toggle = screen.getByRole('button', { name: 'Collapse lead' });
-    toggle.focus();
+    const reach = async (el: HTMLElement) => {
+      for (let i = 0; i < 40 && document.activeElement !== el; i++) await u.tab();
+      expect(document.activeElement).toBe(el);
+    };
+    const pause = screen.getByRole('button', { name: 'Pause' });
+    await reach(pause);
+    await u.keyboard('{Enter}');
+    await vi.waitFor(() => expect(document.activeElement).toBe(pause));
+    const toggle = screen.getByRole('button', { name: 'Children of lead' });
+    await reach(toggle);
     await u.keyboard('{Enter}');
     expect(screen.queryByRole('link', { name: /kid/ })).not.toBeInTheDocument();
     await u.keyboard(' ');
     expect(screen.getByRole('link', { name: /kid/ })).toBeInTheDocument();
     const call = screen.getByRole('button', { name: /shell/ });
-    call.focus();
+    await reach(call);
     await u.keyboard('{Enter}');
     expect(call).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByText(/"cmd": "ls"/)).toBeInTheDocument();
-    const pause = screen.getByRole('button', { name: 'Pause' });
-    pause.focus();
-    await u.keyboard('{Enter}');
-    await vi.waitFor(() => expect(document.activeElement).toBe(pause));
   });
 
   it('renders every kind of event', async () => {
@@ -574,6 +586,140 @@ describe('Run view', () => {
     expect(text[11]).toContain('Finished: All green.');
     expect(text[12]).toContain('Finished');
     expect(text[13]).toContain('Running to Completed');
+  });
+});
+
+describe('Run view: moving between runs, the dialog and budgets', () => {
+  it('clears the controls when another run is shown', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const { rerender } = show(kid.id, [root, kid], { status: 409, error: 'nope' });
+    const u = user();
+    await u.type(await screen.findByLabelText('Message'), 'hi');
+    await u.click(screen.getByRole('button', { name: 'Send' }));
+    expect(await screen.findByText('nope')).toBeInTheDocument();
+    await u.type(screen.getByLabelText('New budget (USD)'), 'abc');
+    await rerender({ id: root.id });
+    await screen.findByRole('heading', { level: 1, name: 'lead' });
+    expect(screen.queryByText('nope')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('New budget (USD)')).toHaveValue('');
+  });
+
+  it('closes an open cancel dialog when another run is shown, so it never cancels the wrong run', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const { rerender, calls } = show(kid.id, [root, kid]);
+    await user().click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('This cancels kid.');
+    await rerender({ id: root.id });
+    await screen.findByRole('heading', { level: 1, name: 'lead' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(calls.filter((c) => c.method === 'POST')).toEqual([]);
+  });
+
+  it('a run that is not found after another was shown drops the old run and its sockets', async () => {
+    const root = run({ agent: 'lead' });
+    const { rerender, sockets } = show(root.id, [root]);
+    await screen.findByRole('heading', { level: 1, name: 'lead' });
+    await rerender({ id: 'nope' });
+    expect(await screen.findByText('Run not found.')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Run nope' })).toBeInTheDocument();
+    expect(stream(sockets, root.id).closed).toBe(true);
+    expect(tree(sockets, root.id).closed).toBe(true);
+  });
+
+  it('moving to another tree closes the old sockets and opens new ones; unmount closes all', async () => {
+    const a = run({ agent: 'alpha' });
+    const b = run({ agent: 'beta' });
+    const { rerender, sockets, unmount } = show(a.id, [a, b]);
+    await screen.findByRole('heading', { level: 1, name: 'alpha' });
+    await rerender({ id: b.id });
+    await screen.findByRole('heading', { level: 1, name: 'beta' });
+    expect(stream(sockets, a.id).closed).toBe(true);
+    expect(tree(sockets, a.id).closed).toBe(true);
+    expect(stream(sockets, b.id).closed).toBe(false);
+    expect(tree(sockets, b.id).closed).toBe(false);
+    unmount();
+    expect(sockets.made.every((x) => x.closed)).toBe(true);
+  });
+
+  it('shows a run of the same tree that the tree has not delivered yet', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const sockets = fakeSockets();
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = new URL(String(input), 'http://kestrel.test');
+      if (url.pathname === '/api/runs') return new Response(JSON.stringify([root]));
+      const one = [root, kid].find((r) => url.pathname === `/api/runs/${r.id}`);
+      return new Response(JSON.stringify(one));
+    };
+    const { rerender } = render(Run, {
+      id: root.id,
+      api: createApi({ fetch, getToken: () => null }),
+      onUnauthorized: () => {},
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('heading', { level: 1, name: 'lead' });
+    await rerender({ id: kid.id });
+    expect(await screen.findByRole('heading', { level: 1, name: 'kid' })).toBeInTheDocument();
+  });
+
+  it('fetches the run again after a new budget, so the bar shows it', async () => {
+    const r = run({ limit: 2_000_000 });
+    const runs = [r];
+    show(r.id, runs);
+    const u = user();
+    await u.type(await screen.findByLabelText('New budget (USD)'), '3.50');
+    runs[0] = { ...r, limit: 3_500_000 };
+    await u.click(screen.getByRole('button', { name: 'Set budget' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(screen.getByText('$0.00 of $3.50, $0.00 carved to children')).toBeInTheDocument();
+  });
+
+  it('keeps focus in the dialog after a click on its text or the backdrop; Esc still closes it', async () => {
+    const r = run();
+    show(r.id, [r]);
+    const u = user();
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await u.click(cancel);
+    const dialog = screen.getByRole('dialog');
+    await u.click(within(dialog).getByText('Cancel this run?'));
+    await u.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await u.click(dialog.parentElement as HTMLElement);
+    await u.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    // Focus moved behind the dialog by other means (a script, assistive tech) comes back into it.
+    screen.getByRole('button', { name: 'Pause' }).focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await u.click(dialog.parentElement as HTMLElement);
+    await u.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(cancel);
+  });
+
+  it('closes the dialog when the run ends while it is open, keeping focus in the controls', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    await user().click(await screen.findByRole('button', { name: 'Cancel' }));
+    const t = tree(sockets, r.id);
+    t.open();
+    t.event(1, event(r.id, 1, { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    await settle();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(screen.getByRole('group', { name: 'Controls' }));
+  });
+
+  it('sends a command once however fast it is clicked', async () => {
+    const r = run();
+    const { calls } = show(r.id, [r]);
+    const pause = await screen.findByRole('button', { name: 'Pause' });
+    // Both clicks land before the first command is answered.
+    void fireEvent.click(pause);
+    void fireEvent.click(pause);
+    await settle();
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1);
   });
 });
 

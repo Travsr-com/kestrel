@@ -38,7 +38,10 @@
   let shown: RunId | null = $state(null);
   let missing = $state(false);
   let error: string | null = $state(null);
-  let events: Event[] = $state([]);
+  // Raw: events are never changed in place, so they need no deep proxy (outputs can be large).
+  let events: Event[] = $state.raw([]);
+  /** Events that arrived since the last render; added in one go. */
+  let pending: Event[] = [];
   /** Sockets that dropped and are not open again yet. */
   let down: Record<string, true> = $state({});
 
@@ -73,12 +76,18 @@
           if (!tree.some((r) => r.id === summary.id)) tree.push(summary);
           fleet.load(tree);
           root = summary.root;
-        } else {
+        } else if (fleet.runs[summary.id]) {
           fleet.update(summary, Date.now());
+        } else {
+          // A run of this tree that the tree socket has not delivered yet.
+          fleet.add(summary);
         }
         shown = summary.id;
       },
       (e) => {
+        // Nothing of the run shown before stays on screen, and its sockets close.
+        shown = null;
+        root = null;
         if (e instanceof ApiFailure && e.status === 404) missing = true;
         else error = failureText(e, onUnauthorized);
       },
@@ -112,17 +121,35 @@
     const run = shown;
     if (run === null) return;
     events = [];
+    pending = [];
     stick = true;
+    let queued = false;
+    let open = true;
+    const flush = () => {
+      queued = false;
+      if (!open) return;
+      events = events.concat(pending);
+      pending = [];
+    };
     const stream = connectEvents({
       base,
       path: `/ws/runs/${encodeURIComponent(run)}`,
       after: 0,
       getToken,
       socketFactory: sockets,
-      onEvent: (event) => events.push(event),
+      onEvent: (event) => {
+        pending.push(event);
+        if (!queued) {
+          queued = true;
+          queueMicrotask(flush);
+        }
+      },
       onState: (state) => track('run', state),
     });
-    return () => stream.close();
+    return () => {
+      open = false;
+      stream.close();
+    };
   });
 
   // Follow the newest event unless the user scrolled up.
@@ -140,6 +167,22 @@
     box.scrollTop = box.scrollHeight;
     stick = true;
   }
+
+  // A new budget is applied by the engine a moment after the command is accepted, and writes no
+  // event: the run and its parent (whose limit pays for it) are fetched again shortly after.
+  const budgetTimers: ReturnType<typeof setTimeout>[] = [];
+  function afterBudget(rid: RunId) {
+    for (const wait of [500, 1_500]) {
+      budgetTimers.push(
+        setTimeout(() => {
+          refresh(rid);
+          const parent = fleet.runs[rid]?.parent;
+          if (parent) refresh(parent);
+        }, wait),
+      );
+    }
+  }
+  $effect(() => () => budgetTimers.forEach(clearTimeout));
 
   /** After a refused command, the run's status from the server: it is newer than what is shown. */
   function reload() {
@@ -178,13 +221,23 @@
         {/if}
       </p>
       <BudgetBar spent={run.spent} limit={run.limit} carved={carved(all, run.id)} />
-      <Controls {run} live={liveBelow(all, run.id)} {api} {onUnauthorized} onRefused={reload} />
+      <!-- Keyed by run: nothing typed, refused or open for one run carries over to another. -->
+      {#key run.id}
+        <Controls
+          {run}
+          live={liveBelow(all, run.id)}
+          {api}
+          {onUnauthorized}
+          onRefused={reload}
+          onBudget={() => afterBudget(run.id)}
+        />
+      {/key}
     </header>
     <SpawnTree runs={fleet.runs} {root} selected={run.id} />
-    <section class="stream" aria-label="Event stream">
-      <!-- Focusable so keyboard users can scroll it. -->
+    <section class="stream">
+      <!-- A named region, focusable so keyboard users can scroll it. -->
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <div class="scroll" bind:this={box} onscroll={onScroll} tabindex="0">
+      <div class="scroll" role="region" aria-label="Event stream" bind:this={box} onscroll={onScroll} tabindex="0">
         <ul aria-label="Events">
           {#each events as event (event.seq)}
             <EventItem {event} />

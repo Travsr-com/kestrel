@@ -64,6 +64,20 @@ export class FleetState {
     this.runs = next;
   }
 
+  /** Adds a run the server answered for, unless it is known already. */
+  add(summary: RunSummary): void {
+    if (this.runs[summary.id]) return;
+    this.runs[summary.id] = {
+      ...summary,
+      endedAt: isTerminal(summary.status) ? 0 : null,
+      finishedAt: null,
+      reported: summary.spent,
+      counted: 0,
+      provisional: false,
+      fetched: true,
+    };
+  }
+
   /**
    * Takes what a fetch says about a known run: its limit (a spawn lowers a parent's, a child's end
    * raises it), tier, start time and a cost that is never lower than what is shown. The status is

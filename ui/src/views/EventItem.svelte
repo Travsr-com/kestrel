@@ -10,12 +10,13 @@
 
   let open = $state(false);
   const kind = $derived(event.kind);
-  const time = $derived(event.ts.slice(11, 19));
+  // The viewer's local time; the full UTC time is in `datetime` and the tooltip.
+  const time = $derived(new Date(event.ts).toLocaleTimeString([], { hour12: false }));
   const bytes = (text: string) => new TextEncoder().encode(text).length;
 </script>
 
 <li class="event">
-  <time datetime={event.ts}>{time}</time>
+  <time datetime={event.ts} title={event.ts}>{time}</time>
   {#if kind.kind === 'run_created'}
     <span>Run created: {kind.agent}</span>
   {:else if kind.kind === 'status_changed'}

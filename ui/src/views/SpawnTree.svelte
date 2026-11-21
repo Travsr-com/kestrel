@@ -41,7 +41,7 @@
           type="button"
           class="toggle"
           aria-expanded={open}
-          aria-label="{open ? 'Collapse' : 'Expand'} {run.agent}"
+          aria-label="Children of {run.agent}"
           onclick={() => (collapsed[run.id] = open)}
         >
           <span aria-hidden="true">{open ? '-' : '+'}</span>

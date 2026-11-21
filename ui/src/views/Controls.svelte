@@ -13,7 +13,15 @@
     api,
     onUnauthorized,
     onRefused,
-  }: { run: FleetRun; live: number; api: Api; onUnauthorized: OnUnauthorized; onRefused: () => void } = $props();
+    onBudget = () => {},
+  }: {
+    run: FleetRun;
+    live: number;
+    api: Api;
+    onUnauthorized: OnUnauthorized;
+    onRefused: () => void;
+    onBudget?: () => void;
+  } = $props();
 
   const can = $derived(allowed(run.status));
 
@@ -22,12 +30,19 @@
   let budget = $state('');
   let budgetError: string | null = $state(null);
   let message = $state('');
+  /** A command is on its way: another click sends nothing. */
+  let busy = false;
+
+  let group: HTMLElement | undefined = $state();
+  let dialog: HTMLElement | undefined = $state();
 
   let cancelButton: HTMLButtonElement | undefined = $state();
   let keepButton: HTMLButtonElement | undefined = $state();
   let confirmButton: HTMLButtonElement | undefined = $state();
 
   async function send(command: () => Promise<void>): Promise<boolean> {
+    if (busy) return false;
+    busy = true;
     refused = null;
     try {
       await command();
@@ -36,6 +51,8 @@
       refused = failureText(e, onUnauthorized);
       onRefused();
       return false;
+    } finally {
+      busy = false;
     }
   }
 
@@ -43,9 +60,16 @@
     if (confirming) keepButton?.focus();
   });
 
+  // The run ended while the dialog was open: there is nothing left to cancel.
+  $effect(() => {
+    if (confirming && !can.cancel) close();
+  });
+
+  /** Closes the dialog; focus goes back to Cancel, or to the controls if Cancel is now off. */
   function close() {
     confirming = false;
-    cancelButton?.focus();
+    if (cancelButton && !cancelButton.disabled) cancelButton.focus();
+    else group?.focus();
   }
 
   function confirmCancel() {
@@ -53,18 +77,29 @@
     void send(() => api.cancel(run.id));
   }
 
-  /** Esc closes the dialog; Tab and Shift+Tab stay on its two buttons. */
-  function onDialogKey(e: KeyboardEvent) {
+  /**
+   * While the dialog is open, from anywhere on the page: Esc closes it, and Tab and Shift+Tab move
+   * between its two buttons only.
+   */
+  function onKey(e: KeyboardEvent) {
+    if (!confirming) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       close();
     } else if (e.key === 'Tab') {
-      const leaving = e.shiftKey ? keepButton : confirmButton;
-      if (document.activeElement === leaving) {
-        e.preventDefault();
-        (e.shiftKey ? confirmButton : keepButton)?.focus();
-      }
+      e.preventDefault();
+      const order = [keepButton, confirmButton];
+      const at = order.indexOf(document.activeElement as HTMLButtonElement);
+      // Two buttons: the next one either way is the other one; from elsewhere, Tab enters at the
+      // first and Shift+Tab at the last.
+      const next = at === -1 ? (e.shiftKey ? 1 : 0) : 1 - at;
+      order[next]?.focus();
     }
+  }
+
+  /** Focus that lands outside the open dialog is brought back into it. */
+  function onFocusIn(e: FocusEvent) {
+    if (confirming && dialog && !dialog.contains(e.target as Node)) keepButton?.focus();
   }
 
   function setBudget(e: SubmitEvent) {
@@ -74,7 +109,7 @@
       return;
     }
     budgetError = null;
-    void send(() => api.setBudget(run.id, budget.trim()));
+    void send(() => api.setBudget(run.id, budget.trim())).then((ok) => ok && onBudget());
   }
 
   async function sendMessage(e: SubmitEvent) {
@@ -87,7 +122,9 @@
   const children = (n: number) => (n === 1 ? '1 child run' : `${n} child runs`);
 </script>
 
-<div class="controls" role="group" aria-label="Controls">
+<svelte:window onkeydown={onKey} onfocusin={onFocusIn} />
+
+<div class="controls" role="group" aria-label="Controls" tabindex="-1" bind:this={group}>
   <div class="buttons">
     <button type="button" disabled={!can.pause} onclick={() => send(() => api.pause(run.id))}>Pause</button>
     <button type="button" disabled={!can.resume} onclick={() => send(() => api.resume(run.id))}>Resume</button>
@@ -133,7 +170,7 @@
       aria-labelledby="cancel-title-{run.id}"
       aria-describedby="cancel-text-{run.id}"
       tabindex="-1"
-      onkeydown={onDialogKey}
+      bind:this={dialog}
     >
       <h2 id="cancel-title-{run.id}">Cancel this run?</h2>
       <p id="cancel-text-{run.id}">
