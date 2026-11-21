@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="150 190 730 720" role="img" aria-label="Kestrel">
+<g fill="currentColor">
+<mask id="m"><rect x="0" y="0" width="1024" height="1024" fill="#fff"/><path d="M360 454L486 420L458 498Z" fill="#000"/><path d="M406 544L504 530L546 716Z" fill="#000"/></mask>
+<path transform="translate(-110 -146) scale(1.1)" mask="url(#m)" d="M266 690Q192 560 300 464L374 392L500 322L660 316L760 410L772 540L900 866L736 826L650 884L560 800L520 742L440 696L392 662L322 668Z"/>
+</g>
+</svg>
