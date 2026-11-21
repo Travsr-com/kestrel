@@ -6,6 +6,9 @@ Research.md
 node_modules/
 /ui/dist/
 /ui/coverage/
+# Playwright output of the M2 browser suite (traces and screenshots of failures).
+/tests/e2e/ui/test-results/
+/tests/e2e/ui/playwright-report/
 *.profraw
 lcov.info
 .env

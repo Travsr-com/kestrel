@@ -1,0 +1,20 @@
+{
+  "name": "kestrel-e2e-ui",
+  "private": true,
+  "version": "0.0.0",
+  "description": "M2 browser smoke tests: the embedded UI of a real `kestrel up`, driven by Playwright. Started by tests/ui.rs.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "@types/node": "24.19.2",
+    "typescript": "6.0.3"
+  }
+}
