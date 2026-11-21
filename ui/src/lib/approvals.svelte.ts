@@ -6,15 +6,16 @@
 // connected. Two rules keep the two sources from fighting:
 //
 // * An approval seen resolved is never added back by a list that was fetched before the
-//   resolution was seen.
+//   resolution was seen, and an approval of a run seen to end comes back only as ended.
 // * A list only removes rows that were known before it was asked for, so a request that arrived
 //   while the list was on its way is kept.
+// * A list older than one already taken is dropped (two can be on their way at once).
 
 import type { Api } from './api';
 import { isTerminal } from './format';
 import { failureText, type OnUnauthorized } from './load';
 import { getToken } from './token';
-import type { Approval, ApprovalId, Event } from './types';
+import type { Approval, ApprovalId, Event, RunId } from './types';
 import { connectEvents, type SocketFactory } from './ws';
 
 export interface ApprovalRow {
@@ -30,7 +31,10 @@ export class ApprovalsState {
   loaded = $state(false);
   error: string | null = $state(null);
   private gen = 0;
+  /** The newest sync whose list was taken. */
+  private loadedToken = 0;
   private readonly resolved: Record<ApprovalId, true> = {};
+  private readonly endedRuns: Record<RunId, 'cancelled' | 'ended'> = {};
 
   /** Approvals that can still be decided. */
   get count(): number {
@@ -45,11 +49,13 @@ export class ApprovalsState {
 
   /** Takes the pending list fetched for the sync `token`. */
   load(list: Approval[], token: number): void {
+    if (token < this.loadedToken) return;
+    this.loadedToken = token;
     const listed: Record<ApprovalId, true> = {};
     for (const approval of list) {
       listed[approval.id] = true;
       if (this.resolved[approval.id] || this.rows[approval.id]) continue;
-      this.rows[approval.id] = { approval, ended: null, gen: token };
+      this.rows[approval.id] = { approval, ended: this.endedRuns[approval.run_id] ?? null, gen: token };
     }
     for (const [id, row] of Object.entries(this.rows)) {
       // Known before this list was asked for, and not on it any more: resolved meanwhile.
@@ -80,12 +86,15 @@ export class ApprovalsState {
       case 'approval_resolved':
         this.remove(kind.id);
         return;
-      case 'status_changed':
+      case 'status_changed': {
         if (!isTerminal(kind.to)) return;
+        const ended = kind.to === 'Cancelled' ? 'cancelled' : 'ended';
+        this.endedRuns[event.run_id] = ended;
         for (const row of Object.values(this.rows)) {
-          if (row.approval.run_id === event.run_id) row.ended = kind.to === 'Cancelled' ? 'cancelled' : 'ended';
+          if (row.approval.run_id === event.run_id) row.ended = ended;
         }
         return;
+      }
       default:
         return;
     }
@@ -95,6 +104,12 @@ export class ApprovalsState {
   remove(id: ApprovalId): void {
     this.resolved[id] = true;
     delete this.rows[id];
+  }
+
+  /** The run stopped waiting on this approval (the server said so before its event came). */
+  endRow(id: ApprovalId): void {
+    const row = this.rows[id];
+    if (row) row.ended = 'ended';
   }
 
   /** Takes away a row the user has seen (one whose run ended). */

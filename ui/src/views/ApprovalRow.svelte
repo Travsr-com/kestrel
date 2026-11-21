@@ -2,7 +2,7 @@
   // One pending approval: who asks and what, how long it has waited, and the ways to decide it.
   // A decision stays "in progress" until the resolved event takes the row away; a refusal because
   // someone else decided first (409) is handed to `onGone`; any other failure puts the row back
-  // with the error and a Retry.
+  // with the error and a Retry, which sends what the fields hold then.
   import { ApiFailure, type Api } from '../lib/api';
   import type { ApprovalRow } from '../lib/approvals.svelte';
   import { formatElapsed } from '../lib/format';
@@ -24,7 +24,7 @@
     now: number;
     api: Api;
     onUnauthorized: OnUnauthorized;
-    onGone: () => void;
+    onGone: (why: 'resolved' | 'not-waiting') => void;
     onDismiss: () => void;
   } = $props();
 
@@ -58,7 +58,8 @@
     } catch (e) {
       sending = null;
       if (e instanceof ApiFailure && e.status === 409) {
-        onGone();
+        // The server says which: resolved already, or its run is no longer waiting on it.
+        onGone(e.message.includes('not waiting') ? 'not-waiting' : 'resolved');
         return;
       }
       error = failureText(e, onUnauthorized);
@@ -71,8 +72,8 @@
 
   function confirmReject(e: SubmitEvent) {
     e.preventDefault();
-    const text = reason.trim();
-    void decide('reject', () => api.reject(id, text === '' ? undefined : text));
+    // Read when sent, so a Retry sends the reason as it is then.
+    void decide('reject', () => api.reject(id, reason.trim() === '' ? undefined : reason.trim()));
   }
 
   function startEdit() {
@@ -93,12 +94,12 @@
       return;
     }
     answerError = null;
-    void decide('answer', () => api.approve(id, text));
+    void decide('answer', () => api.approve(id, answer.trim()));
   }
 </script>
 
 <li class="row" data-id={id}>
-  <p class="who">
+  <p class="who" id="who-{id}">
     <strong>{run?.agent ?? 'agent not known yet'}</strong>
     <a href={href({ name: 'run', id: approval.run_id })} title={approval.run_id}>Run {short(approval.run_id)}</a>
     {#if run && run.root !== run.id}
@@ -121,20 +122,6 @@
     <div class="buttons">
       <button type="button" onclick={onDismiss}>Dismiss</button>
     </div>
-  {:else if approval.question}
-    <form class="stack" onsubmit={sendAnswer} novalidate>
-      <label for="answer-{id}">Answer</label>
-      <textarea id="answer-{id}" rows="3" bind:value={answer} disabled={sending !== null}></textarea>
-      {#if answerError !== null}
-        <p class="error" role="alert">{answerError}</p>
-      {/if}
-      <div class="buttons">
-        <button type="submit" disabled={sending !== null}>{sending === 'answer' ? 'Sending answer' : 'Send answer'}</button>
-        <button type="button" disabled={sending !== null} onclick={() => void decide('reject', () => api.reject(id))}>
-          {sending === 'reject' ? 'Rejecting' : 'Reject'}
-        </button>
-      </div>
-    </form>
   {:else if mode === 'rejecting'}
     <form class="stack" onsubmit={confirmReject}>
       <label for="reason-{id}">Reason (optional)</label>
@@ -153,11 +140,34 @@
         <button type="button" disabled={sending !== null} onclick={() => (mode = 'idle')}>Cancel</button>
       </div>
     </form>
+  {:else if approval.question}
+    <form class="stack" onsubmit={sendAnswer} novalidate>
+      <label for="answer-{id}">Answer</label>
+      <textarea id="answer-{id}" rows="3" bind:value={answer} disabled={sending !== null}></textarea>
+      {#if answerError !== null}
+        <p class="error" role="alert">{answerError}</p>
+      {/if}
+      <div class="buttons">
+        <button type="submit" disabled={sending !== null} aria-describedby="who-{id}">
+          {sending === 'answer' ? 'Sending answer' : 'Send answer'}
+        </button>
+        <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={() => (mode = 'rejecting')}>
+          Reject
+        </button>
+      </div>
+    </form>
   {:else}
+    <!-- Described by who asks, so the buttons of different rows are told apart. -->
     <div class="buttons">
-      <button type="button" disabled={sending !== null} onclick={approve}>{sending === 'approve' ? 'Approving' : 'Approve'}</button>
-      <button type="button" disabled={sending !== null} onclick={() => (mode = 'rejecting')}>Reject</button>
-      <button type="button" disabled={sending !== null} onclick={startEdit}>Edit and approve</button>
+      <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={approve}>
+        {sending === 'approve' ? 'Approving' : 'Approve'}
+      </button>
+      <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={() => (mode = 'rejecting')}>
+        Reject
+      </button>
+      <button type="button" disabled={sending !== null} aria-describedby="who-{id}" onclick={startEdit}>
+        Edit and approve
+      </button>
     </div>
   {/if}
 

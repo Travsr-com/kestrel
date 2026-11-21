@@ -147,6 +147,7 @@ describe('Approvals inbox', () => {
     expect(badge()).toBe('Approvals 3 pending');
     const approve = within(rows()[1] as HTMLElement).getByRole('button', { name: 'Approve' });
     approve.focus();
+    const focusedId = approve.closest('li')?.dataset.id;
     const s = feed(sockets);
     s.open();
     s.event(9, event(r.id, { kind: 'approval_requested', id: 'new-1', action: 'deploy to staging' }, NOW + 1_000));
@@ -154,6 +155,7 @@ describe('Approvals inbox', () => {
     expect(rows()[0]).toHaveTextContent('deploy to staging');
     expect(badge()).toBe('Approvals 4 pending');
     expect(document.activeElement).toBe(approve);
+    expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(focusedId);
   });
 
   it('shows the count on every view', async () => {
@@ -370,6 +372,129 @@ describe('Approvals inbox', () => {
   });
 });
 
+describe('Approvals inbox: focus, refusals and retries', () => {
+  it('moves focus to the next approval when the focused one goes, and to the heading when none is left', async () => {
+    const r = run();
+    const a = approval(r, { requested_at: new Date(NOW - 10_000).toISOString() });
+    const b = approval(r, { requested_at: new Date(NOW - 20_000).toISOString() });
+    const { sockets } = show([a, b], [r]);
+    await vi.waitFor(() => expect(rows()).toHaveLength(2));
+    const u = user();
+    const first = within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' });
+    first.focus();
+    await u.keyboard('{Enter}');
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
+    await vi.waitFor(() => expect(rows()).toHaveLength(1));
+    expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(b.id);
+    await u.keyboard('{Enter}');
+    s.event(6, event(r.id, { kind: 'approval_resolved', id: b.id, approved: true }));
+    await vi.waitFor(() => expect(screen.getByText('Nothing waiting for you')).toBeInTheDocument());
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Approvals' }));
+  });
+
+  it('a 409 because the run stopped waiting marks the row ended instead of resolved', async () => {
+    const r = run();
+    const a = approval(r);
+    show([a], [r], () => new Response(JSON.stringify({ error: `run ${r.id} is not waiting on approval ${a.id}` }), { status: 409 }));
+    await user().click(await screen.findByRole('button', { name: 'Approve' }));
+    const row = await vi.waitFor(() => {
+      const found = rows()[0] as HTMLElement;
+      expect(found).toHaveTextContent('Run ended');
+      return found;
+    });
+    expect(within(row).getAllByRole('button').map((x) => x.textContent?.trim())).toEqual(['Dismiss']);
+    expect(screen.queryByText('Already resolved by someone else')).not.toBeInTheDocument();
+  });
+
+  it('keeps the notice region in the page, and says it again for a second 409', async () => {
+    const r = run();
+    const a = approval(r);
+    const b = approval(r);
+    show([a, b], [r], () => new Response(JSON.stringify({ error: 'approval is resolved already' }), { status: 409 }));
+    await vi.waitFor(() => expect(rows()).toHaveLength(2));
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('');
+    const u = user();
+    await u.click(within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(status).toHaveTextContent('Already resolved by someone else'));
+    const seen: string[] = [];
+    const watch = new MutationObserver(() => seen.push(status.textContent ?? ''));
+    watch.observe(status, { childList: true, characterData: true, subtree: true });
+    await u.click(within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(seen.at(-1)).toBe('Already resolved by someone else'));
+    // It was cleared first, so screen readers hear it again.
+    expect(seen).toContain('');
+    watch.disconnect();
+  });
+
+  it('Retry sends what the fields hold now', async () => {
+    const r = run();
+    const a = approval(r);
+    let fail = true;
+    const { calls } = show([a], [r], () => {
+      if (fail) {
+        fail = false;
+        throw new TypeError('Failed to fetch');
+      }
+      return new Response(null, { status: 202 });
+    });
+    const u = user();
+    await u.click(await screen.findByRole('button', { name: 'Reject' }));
+    await u.type(screen.getByLabelText('Reason (optional)'), 'first');
+    await u.click(screen.getByRole('button', { name: 'Confirm reject' }));
+    await screen.findByRole('alert');
+    await u.clear(screen.getByLabelText('Reason (optional)'));
+    await u.type(screen.getByLabelText('Reason (optional)'), 'second');
+    await u.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(posts(calls).map((c) => c.body)).toEqual([{ reason: 'first' }, { reason: 'second' }]);
+  });
+
+  it('rejecting a question asks for a reason first, like any approval', async () => {
+    const r = run();
+    const q = approval(r, { question: true, action: 'Which branch?' });
+    const { calls } = show([q], [r]);
+    const u = user();
+    await u.click(await screen.findByRole('button', { name: 'Reject' }));
+    expect(posts(calls)).toEqual([]);
+    await u.type(screen.getByLabelText('Reason (optional)'), 'ask the release manager');
+    await u.click(screen.getByRole('button', { name: 'Confirm reject' }));
+    expect(posts(calls)).toEqual([
+      { method: 'POST', path: `/api/approvals/${q.id}/reject`, body: { reason: 'ask the release manager' } },
+    ]);
+  });
+
+  it('describes each row\'s buttons by who asks, so rows are told apart', async () => {
+    const lead = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid' });
+    show([approval(lead), approval(kid)], [lead, kid]);
+    await screen.findByText('kid');
+    const approves = screen.getAllByRole('button', { name: 'Approve' });
+    const described = approves.map((b) => document.getElementById(b.getAttribute('aria-describedby') ?? '')?.textContent);
+    expect(described[0]).not.toEqual(described[1]);
+    expect(described.join(' ')).toMatch(/lead/);
+  });
+
+  it('asks again for a run whose details failed to load', async () => {
+    const r = run({ agent: 'planner' });
+    let fails = 1;
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = new URL(String(input), 'http://kestrel.test');
+      if (url.pathname === '/api/approvals') return new Response(JSON.stringify([approval(r)]));
+      if (fails-- > 0) return new Response('{"error":"busy"}', { status: 503 });
+      return new Response(JSON.stringify(r));
+    };
+    const sockets = fakeSockets();
+    window.location.hash = '#/approvals';
+    render(App, { fetch, sockets: sockets.factory });
+    await vi.waitFor(() => expect(rows()).toHaveLength(1));
+    expect(rows()[0]).toHaveTextContent('agent not known yet');
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(await screen.findByText('planner')).toBeInTheDocument();
+  });
+});
+
 describe('ApprovalsState', () => {
   const a1: Approval = {
     id: 'a1', run_id: 'r1', action: 'x', status: 'pending', requested_at: '2026-11-21T10:00:00Z', question: false,
@@ -397,6 +522,24 @@ describe('ApprovalsState', () => {
     state.apply(event('r1', { kind: 'approval_requested', id: 'b', action: 'y' }));
     expect(state.rows.b?.approval.question).toBe(true);
     expect(state.count).toBe(1);
+  });
+
+  it('ignores a list older than one already loaded', () => {
+    const state = new ApprovalsState();
+    const older = state.beginSync();
+    const newer = state.beginSync();
+    state.load([], newer);
+    state.load([a1], older);
+    expect(state.count).toBe(0);
+  });
+
+  it('a run that ended while a list was on its way does not come back as decidable', () => {
+    const state = new ApprovalsState();
+    const token = state.beginSync();
+    state.apply(event('r1', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }));
+    state.load([a1], token);
+    expect(state.rows.a1?.ended).toBe('cancelled');
+    expect(state.count).toBe(0);
   });
 
   it('marks rows of a run that ended, and ignores status changes that are not an end', () => {
