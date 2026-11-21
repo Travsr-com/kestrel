@@ -102,7 +102,11 @@ fn kind_with_tag() -> impl Strategy<Value = (EventKind, &'static str)> {
             "approval_requested"
         )),
         (approval_id(), any::<bool>()).prop_map(|(id, approved)| (
-            EventKind::ApprovalResolved { id, approved },
+            EventKind::ApprovalResolved {
+                id,
+                approved,
+                payload: None,
+            },
             "approval_resolved"
         )),
         text().prop_map(|line| (EventKind::AgentLog { line }, "agent_log")),

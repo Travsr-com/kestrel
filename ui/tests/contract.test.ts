@@ -78,7 +78,7 @@ const EVENT_KIND_KEYS = {
   },
   budget_warning: { kind: true, spent: true, limit: true },
   approval_requested: { kind: true, id: true, action: true },
-  approval_resolved: { kind: true, id: true, approved: true },
+  approval_resolved: { kind: true, id: true, approved: true, payload: true },
   agent_log: { kind: true, line: true },
   run_finished: { kind: true, summary: true },
   child_spawned: { kind: true, child: true, agent: true, budget: true },

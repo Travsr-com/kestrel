@@ -1011,7 +1011,7 @@ impl Inner {
         match cmd {
             Some(cmd) => {
                 let what = match cmd {
-                    ControlCommand::Approve(_) => "approve",
+                    c if c.approves() => "approve",
                     ControlCommand::Resume => "resume",
                     // Only resumes and approves wait for a slot (see `route`); anything else is
                     // named generically rather than mislabelled.
@@ -1073,7 +1073,7 @@ impl Inner {
             s.waiting.retain(|w| !w.is_resume_of(run));
             resumes.retain(|w| !w.is_resume_of(run));
         }
-        let needs_slot = matches!(cmd, ControlCommand::Resume | ControlCommand::Approve(_));
+        let needs_slot = cmd == ControlCommand::Resume || cmd.approves();
         if needs_slot && !self.slots().holds(run) && self.is_suspended(run)? {
             if s.waiting
                 .iter()
@@ -1539,7 +1539,7 @@ impl Actor {
         // Only these may have been given a slot (and a block) by the scheduler. Any other command
         // leaves both alone: a resume it arrived with may be right behind it, and its slot and
         // block must still be there when it is read.
-        let resumes = matches!(cmd, ControlCommand::Resume | ControlCommand::Approve(_));
+        let resumes = cmd == ControlCommand::Resume || cmd.approves();
         let next = self.on_command(cmd)?;
         // An approval granted after a restart leaves the run `Running` with nothing attached.
         let go = matches!(next, Next::Resume) || self.status == RunStatus::Running;
@@ -1840,22 +1840,8 @@ impl Actor {
                 }
                 Ok(Next::Resume)
             }
-            C::Approve(id) | C::Reject(id) if pending != Some(id) => {
-                self.log(&format!(
-                    "kestrel: no pending approval {id}, command ignored"
-                ))?;
-                Ok(Next::Continue)
-            }
-            C::Approve(_) if !self.ensure_slot()? => Ok(Next::Continue),
-            C::Approve(id) => {
-                self.resolve(id, true)?;
-                self.set(RunStatus::Running)?;
-                Ok(Next::Continue)
-            }
-            C::Reject(id) => {
-                self.resolve(id, false)?;
-                self.set(RunStatus::Failed(format!("approval {id} rejected")))?;
-                Ok(Next::Stop)
+            cmd @ (C::Approve(_) | C::Reject(_) | C::ApproveWith { .. } | C::RejectWith { .. }) => {
+                self.on_approval(cmd, pending)
             }
             other => {
                 self.inner
@@ -1866,10 +1852,47 @@ impl Actor {
         }
     }
 
-    fn resolve(&self, id: ApprovalId, approved: bool) -> Result<()> {
-        self.inner
-            .store
-            .append(self.id, EventKind::ApprovalResolved { id, approved })?;
+    /// Approve or reject, with or without text. Only the approval the run waits on counts.
+    fn on_approval(&mut self, cmd: ControlCommand, pending: Option<ApprovalId>) -> Result<Next> {
+        use ControlCommand as C;
+        let Some(id) = cmd.approval().filter(|id| pending == Some(*id)) else {
+            let id = cmd.approval().map_or_else(String::new, |id| id.to_string());
+            self.log(&format!(
+                "kestrel: no pending approval {id}, command ignored"
+            ))?;
+            return Ok(Next::Continue);
+        };
+        let (approved, text) = match cmd {
+            C::ApproveWith { payload, .. } => (true, Some(payload)),
+            C::RejectWith { reason, .. } => (false, Some(reason)),
+            other => (other.approves(), None),
+        };
+        if approved {
+            if !self.ensure_slot()? {
+                return Ok(Next::Continue);
+            }
+            self.resolve(id, true, text)?;
+            self.set(RunStatus::Running)?;
+            return Ok(Next::Continue);
+        }
+        let failure = match &text {
+            Some(reason) => format!("approval {id} rejected: {reason}"),
+            None => format!("approval {id} rejected"),
+        };
+        self.resolve(id, false, text)?;
+        self.set(RunStatus::Failed(failure))?;
+        Ok(Next::Stop)
+    }
+
+    fn resolve(&self, id: ApprovalId, approved: bool, payload: Option<String>) -> Result<()> {
+        self.inner.store.append(
+            self.id,
+            EventKind::ApprovalResolved {
+                id,
+                approved,
+                payload,
+            },
+        )?;
         Ok(())
     }
 

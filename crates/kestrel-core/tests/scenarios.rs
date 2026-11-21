@@ -344,7 +344,8 @@ async fn s8_approval_requested_suspends_and_approve_resumes() {
     assert!(h.has_event(id, |k| *k
         == EventKind::ApprovalResolved {
             id: aid,
-            approved: true
+            approved: true,
+            payload: None,
         }));
 }
 
@@ -360,7 +361,8 @@ async fn s8_reject_fails_run_with_rejected() {
     assert!(h.has_event(id, |k| *k
         == EventKind::ApprovalResolved {
             id: aid,
-            approved: false
+            approved: false,
+            payload: None,
         }));
     until("sandbox destroyed", || h.driver.leaked().is_empty()).await;
 }
@@ -515,4 +517,73 @@ async fn run_forever_returns_ok_on_shutdown() {
     let task = h.task.take().expect("started");
     let result = task.await.expect("run_forever did not panic");
     assert!(result.is_ok(), "{result:?}");
+}
+
+// Issue #37, scenario 11: approve and reject with text. The resolved event carries it.
+
+#[tokio::test(start_paused = true)]
+async fn approve_with_a_payload_records_it_on_the_resolved_event() {
+    let mut h = Harness::new(4);
+    let (id, aid, _s) = run_to_approval(&mut h).await;
+    h.control(
+        id,
+        ControlCommand::ApproveWith {
+            id: aid,
+            payload: "gh.comment --body edited".into(),
+        },
+    );
+    until("running again", || h.is(id, &Running)).await;
+    assert!(h.has_event(id, |k| *k
+        == EventKind::ApprovalResolved {
+            id: aid,
+            approved: true,
+            payload: Some("gh.comment --body edited".into()),
+        }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reject_with_a_reason_records_it_and_names_it_in_the_failure() {
+    let mut h = Harness::new(4);
+    let (id, aid, _s) = run_to_approval(&mut h).await;
+    h.control(
+        id,
+        ControlCommand::RejectWith {
+            id: aid,
+            reason: "not on main".into(),
+        },
+    );
+    until("failed", || h.is_failed(id).is_some()).await;
+    let msg = h.is_failed(id).unwrap_or_default();
+    assert!(
+        msg.contains("rejected") && msg.contains("not on main"),
+        "{msg}"
+    );
+    assert!(h.has_event(id, |k| *k
+        == EventKind::ApprovalResolved {
+            id: aid,
+            approved: false,
+            payload: Some("not on main".into()),
+        }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn approve_with_text_for_another_approval_is_ignored() {
+    let mut h = Harness::new(4);
+    let (id, aid, _s) = run_to_approval(&mut h).await;
+    let other = ApprovalId::new();
+    h.control(
+        id,
+        ControlCommand::ApproveWith {
+            id: other,
+            payload: "x".into(),
+        },
+    );
+    until("ignored", || {
+        h.has_event(
+            id,
+            |k| matches!(k, EventKind::AgentLog { line } if line.contains(&other.to_string())),
+        )
+    })
+    .await;
+    assert!(h.is(id, &Suspended(SuspendReason::Approval(aid))));
 }

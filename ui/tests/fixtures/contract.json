@@ -120,7 +120,12 @@
     },
     { "kind": "budget_warning", "spent": 1600000, "limit": 2000000 },
     { "kind": "approval_requested", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "action": "git push" },
-    { "kind": "approval_resolved", "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "approved": true },
+    {
+      "kind": "approval_resolved",
+      "id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a",
+      "approved": true,
+      "payload": "git push origin kestrel/run-9a8b"
+    },
     { "kind": "agent_log", "line": "test result: FAILED. 11 passed; 1 failed" },
     { "kind": "run_finished", "summary": null },
     {

@@ -76,7 +76,7 @@ export type EventKind =
   | ({ kind: 'model_call' } & ModelCallFields)
   | { kind: 'budget_warning'; spent: MicroUsd; limit: MicroUsd }
   | { kind: 'approval_requested'; id: ApprovalId; action: string }
-  | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean }
+  | { kind: 'approval_resolved'; id: ApprovalId; approved: boolean; payload?: string }
   | { kind: 'agent_log'; line: string }
   | { kind: 'run_finished'; summary: string | null }
   | { kind: 'child_spawned'; child: RunId; agent: string; budget: MicroUsd }
