@@ -266,3 +266,73 @@ async fn an_existing_root_is_made_private() {
     s.exit(0);
     until("completed", || h.is(id, &RunStatus::Completed)).await;
 }
+
+/// Set (to a marker file) in the child that `modes_hold_under_a_strict_umask` runs.
+#[cfg(unix)]
+const STRICT_UMASK: &str = "KESTREL_TEST_STRICT_UMASK";
+
+// A hardened service often runs with umask 077, and the sandbox may run as another user than
+// Kestrel: the run's directory and files must still be readable to it. The test runs itself again
+// under that umask, and the child leaves a marker so a filter that matched nothing cannot pass.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn modes_hold_under_a_strict_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(marker) = std::env::var_os(STRICT_UMASK) else {
+        let holder = tempfile::tempdir().unwrap();
+        let marker = holder.path().join("ran");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 077 && exec \"$0\" --exact modes_hold_under_a_strict_umask")
+            .arg(std::env::current_exe().unwrap())
+            .env(STRICT_UMASK, &marker)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the run under umask 077 failed: {status}");
+        assert!(marker.exists(), "the test did not run under umask 077");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(4);
+    let path = root.path().to_path_buf();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let dir = root.path().join(id.to_string());
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o755);
+    assert_eq!(mode(&dir.join("mcp.json")), 0o644);
+    s.line("ok:done");
+    s.exit(0);
+    until("completed", || h.is(id, &RunStatus::Completed)).await;
+    std::fs::write(marker, "ran").unwrap();
+}
+
+// A root that belongs to someone else stays theirs to open again, whatever mode Kestrel sets, so
+// it fails the run. /tmp belongs to root and anyone may write in it, so the owner check can be
+// made there and must find another owner. Running as root there is no other user to be, and a
+// broken check would make /tmp private, so the test does nothing then.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_root_owned_by_another_user_fails_the_run() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = std::fs::canonicalize("/tmp").unwrap();
+    let mine = tempfile::tempfile().unwrap().metadata().unwrap().uid();
+    if std::fs::metadata(&tmp).unwrap().uid() == mine {
+        return;
+    }
+    let mut h = Harness::new(4);
+    let path = tmp.clone();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("failed", || h.is_failed(id).is_some()).await;
+    let why = h.is_failed(id).unwrap_or_default();
+    assert!(why.contains("owned by another user"), "{why}");
+    assert!(!tmp.join(id.to_string()).exists());
+}

@@ -676,9 +676,11 @@ impl Engine {
     /// when the run's sandbox goes. `root` is made its owner's only, so no other host user reaches
     /// a run's token; a run's directory is readable by any user, so the sandbox can read it
     /// whichever user its image runs as. A `root` that is a link, not a directory, or owned by
-    /// another user fails the run. Without this, a temp directory with a random name, of this engine only: it is left
-    /// behind when the engine goes, and a later engine's [`Engine::recover`] cannot find what a
-    /// killed one left in it, so set a fixed root (as `kestrel serve` does) for anything long-lived.
+    /// another user fails the run.
+    ///
+    /// Without this, a temp directory with a random name, of this engine only. It is left behind
+    /// when the engine goes, and a later engine's [`Engine::recover`] cannot find what a killed
+    /// one left in it, so set a fixed root (as `kestrel serve` does) for anything long-lived.
     pub fn with_run_config(mut self, root: PathBuf) -> Engine {
         let inner = Arc::get_mut(&mut self.inner);
         debug_assert!(inner.is_some(), "engine state is shared");
@@ -1906,8 +1908,8 @@ impl Inner {
     }
 
     /// Writes `files` to `run`'s config directory, made afresh in the owner-only root (see
-    /// [`Engine::with_run_config`]). `None` when there are no files. A name that is not a plain file
-    /// name is refused, so nothing is written outside the directory.
+    /// [`Engine::with_run_config`]). `None` when there are no files. A name that is not a plain
+    /// file name is refused, so nothing is written outside the directory.
     fn write_run_config(
         &self,
         run: RunId,
