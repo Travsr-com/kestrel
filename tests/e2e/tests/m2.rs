@@ -211,6 +211,22 @@ fn fan_out_and_commit(same: bool) {
                 .exists(),
             "kid {n}'s clone borrows objects through .git/objects/info/alternates"
         );
+        // Nor shares them through hardlinks: every object file has a link count of 1.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let objects = files_under(&ws.join(".git").join("objects"));
+            assert!(!objects.is_empty(), "kid {n}'s clone has no object files");
+            for file in &objects {
+                let links = std::fs::metadata(file).expect("object file").nlink();
+                assert_eq!(
+                    links,
+                    1,
+                    "{} in kid {n}'s clone is hardlinked ({links} links)",
+                    file.display()
+                );
+            }
+        }
         let branch = branch_of(&id);
         assert!(
             branches.insert(branch.clone()),
