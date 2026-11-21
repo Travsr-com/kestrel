@@ -150,13 +150,15 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 
 * `join(parent, children, mode, timeout)` waits for the named children (all of them when none are named) and returns each one's result: `Completed` with its summary, `Failed` with the reason, `Cancelled`, or `TimedOut`. Each result also has what the child spent. `All` waits for every child; `Any` returns as soon as one has ended, with only those that ended. A child that times out keeps running.
 * A parent that waits gives its concurrency slot back. It takes it back in line with queued runs before the join returns, so a fan-out to as many children as there are slots cannot deadlock. Its sandbox keeps running meanwhile (it is inside a tool call), so running sandboxes can briefly outnumber the slots by the parents that wait.
+* Several joins of one parent share this: the first gives the slot back, the last takes it again. A timeout bounds the wait for the slot too: past its deadline a join returns without it, and the parent takes the slot back once one is free. A join whose caller goes away also leaves the slot to come back to the parent.
 * A join reads everything from the store. Calling it again, after a restart too, returns the children that ended at once.
 
 **Cancelling a tree:**
 
 * Cancelling a run cancels every run below it first, from the leaves up, then the run itself. Every sandbox is stopped. A queued child never starts.
 * Cancelling a child alone never touches its parent: the parent's join reports `Cancelled`.
-* A run that ends with children still going cancels them before its own `RunFinished`, so no child is left behind. `spawn.keep_children: true` in the spec leaves them running.
+* A run that ends with children still going cancels them before its own `RunFinished`, so no child is left behind. `spawn.keep_children: true` in the spec leaves them running; a child keeps its own children only if its parent keeps its. Cancelling a tree reaches every live run in it, also below a child that ended and kept its children.
+* While a run's cancel waits for the runs below it, the run may not spawn. A cancel still waiting when the engine stops goes back into the store, so the next start delivers it.
 * Pausing a parent, or changing its budget, does not touch its children.
 
 ### 3.4 Sandbox drivers

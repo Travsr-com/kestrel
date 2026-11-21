@@ -106,30 +106,64 @@ async fn s1_cap_one_parent_and_child_do_not_deadlock() {
     scenario_1().await;
 }
 
+/// A small deterministic generator, so each loop iteration takes a different, repeatable path.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, below: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 33) as usize) % below.max(1)
+    }
+}
+
 // 2 and 3. Cap 3, a parent and 5 children, join all: at most 3 slots are held at any moment, the
-//    waiting parent holds none, and all 5 finish.
-async fn scenario_2() {
+//    waiting parent holds none, 3 children run at once (so the parent's slot went to a child),
+//    sandboxes never outnumber the slots plus the one waiting parent, and all 5 finish. \`seed\`
+//    picks the order the children end in and the ticks between steps; `None` ends them in order.
+async fn scenario_2(seed: Option<u64>) {
+    let random = seed.is_some();
+    let mut rng = Lcg(seed.unwrap_or(0));
     let mut h = harness(3);
     let (lead, _s) = parent(&mut h, false).await;
-    let sessions: Vec<SessionCtl> = (0..5).map(|_| h.driver.live()).collect();
+    let mut sessions: Vec<SessionCtl> = (0..5).map(|_| h.driver.live()).collect();
     let mut children = Vec::new();
     for _ in 0..5 {
         children.push(spawn(&h, lead).await);
+        if random {
+            settle_for(rng.next(3) as u32).await;
+        }
     }
     let join = join_in_background(&h, lead, Vec::new(), JoinMode::All, None);
-    let mut peak = 0;
-    for session in sessions {
+    let mut running_peak = 0;
+    while !sessions.is_empty() {
         until("a child running", || {
-            peak = peak.max(h.engine.slots_in_use());
             assert!(h.engine.slots_in_use() <= 3, "over the cap");
-            children.iter().any(|c| h.is(*c, &RunStatus::Running))
+            assert!(
+                h.driver.leaked().len() <= 4,
+                "more sandboxes than slots plus the parent"
+            );
+            let running = children
+                .iter()
+                .filter(|c| h.is(**c, &RunStatus::Running))
+                .count();
+            running_peak = running_peak.max(running);
+            running > 0
         })
         .await;
+        if random {
+            settle_for(rng.next(4) as u32).await;
+        }
         assert!(
             !h.engine.holds_slot(lead),
             "the waiting parent holds no slot"
         );
-        session.exit(0);
+        // End any one of the sessions still open (in order without a seed): one that is running,
+        // or one queued for a child that has not started (that child then ends as it starts).
+        let pick = if random { rng.next(sessions.len()) } else { 0 };
+        sessions.remove(pick).exit(0);
     }
     let results = join.await.unwrap().unwrap();
     assert_eq!(results.len(), 5);
@@ -139,13 +173,20 @@ async fn scenario_2() {
             JoinOutcome::Completed { .. }
         ));
     }
-    assert_eq!(peak, 3, "the children used every slot the parent gave up");
+    // In order, three children run at once: the parent's slot went to one of them. A random order
+    // can end a child before the others start, so the peak is only checked in order.
+    if !random {
+        assert_eq!(
+            running_peak, 3,
+            "the children used the slot the parent gave up"
+        );
+    }
     assert!(h.engine.holds_slot(lead));
 }
 
 #[tokio::test(start_paused = true)]
 async fn s2_s3_fan_out_over_the_cap_finishes_and_never_overshoots() {
-    scenario_2().await;
+    scenario_2(None).await;
 }
 
 // Scenarios 1 to 3 as a loop-tested race, 200 times each (two tests, so they run in parallel).
@@ -158,8 +199,8 @@ async fn s1_repeated_200_times() {
 
 #[tokio::test(start_paused = true)]
 async fn s2_s3_repeated_200_times() {
-    for _ in 0..200 {
-        scenario_2().await;
+    for seed in 0..200 {
+        scenario_2(Some(seed)).await;
     }
 }
 
@@ -536,8 +577,224 @@ async fn a_join_dropped_while_waiting_for_its_slot_leaks_nothing() {
     join.abort();
     other_session.exit(0);
     until("other completed", || h.is(other, &RunStatus::Completed)).await;
+    // The dropped join still gives the parent its slot back once one is free: it keeps running.
+    until("parent has its slot", || h.engine.holds_slot(lead)).await;
+    assert_eq!(h.engine.slots_in_use(), 1);
+}
+
+// A join dropped while it waits on its children (the caller went away) gives the parent its slot
+// back once one is free, instead of leaving a running parent without one.
+#[tokio::test(start_paused = true)]
+async fn a_join_dropped_while_waiting_on_children_gives_the_slot_back_later() {
+    let mut h = harness(1);
+    let (lead, _s) = parent(&mut h, false).await;
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead).await;
+    let join = join_in_background(&h, lead, vec![child], JoinMode::All, None);
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    assert!(!h.engine.holds_slot(lead));
+    join.abort();
     settle().await;
-    assert_eq!(h.engine.slots_in_use(), 0, "the dropped join took no slot");
+    child_session.exit(0);
+    until("parent has its slot", || h.engine.holds_slot(lead)).await;
+    // Nothing else can start while the parent holds the only slot.
+    let _other_session = h.driver.live();
+    let other = h.submit(spec()).await;
+    settle().await;
+    assert!(h.is(other, &RunStatus::Queued));
+}
+
+// 6, with every slot taken by the children: the timeout still bounds the join. The parent runs
+// over the cap until a slot frees, then has it again.
+#[tokio::test(start_paused = true)]
+async fn s6_a_timeout_bounds_the_join_even_when_the_cap_is_full() {
+    let mut h = harness(1);
+    let (lead, _s) = parent(&mut h, false).await;
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead).await;
+    // The parent holds the one slot, so the child starts only once the join gives it back.
+    let started = tokio::time::Instant::now();
+    let join = join_in_background(
+        &h,
+        lead,
+        vec![child],
+        JoinMode::All,
+        Some(Duration::from_secs(5)),
+    );
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    let results = join.await.unwrap().unwrap();
+    assert!(
+        started.elapsed() <= Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome(&results, child), JoinOutcome::TimedOut);
+    assert!(
+        !h.engine.holds_slot(lead),
+        "the child still has the only slot"
+    );
+    child_session.exit(0);
+    until("parent has its slot", || h.engine.holds_slot(lead)).await;
+}
+
+// Two joins by one parent at once: the slot is given back by the first and taken back by the
+// last, so a parent never holds a slot while one of its joins still waits.
+#[tokio::test(start_paused = true)]
+async fn overlapping_joins_hold_no_slot_until_the_last_one_ends() {
+    let mut h = harness(4);
+    let (lead, _s) = parent(&mut h, false).await;
+    let a_session = h.driver.live();
+    let a = spawn(&h, lead).await;
+    let b_session = h.driver.live();
+    let b = spawn(&h, lead).await;
+    until("both running", || {
+        h.is(a, &RunStatus::Running) && h.is(b, &RunStatus::Running)
+    })
+    .await;
+    let join_a = join_in_background(&h, lead, vec![a], JoinMode::All, None);
+    let join_b = join_in_background(&h, lead, vec![b], JoinMode::All, None);
+    settle().await;
+    assert!(!h.engine.holds_slot(lead));
+    a_session.exit(0);
+    join_a.await.unwrap().unwrap();
+    settle().await;
+    assert!(!join_b.is_finished());
+    assert!(!h.engine.holds_slot(lead), "a join still waits");
+    b_session.exit(0);
+    join_b.await.unwrap().unwrap();
+    assert!(h.engine.holds_slot(lead));
+}
+
+// A parent that starts waiting on an approval while a join waits (a parallel tool call) keeps
+// its sandbox, so it gets its slot back like a running one.
+#[tokio::test(start_paused = true)]
+async fn a_parent_waiting_on_an_approval_gets_its_slot_back() {
+    let mut h = harness(2);
+    let (lead, session) = parent(&mut h, false).await;
+    let child_session = h.driver.live();
+    let child = spawn(&h, lead).await;
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    let join = join_in_background(&h, lead, vec![child], JoinMode::All, None);
+    settle().await;
+    let aid = kestrel_types::ApprovalId::new();
+    session.line(&format!("approval:{aid}:deploy"));
+    until("parent waits on approval", || {
+        h.is(
+            lead,
+            &RunStatus::Suspended(kestrel_types::SuspendReason::Approval(aid)),
+        )
+    })
+    .await;
+    child_session.exit(0);
+    join.await.unwrap().unwrap();
+    assert!(h.engine.holds_slot(lead));
+}
+
+// 3. Cancel reaches runs below a child that ended and kept its children.
+#[tokio::test(start_paused = true)]
+async fn cancel_reaches_runs_below_a_finished_child_that_kept_its_children() {
+    let mut h = harness(8);
+    let (root, _s) = parent(&mut h, true).await;
+    let mid_session = h.driver.live();
+    let mid = h
+        .engine
+        .spawn_child(root, &agent("lead", true), "mid", Some(MicroUsd(DOLLAR)))
+        .await
+        .unwrap();
+    until("mid running", || h.is(mid, &RunStatus::Running)).await;
+    let _g = h.driver.live();
+    let grand = spawn(&h, mid).await;
+    until("grandchild running", || h.is(grand, &RunStatus::Running)).await;
+    mid_session.exit(0);
+    until("mid completed", || h.is(mid, &RunStatus::Completed)).await;
+    assert!(h.is(grand, &RunStatus::Running), "mid kept its child");
+    h.control(root, ControlCommand::Cancel);
+    until("all ended", || {
+        h.is(root, &RunStatus::Cancelled) && h.is(grand, &RunStatus::Cancelled)
+    })
+    .await;
+    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+}
+
+// A run that ends cancels runs below a child that ended and kept its children.
+#[tokio::test(start_paused = true)]
+async fn a_finishing_parent_reaps_below_a_finished_child_that_kept_its_children() {
+    let mut h = harness(8);
+    let (root, session) = parent(&mut h, false).await;
+    let mid_session = h.driver.live();
+    let mid = h
+        .engine
+        .spawn_child(root, &agent("lead", true), "mid", Some(MicroUsd(DOLLAR)))
+        .await
+        .unwrap();
+    until("mid running", || h.is(mid, &RunStatus::Running)).await;
+    let _g = h.driver.live();
+    let grand = spawn(&h, mid).await;
+    until("grandchild running", || h.is(grand, &RunStatus::Running)).await;
+    mid_session.exit(0);
+    until("mid completed", || h.is(mid, &RunStatus::Completed)).await;
+    session.exit(0);
+    until("root completed", || h.is(root, &RunStatus::Completed)).await;
+    assert!(h.is(grand, &RunStatus::Cancelled));
+}
+
+// A child may keep its children only when its parent keeps its own.
+#[tokio::test(start_paused = true)]
+async fn keep_children_is_narrowed_by_the_parent() {
+    let mut h = harness(4);
+    let (lead, _s) = parent(&mut h, false).await;
+    let child = h
+        .engine
+        .spawn_child(lead, &agent("lead", true), "x", Some(MicroUsd(DOLLAR / 10)))
+        .await
+        .unwrap();
+    let keep = h
+        .store
+        .run_spec(child)
+        .unwrap()
+        .unwrap()
+        .capabilities
+        .spawn
+        .is_some_and(|s| s.keep_children);
+    assert!(!keep);
+}
+
+// 13, with a child still running at the restart: it comes back suspended, and once it is resumed
+// and ends, a new join returns its result.
+#[tokio::test(start_paused = true)]
+async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let key = RootKey::generate().to_bytes();
+    let mut h = Harness::on(&db, 4);
+    h.rebuild(|e| e.with_root_key(RootKey::from_bytes(&key).unwrap()));
+    let (lead, _s) = parent(&mut h, false).await;
+    let _c = h.driver.live();
+    let child = spawn(&h, lead).await;
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    h.shutdown.cancel();
+    if let Some(task) = h.task.take() {
+        task.await.unwrap().unwrap();
+    }
+    drop(h);
+
+    let mut again = Harness::on(&db, 4);
+    again.rebuild(|e| e.with_root_key(RootKey::from_bytes(&key).unwrap()));
+    again.engine.recover().await.unwrap();
+    again.driver.script(&["ok:after the restart"], 0);
+    again.start();
+    again.control(child, ControlCommand::Resume);
+    let results = again
+        .engine
+        .join(lead, &[child], JoinMode::All, Some(Duration::from_secs(60)))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome(&results, child),
+        JoinOutcome::Completed {
+            summary: Some("after the restart".into())
+        }
+    );
 }
 
 #[test]
