@@ -3,7 +3,8 @@
 //!
 //! Model: a run may spend up to its own `limit`. A spawn moves `carve` from the parent's limit to
 //! the child's; a finished child keeps what it spent and returns the rest. So the limits of a
-//! tree always add up to the root budget, and the tree can never spend more than that.
+//! tree always add up to the root budget. Each run can still go past its own limit by one
+//! in-flight call, so the tree can go past the root budget by those overshoots, never more.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -481,72 +482,218 @@ fn s13_a_spawn_survives_reopening_the_store() {
     assert_eq!(store.run_cap(child).unwrap(), Some(b"tok".to_vec()));
 }
 
+// `kestrel budget` inside a tree: the money of a tree comes from its root. Raising a spawned run
+// takes the difference from its parent; lowering one gives it back. A root's limit is its own
+// share, set as given. No run is set below what it already spent.
+
+#[test]
+fn set_budget_on_a_child_takes_the_raise_from_its_parent() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    let child = spawn(&store, parent, Some(usd(DOLLAR))).unwrap().id;
+    assert_eq!(
+        store.set_budget(child, usd(3 * DOLLAR / 2)).unwrap(),
+        usd(3 * DOLLAR / 2)
+    );
+    assert_eq!(store.limit(child).unwrap(), usd(3 * DOLLAR / 2));
+    assert_eq!(store.remaining(parent).unwrap(), usd(DOLLAR / 2));
+}
+
+#[test]
+fn set_budget_on_a_child_is_refused_when_the_parent_cannot_cover_it() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "1.00");
+    let child = spawn(&store, parent, Some(usd(9 * DOLLAR / 10)))
+        .unwrap()
+        .id;
+    let err = store.set_budget(child, usd(2 * DOLLAR)).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ParentBudget { asked, remaining }
+            if asked == usd(11 * DOLLAR / 10) && remaining == usd(DOLLAR / 10)),
+        "{err:?}"
+    );
+    assert_eq!(store.limit(child).unwrap(), usd(9 * DOLLAR / 10));
+    assert_eq!(store.remaining(parent).unwrap(), usd(DOLLAR / 10));
+}
+
+#[test]
+fn set_budget_lowering_a_child_gives_back_down_to_what_it_spent() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    let child = spawn(&store, parent, Some(usd(DOLLAR))).unwrap().id;
+    run(&store, child);
+    spend(&store, child, 3 * DOLLAR / 10);
+    // Asked for $0.10, but it already spent $0.30: it keeps $0.30 and gives back $0.70.
+    assert_eq!(
+        store.set_budget(child, usd(DOLLAR / 10)).unwrap(),
+        usd(3 * DOLLAR / 10)
+    );
+    assert_eq!(store.remaining(parent).unwrap(), usd(17 * DOLLAR / 10));
+}
+
+#[test]
+fn set_budget_on_a_root_sets_its_own_share_but_not_below_its_spend() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    spawn(&store, parent, Some(usd(DOLLAR))).unwrap();
+    assert_eq!(
+        store.set_budget(parent, usd(5 * DOLLAR)).unwrap(),
+        usd(5 * DOLLAR)
+    );
+    assert_eq!(store.remaining(parent).unwrap(), usd(5 * DOLLAR));
+    spend(&store, parent, DOLLAR);
+    assert_eq!(store.set_budget(parent, usd(0)).unwrap(), usd(DOLLAR));
+}
+
+// The review's probe: raising a child and letting it finish never grows the tree.
+#[test]
+fn a_raised_child_that_finishes_leaves_the_tree_total_unchanged() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    let child = spawn(&store, parent, Some(usd(DOLLAR / 2))).unwrap().id;
+    run(&store, child);
+    store.set_budget(child, usd(DOLLAR)).unwrap();
+    spend(&store, child, DOLLAR / 2);
+    finish(&store, child);
+    let total = store.limit(parent).unwrap().0 + store.limit(child).unwrap().0;
+    assert_eq!(total, 2 * DOLLAR);
+    assert_eq!(store.remaining(parent).unwrap(), usd(3 * DOLLAR / 2));
+}
+
+#[test]
+fn set_budget_needs_a_run() {
+    let store = Store::open_in_memory().unwrap();
+    assert!(matches!(
+        store.set_budget(RunId::new(), usd(1)),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn live_children_counts_only_children_that_have_not_ended() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    let a = spawn(&store, parent, Some(usd(DOLLAR / 10))).unwrap().id;
+    let b = spawn(&store, parent, Some(usd(DOLLAR / 10))).unwrap().id;
+    let c = spawn(&store, parent, Some(usd(DOLLAR / 10))).unwrap().id;
+    run(&store, b);
+    run(&store, c);
+    assert_eq!(store.live_children(parent).unwrap(), 3);
+    store
+        .transition(a, &RunStatus::Queued, RunStatus::Cancelled)
+        .unwrap();
+    store
+        .transition(b, &RunStatus::Running, RunStatus::Failed("x".into()))
+        .unwrap();
+    finish(&store, c);
+    assert_eq!(store.live_children(parent).unwrap(), 0);
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     /// Spawn under the live run at this index (modulo), asking this many thousandths of what
     /// it has left (or the default carve for 0).
     Spawn(usize, u16),
-    /// The live run at this index spends everything it has left.
-    SpendAll(usize),
+    /// Spawn under the live run at this index and cancel the child while it is still queued.
+    SpawnAndCancel(usize, u16),
+    /// The live run at this index spends what it has left, plus this many micro-dollars over:
+    /// one gateway call can go past a run's limit before the engine stops it.
+    Spend(usize, u16),
     /// The live run at this index finishes.
     Finish(usize),
+    /// The live run at this index fails.
+    Fail(usize),
+    /// A human sets the budget of the run at this index to this many thousandths of $2.
+    SetBudget(usize, u16),
 }
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         (any::<usize>(), 0u16..=1000).prop_map(|(i, f)| Op::Spawn(i, f)),
-        any::<usize>().prop_map(Op::SpendAll),
+        (any::<usize>(), 0u16..=1000).prop_map(|(i, f)| Op::SpawnAndCancel(i, f)),
+        (any::<usize>(), 0u16..=50).prop_map(|(i, over)| Op::Spend(i, over)),
         any::<usize>().prop_map(Op::Finish),
+        any::<usize>().prop_map(Op::Fail),
+        (any::<usize>(), 0u16..=2000).prop_map(|(i, f)| Op::SetBudget(i, f)),
     ]
 }
 
+fn ask(store: &Store, parent: RunId, f: u16) -> Option<MicroUsd> {
+    let left = store.remaining(parent).unwrap().0;
+    (f > 0).then(|| usd(left * i64::from(f) / 1000))
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(96))]
 
     // 5. Given a tree with a $2 root, when every run spends its full budget, then the total spend
-    //    across the tree is at most $2.00. Also checks the stronger invariant after every step:
-    //    the limits of all runs add up to the root budget, and no run's spend exceeds its limit.
+    //    is at most $2.00 plus what single calls went over. Checked after every step: the limits
+    //    of all runs add up to the root budget (which only a human change to the root's own
+    //    budget moves), and no run spends more than its limit plus its own overshoot. Steps mix
+    //    spawns, cancels of queued children, overspend, finish, fail and `kestrel budget`.
     #[test]
-    fn s5_a_tree_never_spends_more_than_the_root_budget(ops in prop::collection::vec(op(), 1..40)) {
+    fn s5_a_tree_never_spends_more_than_the_root_budget(ops in prop::collection::vec(op(), 1..48)) {
         let store = Store::open_in_memory().unwrap();
         let root_id = root(&store, "2.00");
         let mut all = vec![root_id];
         let mut live = vec![root_id];
-        let total_limit = |store: &Store, all: &[RunId]| -> i64 {
-            all.iter().map(|r| store.limit(*r).unwrap().0).sum()
-        };
+        let mut budget = 2 * DOLLAR;
+        let mut over: std::collections::HashMap<RunId, i64> = Default::default();
         for op in ops {
             match op {
                 Op::Spawn(i, f) => {
                     let parent = live[i % live.len()];
-                    let left = store.remaining(parent).unwrap().0;
-                    let ask = (f > 0).then(|| usd(left * i64::from(f) / 1000));
-                    if let Ok(child) = spawn(&store, parent, ask) {
+                    if let Ok(child) = spawn(&store, parent, ask(&store, parent, f)) {
                         run(&store, child.id);
                         all.push(child.id);
                         live.push(child.id);
                     }
                 }
-                Op::SpendAll(i) => {
+                Op::SpawnAndCancel(i, f) => {
+                    let parent = live[i % live.len()];
+                    if let Ok(child) = spawn(&store, parent, ask(&store, parent, f)) {
+                        all.push(child.id);
+                        store
+                            .transition(child.id, &RunStatus::Queued, RunStatus::Cancelled)
+                            .unwrap();
+                    }
+                }
+                Op::Spend(i, extra) => {
                     let r = live[i % live.len()];
                     let left = store.remaining(r).unwrap().0;
                     if left > 0 {
-                        spend(&store, r, left);
+                        spend(&store, r, left + i64::from(extra));
+                        *over.entry(r).or_default() += i64::from(extra);
                     }
                 }
-                Op::Finish(i) => {
-                    if live.len() > 1 {
-                        let r = live.remove(i % live.len());
-                        finish(&store, r);
+                Op::Finish(i) | Op::Fail(i) if live.len() > 1 => {
+                    let r = live.remove(1 + i % (live.len() - 1));
+                    let end = if matches!(op, Op::Finish(_)) {
+                        RunStatus::Completed
+                    } else {
+                        RunStatus::Failed("x".into())
+                    };
+                    store.transition(r, &RunStatus::Running, end).unwrap();
+                }
+                Op::Finish(_) | Op::Fail(_) => {}
+                Op::SetBudget(i, f) => {
+                    let r = all[i % all.len()];
+                    let before = store.limit(r).unwrap().0;
+                    let asked = usd(2 * DOLLAR * i64::from(f) / 1000);
+                    if let Ok(set) = store.set_budget(r, asked)
+                        && r == root_id
+                    {
+                        budget += set.0 - before;
                     }
                 }
             }
-            prop_assert_eq!(total_limit(&store, &all), 2 * DOLLAR);
+            let limits: i64 = all.iter().map(|r| store.limit(*r).unwrap().0).sum();
+            prop_assert_eq!(limits, budget);
             for r in &all {
-                prop_assert!(store.spent(*r).unwrap().0 <= store.limit(*r).unwrap().0);
+                let allowed = store.limit(*r).unwrap().0 + over.get(r).copied().unwrap_or(0);
+                prop_assert!(store.spent(*r).unwrap().0 <= allowed);
             }
         }
-        // Everything still live spends what it has left, then finishes.
         for r in live.iter().rev() {
             let left = store.remaining(*r).unwrap().0;
             if left > 0 {
@@ -554,6 +701,7 @@ proptest! {
             }
         }
         let spent: i64 = all.iter().map(|r| store.spent(*r).unwrap().0).sum();
-        prop_assert!(spent <= 2 * DOLLAR, "tree spent {spent}");
+        let overshoot: i64 = over.values().sum();
+        prop_assert!(spent <= budget + overshoot, "tree spent {spent} of {budget} (+{overshoot})");
     }
 }

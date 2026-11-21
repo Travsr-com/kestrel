@@ -57,6 +57,13 @@ pub enum StoreError {
     /// The capability token for a spawned child could not be made. Nothing was written.
     #[error("capability token: {0}")]
     Capability(String),
+    /// [`Store::set_budget`] would raise a spawned run by `asked`, and its parent has only
+    /// `remaining` to give. Nothing was written.
+    #[error("the parent has {remaining} left, and the raise needs {asked}")]
+    ParentBudget {
+        asked: MicroUsd,
+        remaining: MicroUsd,
+    },
 }
 
 /// Why [`Store::spawn_child`] refused a spawn.
@@ -312,37 +319,62 @@ impl Store {
         Ok(id)
     }
 
-    /// Changes the budget limit in a run's stored spec, so the change survives a restart.
+    /// Sets a run's budget limit (`kestrel budget`) in its stored spec, so the change survives a
+    /// restart, and returns the limit set.
+    ///
+    /// The money of a tree comes from its root, so the limits of a tree keep adding up to the
+    /// root's budget:
+    ///
+    /// * A root's limit is its own share (what it has not carved out for children), set as given.
+    /// * A spawned run's raise is taken from its parent, refused with
+    ///   [`StoreError::ParentBudget`] when the parent has less than that left. Lowering one gives
+    ///   the difference back to its parent (or further up, like an ended run's unspent budget).
+    /// * No run is set below what it already spent.
+    ///
     /// [`StoreError::NotFound`] when the run has no stored spec.
-    pub fn set_budget(&self, id: RunId, limit: MicroUsd) -> Result<()> {
+    pub fn set_budget(&self, id: RunId, limit: MicroUsd) -> Result<MicroUsd> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let spec: Option<String> = tx
-            .query_row(
-                "SELECT spec FROM run_specs WHERE run_id = ?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let mut spec: AgentSpec = match spec {
-            Some(s) => serde_json::from_str(&s)?,
-            None => return Err(StoreError::NotFound(id)),
-        };
-        spec.budget.limit = limit;
-        tx.execute(
-            "UPDATE run_specs SET spec = ?1 WHERE run_id = ?2",
-            params![serde_json::to_string(&spec)?, id.to_string()],
-        )?;
+        let old = read_limit(&tx, id)?;
+        let new = limit.max(spent_in(&tx, id)?);
+        if let Some(parent) = parent_of(&tx, id)? {
+            if new > old {
+                let asked = MicroUsd(new.0 - old.0);
+                let theirs = read_limit(&tx, parent)?;
+                let remaining = left(theirs, spent_in(&tx, parent)?);
+                if asked > remaining {
+                    return Err(StoreError::ParentBudget { asked, remaining });
+                }
+                write_limit(&tx, parent, MicroUsd(theirs.0 - asked.0))?;
+            } else if new < old {
+                credit(&tx, parent, MicroUsd(old.0 - new.0))?;
+            }
+        }
+        write_limit(&tx, id, new)?;
         tx.commit()?;
-        Ok(())
+        Ok(new)
+    }
+
+    /// How many children of `run` have not ended yet.
+    pub fn live_children(&self, run: RunId) -> Result<u64> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        count(
+            &tx,
+            "SELECT COUNT(*) FROM runs WHERE parent_run_id = ?1
+             AND status NOT IN ('\"Completed\"', '\"Cancelled\"')
+             AND status NOT LIKE '{\"Failed\"%'",
+            run,
+        )
     }
 
     /// Creates a child of `parent` and carves its budget out of the parent's, in one transaction.
     ///
     /// A run may spend up to its own limit (`budget.limit` in its stored spec). The spawn moves
     /// the carve from the parent's limit to the child's, so the limits of a tree always add up to
-    /// the root's budget and the tree can never spend more than that. When the child ends, its
-    /// unspent budget goes back (see [`Store::transition`]).
+    /// the root's budget (which only [`Store::set_budget`] on the root changes). A run can still go
+    /// past its limit by the model calls it has in flight. When the child ends, its unspent budget
+    /// goes back (see [`Store::transition`]).
     ///
     /// Refused with [`StoreError::Spawn`] when the parent is not `Running`, has
     /// `max_children` children already, its tree has `max_tree_runs` runs, or the carve is not
@@ -893,21 +925,26 @@ fn status_of(tx: &Transaction<'_>, run: RunId) -> Result<RunStatus> {
 }
 
 /// Gives a spawned run that just ended its unspent budget back to its parent. The run keeps a
-/// limit equal to what it spent, so a second call returns nothing. When the parent has ended too,
-/// the amount passes on up to the nearest run still going, or to the root, which keeps it. A root
-/// keeps its own limit: there is no one to return it to. A run that spent more than its limit
-/// returns nothing and takes nothing.
+/// limit equal to what it spent, so a second call returns nothing. A root keeps its own limit:
+/// there is no one to return it to. A run that spent more than its limit returns nothing and
+/// takes nothing.
 fn return_unspent(tx: &Transaction<'_>, run: RunId) -> Result<()> {
-    let Some(mut parent) = parent_of(tx, run)? else {
+    let Some(parent) = parent_of(tx, run)? else {
         return Ok(());
     };
     let limit = read_limit(tx, run)?;
     let spent = spent_in(tx, run)?;
-    let mut amount = left(limit, spent);
+    let amount = left(limit, spent);
     if amount.0 == 0 {
         return Ok(());
     }
     write_limit(tx, run, spent)?;
+    credit(tx, parent, amount)
+}
+
+/// Adds `amount` to `parent`'s limit. When `parent` has ended, it keeps only what it spent and
+/// passes the rest on up to the nearest run still going, or to the root, which keeps it.
+fn credit(tx: &Transaction<'_>, mut parent: RunId, mut amount: MicroUsd) -> Result<()> {
     loop {
         let to = read_limit(tx, parent)?;
         let grandparent = parent_of(tx, parent)?;
