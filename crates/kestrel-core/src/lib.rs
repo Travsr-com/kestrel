@@ -1881,17 +1881,17 @@ impl Actor {
         let spent = self.spent()?;
         // Read from the store, not the spec this actor started with: spawning a child lowers the
         // limit, and a finished child's unspent budget raises it again.
-        let limit = self.inner.store.limit(self.id)?;
+        let mut limit = self.inner.store.limit(self.id)?;
         // A parent with children still going may have handed out all of its own budget: it cannot
         // spend (the gateway refuses it at its limit), but it stays up to wait for them. With none
         // left, read the limit again: the last child's refund commits with its end, so a child that
         // ended after the first read has already given its budget back.
-        if spent >= limit
-            && self.inner.store.live_children(self.id)? == 0
-            && spent >= self.inner.store.limit(self.id)?
-        {
-            self.set(RunStatus::Suspended(SuspendReason::Budget))?;
-            return Ok(Next::Stop);
+        if spent >= limit && self.inner.store.live_children(self.id)? == 0 {
+            limit = self.inner.store.limit(self.id)?;
+            if spent >= limit {
+                self.set(RunStatus::Suspended(SuspendReason::Budget))?;
+                return Ok(Next::Stop);
+            }
         }
         let new_limit = self.warned_at.is_none_or(|at| limit > at);
         if new_limit && i128::from(spent.0) * 5 >= i128::from(limit.0) * 4 {
