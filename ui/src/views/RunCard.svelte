@@ -35,7 +35,7 @@
   <span class="elapsed">{elapsed}</span>
   <span class="label">Cost</span>
   <span class="cost">
-    {formatUsd(run.spent)} / {run.provisional ? 'limit not known yet' : formatUsd(run.limit)}
+    {formatUsd(run.spent)} / {run.fetched ? formatUsd(run.limit) : 'limit not known yet'}
   </span>
   <span class="label">Sandbox</span>
   <span class="tier">{run.sandbox_tier ?? 'tier not known yet'}</span>

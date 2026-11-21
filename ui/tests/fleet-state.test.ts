@@ -71,6 +71,17 @@ describe('FleetState', () => {
     expect(fleet.runs.p?.agent).toBe('a');
   });
 
+  it('a run is fetched once the server has answered for it, not before', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p')]);
+    expect(fleet.runs.p?.fetched).toBe(true);
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
+    fleet.apply(ev('c', { kind: 'status_changed', from: 'Queued', to: 'Provisioning' }), 0, () => {}, 'p');
+    expect(fleet.runs.c).toMatchObject({ provisional: false, fetched: false });
+    fleet.update(summary('c'), 0);
+    expect(fleet.runs.c?.fetched).toBe(true);
+  });
+
   it('a fetch fills in limit, tier and start time, and never lowers the cost', () => {
     const fleet = new FleetState();
     fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
@@ -172,18 +183,22 @@ describe('FleetState', () => {
       summary(`r${i}`, i % 100 === 0 ? {} : { status: 'Completed' }),
     );
     fleet.load(list);
+    fleet.liveRoots(100, 10);
     const start = performance.now();
     expect(fleet.liveRoots(100, 10)).toHaveLength(50);
-    expect(performance.now() - start).toBeLessThan(250);
+    // A quadratic walk took over a minute here; a loaded CI runner stays far below this bound.
+    expect(performance.now() - start).toBeLessThan(2_000);
   });
 
   it('rebuilds many trees in one pass', () => {
     const fleet = new FleetState();
     fleet.load(Array.from({ length: 5_000 }, (_, i) => summary(`r${i}`)));
-    const roots = Array.from({ length: 50 }, (_, i) => `r${i}`);
+    const roots = Array.from({ length: 1_000 }, (_, i) => `r${i}`);
+    fleet.rebuild(['warm']);
     const start = performance.now();
     fleet.rebuild(roots);
-    expect(performance.now() - start).toBeLessThan(150);
+    // One pass per root would walk 5,000 runs 1,000 times (seconds); one pass is milliseconds.
+    expect(performance.now() - start).toBeLessThan(1_000);
     expect(fleet.runs.r0).toMatchObject({ reported: 100, counted: 0 });
   });
 

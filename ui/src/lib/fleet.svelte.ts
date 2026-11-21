@@ -32,6 +32,8 @@ export interface FleetRun extends RunSummary {
   counted: MicroUsd;
   /** Known only from its `run_created` event: no status from the server or an event yet. */
   provisional: boolean;
+  /** The server has answered for this run (list or fetch), so its limit and tier are real. */
+  fetched: boolean;
 }
 
 /** A run's direct children, as its card shows them. */
@@ -56,6 +58,7 @@ export class FleetState {
         reported: r.spent,
         counted: 0,
         provisional: false,
+        fetched: true,
       };
     }
     this.runs = next;
@@ -69,6 +72,7 @@ export class FleetState {
   update(summary: RunSummary, now: number): void {
     const run = this.runs[summary.id];
     if (!run) return;
+    run.fetched = true;
     run.limit = summary.limit;
     run.sandbox_tier = summary.sandbox_tier;
     run.created_at = summary.created_at;
@@ -109,6 +113,7 @@ export class FleetState {
             reported: 0,
             counted: 0,
             provisional: true,
+            fetched: false,
           };
           refresh(event.run_id);
         }

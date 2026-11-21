@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fleet from '../src/views/Fleet.svelte';
 import { createApi } from '../src/lib/api';
+import { FleetState } from '../src/lib/fleet.svelte';
 import type { Event, RunStatus, RunSummary } from '../src/lib/types';
 import { fakeSockets } from './fake-socket';
 import { ids, seriousViolations } from './axe';
@@ -301,6 +302,44 @@ describe('Fleet', () => {
     expect(card('kid')).toHaveTextContent('limit not known yet');
     await vi.advanceTimersByTimeAsync(6_000);
     expect(card('kid')).toHaveTextContent('$0.70');
+  });
+
+  it('retries a new run whose fetch failed after its status moved, until the server answers', async () => {
+    const root = run({ agent: 'lead' });
+    const child = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1, limit: 700_000 });
+    const sockets = fakeSockets();
+    let fails = 1;
+    const fetch: typeof globalThis.fetch = async (input) => {
+      if (String(input).endsWith('/api/runs')) return new Response(JSON.stringify([root]));
+      if (String(input).endsWith(child.id) && fails-- > 0) return new Response('{}', { status: 503 });
+      return new Response(JSON.stringify(String(input).endsWith(child.id) ? child : root));
+    };
+    render(Fleet, { api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    // The status moves before the failed fetch comes back.
+    socket.event(1, event(child.id, { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
+    socket.event(2, event(child.id, { kind: 'status_changed', from: 'Queued', to: 'Provisioning' }, 2));
+    await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    expect(card('kid')).toHaveTextContent('limit not known yet');
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(card('kid')).toHaveTextContent('$0.70');
+  });
+
+  it('does no list work on a clock tick: only the elapsed times change', async () => {
+    const done = run({ agent: 'done', status: 'Completed' });
+    const { sockets } = show([run({ agent: 'live' }), done]);
+    await screen.findByRole('link', { name: 'live' });
+    const made = sockets.made.length;
+    const live = vi.spyOn(FleetState.prototype, 'liveRoots');
+    const rebuild = vi.spyOn(FleetState.prototype, 'rebuild');
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(live).not.toHaveBeenCalled();
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(sockets.made).toHaveLength(made);
+    live.mockRestore();
+    rebuild.mockRestore();
   });
 
   it('backs off retrying a failing fetch, and asks in between do not add requests', async () => {

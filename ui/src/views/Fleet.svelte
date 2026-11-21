@@ -43,7 +43,13 @@
   let loaded = $state(false);
   let error: string | null = $state(null);
   let attempt = $state(0);
+  /** The clock for elapsed times on the cards; ticks every second. */
   let now = $state(Date.now());
+  /**
+   * The clock for what has lingered long enough to leave: it moves only when a linger runs out, so
+   * the list and the sockets are not worked out again every second.
+   */
+  let lingered = $state(Date.now());
 
   let agent = $state('');
   let status = $state('');
@@ -89,6 +95,17 @@
     return () => clearInterval(tick);
   });
 
+  // Moves `lingered` when the next run that ended has lingered: re-run when a run ends (or is added).
+  $effect(() => {
+    let next = Infinity;
+    for (const run of Object.values(fleet.runs)) {
+      if (run.endedAt !== null && run.endedAt + LINGER_MS > lingered) next = Math.min(next, run.endedAt + LINGER_MS);
+    }
+    if (next === Infinity) return;
+    const timer = setTimeout(() => (lingered = Date.now()), Math.max(0, next - Date.now()));
+    return () => clearTimeout(timer);
+  });
+
   /**
    * Fetches a run's limit, tier and cost. One request per run at a time: whatever asks while one is
    * out gets a single request after it, so a replay of many spawns costs two requests, and answers
@@ -111,8 +128,9 @@
         (e: unknown) => {
           if (!mounted) return;
           failureText(e, onUnauthorized);
-          // A run known only from its creation still needs its limit: try again, backing off.
-          if (!(e instanceof Unauthorized) && fleet.runs[id]?.provisional) retry(id);
+          // A run the server has not answered for yet still needs its limit: try again, backing off.
+          if (!(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false) retry(id);
+          else delete retryDelay[id];
         },
       )
       .finally(() => {
@@ -179,11 +197,22 @@
   /** A filter on a finished status shows those runs however long ago they ended. */
   const finishedFilter = $derived(['completed', 'failed', 'cancelled'].includes(status));
 
+  /**
+   * Newest first. The server writes UTC times with a fraction of varying length (`...09Z`,
+   * `...09.5Z`), so whole seconds compare as text and only a tie is parsed.
+   */
+  function newestFirst(a: string, b: string): number {
+    const sa = a.slice(0, 19);
+    const sb = b.slice(0, 19);
+    if (sa !== sb) return sa < sb ? 1 : -1;
+    return Date.parse(b) - Date.parse(a);
+  }
+
   function shown(run: FleetRun): boolean {
     if (rootsOnly && run.parent !== null) return false;
     if (agent && run.agent !== agent) return false;
     if (status && statusName(run.status) !== status) return false;
-    if (!showFinished && !finishedFilter && run.endedAt !== null && now - run.endedAt >= LINGER_MS) return false;
+    if (!showFinished && !finishedFilter && run.endedAt !== null && lingered - run.endedAt >= LINGER_MS) return false;
     return true;
   }
 
@@ -195,8 +224,7 @@
   const visible = $derived(
     Object.values(fleet.runs)
       .filter(shown)
-      // RFC 3339 times in UTC sort as strings: no date parsing on every tick.
-      .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0)),
+      .sort((a, b) => newestFirst(a.created_at, b.created_at)),
   );
   const pages = $derived(Math.max(1, Math.ceil(visible.length / PAGE)));
   const current = $derived(Math.min(page, pages - 1));
@@ -220,7 +248,7 @@
   // this page first. A tree followed again replays from the start, so it counts its events afresh.
   $effect(() => {
     if (!loaded) return;
-    const live = fleet.liveRoots(now, LINGER_MS);
+    const live = fleet.liveRoots(lingered, LINGER_MS);
     const isLive: Record<RunId, true> = {};
     for (const root of live) isLive[root] = true;
     // The trees on this page first, then the rest, each once.
@@ -235,6 +263,7 @@
     const fresh = Object.keys(wanted).filter((root) => !streams.has(root));
     untrack(() => {
       // One pass over the runs for all of them, then a socket each.
+      if (fresh.length === 0) return;
       fleet.rebuild(fresh);
       for (const root of fresh) follow(root);
     });
