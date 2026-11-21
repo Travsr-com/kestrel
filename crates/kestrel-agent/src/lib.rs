@@ -85,8 +85,9 @@ can go on at the same time.
 /// The part of the agent note for a run that may spawn and also holds `kestrel.join`.
 const JOIN_NOTE: &str = "\
 * kestrel.join(children?, mode?, timeout_s?) waits for children and returns how each ended:
-  completed with its summary, failed with a reason, cancelled, or timed out. Waiting costs no
-  model calls.
+  completed with its summary, failed with a reason, cancelled, or timed out (still running: a
+  timeout does not stop it). With mode any it returns as soon as one ends, with only those that
+  ended. Waiting costs no model calls.
 ";
 
 /// The part of the agent note for a run granted `kestrel.ask_human`.

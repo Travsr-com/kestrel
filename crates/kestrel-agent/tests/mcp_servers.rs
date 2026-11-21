@@ -344,6 +344,8 @@ fn the_agent_note_is_short_and_holds_no_token_or_path() {
     assert!(two.contains("You may spawn: worker, reviewer."), "{two}");
     // Not every child gets a clone: its own spec sets its workspace.
     assert!(full.contains("agent spec"), "{full}");
+    // A timed-out child is not stopped, so spawning it again would pay twice.
+    assert!(full.contains("still running"), "{full}");
     assert!(full.contains("summary"), "{full}");
     assert!(!full.contains("branch"), "{full}");
     for note in [full.clone(), agent_note(&[], true, true).expect("a note")] {
