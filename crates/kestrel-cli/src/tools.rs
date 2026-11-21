@@ -8,6 +8,7 @@
 //!   by its owner only. Every capability token is signed with it, so it must stay the same across
 //!   restarts: a new key would refuse the tokens of every run spawned before.
 
+use std::hash::BuildHasher;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,14 +43,21 @@ pub(crate) fn load_or_create_root_key(path: &Path) -> Result<RootKey, Failure> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let key = RootKey::generate();
             let text = hex(&key.to_bytes());
-            // Written whole and flushed to disk under a name of its own (from the new key, so no
-            // leftover of a crashed start is in the way), then linked into place: a link never
-            // replaces a file, so the key file is never seen half written.
-            let tmp =
-                path.with_file_name(format!("root.key.{}.tmp", text.get(..16).unwrap_or("new")));
-            write_new(&tmp, &text).map_err(|e| named(e.to_string()))?;
+            // Written whole and flushed to disk under a random name of its own (so no leftover of
+            // a crashed start is in the way, and nothing of the key is in a file name), then
+            // linked into place: a link never replaces a file, so the key file is never seen half
+            // written.
+            let nonce = std::collections::hash_map::RandomState::new().hash_one(std::process::id());
+            let tmp = path.with_file_name(format!("root.key.{nonce:016x}.tmp"));
+            if let Err(e) = write_new(&tmp, &text) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(named(e.to_string()));
+            }
             let linked = std::fs::hard_link(&tmp, path);
             let _ = std::fs::remove_file(&tmp);
+            if linked.is_ok() {
+                sync_dir(path);
+            }
             match linked {
                 Ok(()) => Ok(key),
                 // Another process made it first: use theirs.
@@ -74,6 +82,17 @@ fn write_new(path: &Path, text: &str) -> io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()
+}
+
+/// Flushes the directory holding `path`, so a new name in it survives a power loss (Unix; best
+/// effort).
+fn sync_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn hex(bytes: &[u8]) -> String {
