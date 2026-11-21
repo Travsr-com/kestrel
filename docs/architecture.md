@@ -127,7 +127,7 @@ Pause, resume, replay and the live UI all read from this log. Cancelling a run c
 Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd?, wait?)`.
 
 * The server checks the caller's token: is the child agent allowed, are depth and child-count within limits?
-* The child's budget is **carved out of** the parent's remaining budget, so a tree can never exceed the root budget.
+* The child's budget is **carved out of** the parent's remaining budget, so a tree never exceeds the root budget by more than the calls in flight.
 * The child token is the parent token plus attenuation (fewer tools, hosts, secrets). Never more.
 * `wait=true` blocks and returns the child's result; `wait=false` returns a handle for fan-in via `kestrel.join`.
 * Concurrency is capped per host (a semaphore sized to CPU/RAM), so a runaway fan-out queues instead of thrashing.
@@ -508,10 +508,10 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 * `kestrel-server`: HTTP and WebSocket API for the UI (loopback and token by default), serving the embedded UI.
 * UI: Fleet, Run (spawn tree, live stream), Approvals. The 95% coverage rule also applies to `ui/src` (vitest).
 * Accept: one run fans out to 5+ parallel children in separate per-run clones with no conflicts; a child cannot use a
-  tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget; the UI
-  shows the whole tree live.
+  tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget by more
+  than the calls in flight; the UI shows the whole tree live.
 * Status: built. Acceptance is in progress: the suite in [m2.md](milestones/m2.md) (#45) runs in the `e2e-m2` CI
-  job, and M2 is done once that job passes. Scenario 11 (Travsr) lands with #44.
+  job. M2 is done once scenario 11 lands (#44) and the e2e-m2 job passes.
 
 **M3. Cheaper**
 * Model profiles, role tiers, cache-aware prompt shaping, context bundles, reserved hard budgets,
