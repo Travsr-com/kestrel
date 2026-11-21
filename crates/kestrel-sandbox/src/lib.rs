@@ -65,6 +65,12 @@ pub enum SandboxError {
         "invalid workspace path `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
     )]
     InvalidWorkspace { path: String },
+    /// A config directory path that is not absolute UTF-8, or that would change the `--mount`
+    /// options.
+    #[error(
+        "invalid config directory `{path}`: must be absolute UTF-8 without `,` `=` `\"` or newlines"
+    )]
+    InvalidConfig { path: String },
     /// A container id that is empty, starts with `-`, or has characters outside
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
@@ -162,6 +168,9 @@ pub struct LaunchSpec {
     pub env: BTreeMap<String, String>,
     /// Host directory mounted at `/workspace`.
     pub workspace: Option<PathBuf>,
+    /// Host directory mounted read-only at `/kestrel`: the run's config (its launch plan's files),
+    /// outside the workspace so the agent can neither change nor commit it.
+    pub config: Option<PathBuf>,
     pub cpu_millis: u32,
     pub memory_mb: u64,
     pub network: NetworkPolicy,
@@ -539,6 +548,15 @@ impl Cli {
                 "/workspace".to_string(),
             ]);
         }
+        if let Some(config) = &spec.config {
+            argv.extend([
+                "--mount".to_string(),
+                format!(
+                    "type=bind,source={},target=/kestrel,readonly",
+                    config.display()
+                ),
+            ]);
+        }
         let gateway = match &spec.network {
             NetworkPolicy::None => None,
             NetworkPolicy::GatewayOnly { gateway } | NetworkPolicy::RunNetwork { gateway, .. } => {
@@ -607,6 +625,11 @@ impl Cli {
     ) -> Result<SandboxHandle> {
         check_secrets(&spec.env)?;
         check_image(&spec.image)?;
+        if let Some(config) = &spec.config {
+            validate_workspace_path(config).map_err(|_| SandboxError::InvalidConfig {
+                path: config.display().to_string(),
+            })?;
+        }
         let mut user = None;
         let mut resolved;
         let mut spec = spec;

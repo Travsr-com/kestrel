@@ -131,6 +131,7 @@ pub fn spec() -> LaunchSpec {
         argv: s(&["sh", "-c", "echo hi"]),
         env,
         workspace: Some(PathBuf::from(ws())),
+        config: None,
         cpu_millis: 1500,
         memory_mb: 512,
         network: NetworkPolicy::None,

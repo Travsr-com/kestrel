@@ -17,6 +17,7 @@ fn alpine(argv: &[&str]) -> LaunchSpec {
         argv: argv.iter().map(|a| (*a).to_string()).collect(),
         env: BTreeMap::new(),
         workspace: None,
+        config: None,
         cpu_millis: 1000,
         memory_mb: 256,
         network: NetworkPolicy::None,

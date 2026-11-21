@@ -2237,6 +2237,7 @@ impl Actor {
             argv: plan.argv,
             env: plan.env,
             workspace: None,
+            config: None,
             cpu_millis: self.spec.sandbox.cpu_millis,
             memory_mb: self.spec.sandbox.memory_mb,
             network: match network {

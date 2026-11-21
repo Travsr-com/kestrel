@@ -840,6 +840,7 @@ async fn sandbox_accepts(workspace: PathBuf) {
         argv: s(&["true"]),
         env: BTreeMap::new(),
         workspace: Some(workspace),
+        config: None,
         cpu_millis: 1000,
         memory_mb: 256,
         network: NetworkPolicy::None,
