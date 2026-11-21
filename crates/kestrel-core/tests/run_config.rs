@@ -123,6 +123,17 @@ async fn recovery_removes_the_config_left_by_a_finished_run() {
 // predictable temp path another user could make first.
 #[tokio::test(start_paused = true)]
 async fn the_default_root_is_private_to_the_engine() {
+    let first = default_root().await;
+    assert_ne!(first, std::env::temp_dir().join("kestrel-run-config"));
+    let name = first.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("kestrel-run-config-"), "{name}");
+    // Random per engine, so nobody can make it ahead of time.
+    assert_ne!(default_root().await, first);
+}
+
+/// The config root an engine without `with_run_config` uses, from one run of it. Checks the
+/// root is private, then removes it.
+async fn default_root() -> std::path::PathBuf {
     let mut h = Harness::new(4);
     h.adapters.set_files(vec![mcp_file()]);
     let s = h.driver.live();
@@ -131,9 +142,6 @@ async fn the_default_root_is_private_to_the_engine() {
     until("running", || h.is(id, &RunStatus::Running)).await;
     let dir = h.driver.specs()[0].config.clone().expect("a config dir");
     let root = dir.parent().expect("a root").to_path_buf();
-    assert_ne!(root, std::env::temp_dir().join("kestrel-run-config"));
-    let name = root.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(name.starts_with("kestrel-run-config-"), "{name}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -144,6 +152,7 @@ async fn the_default_root_is_private_to_the_engine() {
     s.exit(0);
     until("completed", || h.is(id, &RunStatus::Completed)).await;
     let _ = std::fs::remove_dir_all(&root);
+    root
 }
 
 // A cancelled run leaves no config behind either.
