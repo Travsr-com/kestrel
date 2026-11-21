@@ -847,6 +847,8 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
     assert_eq!(carved, vec![share; 6], "each child got $0.15 carved out");
     calls += assert_exact_cost(&env, &root);
     let parent_spent = env.spent(&root);
+    // Given each child's pin above, this cannot fail on its own: the tree stays within $1.00
+    // because $0.10 of it is not carved out, and the overshoots and the parent's call fit in it.
     assert!(
         children_spent <= 1_000_000 - parent_spent,
         "children spent {children_spent}, more than $1.00 minus the parent's {parent_spent}"
