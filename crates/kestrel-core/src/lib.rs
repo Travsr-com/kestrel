@@ -28,7 +28,9 @@ use kestrel_sandbox::{
     INSTANCE_LABEL, Ipv4Cidr, LaunchSpec, NetworkPolicy, PreparedNetwork, RUN_LABEL, SandboxDriver,
     SandboxError, SandboxHandle, Subnet, SubnetPool,
 };
-use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
+use kestrel_store::{
+    ChildPlan, ControlCommand, RunFilter, RunRow, SpawnRefusal, Store, StoreError,
+};
 use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
     SuspendReason, Tier, WorkspaceSpec,
@@ -91,9 +93,146 @@ fn no_subnet(pool: &Ipv4Cidr, taken: usize, held: usize) -> String {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// Why [`Engine::spawn_child`] did not spawn. Nothing was created in any of these cases.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// The engine has no root key ([`Engine::with_root_key`]), so it cannot check or make
+    /// capability tokens.
+    #[error("spawning needs capability tokens, and this engine has no root key")]
+    NoRootKey,
+    #[error("no run {0}")]
+    ParentNotFound(RunId),
+    /// Only a `Running` run can spawn. A suspended one can again once it is resumed.
+    #[error("run {0} is {1:?}; only a running run can spawn")]
+    ParentNotRunning(RunId, RunStatus),
+    /// The parent's capability does not allow spawning (no `kestrel.spawn`, no spawn rights, no
+    /// token, or an expired one).
+    #[error("the parent may not spawn: {0}")]
+    NotPermitted(String),
+    /// The parent's spawn rights reach no deeper (its `max_depth` is used up).
+    #[error("the parent may not spawn one more level down (max_depth)")]
+    Depth,
+    #[error("the parent may not spawn agent `{0}`")]
+    AgentNotAllowed(String),
+    #[error("the parent already has {0} children (max_children)")]
+    TooManyChildren(u32),
+    #[error("the tree already has {0} runs, the most one tree may have")]
+    TooManyRuns(u32),
+    /// The carve is not positive, or more than the parent has left.
+    #[error("asked for {asked}, but the parent has {remaining} left")]
+    Budget {
+        asked: MicroUsd,
+        remaining: MicroUsd,
+    },
+    #[error(transparent)]
+    Store(StoreError),
+}
+
+impl From<StoreError> for SpawnError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::Spawn(SpawnRefusal::ParentNotRunning(id, status)) => {
+                SpawnError::ParentNotRunning(id, status)
+            }
+            StoreError::Spawn(SpawnRefusal::Budget { asked, remaining }) => {
+                SpawnError::Budget { asked, remaining }
+            }
+            StoreError::Spawn(SpawnRefusal::TooManyChildren(n)) => SpawnError::TooManyChildren(n),
+            StoreError::Spawn(SpawnRefusal::TooManyRuns(n)) => SpawnError::TooManyRuns(n),
+            StoreError::NotFound(id) => SpawnError::ParentNotFound(id),
+            other => SpawnError::Store(other),
+        }
+    }
+}
+
+/// Default for [`Engine::with_tree_limit`]: the most runs one spawn tree may hold.
+pub const DEFAULT_TREE_LIMIT: u32 = 256;
+
+/// How long a capability token is valid. The wall-clock budget is enforced by the engine on its
+/// own; this only bounds how long a leaked token stays usable.
+const TOKEN_LIFETIME: time::Duration = time::Duration::days(7);
+
 /// Builds a fresh runtime adapter. The engine calls it once per run and never shares an adapter
 /// across runs. In production this is `kestrel_agent::adapter_for`.
 pub type AdapterFactory = Arc<dyn Fn(Runtime) -> Box<dyn RuntimeAdapter> + Send + Sync>;
+
+/// The checks behind [`Engine::spawn_child`]'s authorisation, in an order that gives the most
+/// specific refusal: no `kestrel.spawn` or no spawn rights, then depth, then the agent, then the
+/// token's own verdict (run and expiry).
+fn authorise(
+    held: &caps::Capability,
+    token: &caps::CapToken,
+    public: &caps::RootPublicKey,
+    parent: RunId,
+    agent: &str,
+    now: time::OffsetDateTime,
+) -> std::result::Result<(), SpawnError> {
+    if !held.tools.contains(caps::SPAWN_TOOL) {
+        return Err(SpawnError::NotPermitted(format!(
+            "its capability does not include {}",
+            caps::SPAWN_TOOL
+        )));
+    }
+    let Some(limits) = &held.spawn else {
+        return Err(SpawnError::NotPermitted(
+            "its capability has no spawn rights".into(),
+        ));
+    };
+    if limits.max_depth == 0 {
+        return Err(SpawnError::Depth);
+    }
+    if !limits.agents.contains(agent) {
+        return Err(SpawnError::AgentNotAllowed(agent.to_string()));
+    }
+    let request = caps::Request {
+        run: parent,
+        action: caps::Action::Spawn {
+            agent: agent.to_string(),
+        },
+        now,
+    };
+    match caps::verify(token, public, &request) {
+        caps::Decision::Allow => Ok(()),
+        caps::Decision::Deny(reason) => Err(SpawnError::NotPermitted(reason)),
+    }
+}
+
+/// The log line for a `kestrel budget` raise its parent cannot cover.
+fn budget_refused(asked: MicroUsd, remaining: MicroUsd) -> String {
+    format!(
+        "kestrel: budget not changed: the raise needs {asked} from the parent, which has {remaining} left; raise the root's budget first"
+    )
+}
+
+/// `spec.capabilities` for a grant.
+fn granted_capabilities(cap: &caps::Capability) -> kestrel_types::Capabilities {
+    kestrel_types::Capabilities {
+        mcp: cap.tools.iter().cloned().collect(),
+        network: cap.hosts.iter().cloned().collect(),
+        secrets: cap.secrets.iter().cloned().collect(),
+        spawn: cap.spawn.as_ref().map(|s| kestrel_types::SpawnPolicy {
+            max_children: s.max_children,
+            max_depth: s.max_depth,
+            agents: s.agents.iter().cloned().collect(),
+        }),
+    }
+}
+
+/// The spec a child runs with: one tier below the parent unless it states a `model_policy`, and
+/// the parent's repo when its `git-clone` repo is relative.
+fn child_spec(child: &AgentSpec, parent: &AgentSpec) -> AgentSpec {
+    let mut spec = child.clone();
+    if !spec.model_policy.stated {
+        spec.model_policy.default = parent.model_policy.default.below();
+    }
+    if let (WorkspaceSpec::GitClone { repo, .. }, WorkspaceSpec::GitClone { repo: theirs, .. }) =
+        (&mut spec.sandbox.workspace, &parent.sandbox.workspace)
+        && repo.is_relative()
+    {
+        repo.clone_from(theirs);
+    }
+    spec
+}
 
 /// Engine-wide limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +404,10 @@ struct Inner {
     instance: Option<String>,
     /// Blocks for run networks, see [`Engine::with_subnets`].
     subnets: Option<Arc<SubnetPool>>,
+    /// Signs and checks capability tokens, see [`Engine::with_root_key`].
+    root_key: Option<caps::RootKey>,
+    /// Most runs in one spawn tree, see [`Engine::with_tree_limit`].
+    tree_limit: u32,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
     live: Mutex<Live>,
     /// Signals a change of `live`.
@@ -356,6 +499,8 @@ impl Engine {
                 workspaces: None,
                 instance: None,
                 subnets: None,
+                root_key: None,
+                tree_limit: DEFAULT_TREE_LIMIT,
                 live: Mutex::default(),
                 changed: Notify::new(),
             }),
@@ -402,6 +547,136 @@ impl Engine {
             inner.subnets = Some(pool);
         }
         self
+    }
+
+    /// Signs capability tokens with `key`, which [`Engine::spawn_child`] needs. Use the same key
+    /// across restarts: tokens in the store are checked against it. Takes the engine by value,
+    /// like [`Engine::with_workspaces`].
+    pub fn with_root_key(mut self, key: caps::RootKey) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.root_key = Some(key);
+        }
+        self
+    }
+
+    /// The most runs one spawn tree may hold, its root included ([`DEFAULT_TREE_LIMIT`] unless
+    /// set). A spawn past it fails with [`SpawnError::TooManyRuns`]. Takes the engine by value.
+    pub fn with_tree_limit(mut self, runs: u32) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.tree_limit = runs;
+        }
+        self
+    }
+
+    /// Creates a child run of `parent` from `child` and returns its id. The child starts like
+    /// any run: it waits `Queued` for a slot, and gets its own workspace.
+    ///
+    /// * **Authorised by the parent's capability token**: it needs `kestrel.spawn`, spawn rights
+    ///   with depth left, and `child.name` among its spawnable agents. A root run's token is made
+    ///   from its spec on its first spawn.
+    /// * **The child's token** is the parent's, attenuated to what the child's spec asks for and
+    ///   the parent holds. What the spec asked for beyond that is recorded on the child as
+    ///   `CapabilitiesDropped`.
+    /// * **Budget**: `budget` is carved out of what the parent has left, atomically (see
+    ///   [`Store::spawn_child`]). Without one, the child gets the smaller of its spec's budget and
+    ///   half of what the parent has left. A finished child returns what it did not spend.
+    /// * **Limits**: the parent's `max_children` (live and finished) and the tree limit
+    ///   ([`Engine::with_tree_limit`]).
+    /// * **Model tier**: a child spec without `model_policy` runs one tier below its parent.
+    /// * **Workspace**: a `git-clone` child with a relative repo clones its parent's repo.
+    pub async fn spawn_child(
+        &self,
+        parent: RunId,
+        child: &AgentSpec,
+        input: &str,
+        budget: Option<MicroUsd>,
+    ) -> std::result::Result<RunId, SpawnError> {
+        let inner = &self.inner;
+        let key = inner.root_key.as_ref().ok_or(SpawnError::NoRootKey)?;
+        let store = &inner.store;
+        let row = store
+            .get_run(parent)?
+            .ok_or(SpawnError::ParentNotFound(parent))?;
+        if row.status != RunStatus::Running {
+            return Err(SpawnError::ParentNotRunning(parent, row.status));
+        }
+        let parent_spec = store
+            .run_spec(parent)?
+            .ok_or(SpawnError::ParentNotFound(parent))?;
+        let now = time::OffsetDateTime::now_utc();
+        let token = self.token_of(&row, &parent_spec, key, now)?;
+        let public = key.public();
+        let held =
+            caps::grant(&token, &public).map_err(|e| SpawnError::NotPermitted(e.to_string()))?;
+        authorise(&held, &token, &public, parent, &child.name, now)?;
+        let max_children = held.spawn.as_ref().map_or(0, |s| s.max_children);
+
+        let mut spec = child_spec(child, &parent_spec);
+        let wanted = caps::Capability::from_spec(parent, &spec, now + TOKEN_LIFETIME);
+        let (narrowed, dropped) = caps::narrow(&held, &wanted);
+        // The stored spec says only what the child was granted, so nothing that reads it later
+        // can see more than its token holds.
+        spec.capabilities = granted_capabilities(&narrowed);
+        let mut child_events = Vec::new();
+        if !dropped.is_empty() {
+            child_events.push(EventKind::CapabilitiesDropped {
+                tools: dropped.tools,
+                hosts: dropped.hosts,
+                secrets: dropped.secrets,
+                agents: dropped.agents,
+            });
+        }
+        let plan = ChildPlan {
+            spec: &spec,
+            input,
+            budget,
+            max_children,
+            max_tree_runs: inner.tree_limit,
+            child_events,
+        };
+        let spawned = store.spawn_child(parent, plan, |id, carve| {
+            let mut cap = narrowed.clone();
+            cap.run = id;
+            // The token's budget is a ceiling: never more than the parent's grant.
+            cap.budget = carve.min(held.budget);
+            caps::attenuate(&token, key, &cap)
+                .map(|t| Some(t.as_bytes().to_vec()))
+                .map_err(|e| StoreError::Capability(e.to_string()))
+        })?;
+        Ok(spawned.id)
+    }
+
+    /// The parent's capability token. A root run without one gets one from its spec; any other
+    /// run without one may not spawn.
+    fn token_of(
+        &self,
+        row: &RunRow,
+        spec: &AgentSpec,
+        key: &caps::RootKey,
+        now: time::OffsetDateTime,
+    ) -> std::result::Result<caps::CapToken, SpawnError> {
+        let store = &self.inner.store;
+        if let Some(bytes) = store.run_cap(row.id)? {
+            let token = caps::CapToken::from_bytes(bytes);
+            // A spawned run's token comes from its parent's and cannot be remade here. A root's
+            // comes from its spec, so an expired (or unreadable) one is made again below.
+            let fresh = caps::grant(&token, &key.public()).is_ok_and(|c| c.expires_at > now);
+            if row.parent.is_some() || fresh {
+                return Ok(token);
+            }
+        } else if row.parent.is_some() {
+            return Err(SpawnError::NotPermitted(
+                "the run has no capability token".into(),
+            ));
+        }
+        let cap = caps::Capability::from_spec(row.id, spec, now + TOKEN_LIFETIME);
+        let token = caps::issue(key, &cap).map_err(|e| SpawnError::NotPermitted(e.to_string()))?;
+        store.set_run_cap(row.id, token.as_bytes())?;
+        Ok(token)
     }
 
     /// Creates a `Queued` run and writes its `RunCreated` event. The spec is persisted so a later
@@ -982,7 +1257,14 @@ impl Inner {
             }
             (RunStatus::Queued, ControlCommand::SetBudget(limit)) => {
                 // The run starts later and reads its stored spec then.
-                self.store.set_budget(run, limit)?;
+                match self.store.set_budget(run, limit) {
+                    Ok(_) => {}
+                    Err(StoreError::ParentBudget { asked, remaining }) => {
+                        let line = budget_refused(asked, remaining);
+                        self.store.append(run, EventKind::AgentLog { line })?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             (RunStatus::Queued, ControlCommand::Cancel) => {
                 self.store
@@ -1148,7 +1430,9 @@ struct Actor {
     status: RunStatus,
     adapter: Box<dyn RuntimeAdapter>,
     sandbox: Option<Sandbox>,
-    warned: bool,
+    /// The limit the last 80% budget warning was written for. A larger limit gets its own
+    /// warning; the same one (a limit that dropped for a spawn and came back) does not.
+    warned_at: Option<MicroUsd>,
     clock: WallClock,
     cmds: mpsc::UnboundedReceiver<ControlCommand>,
 }
@@ -1177,7 +1461,7 @@ impl Actor {
             status,
             adapter,
             sandbox: None,
-            warned: false,
+            warned_at: None,
             clock,
             cmds,
         }
@@ -1527,10 +1811,17 @@ impl Actor {
             }
             C::SetBudget(limit) => {
                 // Stored first, so the new limit survives a restart.
-                self.inner.store.set_budget(self.id, limit)?;
-                self.spec.budget.limit = limit;
-                // One warning per limit.
-                self.warned = false;
+                match self.inner.store.set_budget(self.id, limit) {
+                    Ok(set) => {
+                        self.spec.budget.limit = set;
+                        // A limit a human set gets its own warning.
+                        self.warned_at = None;
+                    }
+                    Err(StoreError::ParentBudget { asked, remaining }) => {
+                        self.log(&budget_refused(asked, remaining))?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 Ok(Next::Continue)
             }
             C::Pause if self.status == RunStatus::Running => {
@@ -1539,7 +1830,7 @@ impl Actor {
             }
             C::Resume if matches!(self.status, RunStatus::Suspended(_)) && pending.is_none() => {
                 let over = self.status == RunStatus::Suspended(SuspendReason::Budget)
-                    && self.spent()? >= self.spec.budget.limit;
+                    && self.spent()? >= self.inner.store.limit(self.id)?;
                 if over {
                     self.log("kestrel: not resumed, the run is still over its budget")?;
                     return Ok(Next::Continue);
@@ -1588,13 +1879,23 @@ impl Actor {
             return Ok(Next::Continue);
         }
         let spent = self.spent()?;
-        let limit = self.spec.budget.limit;
-        if spent >= limit {
-            self.set(RunStatus::Suspended(SuspendReason::Budget))?;
-            return Ok(Next::Stop);
+        // Read from the store, not the spec this actor started with: spawning a child lowers the
+        // limit, and a finished child's unspent budget raises it again.
+        let mut limit = self.inner.store.limit(self.id)?;
+        // A parent with children still going may have handed out all of its own budget: it cannot
+        // spend (the gateway refuses it at its limit), but it stays up to wait for them. With none
+        // left, read the limit again: the last child's refund commits with its end, so a child that
+        // ended after the first read has already given its budget back.
+        if spent >= limit && self.inner.store.live_children(self.id)? == 0 {
+            limit = self.inner.store.limit(self.id)?;
+            if spent >= limit {
+                self.set(RunStatus::Suspended(SuspendReason::Budget))?;
+                return Ok(Next::Stop);
+            }
         }
-        if !self.warned && i128::from(spent.0) * 5 >= i128::from(limit.0) * 4 {
-            self.warned = true;
+        let new_limit = self.warned_at.is_none_or(|at| limit > at);
+        if new_limit && i128::from(spent.0) * 5 >= i128::from(limit.0) * 4 {
+            self.warned_at = Some(limit);
             self.inner
                 .store
                 .append(self.id, EventKind::BudgetWarning { spent, limit })?;

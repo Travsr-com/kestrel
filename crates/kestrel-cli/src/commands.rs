@@ -134,6 +134,30 @@ fn describe(kind: &EventKind) -> String {
             Some(s) => format!("finished: {s}"),
             None => "finished".to_string(),
         },
+        EventKind::ChildSpawned {
+            child,
+            agent,
+            budget,
+        } => format!("spawned {agent} as run {child} with {budget}"),
+        EventKind::CapabilitiesDropped {
+            tools,
+            hosts,
+            secrets,
+            agents,
+        } => {
+            let named = [
+                ("tools", tools),
+                ("hosts", hosts),
+                ("secrets", secrets),
+                ("agents", agents),
+            ];
+            let parts: Vec<String> = named
+                .iter()
+                .filter(|(_, items)| !items.is_empty())
+                .map(|(what, items)| format!("{what} {}", items.join(", ")))
+                .collect();
+            format!("not granted by the parent: {}", parts.join("; "))
+        }
     }
 }
 
@@ -349,6 +373,23 @@ mod tests {
             ),
             (EventKind::AgentLog { line: "l".into() }, "log: l"),
             (EventKind::RunFinished { summary: None }, "finished"),
+            (
+                EventKind::ChildSpawned {
+                    child: RunId::new(),
+                    agent: "fixer".into(),
+                    budget: MicroUsd(500_000),
+                },
+                "spawned fixer as run ",
+            ),
+            (
+                EventKind::CapabilitiesDropped {
+                    tools: vec!["a".into(), "b".into()],
+                    hosts: vec![],
+                    secrets: vec![],
+                    agents: vec!["x".into()],
+                },
+                "not granted by the parent: tools a, b; agents x",
+            ),
         ];
         for (kind, want) in cases {
             let got = describe(&kind);

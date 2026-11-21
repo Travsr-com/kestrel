@@ -491,6 +491,8 @@ pub struct Harness {
     pub shutdown: CancellationToken,
     pub task: Option<JoinHandle<kestrel_core::Result<()>>>,
     pub db: PathBuf,
+    /// `max_concurrent_runs` of the engine, kept for [`Harness::rebuild`].
+    pub max: usize,
     _dir: Option<TempDir>,
 }
 
@@ -527,8 +529,25 @@ impl Harness {
             shutdown: CancellationToken::new(),
             task: None,
             db: db.to_path_buf(),
+            max,
             _dir: None,
         }
+    }
+
+    /// Replaces the engine with a fresh one on the same store, driver and adapters, passed through
+    /// `f` (for example to add `with_root_key`). Call before [`Harness::start`].
+    pub fn rebuild(&mut self, f: impl FnOnce(Engine) -> Engine) {
+        let engine = Engine::new(
+            self.store.clone(),
+            vec![Box::new(self.driver.clone())],
+            adapter_factory(self.adapters.clone()),
+            Url::parse(GATEWAY).expect("gateway url"),
+            Limits {
+                max_concurrent_runs: self.max,
+                poll_interval: POLL,
+            },
+        );
+        self.engine = Arc::new(f(engine));
     }
 
     /// Spawns `run_forever`.

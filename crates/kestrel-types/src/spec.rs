@@ -83,6 +83,15 @@ impl Tier {
             Tier::Frontier => "tier:frontier",
         }
     }
+
+    /// One tier cheaper; `Cheap` stays `Cheap`. A spawned child defaults to its parent's tier
+    /// below (architecture section 3.5, lever 1).
+    pub fn below(self) -> Tier {
+        match self {
+            Tier::Frontier => Tier::Mid,
+            Tier::Mid | Tier::Cheap => Tier::Cheap,
+        }
+    }
 }
 
 impl fmt::Display for Tier {
@@ -166,6 +175,15 @@ pub struct Budget {
 pub struct ModelPolicy {
     pub default: Tier,
     pub escalate: Option<Tier>,
+    /// True when the YAML gave `model_policy`. A spec without it runs at `tier:mid` as a root,
+    /// and one tier below its parent as a spawned child. Specs stored before this field existed
+    /// all had a `model_policy`, so a missing value reads as true.
+    #[serde(default = "stated_by_default")]
+    pub stated: bool,
+}
+
+fn stated_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,7 +246,7 @@ struct RawSpec {
     name: String,
     runtime: String,
     role: String,
-    model_policy: RawModelPolicy,
+    model_policy: Option<RawModelPolicy>,
     #[serde(default)]
     capabilities: Capabilities,
     sandbox: RawSandbox,
@@ -273,20 +291,23 @@ impl AgentSpec {
         if raw.name.trim().is_empty() {
             return Err(invalid("name", "must not be empty"));
         }
-        let escalate = raw
-            .model_policy
-            .escalate
-            .as_deref()
-            .map(str::parse)
-            .transpose()?;
+        let model_policy = match raw.model_policy {
+            Some(policy) => ModelPolicy {
+                default: policy.default.parse()?,
+                escalate: policy.escalate.as_deref().map(str::parse).transpose()?,
+                stated: true,
+            },
+            None => ModelPolicy {
+                default: Tier::Mid,
+                escalate: None,
+                stated: false,
+            },
+        };
         Ok(AgentSpec {
             name: raw.name,
             runtime: raw.runtime.parse()?,
             role: raw.role,
-            model_policy: ModelPolicy {
-                default: raw.model_policy.default.parse()?,
-                escalate,
-            },
+            model_policy,
             capabilities: raw.capabilities,
             sandbox: SandboxSpec {
                 tier: raw.sandbox.tier.parse()?,

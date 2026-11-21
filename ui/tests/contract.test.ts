@@ -81,6 +81,8 @@ const EVENT_KIND_KEYS = {
   approval_resolved: { kind: true, id: true, approved: true },
   agent_log: { kind: true, line: true },
   run_finished: { kind: true, summary: true },
+  child_spawned: { kind: true, child: true, agent: true, budget: true },
+  capabilities_dropped: { kind: true, tools: true, hosts: true, secrets: true, agents: true },
 } satisfies { [K in EventKind['kind']]: Record<keyof Variant<K>, true> };
 
 type ValueKind = 'string' | 'number' | 'string|null' | 'number|null' | 'status' | 'tier|null';
