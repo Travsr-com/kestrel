@@ -663,8 +663,11 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Scenario 7: a root of $1.00 carves $0.15 for each of 6 children that each try to spend $0.30.
-/// Each is suspended at its own $0.15, the tree stays within the root budget, and every cost is
-/// exact to the micro-dollar.
+/// Each is held to its own $0.15 plus at most one call and suspended, the tree stays within the
+/// root budget, and every cost is exact to the micro-dollar.
+///
+/// The overshoot is by design (architecture section 3.3, Budget): the gateway checks the limit
+/// before each call, so the call that crosses it goes through and the next one is refused.
 #[test]
 fn m2_s07_budget_carving_holds_each_child_to_its_share() {
     let env = Env::with_max(8);
@@ -676,8 +679,9 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
     let kids = env.wait_children(&root, 6);
     let share = 150_000;
     // The gateway refuses a call once the spend reaches the limit, so a child stops after the
-    // first call that crosses it.
+    // first call that crosses it: $0.15 plus less than one call (155160 = 24 calls).
     let at_share = (share + ONE_CALL_MICRO_USD - 1) / ONE_CALL_MICRO_USD * ONE_CALL_MICRO_USD;
+    assert!(at_share - share < ONE_CALL_MICRO_USD);
     let mut children_spent = 0;
     let mut calls = 0;
     for kid in &kids {
@@ -688,7 +692,7 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
         let spent = env.spent(&id);
         assert_eq!(
             spent, at_share,
-            "child {id} is held to its own $0.15 ({n} calls)"
+            "child {id} is held to its $0.15 plus at most one call ({n} calls)"
         );
         assert!(
             env.read_out(&id, "spend.out").contains("refused=yes"),
