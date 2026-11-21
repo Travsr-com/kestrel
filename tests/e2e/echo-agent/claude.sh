@@ -14,16 +14,24 @@
 #   mcp.txt      only when the input contains `mcp=1` (issue #42): the answers to an MCP
 #                `initialize`, `tools/list` and a `tools/call` of kestrel.join (as an event
 #                stream) at the gateway's /r/<token>/mcp
+#   spawn.txt    only when the input contains `spawn=1` (issue #43): the `--allowedTools` it was
+#                given, whether it could write to /kestrel, then the answers to a `tools/list` and a
+#                `tools/call` of kestrel.spawn (with wait) at the Kestrel server URL read from the
+#                `--mcp-config` file, the way a real runtime finds it
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
 set -u
 
 model="unknown"
+mcp_config=""
+allowed=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model="${2:-unknown}"; shift 2 ;;
-    --output-format | --permission-mode) shift 2 ;;
+    --mcp-config) mcp_config="${2:-}"; shift 2 ;;
+    --allowedTools) allowed="${2:-}"; shift 2 ;;
+    --output-format | --permission-mode | --append-system-prompt) shift 2 ;;
     --) shift; break ;;
     *) shift ;;
   esac
@@ -84,6 +92,26 @@ case "$input" in
       mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}'
       echo
     } > /workspace/mcp.txt 2>&1
+    ;;
+  *spawn=1*)
+    # The Kestrel server as a real runtime finds it: in the MCP config Kestrel mounted at /kestrel.
+    url=$(sed -n 's/.*"kestrel":{[^}]*"url":"\([^"]*\)".*/\1/p' "$mcp_config" 2> /dev/null)
+    call() { # $1 = request, $2 = seconds
+      curl -sS -f --max-time "$2" -H "content-type: application/json" \
+        -H "accept: application/json, text/event-stream" -d "$1" "$url"
+    }
+    {
+      echo "allowed=$allowed"
+      if touch /kestrel/agent-was-here 2> /dev/null; then echo "config_writable=yes"; else echo "config_writable=no"; fi
+      case "$url" in
+        */mcp) echo "url=ok" ;;
+        *) echo "url=missing" ;;
+      esac
+      call '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 30
+      echo
+      call '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kestrel.spawn","arguments":{"agent":"echo","input":"child task","budget_usd":"0.50","wait":true}}}' 150
+      echo
+    } > /workspace/spawn.txt 2>&1
     ;;
   *git=1*)
     # What a real coding agent does: configure an identity, look, write, add, commit. All of it
