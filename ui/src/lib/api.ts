@@ -2,9 +2,9 @@
 
 import type { ApiError, Approval, ApprovalStatus, Event, RunSummary, TreeNode } from './types';
 
-/** The server answered 401: no token, or a wrong one. */
+/** The server answered 401: no token, or a wrong one. `token` is the one the request carried. */
 export class Unauthorized extends Error {
-  constructor() {
+  constructor(readonly token: string | null) {
     super('token required');
     this.name = 'Unauthorized';
   }
@@ -38,8 +38,8 @@ export type Api = ReturnType<typeof createApi>;
 
 const seg = encodeURIComponent;
 
-async function failure(res: Response): Promise<Error> {
-  if (res.status === 401) return new Unauthorized();
+async function failure(res: Response, token: string | null): Promise<Error> {
+  if (res.status === 401) return new Unauthorized(token);
   try {
     const body = (await res.json()) as Partial<ApiError>;
     if (typeof body.error === 'string') return new ApiFailure(res.status, body.error);
@@ -50,7 +50,7 @@ async function failure(res: Response): Promise<Error> {
 }
 
 export function createApi({ fetch, getToken, baseUrl = '' }: ApiOptions) {
-  async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+  async function send(method: 'GET' | 'POST', path: string, body?: unknown): Promise<Response> {
     const headers: Record<string, string> = { accept: 'application/json' };
     const token = getToken();
     if (token !== null) headers.authorization = `Bearer ${token}`;
@@ -60,11 +60,18 @@ export function createApi({ fetch, getToken, baseUrl = '' }: ApiOptions) {
       init.body = JSON.stringify(body);
     }
     const res = await fetch(`${baseUrl}${path}`, init);
-    if (!res.ok) throw await failure(res);
-    return (await res.json()) as T;
+    if (!res.ok) throw await failure(res, token);
+    return res;
   }
 
-  const post = (path: string, body?: unknown) => call<unknown>('POST', path, body).then(() => undefined);
+  async function get<T>(path: string): Promise<T> {
+    return (await (await send('GET', path)).json()) as T;
+  }
+
+  /** Commands answer 202 or 204, usually with no body, so the body is not read. */
+  async function post(path: string, body?: unknown): Promise<void> {
+    await send('POST', path, body);
+  }
 
   return {
     listRuns(filter: RunFilter = {}): Promise<RunSummary[]> {
@@ -74,13 +81,12 @@ export function createApi({ fetch, getToken, baseUrl = '' }: ApiOptions) {
         if (value !== undefined) query.set(key, value);
       }
       const qs = query.toString();
-      return call('GET', `/api/runs${qs ? `?${qs}` : ''}`);
+      return get(`/api/runs${qs ? `?${qs}` : ''}`);
     },
-    getRun: (id: string): Promise<RunSummary> => call('GET', `/api/runs/${seg(id)}`),
-    tree: (id: string): Promise<TreeNode[]> => call('GET', `/api/runs/${seg(id)}/tree`),
-    events: (id: string, after: number): Promise<Event[]> =>
-      call('GET', `/api/runs/${seg(id)}/events?after=${after}`),
-    approvals: (status: ApprovalStatus): Promise<Approval[]> => call('GET', `/api/approvals?status=${status}`),
+    getRun: (id: string): Promise<RunSummary> => get(`/api/runs/${seg(id)}`),
+    tree: (id: string): Promise<TreeNode[]> => get(`/api/runs/${seg(id)}/tree`),
+    events: (id: string, after: number): Promise<Event[]> => get(`/api/runs/${seg(id)}/events?after=${after}`),
+    approvals: (status: ApprovalStatus): Promise<Approval[]> => get(`/api/approvals?status=${status}`),
     pause: (id: string) => post(`/api/runs/${seg(id)}/pause`),
     resume: (id: string) => post(`/api/runs/${seg(id)}/resume`),
     cancel: (id: string) => post(`/api/runs/${seg(id)}/cancel`),

@@ -5,10 +5,12 @@
 
 import { describe, expect, it } from 'vitest';
 import contract from './fixtures/contract.json';
+import { WS_CLOSE_UNAUTHORIZED, WS_PROTOCOL, WS_TOKEN_PREFIX } from '../src/lib/ws';
 import type {
   Approval,
   ApprovalStatus,
   Event,
+  EventKind,
   RunStatus,
   RunSummary,
   SandboxTier,
@@ -52,6 +54,65 @@ const SANDBOX_TIERS = { auto: true, gvisor: true, 'apple-container': true, 'dock
 >;
 const APPROVAL_STATUSES = { pending: true, approved: true, rejected: true } satisfies Record<ApprovalStatus, true>;
 const PLAIN_STATUSES = new Set(['Queued', 'Provisioning', 'Running', 'Completed', 'Cancelled']);
+
+type Variant<K extends EventKind['kind']> = Extract<EventKind, { kind: K }>;
+const EVENT_KIND_KEYS = {
+  run_created: { kind: true, agent: true, parent: true },
+  status_changed: { kind: true, from: true, to: true },
+  sandbox_provisioned: { kind: true, driver: true, sandbox_id: true },
+  agent_message: { kind: true, text: true },
+  tool_call: { kind: true, name: true, input: true },
+  tool_result: { kind: true, name: true, ok: true, output: true },
+  model_call: {
+    kind: true,
+    run_id: true,
+    provider: true,
+    model: true,
+    tokens_in: true,
+    tokens_out: true,
+    tokens_cache_read: true,
+    tokens_cache_write: true,
+    cost: true,
+    latency_ms: true,
+    status: true,
+  },
+  budget_warning: { kind: true, spent: true, limit: true },
+  approval_requested: { kind: true, id: true, action: true },
+  approval_resolved: { kind: true, id: true, approved: true },
+  agent_log: { kind: true, line: true },
+  run_finished: { kind: true, summary: true },
+} satisfies { [K in EventKind['kind']]: Record<keyof Variant<K>, true> };
+
+type ValueKind = 'string' | 'number' | 'string|null' | 'number|null' | 'status' | 'tier|null';
+const RUN_VALUE_KINDS = {
+  id: 'string',
+  agent: 'string',
+  status: 'status',
+  parent: 'string|null',
+  root: 'string',
+  depth: 'number',
+  spent: 'number',
+  limit: 'number|null',
+  sandbox_tier: 'tier|null',
+  created_at: 'string',
+} satisfies Record<keyof RunSummary, ValueKind>;
+
+function hasKind(v: unknown, kind: ValueKind): boolean {
+  switch (kind) {
+    case 'string':
+      return typeof v === 'string';
+    case 'number':
+      return Number.isInteger(v);
+    case 'string|null':
+      return v === null || typeof v === 'string';
+    case 'number|null':
+      return v === null || Number.isInteger(v);
+    case 'status':
+      return isRunStatus(v);
+    case 'tier|null':
+      return v === null || (typeof v === 'string' && v in SANDBOX_TIERS);
+  }
+}
 
 function keys(o: object): string[] {
   return Object.keys(o).sort();
@@ -104,6 +165,36 @@ describe('contract fixture', () => {
     expect(contract.frames.map((f) => f.type)).toEqual(['event', 'heartbeat']);
   });
 
+  it('every event kind has exactly the keys of its EventKind variant', () => {
+    const seen = new Set<string>();
+    for (const k of contract.event_kinds) {
+      const expected = EVENT_KIND_KEYS[k.kind as EventKind['kind']];
+      expect(expected, `unknown kind ${k.kind}`).toBeDefined();
+      // `parent` is the one optional field: Rust leaves it out of a root's `run_created`.
+      const required = Object.keys(expected).filter((key) => !(k.kind === 'run_created' && key === 'parent'));
+      expect(keys(k).filter((key) => !required.includes(key) && !(key in expected))).toEqual([]);
+      for (const key of required) expect(k).toHaveProperty(key);
+      seen.add(k.kind);
+    }
+    expect(seen.size).toBe(Object.keys(EVENT_KIND_KEYS).length);
+  });
+
+  it('run values have the types RunSummary declares', () => {
+    for (const run of contract.runs) {
+      for (const [key, kind] of Object.entries(RUN_VALUE_KINDS)) {
+        expect(hasKind((run as Record<string, unknown>)[key], kind), `${key} of ${run.id}`).toBe(true);
+      }
+    }
+  });
+
+  it('the socket conventions match the client', () => {
+    expect(contract.socket).toEqual({
+      protocol: WS_PROTOCOL,
+      token_prefix: WS_TOKEN_PREFIX,
+      close_unauthorized: WS_CLOSE_UNAUTHORIZED,
+    });
+  });
+
   it('rejects shapes outside the unions', () => {
     expect(isRunStatus('Paused')).toBe(false);
     expect(isRunStatus(null)).toBe(false);
@@ -149,6 +240,10 @@ describe('formatUsd', () => {
     expect(formatUsd(420_000)).toBe('$0.42');
     expect(formatUsd(2_000_000)).toBe('$2.00');
     expect(formatUsd(1_234_567)).toBe('$1.23');
+  });
+  it('puts the sign in front of a negative amount', () => {
+    expect(formatUsd(-1)).toBe('-$0.00');
+    expect(formatUsd(-1_234_567)).toBe('-$1.23');
   });
   it('shows "no limit" for a missing limit', () => {
     expect(formatUsd(null)).toBe('no limit');

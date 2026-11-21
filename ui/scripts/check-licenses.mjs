@@ -3,6 +3,7 @@
 // no network and no installed packages. Run with `npm run licenses`.
 
 import { readFileSync } from 'node:fs';
+import { satisfies } from './spdx.mjs';
 
 const ALLOW = new Set([
   'MIT',
@@ -17,24 +18,12 @@ const ALLOW = new Set([
   'Zlib',
 ]);
 
-/**
- * True when an SPDX expression is satisfied by the allow list (`OR`: any side, `AND`: both).
- * @param {string} expr
- * @returns {boolean}
- */
-function allowed(expr) {
-  const e = expr.trim().replace(/^\((.*)\)$/, '$1');
-  if (/ OR /.test(e)) return e.split(/ OR /).some(allowed);
-  if (/ AND /.test(e)) return e.split(/ AND /).every(allowed);
-  return ALLOW.has(e);
-}
-
 const lock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
 const bad = [];
 for (const [path, pkg] of Object.entries(lock.packages ?? {})) {
   if (path === '' || pkg.link) continue;
   const license = typeof pkg.license === 'string' ? pkg.license : null;
-  if (license === null || !allowed(license)) bad.push(`${path.replace(/^.*node_modules\//, '')}: ${license ?? 'no license'}`);
+  if (license === null || !satisfies(license, ALLOW)) bad.push(`${path.replace(/^.*node_modules\//, '')}: ${license ?? 'no license'}`);
 }
 
 if (bad.length > 0) {

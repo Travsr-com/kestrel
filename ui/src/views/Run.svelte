@@ -1,25 +1,26 @@
 <script lang="ts">
   import { ApiFailure, type Api } from '../lib/api';
   import { formatUsd, statusLabel } from '../lib/format';
-  import { failureText } from '../lib/load';
+  import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { href } from '../lib/router';
   import type { RunSummary } from '../lib/types';
 
-  let { id, api, onUnauthorized }: { id: string; api: Api; onUnauthorized: () => void } = $props();
+  let { id, api, onUnauthorized }: { id: string; api: Api; onUnauthorized: OnUnauthorized } = $props();
 
   let run: RunSummary | null = $state(null);
   let missing = $state(false);
   let error: string | null = $state(null);
 
-  $effect(() => {
-    api.getRun(id).then(
+  $effect(() =>
+    whileMounted(
+      () => api.getRun(id),
       (r) => (run = r),
-      (e: unknown) => {
+      (e) => {
         if (e instanceof ApiFailure && e.status === 404) missing = true;
         else error = failureText(e, onUnauthorized);
       },
-    );
-  });
+    ),
+  );
 </script>
 
 <h1>Run {id}</h1>

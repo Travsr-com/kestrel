@@ -91,9 +91,19 @@ describe('createApi', () => {
     expect(server.calls[2]?.path).toBe(`/api/approvals/${PENDING}/reject`);
   });
 
-  it('throws Unauthorized on 401', async () => {
+  it('throws Unauthorized on 401, naming the token the request carried', async () => {
     const { api } = client('wrong');
-    await expect(api.listRuns()).rejects.toBeInstanceOf(Unauthorized);
+    const err = await api.listRuns().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Unauthorized);
+    expect(err).toMatchObject({ token: 'wrong' });
+    const anonymous = await client(null).api.listRuns().catch((e: unknown) => e);
+    expect(anonymous).toMatchObject({ token: null });
+  });
+
+  it.each([202, 204])('accepts a command answered %i with an empty body', async (status) => {
+    const api = createApi({ fetch: async () => new Response(null, { status }), getToken: () => null });
+    await expect(api.cancel(ROOT)).resolves.toBeUndefined();
+    await expect(api.approve(PENDING, 'x')).resolves.toBeUndefined();
   });
 
   it('throws ApiFailure with the status and server message otherwise', async () => {

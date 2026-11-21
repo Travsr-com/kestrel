@@ -14,3 +14,11 @@ export function setToken(value: string): void {
 export function clearToken(): void {
   token = null;
 }
+
+/**
+ * True when `sent` is the token held now. A 401 for an older token (a request sent before the
+ * user entered a new one) says nothing about the current token, so the app ignores it.
+ */
+export function isCurrent(sent: string | null): boolean {
+  return sent === token;
+}

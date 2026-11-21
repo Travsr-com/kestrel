@@ -3,10 +3,11 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 const BUDGET_BYTES = 150 * 1024;
-const dist = new URL('../dist/', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 
 if (!existsSync(join(dist, 'index.html'))) {
   console.error('error: dist/index.html is missing, run `npm run build` first');

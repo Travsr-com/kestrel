@@ -56,7 +56,12 @@ jobs:
       - run: npm ci
       - name: Licenses on the allow list
         run: npm run licenses
-      - run: npm audit --omit=dev --audit-level=high
+      # Every UI package is a dev dependency (only the compiled bundle ships), so the first audit
+      # covers no packages today. The second one also checks the build and test toolchain.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit all dependencies
+        run: npm audit --audit-level=high
       - name: Lint (Svelte a11y warnings are errors)
         run: npm run lint
       - name: Type check
@@ -68,7 +73,8 @@ jobs:
         run: npm run size
       - name: CLAUDE.md states the UI coverage rule
         working-directory: .
-        run: grep -q "UI: " .claude/CLAUDE.md
+        run: |
+          grep -q 'UI: ' .claude/CLAUDE.md
 
   macos:
     name: test (macos)

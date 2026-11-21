@@ -1,20 +1,21 @@
 <script lang="ts">
   import type { Api } from '../lib/api';
-  import { failureText } from '../lib/load';
+  import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { href } from '../lib/router';
   import type { Approval } from '../lib/types';
 
-  let { api, onUnauthorized }: { api: Api; onUnauthorized: () => void } = $props();
+  let { api, onUnauthorized }: { api: Api; onUnauthorized: OnUnauthorized } = $props();
 
   let pending: Approval[] | null = $state(null);
   let error: string | null = $state(null);
 
-  $effect(() => {
-    api.approvals('pending').then(
+  $effect(() =>
+    whileMounted(
+      () => api.approvals('pending'),
       (list) => (pending = list),
-      (e: unknown) => (error = failureText(e, onUnauthorized)),
-    );
-  });
+      (e) => (error = failureText(e, onUnauthorized)),
+    ),
+  );
 </script>
 
 <h1>Approvals</h1>

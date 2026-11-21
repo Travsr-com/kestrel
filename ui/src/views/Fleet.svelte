@@ -1,21 +1,22 @@
 <script lang="ts">
   import type { Api } from '../lib/api';
   import { formatUsd, statusLabel } from '../lib/format';
-  import { failureText } from '../lib/load';
+  import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { href } from '../lib/router';
   import type { RunSummary } from '../lib/types';
 
-  let { api, onUnauthorized }: { api: Api; onUnauthorized: () => void } = $props();
+  let { api, onUnauthorized }: { api: Api; onUnauthorized: OnUnauthorized } = $props();
 
   let runs: RunSummary[] | null = $state(null);
   let error: string | null = $state(null);
 
-  $effect(() => {
-    api.listRuns().then(
+  $effect(() =>
+    whileMounted(
+      () => api.listRuns(),
       (list) => (runs = list),
-      (e: unknown) => (error = failureText(e, onUnauthorized)),
-    );
-  });
+      (e) => (error = failureText(e, onUnauthorized)),
+    ),
+  );
 </script>
 
 <h1>Fleet</h1>

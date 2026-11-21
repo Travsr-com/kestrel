@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createApi } from './lib/api';
   import { href, parseRoute, type Route } from './lib/router';
-  import { clearToken, getToken, setToken } from './lib/token';
+  import { clearToken, getToken, isCurrent, setToken } from './lib/token';
   import Approvals from './views/Approvals.svelte';
   import Fleet from './views/Fleet.svelte';
   import NotFound from './views/NotFound.svelte';
@@ -27,8 +27,10 @@
     return () => window.removeEventListener('hashchange', onHash);
   });
 
-  function onUnauthorized() {
-    refused = getToken() !== null;
+  function onUnauthorized(sent: string | null) {
+    // A 401 for a token that is no longer held (an answer that crossed a token change) is stale.
+    if (!isCurrent(sent)) return;
+    refused = sent !== null;
     clearToken();
     needsToken = true;
   }

@@ -98,10 +98,10 @@ describe('skip link', () => {
 });
 
 describe('failureText', () => {
-  it('sends a 401 to the handler and shows nothing', () => {
-    let called = 0;
-    expect(failureText(new Unauthorized(), () => (called += 1))).toBeNull();
-    expect(called).toBe(1);
+  it('sends a 401 to the handler with the token it carried, and shows nothing', () => {
+    const sent: (string | null)[] = [];
+    expect(failureText(new Unauthorized('t0k'), (token) => sent.push(token))).toBeNull();
+    expect(sent).toEqual(['t0k']);
   });
 
   it('shows the message of an Error, or the value itself', () => {

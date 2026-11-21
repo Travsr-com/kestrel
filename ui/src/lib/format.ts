@@ -19,9 +19,13 @@ export function isTerminal(status: RunStatus): boolean {
   return status === 'Completed' || status === 'Cancelled' || (typeof status === 'object' && 'Failed' in status);
 }
 
-/** Micro-dollars as dollars and cents, rounded down, e.g. `$0.42`. `null` means no limit. */
+/**
+ * Micro-dollars as dollars and cents, truncated toward zero, e.g. `$0.42` or `-$1.23`. `null`
+ * means no limit.
+ */
 export function formatUsd(micro: MicroUsd | null): string {
   if (micro === null) return 'no limit';
-  const cents = Math.floor(micro / 10_000);
-  return `$${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}`;
+  const cents = Math.floor(Math.abs(micro) / 10_000);
+  const sign = micro < 0 ? '-' : '';
+  return `${sign}$${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}`;
 }

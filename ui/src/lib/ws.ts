@@ -3,17 +3,23 @@
 // sees every event once, in order.
 //
 // Browsers cannot set headers on a WebSocket, so the token travels as a subprotocol:
-// `kestrel.v1` (which the server echoes) plus `kestrel.token.<token>`.
+// `kestrel.v1` (which the server echoes) plus `kestrel.token.<token>`. A close with code 4401 means
+// the token was refused: the stream stops in state `unauthorized` instead of retrying. These values
+// are `WS_PROTOCOL`, `WS_TOKEN_PREFIX` and `WS_CLOSE_UNAUTHORIZED` in `kestrel-types`.
 
 import type { Event, WsFrame } from './types';
 
-export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
+export const WS_PROTOCOL = 'kestrel.v1';
+export const WS_TOKEN_PREFIX = 'kestrel.token.';
+export const WS_CLOSE_UNAUTHORIZED = 4401;
+
+export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'unauthorized' | 'closed';
 
 /** The part of `WebSocket` this module uses, so tests can pass a fake. */
 export interface SocketLike {
   onopen: (() => void) | null;
   onmessage: ((ev: { data: unknown }) => void) | null;
-  onclose: (() => void) | null;
+  onclose: ((ev: { code: number }) => void) | null;
   close(): void;
 }
 
@@ -47,7 +53,7 @@ export const browserSocket: SocketFactory = (url, protocols) => {
   const socket: SocketLike = { onopen: null, onmessage: null, onclose: null, close: () => ws.close() };
   ws.onopen = () => socket.onopen?.();
   ws.onmessage = (ev) => socket.onmessage?.(ev);
-  ws.onclose = () => socket.onclose?.();
+  ws.onclose = (ev) => socket.onclose?.(ev);
   return socket;
 };
 
@@ -113,9 +119,18 @@ export function connectEvents(opts: EventStreamOptions): EventStream {
 
   function open() {
     const token = opts.getToken();
-    const protocols = token === null ? ['kestrel.v1'] : ['kestrel.v1', `kestrel.token.${token}`];
+    const protocols = token === null ? [WS_PROTOCOL] : [WS_PROTOCOL, `${WS_TOKEN_PREFIX}${token}`];
     state('connecting');
-    const s = factory(`${opts.base}${opts.path}?after=${cursor}`, protocols);
+    let s: SocketLike;
+    try {
+      s = factory(`${opts.base}${opts.path}?after=${cursor}`, protocols);
+    } catch {
+      // `new WebSocket` throws on a malformed URL or subprotocol (a token with a space, say).
+      // Try again later: the token is read afresh on each attempt.
+      socket = null;
+      drop();
+      return;
+    }
     socket = s;
     armIdle();
     s.onopen = () => {
@@ -129,22 +144,28 @@ export function connectEvents(opts: EventStreamOptions): EventStream {
       cursor = frame.cursor;
       opts.onEvent(frame.event, frame.cursor);
     };
-    s.onclose = () => drop();
+    s.onclose = (ev) => {
+      if (ev.code === WS_CLOSE_UNAUTHORIZED) stop('unauthorized');
+      else drop();
+    };
+  }
+
+  /** Ends the stream for good. */
+  function stop(final: 'closed' | 'unauthorized') {
+    if (stopped) return;
+    stopped = true;
+    if (retry !== null) clearTimeout(retry);
+    clearIdle();
+    if (socket) {
+      socket.onopen = socket.onmessage = socket.onclose = null;
+      socket.close();
+    }
+    state(final);
   }
 
   open();
 
   return {
-    close() {
-      if (stopped) return;
-      stopped = true;
-      if (retry !== null) clearTimeout(retry);
-      clearIdle();
-      if (socket) {
-        socket.onopen = socket.onmessage = socket.onclose = null;
-        socket.close();
-      }
-      state('closed');
-    },
+    close: () => stop('closed'),
   };
 }

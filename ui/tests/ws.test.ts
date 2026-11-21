@@ -4,12 +4,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import contract from './fixtures/contract.json';
 import type { Event, WsFrame } from '../src/lib/types';
-import { connectEvents, socketBase, type ConnectionState, type SocketLike } from '../src/lib/ws';
+import { WS_CLOSE_UNAUTHORIZED, connectEvents, socketBase, type ConnectionState, type SocketLike } from '../src/lib/ws';
 
 class FakeSocket implements SocketLike {
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((ev: { code: number }) => void) | null = null;
   closed = false;
   constructor(
     readonly url: string,
@@ -24,8 +24,8 @@ class FakeSocket implements SocketLike {
   frame(frame: WsFrame | string): void {
     this.onmessage?.({ data: typeof frame === 'string' ? frame : JSON.stringify(frame) });
   }
-  drop(): void {
-    this.onclose?.();
+  drop(code = 1006): void {
+    this.onclose?.({ code });
   }
 }
 
@@ -153,6 +153,49 @@ describe('connectEvents', () => {
     expect(states.filter((s) => s === 'closed')).toHaveLength(1);
   });
 
+  it('stops and reports when the server closes with the unauthorized code', () => {
+    connect();
+    last().open();
+    last().drop(WS_CLOSE_UNAUTHORIZED);
+    expect(states.at(-1)).toBe('unauthorized');
+    vi.advanceTimersByTime(60_000);
+    expect(sockets).toHaveLength(1);
+  });
+
+  it('reconnects after any other close code', () => {
+    connect();
+    last().open();
+    last().drop(1011);
+    expect(states.at(-1)).toBe('reconnecting');
+    vi.advanceTimersByTime(500);
+    expect(sockets).toHaveLength(2);
+  });
+
+  it('treats a socket that cannot be created as a drop, and tries again', () => {
+    let fail = true;
+    const created: string[] = [];
+    connectEvents({
+      base: 'ws://kestrel.test',
+      path: '/ws/runs/abc',
+      after: 0,
+      getToken: () => (fail ? 'has space' : 'ok'),
+      onEvent: () => {},
+      onState: (s) => states.push(s),
+      socketFactory: (url, protocols) => {
+        if (protocols.some((p) => p.includes(' '))) throw new SyntaxError('invalid subprotocol');
+        created.push(url);
+        return new FakeSocket(url, protocols);
+      },
+    });
+    expect(states).toEqual(['connecting', 'reconnecting']);
+    vi.advanceTimersByTime(500);
+    expect(states.at(-1)).toBe('reconnecting');
+    fail = false;
+    vi.advanceTimersByTime(1000);
+    expect(created).toEqual(['ws://kestrel.test/ws/runs/abc?after=0']);
+    expect(states.at(-1)).toBe('connecting');
+  });
+
   it('cancels a pending reconnect on close()', () => {
     const conn = connect();
     last().drop();
@@ -198,7 +241,7 @@ describe('browserSocket', () => {
     static last: StubWebSocket | null = null;
     onopen: (() => void) | null = null;
     onmessage: ((ev: { data: unknown }) => void) | null = null;
-    onclose: (() => void) | null = null;
+    onclose: ((ev: { code: number }) => void) | null = null;
     closed = false;
     constructor(
       readonly url: string,
@@ -233,8 +276,8 @@ describe('browserSocket', () => {
     ws.onmessage?.({ data: JSON.stringify(event(3)) });
     expect(states).toEqual(['connecting', 'open']);
     expect(seen).toEqual([3]);
-    ws.onclose?.();
-    expect(states.at(-1)).toBe('reconnecting');
+    ws.onclose?.({ code: WS_CLOSE_UNAUTHORIZED });
+    expect(states.at(-1)).toBe('unauthorized');
   });
 
   it('closes the real socket', () => {

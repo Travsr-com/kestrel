@@ -60,7 +60,8 @@ export function createMockServer(token: string | null = null): MockServer {
           const after = Number(url.searchParams.get('after') ?? '0');
           return json(200, contract.events.filter((e) => e.seq > after));
         }
-        if (method === 'POST') return json(202, {});
+        // #37 answers a command with 202 and no body.
+        if (method === 'POST') return new Response(null, { status: 202 });
       }
       if (method === 'GET' && parts[1] === 'approvals' && parts.length === 2) {
         const status = url.searchParams.get('status');
@@ -70,7 +71,7 @@ export function createMockServer(token: string | null = null): MockServer {
         const approval = contract.approvals.find((a) => a.id === parts[2]);
         if (!approval) return json(404, { error: 'approval not found' });
         if (approval.status !== 'pending') return json(409, { error: 'already resolved' });
-        return json(202, {});
+        return new Response(null, { status: 202 });
       }
       return json(404, { error: 'not found' });
     },
