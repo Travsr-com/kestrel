@@ -516,6 +516,22 @@ fn set_budget_on_a_child_is_refused_when_the_parent_cannot_cover_it() {
     assert_eq!(store.remaining(parent).unwrap(), usd(DOLLAR / 10));
 }
 
+// Lowering a run that already went over its limit leaves it where it is: lowering never takes
+// money from the parent.
+#[test]
+fn set_budget_lowering_a_run_that_overspent_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    let parent = root(&store, "2.00");
+    let child = spawn(&store, parent, Some(usd(DOLLAR / 2))).unwrap().id;
+    run(&store, child);
+    spend(&store, child, 55 * DOLLAR / 100);
+    assert_eq!(
+        store.set_budget(child, usd(DOLLAR / 10)).unwrap(),
+        usd(DOLLAR / 2)
+    );
+    assert_eq!(store.remaining(parent).unwrap(), usd(3 * DOLLAR / 2));
+}
+
 #[test]
 fn set_budget_lowering_a_child_gives_back_down_to_what_it_spent() {
     let store = Store::open_in_memory().unwrap();
@@ -638,12 +654,14 @@ proptest! {
         let mut all = vec![root_id];
         let mut live = vec![root_id];
         let mut budget = 2 * DOLLAR;
+        let mut parents: std::collections::HashMap<RunId, RunId> = Default::default();
         let mut over: std::collections::HashMap<RunId, i64> = Default::default();
         for op in ops {
             match op {
                 Op::Spawn(i, f) => {
                     let parent = live[i % live.len()];
                     if let Ok(child) = spawn(&store, parent, ask(&store, parent, f)) {
+                        parents.insert(child.id, parent);
                         run(&store, child.id);
                         all.push(child.id);
                         live.push(child.id);
@@ -652,6 +670,7 @@ proptest! {
                 Op::SpawnAndCancel(i, f) => {
                     let parent = live[i % live.len()];
                     if let Ok(child) = spawn(&store, parent, ask(&store, parent, f)) {
+                        parents.insert(child.id, parent);
                         all.push(child.id);
                         store
                             .transition(child.id, &RunStatus::Queued, RunStatus::Cancelled)
@@ -679,11 +698,28 @@ proptest! {
                 Op::SetBudget(i, f) => {
                     let r = all[i % all.len()];
                     let before = store.limit(r).unwrap().0;
+                    let parent = parents.get(&r).copied();
+                    let theirs = parent.map(|p| store.limit(p).unwrap().0);
                     let asked = usd(2 * DOLLAR * i64::from(f) / 1000);
-                    if let Ok(set) = store.set_budget(r, asked)
-                        && r == root_id
-                    {
-                        budget += set.0 - before;
+                    match store.set_budget(r, asked) {
+                        Ok(set) if r == root_id => budget += set.0 - before,
+                        Ok(set) => {
+                            // A raise comes out of the parent, exactly.
+                            if set.0 > before {
+                                let now = store.limit(parent.unwrap()).unwrap().0;
+                                prop_assert_eq!(now, theirs.unwrap() - (set.0 - before));
+                            }
+                            // Never more than asked when lowering.
+                            if asked.0 < before {
+                                prop_assert!(set.0 <= before);
+                            }
+                        }
+                        Err(StoreError::ParentBudget { .. }) => {
+                            prop_assert!(parent.is_some());
+                            prop_assert_eq!(store.limit(r).unwrap().0, before);
+                            prop_assert_eq!(parent.map(|p| store.limit(p).unwrap().0), theirs);
+                        }
+                        Err(other) => prop_assert!(false, "unexpected {other:?}"),
                     }
                 }
             }

@@ -336,7 +336,14 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = read_limit(&tx, id)?;
-        let new = limit.max(spent_in(&tx, id)?);
+        let spent = spent_in(&tx, id)?;
+        // Not below what it spent; and lowering a run that already went past its limit leaves it
+        // where it is, so a lowering never takes money from the parent.
+        let new = if limit >= old {
+            limit.max(spent)
+        } else {
+            limit.max(spent.min(old))
+        };
         if let Some(parent) = parent_of(&tx, id)? {
             if new > old {
                 let asked = MicroUsd(new.0 - old.0);
