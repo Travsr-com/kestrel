@@ -754,12 +754,21 @@ impl Store {
 
     /// Events of `run` with `seq > after_seq`, in `seq` order.
     pub fn events_since(&self, run: RunId, after_seq: u64) -> Result<Vec<Event>> {
+        self.events_page(run, after_seq, usize::MAX)
+    }
+
+    /// Like [`Store::events_since`], at most `limit` events.
+    pub fn events_page(&self, run: RunId, after_seq: u64, limit: usize) -> Result<Vec<Event>> {
         let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT body FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq")?;
+        let mut stmt = conn.prepare(
+            "SELECT body FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
         let bodies = stmt
-            .query_map(params![run.to_string(), after], |r| r.get::<_, String>(0))?
+            .query_map(params![run.to_string(), after, limit], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         bodies
             .iter()
@@ -773,15 +782,26 @@ impl Store {
     /// rowid only grows. `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
     /// id of a run that is not a root, reads nothing.
     pub fn events_since_global(&self, root: RunId, after_cursor: u64) -> Result<Vec<(u64, Event)>> {
+        self.events_since_global_page(root, after_cursor, usize::MAX)
+    }
+
+    /// Like [`Store::events_since_global`], at most `limit` events.
+    pub fn events_since_global_page(
+        &self,
+        root: RunId,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Event)>> {
         let after = i64::try_from(after_cursor).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT rowid, body FROM events
              WHERE rowid > ?2 AND run_id IN (SELECT id FROM runs WHERE root_run_id = ?1)
-             ORDER BY rowid",
+             ORDER BY rowid LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![root.to_string(), after], |r| {
+            .query_map(params![root.to_string(), after, limit], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
