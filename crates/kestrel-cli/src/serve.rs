@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kestrel_core::{
-    AdapterFactory, Engine, Limits, ModelMap, ShutdownReport, Workspaces, default_models,
+    AdapterFactory, Engine, IndexLimits, Limits, ModelMap, ShutdownReport, Workspaces,
+    default_models,
 };
 use kestrel_gateway::{
     BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
@@ -28,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::commands::say;
+use crate::travsr::{EngineTravsr, TravsrProcesses, TravsrSettings};
 use crate::{Failure, Output, ServeArgs, UpArgs, db_path, open, paths};
 
 /// The config file, as written. The raw structs have no `Debug`, so a key can never be printed
@@ -48,6 +50,18 @@ struct RawConfig {
     models: BTreeMap<String, String>,
     #[serde(default)]
     prices: BTreeMap<String, RawPrice>,
+    /// Present (even empty): Travsr is on, see `docs/travsr.md`.
+    travsr: Option<RawTravsr>,
+}
+
+/// `[travsr]`. Every value is kept raw so a wrong type is reported against the key, never echoed.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTravsr {
+    command: Option<toml::Value>,
+    index_timeout: Option<toml::Value>,
+    call_timeout: Option<toml::Value>,
+    max_indexing: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -128,6 +142,8 @@ struct Config {
     /// `engine.agents_dir`: where `kestrel.spawn` finds agent specs by name. `None` means the
     /// default, `agents` next to the database.
     agents_dir: Option<PathBuf>,
+    /// `[travsr]`: `None` without the section, so Travsr is off.
+    travsr: Option<TravsrSettings>,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -212,7 +228,9 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .allowed_roots
         .map(allowed_roots_setting)
         .transpose()?;
+    let travsr = raw.travsr.map(travsr_settings).transpose()?;
     Ok(Config {
+        travsr,
         listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
         port,
@@ -249,6 +267,56 @@ fn shutdown_grace_secs(value: toml::Value) -> Result<Duration, Failure> {
         .ok_or_else(|| {
             Failure::usage("engine.shutdown_grace_secs must be a whole number from 1 to 3600")
         })
+}
+
+/// `[travsr]`: each key optional, see [`TravsrSettings::default`]. A bad value is a usage error
+/// naming the key and never echoing the value.
+fn travsr_settings(raw: RawTravsr) -> Result<TravsrSettings, Failure> {
+    let defaults = TravsrSettings::default();
+    let whole = |value: Option<toml::Value>, max: u64, default: u64, message: &str| {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        value
+            .as_integer()
+            .and_then(|n| u64::try_from(n).ok())
+            .filter(|n| (1..=max).contains(n))
+            .ok_or_else(|| Failure::usage(message))
+    };
+    let command = match raw.command {
+        None => defaults.command,
+        Some(value) => value
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                Failure::usage("travsr.command must be a non-empty path or command name")
+            })?,
+    };
+    let index_timeout = whole(
+        raw.index_timeout,
+        86_400,
+        defaults.index_timeout.as_secs(),
+        "travsr.index_timeout must be a whole number of seconds from 1 to 86400",
+    )?;
+    let call_timeout = whole(
+        raw.call_timeout,
+        3_600,
+        defaults.call_timeout.as_secs(),
+        "travsr.call_timeout must be a whole number of seconds from 1 to 3600",
+    )?;
+    let max_indexing = whole(
+        raw.max_indexing,
+        64,
+        defaults.max_indexing as u64,
+        "travsr.max_indexing must be a whole number from 1 to 64",
+    )?;
+    Ok(TravsrSettings {
+        command,
+        index_timeout: Duration::from_secs(index_timeout),
+        call_timeout: Duration::from_secs(call_timeout),
+        max_indexing: usize::try_from(max_indexing).unwrap_or(1),
+    })
 }
 
 /// `engine.agents_dir`: an absolute path string. Anything else is a usage error that names the key
@@ -513,6 +581,11 @@ const CONFIG_NAMES: &[&str] = &[
     "output_per_mtok",
     "cache_read_per_mtok",
     "cache_write_per_mtok",
+    "travsr",
+    "command",
+    "index_timeout",
+    "call_timeout",
+    "max_indexing",
 ];
 
 /// A TOML error as `<path>:<line>:<column>: <message>`. Never quotes the source line, which may
@@ -1212,6 +1285,21 @@ async fn start_engine(
     .with_root_key(root_key)
     // Each run's MCP config and the like, mounted read-only at /kestrel in its sandbox.
     .with_run_config(data_dir.join("run-config"));
+    // Travsr, when configured: one process client indexes clones and answers the gateway.
+    let travsr = config
+        .travsr
+        .map(|t| (Arc::new(TravsrProcesses::new(t.command.clone())), t));
+    let engine = match &travsr {
+        Some((processes, t)) => engine.with_indexer(
+            processes.clone(),
+            IndexLimits {
+                timeout: t.index_timeout,
+                max_jobs: t.max_indexing,
+                ..IndexLimits::default()
+            },
+        ),
+        None => engine,
+    };
     let engine = Arc::new(match subnets {
         Some(pool) => engine.with_subnets(pool),
         None => engine,
@@ -1236,7 +1324,13 @@ async fn start_engine(
                 engine: engine.clone(),
                 agents,
             }),
-            travsr: None,
+            travsr: travsr.map(|(processes, t)| {
+                Arc::new(EngineTravsr {
+                    engine: engine.clone(),
+                    processes,
+                    call_timeout: t.call_timeout,
+                }) as Arc<dyn kestrel_gateway::TravsrHost>
+            }),
         },
     );
     let gateway =
@@ -1791,6 +1885,63 @@ budget: { usd: 0.000010, wall_clock: 10m }
         assert!(
             typo.contains("`***`") && typo.contains("`gateway`"),
             "{typo}"
+        );
+    }
+
+    #[test]
+    fn s11_without_a_travsr_section_travsr_is_off() {
+        let (_dir, path) = write(ANTHROPIC);
+        assert_eq!(load_config(&path).expect("config").travsr, None);
+    }
+
+    #[test]
+    fn an_empty_travsr_section_turns_it_on_with_the_defaults() {
+        let (_dir, path) = write(&format!("{ANTHROPIC}[travsr]\n"));
+        let c = load_config(&path).expect("config");
+        assert_eq!(c.travsr, Some(crate::travsr::TravsrSettings::default()));
+    }
+
+    #[test]
+    fn every_travsr_setting_is_read() {
+        let (_dir, path) = write(&format!(
+            "{ANTHROPIC}[travsr]\ncommand = \"/opt/travsr/bin/travsr\"\n\
+             index_timeout = 600\ncall_timeout = 5\nmax_indexing = 4\n"
+        ));
+        let t = load_config(&path).expect("config").travsr.expect("on");
+        assert_eq!(t.command, PathBuf::from("/opt/travsr/bin/travsr"));
+        assert_eq!(t.index_timeout, Duration::from_secs(600));
+        assert_eq!(t.call_timeout, Duration::from_secs(5));
+        assert_eq!(t.max_indexing, 4);
+    }
+
+    #[test]
+    fn bad_travsr_settings_name_their_key_and_never_echo_the_value() {
+        for (line, key) in [
+            ("command = \"\"", "travsr.command"),
+            ("command = 7", "travsr.command"),
+            ("index_timeout = 0", "travsr.index_timeout"),
+            ("index_timeout = \"5m\"", "travsr.index_timeout"),
+            ("index_timeout = 86401", "travsr.index_timeout"),
+            ("call_timeout = -1", "travsr.call_timeout"),
+            ("call_timeout = 3601", "travsr.call_timeout"),
+            ("max_indexing = 0", "travsr.max_indexing"),
+            ("max_indexing = 65", "travsr.max_indexing"),
+            ("max_indexing = 2.5", "travsr.max_indexing"),
+        ] {
+            let msg = err(&format!("{ANTHROPIC}[travsr]\n{line}\n"));
+            assert!(msg.contains(key), "{line}: {msg}");
+            assert!(
+                !msg.contains("5m") && !msg.contains("86401"),
+                "{line}: {msg}"
+            );
+        }
+        // An unknown key (the issue's `url`, say) is refused, listing the known ones.
+        let msg = err(&format!(
+            "{ANTHROPIC}[travsr]\nurl = \"http://127.0.0.1:7777\"\n"
+        ));
+        assert!(
+            msg.contains("`command`") && msg.contains("`max_indexing`") && !msg.contains("7777"),
+            "{msg}"
         );
     }
 
