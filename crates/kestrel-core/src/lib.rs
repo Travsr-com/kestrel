@@ -431,6 +431,29 @@ fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether `dir` (with metadata `meta`) belongs to this process's user. A file made in it is
+/// owned by that user, which is how the user id is learnt without `unsafe`; the file is removed
+/// again. A directory this user cannot write to is an error. Always true off unix.
+#[cfg(unix)]
+fn owned_by_us(dir: &std::path::Path, meta: &std::fs::Metadata) -> std::io::Result<bool> {
+    use std::hash::BuildHasher;
+    use std::os::unix::fs::MetadataExt;
+    let nonce = std::collections::hash_map::RandomState::new().hash_one(std::process::id());
+    let probe = dir.join(format!(".owner-{nonce:016x}"));
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    let ours = made.metadata().map(|m| m.uid());
+    let _ = std::fs::remove_file(&probe);
+    Ok(ours? == meta.uid())
+}
+
+#[cfg(not(unix))]
+fn owned_by_us(_dir: &std::path::Path, _meta: &std::fs::Metadata) -> std::io::Result<bool> {
+    Ok(true)
+}
+
 /// A run config root of this engine only: a temp directory with a random name, so no other user
 /// can make it first.
 fn default_run_config_root() -> PathBuf {
@@ -652,8 +675,8 @@ impl Engine {
     /// `root`, as `{root}/{run id}`, mounted read-only at `/kestrel` in the sandbox and removed
     /// when the run's sandbox goes. `root` is made its owner's only, so no other host user reaches
     /// a run's token; a run's directory is readable by any user, so the sandbox can read it
-    /// whichever user its image runs as. A `root` that is a link, or not a directory, fails the
-    /// run. Without this, a temp directory with a random name, of this engine only: it is left
+    /// whichever user its image runs as. A `root` that is a link, not a directory, or owned by
+    /// another user fails the run. Without this, a temp directory with a random name, of this engine only: it is left
     /// behind when the engine goes, and a later engine's [`Engine::recover`] cannot find what a
     /// killed one left in it, so set a fixed root (as `kestrel serve` does) for anything long-lived.
     pub fn with_run_config(mut self, root: PathBuf) -> Engine {
@@ -1015,7 +1038,11 @@ impl Engine {
         while let Ok(Some((run, done))) = timeout_at(deadline, pending.next()).await {
             left.retain(|r| *r != run);
             match done {
-                Ok(()) => report.destroyed.push(run),
+                Ok(()) => {
+                    // The run stays resumable; recovery writes its config afresh.
+                    inner.remove_run_config(run);
+                    report.destroyed.push(run);
+                }
                 Err(e) => report.failed.push((run, e.to_string())),
             }
         }
@@ -1911,6 +1938,13 @@ impl Inner {
         if !root.is_dir() {
             return Err(EngineError::RunConfig(format!(
                 "{}: not a directory (a link is refused)",
+                self.run_config.display()
+            )));
+        }
+        // Someone else's directory would stay theirs to open again, whatever mode is set here.
+        if !owned_by_us(&self.run_config, &root).map_err(failed)? {
+            return Err(EngineError::RunConfig(format!(
+                "{}: owned by another user",
                 self.run_config.display()
             )));
         }

@@ -213,3 +213,47 @@ async fn a_root_that_is_a_link_fails_the_run() {
     assert!(h.is_failed(id).unwrap_or_default().contains("link"));
     assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
 }
+
+// Shutdown destroys the sandboxes of the runs still going, and their config goes with them: a
+// token left on disk would stay valid until the next recovery.
+#[tokio::test(start_paused = true)]
+async fn shutdown_removes_the_config_of_the_sandboxes_it_destroys() {
+    let root = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(4);
+    let path = root.path().to_path_buf();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let dir = root.path().join(id.to_string());
+    assert!(dir.exists());
+    let report = h.engine.shutdown(std::time::Duration::from_secs(5)).await;
+    assert_eq!(report.destroyed, [id]);
+    assert!(!dir.exists());
+}
+
+// A root that is already there with looser modes is made private before anything is written.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn an_existing_root_is_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let holder = tempfile::tempdir().unwrap();
+    let root = holder.path().join("run-config");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut h = Harness::new(4);
+    let path = root.clone();
+    h.rebuild(|e| e.with_run_config(path));
+    h.adapters.set_files(vec![mcp_file()]);
+    let s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &RunStatus::Running)).await;
+    let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    s.line("ok:done");
+    s.exit(0);
+    until("completed", || h.is(id, &RunStatus::Completed)).await;
+}
