@@ -4,6 +4,8 @@ Research.md
 
 /target
 node_modules/
+/ui/dist/
+/ui/coverage/
 *.profraw
 lcov.info
 .env
