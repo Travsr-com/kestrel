@@ -7,10 +7,12 @@
   import NotFound from './views/NotFound.svelte';
   import Run from './views/Run.svelte';
   import TokenRequired from './views/TokenRequired.svelte';
+  import type { SocketFactory } from './lib/ws';
 
   let {
     fetch: fetchImpl = (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
-  }: { fetch?: typeof fetch } = $props();
+    sockets,
+  }: { fetch?: typeof fetch; sockets?: SocketFactory } = $props();
 
   const api = $derived(createApi({ fetch: fetchImpl, getToken }));
 
@@ -73,13 +75,12 @@
   {:else}
     {#key attempt}
       {#if route.name === 'fleet'}
-        <Fleet {api} {onUnauthorized} />
+        <Fleet {api} {onUnauthorized} {sockets} />
       {:else if route.name === 'approvals'}
         <Approvals {api} {onUnauthorized} />
       {:else if route.name === 'run'}
-        {#key route.id}
-          <Run id={route.id} {api} {onUnauthorized} />
-        {/key}
+        <!-- Not keyed by id: moving between runs of one tree keeps the tree as it is. -->
+        <Run id={route.id} {api} {onUnauthorized} {sockets} />
       {:else}
         <NotFound />
       {/if}

@@ -64,12 +64,27 @@ export class FleetState {
     this.runs = next;
   }
 
+  /** Adds a run the server answered for, unless it is known already. */
+  add(summary: RunSummary): void {
+    if (this.runs[summary.id]) return;
+    this.runs[summary.id] = {
+      ...summary,
+      endedAt: isTerminal(summary.status) ? 0 : null,
+      finishedAt: null,
+      reported: summary.spent,
+      counted: 0,
+      provisional: false,
+      fetched: true,
+    };
+  }
+
   /**
    * Takes what a fetch says about a known run: its limit (a spawn lowers a parent's, a child's end
    * raises it), tier, start time and a cost that is never lower than what is shown. The status is
-   * taken only for a run known from its creation event alone: for any other, the events are newer.
+   * taken only for a run known from its creation event alone (for any other, the events are newer),
+   * or when `takeStatus` says the answer is newer (a command was just refused).
    */
-  update(summary: RunSummary, now: number): void {
+  update(summary: RunSummary, now: number, takeStatus = false): void {
     const run = this.runs[summary.id];
     if (!run) return;
     run.fetched = true;
@@ -78,10 +93,10 @@ export class FleetState {
     run.created_at = summary.created_at;
     run.reported = Math.max(run.reported, summary.spent);
     run.spent = Math.max(run.reported, run.counted);
-    if (run.provisional) {
+    if (run.provisional || takeStatus) {
       run.provisional = false;
       run.status = summary.status;
-      if (isTerminal(summary.status)) run.endedAt = now;
+      if (isTerminal(summary.status) && run.endedAt === null) run.endedAt = now;
     }
   }
 
@@ -95,26 +110,7 @@ export class FleetState {
     switch (kind.kind) {
       case 'run_created':
         if (!run) {
-          const parent = kind.parent ?? null;
-          const above = parent === null ? undefined : this.runs[parent];
-          this.runs[event.run_id] = {
-            id: event.run_id,
-            agent: kind.agent,
-            status: 'Queued',
-            parent,
-            root,
-            depth: above ? above.depth + 1 : parent === null ? 0 : 1,
-            spent: 0,
-            limit: null,
-            sandbox_tier: null,
-            created_at: event.ts,
-            endedAt: null,
-            finishedAt: null,
-            reported: 0,
-            counted: 0,
-            provisional: true,
-            fetched: false,
-          };
+          this.seen(event.run_id, kind.agent, kind.parent ?? null, null, event.ts, root);
           refresh(event.run_id);
         }
         break;
@@ -144,12 +140,40 @@ export class FleetState {
         if (run) run.limit = kind.limit;
         break;
       case 'child_spawned':
-        // The parent's limit went down by the child's budget.
+        // The child shows at once, with the budget it was given; its own events and a fetch fill in
+        // the rest. The parent's limit went down by that budget.
+        if (!this.runs[kind.child]) {
+          this.seen(kind.child, kind.agent, event.run_id, kind.budget, event.ts, root);
+          refresh(kind.child);
+        }
         refresh(event.run_id);
         break;
       default:
         break;
     }
+  }
+
+  /** Adds a run first seen through an event. */
+  private seen(id: RunId, agent: string, parent: RunId | null, limit: MicroUsd | null, ts: string, root: RunId): void {
+    const above = parent === null ? undefined : this.runs[parent];
+    this.runs[id] = {
+      id,
+      agent,
+      status: 'Queued',
+      parent,
+      root,
+      depth: above ? above.depth + 1 : parent === null ? 0 : 1,
+      spent: 0,
+      limit,
+      sandbox_tier: null,
+      created_at: ts,
+      endedAt: null,
+      finishedAt: null,
+      reported: 0,
+      counted: 0,
+      provisional: true,
+      fetched: false,
+    };
   }
 
   /** Direct children of each run, and how many of them run. */

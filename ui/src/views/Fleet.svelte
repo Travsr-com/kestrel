@@ -14,6 +14,7 @@
     type SocketFactory,
   } from '../lib/ws';
   import { untrack } from 'svelte';
+  import { Refresher } from '../lib/refresher';
   import RunCard from './RunCard.svelte';
 
   let {
@@ -33,9 +34,6 @@
   /** How long a run that ended stays in the active view after it was seen to end. */
   const LINGER_MS = 5_000;
   const STATUSES = ['queued', 'provisioning', 'running', 'suspended', 'completed', 'failed', 'cancelled'];
-  /** How long before a failed fetch of a new run is tried again, doubling up to MAX_RETRY_MS. */
-  const RETRY_MS = 5_000;
-  const MAX_RETRY_MS = 60_000;
   /** Open tree sockets at most: each one is polled by the server. */
   const MAX_SOCKETS = 50;
 
@@ -64,17 +62,8 @@
   // Bookkeeping only, never rendered: reactive ones would re-run the effects that fill them.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const streams = new Map<RunId, EventStream>();
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const asking = new Set<RunId>();
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const askAgain = new Set<RunId>();
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const retryTimers = new Map<RunId, ReturnType<typeof setTimeout>>();
-  /** The next wait before retrying a run's fetch; gone once a fetch succeeds. */
-  const retryDelay: Record<RunId, number> = {};
   /** Trees whose socket is down and whose root was fetched once for this outage. */
   const outage: Record<RunId, true> = {};
-  let mounted = true;
 
   $effect(() => {
     // Read so that Retry, which bumps it, loads again.
@@ -106,50 +95,14 @@
     return () => clearTimeout(timer);
   });
 
-  /**
-   * Fetches a run's limit, tier and cost. One request per run at a time: whatever asks while one is
-   * out gets a single request after it, so a replay of many spawns costs two requests, and answers
-   * never arrive out of order. While a retry waits, asks wait with it.
-   */
-  function refresh(id: RunId) {
-    if (retryTimers.has(id)) return;
-    if (asking.has(id)) {
-      askAgain.add(id);
-      return;
-    }
-    asking.add(id);
-    api
-      .getRun(id)
-      .then(
-        (summary) => {
-          delete retryDelay[id];
-          if (mounted) fleet.update(summary, Date.now());
-        },
-        (e: unknown) => {
-          if (!mounted) return;
-          failureText(e, onUnauthorized);
-          // A run the server has not answered for yet still needs its limit: try again, backing off.
-          if (!(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false) retry(id);
-          else delete retryDelay[id];
-        },
-      )
-      .finally(() => {
-        asking.delete(id);
-        if (askAgain.delete(id) && mounted) refresh(id);
-      });
-  }
-
-  function retry(id: RunId) {
-    const wait = retryDelay[id] ?? RETRY_MS;
-    retryDelay[id] = Math.min(wait * 2, MAX_RETRY_MS);
-    retryTimers.set(
-      id,
-      setTimeout(() => {
-        retryTimers.delete(id);
-        refresh(id);
-      }, wait),
-    );
-  }
+  // A run the server has not answered for yet still needs its limit: its failed fetch is retried.
+  const refresher = new Refresher({
+    fetch: (id) => api.getRun(id),
+    answered: (summary) => fleet.update(summary, Date.now()),
+    failed: (e) => failureText(e, onUnauthorized),
+    retry: (id, e) => !(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false,
+  });
+  const refresh = (id: RunId) => refresher.refresh(id);
 
   function follow(root: RunId) {
     streams.set(
@@ -185,9 +138,7 @@
   }
 
   $effect(() => () => {
-    mounted = false;
-    for (const timer of retryTimers.values()) clearTimeout(timer);
-    retryTimers.clear();
+    refresher.stop();
     for (const root of [...streams.keys()]) unfollow(root);
   });
 
