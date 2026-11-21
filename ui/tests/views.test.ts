@@ -49,31 +49,31 @@ describe('server errors', () => {
 describe('Run view', () => {
   it('shows the run and links to its parent', async () => {
     show(`#/runs/${CHILD}`, createMockServer().fetch);
-    expect(await screen.findByText('fixer')).toBeInTheDocument();
-    expect(screen.getByText('Suspended: waiting for approval')).toBeInTheDocument();
-    expect(screen.getByText('$0.125 of $0.50')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: ROOT })).toHaveAttribute('href', `#/runs/${ROOT}`);
+    expect(await screen.findByRole('heading', { level: 1, name: 'fixer' })).toBeInTheDocument();
+    expect(screen.getAllByText('Suspended: waiting for approval').length).toBeGreaterThan(0);
+    expect(screen.getByText('$0.125 of $0.50, $0.00 carved to children')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Parent: planner' })).toHaveAttribute('href', `#/runs/${ROOT}`);
   });
 
   it('has no parent link for a root', async () => {
     show(`#/runs/${ROOT}`, createMockServer().fetch);
-    await screen.findByText('planner');
-    expect(screen.queryByText('Parent')).not.toBeInTheDocument();
+    await screen.findByRole('heading', { level: 1, name: 'planner' });
+    expect(screen.queryByText(/^Parent/)).not.toBeInTheDocument();
   });
 
   it('says when no run has the id, with a way back', async () => {
     show('#/runs/missing', createMockServer().fetch);
-    expect(await screen.findByText(/No run has this id/)).toBeInTheDocument();
+    expect(await screen.findByText('Run not found.')).toBeInTheDocument();
     const main = screen.getByRole('main');
     expect(Array.from(main.querySelectorAll('a')).map((a) => a.getAttribute('href'))).toEqual(['#/fleet']);
   });
 
   it('loads the new run when the id in the hash changes', async () => {
     show(`#/runs/${ROOT}`, createMockServer().fetch);
-    await screen.findByText('planner');
+    await screen.findByRole('heading', { level: 1, name: 'planner' });
     window.location.hash = `#/runs/${CHILD}`;
     window.dispatchEvent(new HashChangeEvent('hashchange'));
-    expect(await screen.findByText('fixer')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { level: 1, name: 'fixer' })).toBeInTheDocument();
   });
 });
 

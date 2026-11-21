@@ -1,0 +1,591 @@
+// Issue #40: the Run view. Component tests against a fake API and fake sockets.
+
+import { fireEvent, render, screen, within } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import App from '../src/App.svelte';
+import Run from '../src/views/Run.svelte';
+import { createApi } from '../src/lib/api';
+import { allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
+import type { Event, RunStatus, RunSummary } from '../src/lib/types';
+import { fakeSockets, type FakeSocket } from './fake-socket';
+import { ids, seriousViolations } from './axe';
+
+const NOW = Date.parse('2026-11-21T10:00:00Z');
+
+let n = 0;
+function run(over: Partial<RunSummary> = {}): RunSummary {
+  n += 1;
+  const id = over.id ?? `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  return {
+    id,
+    agent: 'worker',
+    status: 'Running',
+    parent: null,
+    root: id,
+    depth: 0,
+    spent: 0,
+    limit: 2_000_000,
+    sandbox_tier: 'gvisor',
+    created_at: new Date(NOW - 60_000).toISOString(),
+    ...over,
+  };
+}
+
+interface Call {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+/** A fake API: runs by id, the list filtered by root, and commands answering `command`. */
+function serve(runs: RunSummary[], command: { status: number; error?: string } = { status: 202 }) {
+  const calls: Call[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), 'http://kestrel.test');
+    const method = init?.method ?? 'GET';
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+    calls.push({ method, path: url.pathname, body });
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (method === 'GET' && url.pathname === '/api/runs') {
+      const root = url.searchParams.get('root');
+      return new Response(JSON.stringify(runs.filter((r) => root === null || r.root === root)));
+    }
+    const one = runs.find((r) => r.id === parts[2]);
+    if (!one) return new Response(JSON.stringify({ error: 'run not found' }), { status: 404 });
+    if (method === 'GET') return new Response(JSON.stringify(one));
+    if (command.status === 202) return new Response(null, { status: 202 });
+    return new Response(JSON.stringify({ error: command.error ?? 'no' }), { status: command.status });
+  };
+  return { api: createApi({ fetch, getToken: () => null }), calls };
+}
+
+function show(id: string, runs: RunSummary[], command?: { status: number; error?: string }) {
+  const { api, calls } = serve(runs, command);
+  const sockets = fakeSockets();
+  const result = render(Run, { id, api, onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+  return { ...result, sockets, calls };
+}
+
+function event(runId: string, seq: number, kind: Event['kind']): Event {
+  return { run_id: runId, seq, ts: new Date(NOW).toISOString(), kind };
+}
+
+/** The socket that follows one run's stream. */
+function stream(sockets: ReturnType<typeof fakeSockets>, id: string): FakeSocket {
+  const found = sockets.made.filter((s) => s.url.includes(`/ws/runs/${id}`)).at(-1);
+  if (!found) throw new Error(`no stream socket for ${id}`);
+  return found;
+}
+
+/** The socket that follows a tree. */
+function tree(sockets: ReturnType<typeof fakeSockets>, root: string): FakeSocket {
+  const found = sockets.made.filter((s) => s.url.includes(`/ws/tree/${root}`)).at(-1);
+  if (!found) throw new Error(`no tree socket for ${root}`);
+  return found;
+}
+
+function log(line: string): Event['kind'] {
+  return { kind: 'agent_log', line };
+}
+
+function items(): string[] {
+  return within(screen.getByRole('list', { name: 'Events' }))
+    .queryAllByRole('listitem')
+    .map((li) => li.textContent ?? '');
+}
+
+async function settle() {
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.setSystemTime(NOW);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+describe('Run view', () => {
+  // 1
+  it('replays past events in order from seq 0, then appends a live one', async () => {
+    const r = run({ agent: 'lead' });
+    const { sockets } = show(r.id, [r]);
+    await screen.findByRole('list', { name: 'Events' });
+    const s = stream(sockets, r.id);
+    expect(s.url).toBe(`ws://kestrel.test/ws/runs/${r.id}?after=0`);
+    s.open();
+    for (let i = 1; i <= 20; i++) s.event(i, event(r.id, i, log(`line ${i}`)));
+    await settle();
+    expect(items()).toHaveLength(20);
+    expect(items()[0]).toContain('line 1');
+    expect(items()[19]).toContain('line 20');
+    s.event(21, event(r.id, 21, log('live')));
+    await settle();
+    expect(items()).toHaveLength(21);
+    expect(items()[20]).toContain('live');
+  });
+
+  // 2
+  it('resumes after the last seq on a reconnect and shows no event twice', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    await screen.findByRole('list', { name: 'Events' });
+    const first = stream(sockets, r.id);
+    first.open();
+    first.event(1, event(r.id, 1, log('one')));
+    first.event(2, event(r.id, 2, log('two')));
+    first.drop();
+    expect(await screen.findByText(/Reconnecting/)).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(600);
+    const second = stream(sockets, r.id);
+    expect(second).not.toBe(first);
+    expect(second.url).toContain('after=2');
+    second.open();
+    second.event(2, event(r.id, 2, log('two')));
+    second.event(3, event(r.id, 3, log('three')));
+    await settle();
+    expect(items().map((t) => t.match(/one|two|three/)?.[0])).toEqual(['one', 'two', 'three']);
+    expect(screen.queryByText(/Reconnecting/)).not.toBeInTheDocument();
+  });
+
+  // 3
+  it('shows the tree nested, and collapsing a child hides its descendants', async () => {
+    const root = run({ agent: 'lead' });
+    const a = run({ agent: 'alpha', parent: root.id, root: root.id, depth: 1 });
+    const b = run({ agent: 'beta', parent: root.id, root: root.id, depth: 1 });
+    const g = run({ agent: 'gamma', parent: a.id, root: root.id, depth: 2 });
+    show(root.id, [root, a, b, g, run({ agent: 'stranger' })]);
+    const nav = await screen.findByRole('navigation', { name: 'Spawn tree' });
+    await within(nav).findByRole('link', { name: /gamma/ });
+    expect(within(nav).getAllByRole('link')).toHaveLength(4);
+    expect(within(nav).queryByRole('link', { name: /stranger/ })).not.toBeInTheDocument();
+    // gamma sits inside alpha's list, alpha and beta inside lead's.
+    const alphaItem = within(nav).getByRole('link', { name: /alpha/ }).closest('li');
+    expect(alphaItem).not.toBeNull();
+    expect(within(alphaItem as HTMLElement).getByRole('link', { name: /gamma/ })).toBeInTheDocument();
+    const toggle = within(alphaItem as HTMLElement).getByRole('button', { name: 'Collapse alpha' });
+    await user().click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(within(nav).queryByRole('link', { name: /gamma/ })).not.toBeInTheDocument();
+    expect(within(nav).getByRole('link', { name: /beta/ })).toBeInTheDocument();
+  });
+
+  // 4
+  it('adds a child spawned live under its parent, keeping the selection and the scroll', async () => {
+    const root = run({ agent: 'lead' });
+    const { sockets } = show(root.id, [root]);
+    const nav = await screen.findByRole('navigation', { name: 'Spawn tree' });
+    const box = screen.getByRole('list', { name: 'Events' }).parentElement as HTMLElement;
+    Object.defineProperty(box, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(box, 'clientHeight', { configurable: true, get: () => 200 });
+    box.scrollTop = 37;
+    await fireEvent.scroll(box);
+    const s = stream(sockets, root.id);
+    s.open();
+    const t = tree(sockets, root.id);
+    t.open();
+    // The parent's own stream carries the spawn too.
+    const spawned: Event['kind'] = { kind: 'child_spawned', child: 'kid-1', agent: 'kid', budget: 300_000 };
+    t.event(1, event(root.id, 1, spawned));
+    s.event(1, event(root.id, 1, spawned));
+    await settle();
+    const kid = await within(nav).findByRole('link', { name: /kid/ });
+    expect(kid.closest('ul')?.closest('li')).toBe(within(nav).getByRole('link', { name: /lead/ }).closest('li'));
+    expect(within(nav).getByRole('link', { name: /lead/ })).toHaveAttribute('aria-current', 'page');
+    expect(box.scrollTop).toBe(37);
+    expect(within(nav).getByRole('link', { name: /kid/ })).toHaveAccessibleDescription('Queued, $0.00');
+  });
+
+  // 5
+  it('selecting a child shows its stream and puts it in the URL', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const sockets = fakeSockets();
+    const served = serveFetch([root, kid]);
+    window.location.hash = `#/runs/${root.id}`;
+    render(App, { fetch: served, sockets: sockets.factory });
+    const nav = await screen.findByRole('navigation', { name: 'Spawn tree' });
+    await user().click(await within(nav).findByRole('link', { name: /kid/ }));
+    expect(window.location.hash).toBe(`#/runs/${kid.id}`);
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await vi.waitFor(() => stream(sockets, kid.id));
+    const s = stream(sockets, kid.id);
+    s.open();
+    s.event(1, event(kid.id, 1, log('kid says hi')));
+    expect(await screen.findByText('kid says hi')).toBeInTheDocument();
+    expect(within(nav).getByRole('link', { name: /kid/ })).toHaveAttribute('aria-current', 'page');
+  });
+
+  // 6
+  it('sticks to the bottom until the user scrolls up, then offers to jump to the latest', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    const list = await screen.findByRole('list', { name: 'Events' });
+    const box = list.parentElement as HTMLElement;
+    Object.defineProperty(box, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(box, 'clientHeight', { configurable: true, get: () => 200 });
+    const s = stream(sockets, r.id);
+    s.open();
+    s.event(1, event(r.id, 1, log('a')));
+    await settle();
+    expect(box.scrollTop).toBe(1000);
+    box.scrollTop = 100;
+    await fireEvent.scroll(box);
+    s.event(2, event(r.id, 2, log('b')));
+    await settle();
+    expect(box.scrollTop).toBe(100);
+    const jump = screen.getByRole('button', { name: 'Jump to latest' });
+    await user().click(jump);
+    expect(box.scrollTop).toBe(1000);
+    expect(screen.queryByRole('button', { name: 'Jump to latest' })).not.toBeInTheDocument();
+    s.event(3, event(r.id, 3, log('c')));
+    box.scrollTop = 1000;
+    await settle();
+    expect(box.scrollTop).toBe(1000);
+  });
+
+  // 7
+  it('renders a large tool result collapsed with its size, and expands it', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    await screen.findByRole('list', { name: 'Events' });
+    const s = stream(sockets, r.id);
+    s.open();
+    const output = 'x'.repeat(100_000);
+    s.event(1, event(r.id, 1, { kind: 'tool_result', name: 'read_file', ok: true, output }));
+    await settle();
+    const toggle = screen.getByRole('button', { name: /read_file/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveTextContent('100.0 kB');
+    expect(document.body.textContent?.includes(output)).toBe(false);
+    await user().click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(document.body.textContent?.includes(output)).toBe(true);
+  });
+
+  // 8
+  it('shows the budget bar in the warning style at 80%, with what is carved to children', async () => {
+    const root = run({ spent: 1_600_000, limit: 2_000_000 });
+    const kid = run({ parent: root.id, root: root.id, depth: 1, limit: 150_000 });
+    show(root.id, [root, kid]);
+    const meter = await screen.findByRole('meter', { name: 'Budget used' });
+    expect(meter).toHaveAttribute('aria-valuenow', '80');
+    expect(meter.className).toContain('warn');
+    expect(screen.getByText('$1.60 of $2.00, $0.15 carved to children')).toBeInTheDocument();
+    expect(screen.getByText('$0.40 left to spend')).toBeInTheDocument();
+  });
+
+  it('shows a run without a limit as spent only', async () => {
+    const r = run({ spent: 250_000, limit: null });
+    show(r.id, [r]);
+    expect(await screen.findByText('$0.25 spent, no limit')).toBeInTheDocument();
+    expect(screen.queryByRole('meter')).not.toBeInTheDocument();
+  });
+
+  // 9
+  it('enables only the controls the status allows', async () => {
+    const button = (name: string) => screen.getByRole('button', { name });
+    const r = run({ status: 'Running' });
+    const { unmount } = show(r.id, [r]);
+    await screen.findByRole('button', { name: 'Pause' });
+    expect(button('Pause')).toBeEnabled();
+    expect(button('Cancel')).toBeEnabled();
+    expect(button('Resume')).toBeDisabled();
+    unmount();
+    const p = run({ status: { Suspended: 'Manual' } });
+    const second = show(p.id, [p]);
+    await screen.findByRole('button', { name: 'Resume' });
+    expect(button('Resume')).toBeEnabled();
+    expect(button('Pause')).toBeDisabled();
+    second.unmount();
+    const c = run({ status: 'Completed' });
+    show(c.id, [c]);
+    await screen.findByRole('button', { name: 'Resume' });
+    for (const name of ['Pause', 'Resume', 'Cancel', 'Set budget', 'Send']) expect(button(name)).toBeDisabled();
+  });
+
+  it('names what each status allows', () => {
+    const live: RunStatus[] = ['Queued', 'Provisioning', 'Running'];
+    for (const s of live) expect(allowed(s).cancel).toBe(true);
+    expect(allowed('Running')).toEqual({ pause: true, resume: false, cancel: true, budget: true, message: true });
+    expect(allowed({ Suspended: 'Budget' }).resume).toBe(true);
+    expect(allowed({ Suspended: { Error: 'x' } }).resume).toBe(true);
+    expect(allowed({ Suspended: { Approval: 'a' } }).resume).toBe(false);
+    expect(allowed({ Failed: 'x' })).toEqual({ pause: false, resume: false, cancel: false, budget: false, message: false });
+  });
+
+  // 10
+  it('asks before cancelling, naming the live child runs; Esc keeps the run', async () => {
+    const root = run({ agent: 'lead' });
+    const kids = [
+      run({ parent: root.id, root: root.id, depth: 1 }),
+      run({ parent: root.id, root: root.id, depth: 1, status: 'Completed' }),
+    ];
+    const grand = [
+      run({ parent: kids[0]?.id ?? '', root: root.id, depth: 2 }),
+      run({ parent: kids[1]?.id ?? '', root: root.id, depth: 2, status: { Suspended: 'Manual' } }),
+    ];
+    const { calls } = show(root.id, [root, ...kids, ...grand]);
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    const u = user();
+    await u.click(cancel);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('and 3 child runs');
+    await u.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(cancel);
+    expect(calls.filter((c) => c.method === 'POST')).toEqual([]);
+    await u.click(cancel);
+    await u.click(screen.getByRole('button', { name: 'Cancel run' }));
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([`/api/runs/${root.id}/cancel`]);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(cancel);
+  });
+
+  it('keeps focus inside the cancel dialog', async () => {
+    const r = run();
+    show(r.id, [r]);
+    const u = user();
+    await u.click(await screen.findByRole('button', { name: 'Cancel' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Cancel this run?');
+    const keep = within(dialog).getByRole('button', { name: 'Keep running' });
+    const confirm = within(dialog).getByRole('button', { name: 'Cancel run' });
+    expect(document.activeElement).toBe(keep);
+    await u.tab();
+    expect(document.activeElement).toBe(confirm);
+    await u.tab();
+    expect(document.activeElement).toBe(keep);
+    await u.tab({ shift: true });
+    expect(document.activeElement).toBe(confirm);
+    await u.click(keep);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  // 11
+  it('validates a new budget and posts it as a decimal string', async () => {
+    const r = run();
+    const { calls } = show(r.id, [r]);
+    const input = await screen.findByLabelText('New budget (USD)');
+    const u = user();
+    for (const bad of ['abc', '-1', '1.2345678']) {
+      await u.clear(input);
+      await u.type(input, bad);
+      await u.click(screen.getByRole('button', { name: 'Set budget' }));
+      expect(screen.getByRole('alert')).toHaveTextContent('Enter an amount in dollars');
+    }
+    expect(calls.filter((c) => c.method === 'POST')).toEqual([]);
+    await u.clear(input);
+    await u.type(input, '3.50');
+    await u.click(screen.getByRole('button', { name: 'Set budget' }));
+    const post = calls.find((c) => c.method === 'POST');
+    expect(post).toEqual({ method: 'POST', path: `/api/runs/${r.id}/budget`, body: { usd: '3.50' } });
+    expect(parseUsd('3.50')).toBe(3_500_000);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('sizes output in bytes, kB and MB', () => {
+    expect(formatSize(512)).toBe('512 B');
+    expect(formatSize(100_000)).toBe('100.0 kB');
+    expect(formatSize(2_500_000)).toBe('2.5 MB');
+  });
+
+  it('counts live runs below a run and what it carved to its children', () => {
+    const nodes = [
+      { id: 'r', parent: null, status: 'Running' as RunStatus, limit: 10 },
+      { id: 'a', parent: 'r', status: 'Running' as RunStatus, limit: 3 },
+      { id: 'b', parent: 'r', status: 'Completed' as RunStatus, limit: null },
+      { id: 'c', parent: 'b', status: 'Queued' as RunStatus, limit: 1 },
+    ];
+    expect(liveBelow(nodes, 'r')).toBe(2);
+    expect(liveBelow(nodes, 'c')).toBe(0);
+    expect(carved(nodes, 'r')).toBe(3);
+  });
+
+  it('parses dollars to micro-dollars without float math', () => {
+    expect(parseUsd('0')).toBe(0);
+    expect(parseUsd('2')).toBe(2_000_000);
+    expect(parseUsd('0.000001')).toBe(1);
+    expect(parseUsd(' 1.5 ')).toBe(1_500_000);
+    for (const bad of ['', '.5', '1.', '1e3', '-1', 'abc', '1.2345678', '1,50']) expect(parseUsd(bad)).toBeNull();
+  });
+
+  // 12
+  it('shows the server reason for a refused command and refreshes the controls', async () => {
+    const r = run({ status: 'Running' });
+    const runs = [r];
+    const { calls } = show(r.id, runs, { status: 409, error: 'this run is not running' });
+    const pause = await screen.findByRole('button', { name: 'Pause' });
+    runs[0] = { ...r, status: 'Completed' };
+    await user().click(pause);
+    expect(await screen.findByText('this run is not running')).toBeInTheDocument();
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled());
+    expect(calls.filter((c) => c.method === 'GET' && c.path === `/api/runs/${r.id}`).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('sends a message, and shows why the server refused it', async () => {
+    const r = run();
+    const { calls } = show(r.id, [r], { status: 409, error: "this run's runtime does not take injected messages" });
+    const u = user();
+    await u.type(await screen.findByLabelText('Message'), 'please hurry');
+    await u.click(screen.getByRole('button', { name: 'Send' }));
+    expect(calls.find((c) => c.method === 'POST')).toEqual({
+      method: 'POST',
+      path: `/api/runs/${r.id}/message`,
+      body: { text: 'please hurry' },
+    });
+    expect(await screen.findByText("this run's runtime does not take injected messages")).toBeInTheDocument();
+  });
+
+  it('posts pause and resume, and clears an old error on success', async () => {
+    const r = run({ status: { Suspended: 'Manual' } });
+    const { calls } = show(r.id, [r]);
+    await user().click(await screen.findByRole('button', { name: 'Resume' }));
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([`/api/runs/${r.id}/resume`]);
+  });
+
+  // 13
+  it('says when the run does not exist, with a link to Fleet', async () => {
+    show('missing', []);
+    expect(await screen.findByText('Run not found.')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to Fleet' })).toHaveAttribute('href', '#/fleet');
+  });
+
+  it('shows a load error as an alert', async () => {
+    const sockets = fakeSockets();
+    const fetch: typeof globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error: 'database is locked' }), { status: 500 });
+    render(Run, { id: 'x', api: createApi({ fetch, getToken: () => null }), onUnauthorized: () => {}, sockets: sockets.factory, base: 'ws://kestrel.test' });
+    expect(await screen.findByRole('alert')).toHaveTextContent('database is locked');
+  });
+
+  // 14
+  it('shows a failed child\'s reason on its tree node and in its stream', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1, status: { Failed: 'sandbox exited with code 1' } });
+    const { sockets } = show(kid.id, [root, kid]);
+    const nav = await screen.findByRole('navigation', { name: 'Spawn tree' });
+    const node = await within(nav).findByRole('link', { name: /kid/ });
+    expect(node).toHaveAccessibleDescription(/sandbox exited with code 1/);
+    expect(node).toHaveAttribute('title', 'Failed: sandbox exited with code 1');
+    const s = stream(sockets, kid.id);
+    s.open();
+    s.event(1, event(kid.id, 1, { kind: 'status_changed', from: 'Running', to: { Failed: 'sandbox exited with code 1' } }));
+    await settle();
+    expect(items().at(-1)).toContain('Failed: sandbox exited with code 1');
+  });
+
+  // 15
+  it('has no serious or critical axe violations, with the dialog open too', async () => {
+    const root = run({ agent: 'lead', spent: 1_700_000 });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1, status: { Failed: 'boom' } });
+    const { container, sockets } = show(root.id, [root, kid]);
+    await screen.findByRole('navigation', { name: 'Spawn tree' });
+    const s = stream(sockets, root.id);
+    s.open();
+    s.event(1, event(root.id, 1, { kind: 'tool_call', name: 'shell', input: { cmd: 'ls' } }));
+    s.event(2, event(root.id, 2, { kind: 'tool_result', name: 'shell', ok: false, output: 'denied' }));
+    await settle();
+    vi.useRealTimers();
+    expect(ids(await seriousViolations(container))).toEqual([]);
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(ids(await seriousViolations(container))).toEqual([]);
+  });
+
+  it('is operable from the keyboard: tree toggles, event toggles and controls', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const { sockets } = show(root.id, [root, kid]);
+    await screen.findByRole('link', { name: /kid/ });
+    const s = stream(sockets, root.id);
+    s.open();
+    s.event(1, event(root.id, 1, { kind: 'tool_call', name: 'shell', input: { cmd: 'ls' } }));
+    await settle();
+    const u = user();
+    const toggle = screen.getByRole('button', { name: 'Collapse lead' });
+    toggle.focus();
+    await u.keyboard('{Enter}');
+    expect(screen.queryByRole('link', { name: /kid/ })).not.toBeInTheDocument();
+    await u.keyboard(' ');
+    expect(screen.getByRole('link', { name: /kid/ })).toBeInTheDocument();
+    const call = screen.getByRole('button', { name: /shell/ });
+    call.focus();
+    await u.keyboard('{Enter}');
+    expect(call).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText(/"cmd": "ls"/)).toBeInTheDocument();
+    const pause = screen.getByRole('button', { name: 'Pause' });
+    pause.focus();
+    await u.keyboard('{Enter}');
+    await vi.waitFor(() => expect(document.activeElement).toBe(pause));
+  });
+
+  it('renders every kind of event', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    await screen.findByRole('list', { name: 'Events' });
+    const s = stream(sockets, r.id);
+    s.open();
+    const kinds: Event['kind'][] = [
+      { kind: 'run_created', agent: 'worker' },
+      { kind: 'sandbox_provisioned', driver: 'gvisor', sandbox_id: 'sb-1' },
+      { kind: 'agent_message', text: 'Looking at the tests.' },
+      {
+        kind: 'model_call', run_id: r.id, provider: 'anthropic', model: 'claude-x', tokens_in: 1200, tokens_out: 300,
+        tokens_cache_read: 0, tokens_cache_write: 0, cost: 4_200, latency_ms: 900, status: 200,
+      },
+      {
+        kind: 'model_call', run_id: r.id, provider: 'local', model: 'free', tokens_in: 1, tokens_out: 1,
+        tokens_cache_read: 0, tokens_cache_write: 0, cost: null, latency_ms: 1, status: 200,
+      },
+      { kind: 'budget_warning', spent: 1_600_000, limit: 2_000_000 },
+      { kind: 'approval_requested', id: 'ap-1', action: 'push to main' },
+      { kind: 'approval_resolved', id: 'ap-1', approved: true },
+      { kind: 'approval_resolved', id: 'ap-2', approved: false },
+      { kind: 'child_spawned', child: 'kid-9', agent: 'helper', budget: 500_000 },
+      { kind: 'capabilities_dropped', tools: ['shell'], hosts: ['example.com'], secrets: [], agents: [] },
+      { kind: 'run_finished', summary: 'All green.' },
+      { kind: 'run_finished', summary: null },
+      { kind: 'status_changed', from: 'Running', to: 'Completed' },
+    ];
+    kinds.forEach((k, i) => s.event(i + 1, event(r.id, i + 1, k)));
+    await settle();
+    const text = items();
+    expect(text).toHaveLength(kinds.length);
+    expect(text[0]).toContain('Run created');
+    expect(text[1]).toContain('Sandbox ready: gvisor');
+    expect(text[2]).toContain('Looking at the tests.');
+    expect(text[3]).toContain('claude-x');
+    expect(text[3]).toContain('1200 in, 300 out');
+    expect(text[3]).toContain('$0.0042');
+    expect(text[4]).toContain('cost not known');
+    expect(text[5]).toContain('Budget warning: $1.60 of $2.00');
+    expect(text[6]).toContain('Approval requested: push to main');
+    expect(screen.getByRole('link', { name: 'Open approvals' })).toHaveAttribute('href', '#/approvals');
+    expect(text[7]).toContain('Approved');
+    expect(text[8]).toContain('Rejected');
+    expect(text[9]).toContain('Spawned helper with $0.50');
+    expect(screen.getByRole('link', { name: 'helper' })).toHaveAttribute('href', '#/runs/kid-9');
+    expect(text[10]).toContain('Capabilities dropped: shell, example.com');
+    expect(text[11]).toContain('Finished: All green.');
+    expect(text[12]).toContain('Finished');
+    expect(text[13]).toContain('Running to Completed');
+  });
+});
+
+/** A plain fetch for App-level tests: runs by id and the list. */
+function serveFetch(runs: RunSummary[]): typeof globalThis.fetch {
+  return async (input) => {
+    const url = new URL(String(input), 'http://kestrel.test');
+    if (url.pathname === '/api/runs') {
+      const root = url.searchParams.get('root');
+      return new Response(JSON.stringify(runs.filter((r) => root === null || r.root === root)));
+    }
+    const one = runs.find((r) => url.pathname === `/api/runs/${r.id}`);
+    return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no"}', { status: 404 });
+  };
+}
