@@ -311,6 +311,8 @@ fn send(store: &Store, id: RunId, cmd: ControlCommand, out: Output) -> Result<()
         ControlCommand::Approve(_) | ControlCommand::ApproveWith { .. } => "approve".to_string(),
         ControlCommand::Reject(_) | ControlCommand::RejectWith { .. } => "reject".to_string(),
         ControlCommand::SetBudget(usd) => format!("budget {usd}"),
+        // Sent by the gateway for kestrel.ask_human, never from the command line.
+        ControlCommand::Ask { .. } => "question".to_string(),
     };
     store.push_control(id, cmd)?;
     if out.json {

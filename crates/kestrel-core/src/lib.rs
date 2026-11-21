@@ -15,6 +15,25 @@ mod join;
 mod slots;
 pub mod workspace;
 pub use join::{ChildResult, JoinError, JoinMode, JoinOutcome};
+
+/// Why [`Engine::ask_human`] has no answer. The text is what the agent reads.
+#[derive(Debug, thiserror::Error)]
+pub enum AskError {
+    /// Only a running run can ask (an unknown run is not running either).
+    #[error("the run is not running, so it cannot ask")]
+    NotRunning,
+    /// The person declined, with their reason if they gave one.
+    #[error("the person declined{}", .0.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Declined(Option<String>),
+    /// The run ended while the question waited.
+    #[error("the run ended ({0:?}) before the question was answered")]
+    Ended(RunStatus),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// The Kestrel tools, by the names a capability's `mcp` list uses.
+const KESTREL_TOOLS: [&str; 3] = ["kestrel.spawn", "kestrel.join", "kestrel.ask_human"];
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -624,6 +643,95 @@ impl Engine {
             inner.tree_limit = runs;
         }
         self
+    }
+
+    /// The Kestrel tools `run` may call, in the order spawn, join, ask_human; `None` once it has
+    /// ended (or for an unknown run). A tool must be in the run's capability, and
+    /// `kestrel.spawn` also needs spawn rights. A spawned run's stored spec holds only what it was
+    /// granted, so its capability is read from that spec; spawning itself checks the token.
+    pub fn kestrel_tools(&self, run: RunId) -> Result<Option<Vec<&'static str>>> {
+        let store = &self.inner.store;
+        let Some(row) = store.get_run(run)? else {
+            return Ok(None);
+        };
+        if row.status.is_terminal() {
+            return Ok(None);
+        }
+        let Some(spec) = store.run_spec(run)? else {
+            return Ok(Some(Vec::new()));
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let held = caps::Capability::from_spec(run, &spec, now + TOKEN_LIFETIME);
+        Ok(Some(
+            KESTREL_TOOLS
+                .into_iter()
+                .filter(|tool| held.allows(&caps::Action::Tool((*tool).into())).is_ok())
+                .filter(|tool| *tool != "kestrel.spawn" || held.spawn.is_some())
+                .collect(),
+        ))
+    }
+
+    /// Records that `run` called `tool`, which its capabilities do not allow.
+    pub fn tool_denied(&self, run: RunId, tool: &str) -> Result<()> {
+        self.inner.store.append(
+            run,
+            EventKind::AgentLog {
+                line: format!(
+                    "kestrel: {tool} is not permitted for this run, the call was refused"
+                ),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Asks a person `question` for `run` (`kestrel.ask_human`) and waits for the answer. The run
+    /// records it as a question approval and waits on it (its sandbox keeps running, in the tool
+    /// call); approving with text answers it. Declining fails the run, as any rejection does.
+    pub async fn ask_human(
+        &self,
+        run: RunId,
+        question: String,
+    ) -> std::result::Result<String, AskError> {
+        let store = &self.inner.store;
+        let running = store
+            .get_run(run)?
+            .is_some_and(|r| r.status == RunStatus::Running);
+        if !running {
+            return Err(AskError::NotRunning);
+        }
+        let id = ApprovalId::new();
+        // The run's own actor records it, so the request and the wait happen in its order.
+        store.push_control(run, ControlCommand::Ask { id, question })?;
+        let poll = self
+            .inner
+            .limits
+            .poll_interval
+            .max(Duration::from_millis(1));
+        let mut cursor = 0;
+        loop {
+            for event in store.events_page(run, cursor, 256)? {
+                cursor = event.seq;
+                if let EventKind::ApprovalResolved {
+                    id: resolved,
+                    approved,
+                    payload,
+                } = event.kind
+                    && resolved == id
+                {
+                    return if approved {
+                        Ok(payload.unwrap_or_default())
+                    } else {
+                        Err(AskError::Declined(payload))
+                    };
+                }
+            }
+            if let Some(row) = store.get_run(run)?
+                && row.status.is_terminal()
+            {
+                return Err(AskError::Ended(row.status));
+            }
+            tokio::time::sleep(poll).await;
+        }
     }
 
     /// Creates a child run of `parent` from `child` and returns its id. The child starts like
@@ -2190,6 +2298,19 @@ impl Actor {
             }
             cmd @ (C::Approve(_) | C::Reject(_) | C::ApproveWith { .. } | C::RejectWith { .. }) => {
                 self.on_approval(cmd, pending)
+            }
+            C::Ask { id, question } => {
+                if self.status == RunStatus::Running {
+                    self.record(EventKind::ApprovalRequested {
+                        id,
+                        action: question,
+                        question: true,
+                    })?;
+                } else {
+                    // The run stopped running before it got here: the asker hears no.
+                    self.resolve(id, false, Some("the run is not running".into()))?;
+                }
+                Ok(Next::Continue)
             }
             other => {
                 self.inner
