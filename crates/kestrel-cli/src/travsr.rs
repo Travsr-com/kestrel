@@ -136,6 +136,36 @@ fn absolute_path_entries(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
     std::env::join_paths(kept).ok()
 }
 
+/// The environment of every Travsr command, from Kestrel's own (`vars`): only the variables
+/// [`PASSED_ENV`] names, `PATH` cut to its absolute entries (left out when none is), then
+/// [`SET_ENV`] on top.
+fn travsr_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let is_path = |name: &str| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case("PATH")
+        } else {
+            name == "PATH"
+        }
+    };
+    let mut env: Vec<_> = vars
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let text = name.to_str()?;
+            if !passed(text) {
+                return None;
+            }
+            if is_path(text) {
+                return absolute_path_entries(&value).map(|kept| (name, kept));
+            }
+            Some((name, value))
+        })
+        .collect();
+    env.extend(SET_ENV.iter().map(|(n, v)| ((*n).into(), (*v).into())));
+    env
+}
+
 /// Whether Kestrel's variable `name` is passed to Travsr. Windows names are not case sensitive
 /// (`SystemRoot` may be `SYSTEMROOT`), Unix ones are.
 fn passed(name: &str) -> bool {
@@ -473,14 +503,9 @@ impl TravsrProcesses {
         let mut cmd = Command::new(&self.command);
         cmd.args(args)
             .env_clear()
-            .envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(passed)))
-            .env_remove("PATH")
-            .envs(SET_ENV.iter().copied())
+            .envs(travsr_env(std::env::vars_os()))
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        if let Some(path) = std::env::var_os("PATH").and_then(|p| absolute_path_entries(&p)) {
-            cmd.env("PATH", path);
-        }
         Ok(cmd)
     }
 
@@ -887,6 +912,39 @@ mod tests {
         assert_eq!(kept, [abs, other]);
         let none = std::env::join_paths([PathBuf::from("."), PathBuf::from("rel")]).unwrap();
         assert_eq!(absolute_path_entries(&none), None);
+    }
+
+    // The environment every Travsr command gets, from a given one: locations kept, PATH cut to
+    // its absolute entries, secrets dropped, Kestrel's own settings added.
+    #[test]
+    fn travsr_env_keeps_locations_cuts_path_and_adds_kestrel_s_settings() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+        let abs = std::env::temp_dir();
+        let path = std::env::join_paths([PathBuf::from("."), abs.clone()]).unwrap();
+        let given = [
+            (OsString::from("PATH"), path),
+            (OsString::from("HOME"), OsString::from("/home/op")),
+            (OsString::from("ANTHROPIC_API_KEY"), OsString::from("sk")),
+            (OsString::from("CI"), OsString::from("0")),
+        ];
+        let env: BTreeMap<OsString, OsString> = travsr_env(given).into_iter().collect();
+        let kept: Vec<PathBuf> = std::env::split_paths(&env[&OsString::from("PATH")]).collect();
+        assert_eq!(kept, [abs]);
+        assert_eq!(env[&OsString::from("HOME")], OsString::from("/home/op"));
+        assert!(!env.contains_key(&OsString::from("ANTHROPIC_API_KEY")));
+        assert_eq!(env[&OsString::from("CI")], OsString::from("1"));
+        assert_eq!(
+            env[&OsString::from("TRAVSR_DISABLE_REGISTRY")],
+            OsString::from("1")
+        );
+        // A PATH with no absolute entry is not passed at all.
+        let only_relative = [(OsString::from("PATH"), OsString::from("."))];
+        assert!(
+            !travsr_env(only_relative)
+                .iter()
+                .any(|(n, _)| n == &OsString::from("PATH"))
+        );
     }
 
     #[test]
