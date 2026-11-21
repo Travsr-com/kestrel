@@ -51,6 +51,57 @@ pub enum StoreError {
     /// The OS random source failed while making a run token.
     #[error("no randomness for a run token: {0}")]
     Random(String),
+    /// [`Store::spawn_child`] refused the spawn. Nothing was written.
+    #[error("spawn refused: {0}")]
+    Spawn(SpawnRefusal),
+    /// The capability token for a spawned child could not be made. Nothing was written.
+    #[error("capability token: {0}")]
+    Capability(String),
+}
+
+/// Why [`Store::spawn_child`] refused a spawn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpawnRefusal {
+    /// Only a `Running` parent can spawn.
+    #[error("parent {0} is {1:?}, not Running")]
+    ParentNotRunning(RunId, RunStatus),
+    /// The carve is not positive, or more than the parent has left.
+    #[error("asked for {asked}, the parent has {remaining} left")]
+    Budget {
+        asked: MicroUsd,
+        remaining: MicroUsd,
+    },
+    /// The parent already has this many children, live and finished.
+    #[error("the parent already has {0} children, its limit")]
+    TooManyChildren(u32),
+    /// The tree already has this many runs.
+    #[error("the tree already has {0} runs, its limit")]
+    TooManyRuns(u32),
+}
+
+/// What [`Store::spawn_child`] needs to create a child.
+#[derive(Debug, Clone)]
+pub struct ChildPlan<'a> {
+    /// The child's spec. Its `budget.limit` is replaced by the carve.
+    pub spec: &'a AgentSpec,
+    pub input: &'a str,
+    /// The budget asked for. `None` takes the smaller of `spec.budget.limit` and half of what
+    /// the parent has left.
+    pub budget: Option<MicroUsd>,
+    /// Most children the parent may have, live and finished.
+    pub max_children: u32,
+    /// Most runs the whole tree may have, its root included.
+    pub max_tree_runs: u32,
+    /// Written on the child right after its `RunCreated`.
+    pub child_events: Vec<EventKind>,
+}
+
+/// A child made by [`Store::spawn_child`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spawned {
+    pub id: RunId,
+    /// The budget carved out of the parent for it.
+    pub budget: MicroUsd,
 }
 
 /// One row of the `runs` table.
@@ -286,6 +337,161 @@ impl Store {
         Ok(())
     }
 
+    /// Creates a child of `parent` and carves its budget out of the parent's, in one transaction.
+    ///
+    /// A run may spend up to its own limit (`budget.limit` in its stored spec). The spawn moves
+    /// the carve from the parent's limit to the child's, so the limits of a tree always add up to
+    /// the root's budget and the tree can never spend more than that. When the child ends, its
+    /// unspent budget goes back (see [`Store::transition`]).
+    ///
+    /// Refused with [`StoreError::Spawn`] when the parent is not `Running`, has
+    /// `max_children` children already, its tree has `max_tree_runs` runs, or the carve is not
+    /// positive or more than the parent has left (its limit minus its own spend).
+    /// [`StoreError::NotFound`] when the parent does not exist.
+    ///
+    /// `cap` gets the child's id and carve and returns its capability token, stored in
+    /// `run_caps` (`None` stores none). Events: the child's `RunCreated` naming the parent, then
+    /// `plan.child_events`, then `ChildSpawned` on the parent. On any error nothing is written.
+    pub fn spawn_child<F>(&self, parent: RunId, plan: ChildPlan<'_>, cap: F) -> Result<Spawned>
+    where
+        F: FnOnce(RunId, MicroUsd) -> Result<Option<Vec<u8>>>,
+    {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found = tx
+            .query_row(
+                "SELECT status, root_run_id, depth FROM runs WHERE id = ?1",
+                [parent.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        run_id_col(r, 1)?,
+                        r.get::<_, u32>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, root, depth)) = found else {
+            return Err(StoreError::NotFound(parent));
+        };
+        let status: RunStatus = serde_json::from_str(&status)?;
+        if status != RunStatus::Running {
+            return Err(StoreError::Spawn(SpawnRefusal::ParentNotRunning(
+                parent, status,
+            )));
+        }
+        let children = count(
+            &tx,
+            "SELECT COUNT(*) FROM runs WHERE parent_run_id = ?1",
+            parent,
+        )?;
+        if children >= u64::from(plan.max_children) {
+            return Err(StoreError::Spawn(SpawnRefusal::TooManyChildren(
+                plan.max_children,
+            )));
+        }
+        let tree = count(
+            &tx,
+            "SELECT COUNT(*) FROM runs WHERE root_run_id = ?1",
+            root,
+        )?;
+        if tree >= u64::from(plan.max_tree_runs) {
+            return Err(StoreError::Spawn(SpawnRefusal::TooManyRuns(
+                plan.max_tree_runs,
+            )));
+        }
+        let limit = read_limit(&tx, parent)?;
+        let remaining = left(limit, spent_in(&tx, parent)?);
+        let carve = plan
+            .budget
+            .unwrap_or_else(|| plan.spec.budget.limit.min(MicroUsd(remaining.0 / 2)));
+        if carve.0 <= 0 || carve > remaining {
+            return Err(StoreError::Spawn(SpawnRefusal::Budget {
+                asked: carve,
+                remaining,
+            }));
+        }
+        let mut spec = plan.spec.clone();
+        spec.budget.limit = carve;
+        let above = Parent {
+            id: parent,
+            root,
+            depth,
+        };
+        let id = insert_run(&tx, &spec, plan.input, Some(above))?;
+        write_limit(&tx, parent, MicroUsd(limit.0 - carve.0))?;
+        if let Some(token) = cap(id, carve)? {
+            tx.execute(
+                "INSERT INTO run_caps (run_id, token) VALUES (?1, ?2)",
+                params![id.to_string(), token],
+            )?;
+        }
+        insert_event(
+            &tx,
+            id,
+            EventKind::RunCreated {
+                agent: spec.name.clone(),
+                parent: Some(parent),
+            },
+        )?;
+        for kind in plan.child_events {
+            insert_event(&tx, id, kind)?;
+        }
+        insert_event(
+            &tx,
+            parent,
+            EventKind::ChildSpawned {
+                child: id,
+                agent: spec.name,
+                budget: carve,
+            },
+        )?;
+        tx.commit()?;
+        Ok(Spawned { id, budget: carve })
+    }
+
+    /// The run's budget limit: what it may spend itself. For a spawned run this moves: it shrinks
+    /// by each carve for a child and grows when a child returns unspent budget.
+    /// [`StoreError::NotFound`] when the run has no stored spec.
+    pub fn limit(&self, run: RunId) -> Result<MicroUsd> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        read_limit(&tx, run)
+    }
+
+    /// What the run may still spend: its limit minus its own spend, never below zero.
+    /// [`StoreError::NotFound`] when the run has no stored spec.
+    pub fn remaining(&self, run: RunId) -> Result<MicroUsd> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Ok(left(read_limit(&tx, run)?, spent_in(&tx, run)?))
+    }
+
+    /// The run's capability token, if it has one.
+    pub fn run_cap(&self, run: RunId) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT token FROM run_caps WHERE run_id = ?1",
+                [run.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Stores (or replaces) the run's capability token. [`StoreError::NotFound`] for an unknown run.
+    pub fn set_run_cap(&self, run: RunId, token: &[u8]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_run(&tx, run)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO run_caps (run_id, token) VALUES (?1, ?2)",
+            params![run.to_string(), token],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The run's gateway token. `None` for an unknown run or one created before schema v3.
     pub fn run_token(&self, id: RunId) -> Result<Option<String>> {
         Ok(self
@@ -406,7 +612,8 @@ impl Store {
     }
 
     /// Compare-and-set on the run status. Checks `RunStatus::can_transition_to` and writes a
-    /// `StatusChanged` event in the same SQL transaction.
+    /// `StatusChanged` event in the same SQL transaction. When a spawned run ends, its unspent
+    /// budget goes back to its parent in that transaction too (see [`Store::spawn_child`]).
     pub fn transition(&self, id: RunId, expected: &RunStatus, next: RunStatus) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -438,6 +645,7 @@ impl Store {
             "UPDATE runs SET status = ?1 WHERE id = ?2",
             params![serde_json::to_string(&next)?, id.to_string()],
         )?;
+        let ended = next.is_terminal();
         insert_event(
             &tx,
             id,
@@ -446,6 +654,9 @@ impl Store {
                 to: next,
             },
         )?;
+        if ended {
+            return_unspent(&tx, id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -614,6 +825,107 @@ fn is_busy(e: &rusqlite::Error) -> bool {
         e.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
+}
+
+/// A `COUNT(*)` query with the run id as its one parameter.
+fn count(tx: &Transaction<'_>, sql: &str, run: RunId) -> Result<u64> {
+    let n: i64 = tx.query_row(sql, [run.to_string()], |r| r.get(0))?;
+    Ok(n.unsigned_abs())
+}
+
+/// What is left of `limit` after `spent`, never below zero.
+fn left(limit: MicroUsd, spent: MicroUsd) -> MicroUsd {
+    MicroUsd(limit.0.saturating_sub(spent.0).max(0))
+}
+
+fn spent_in(tx: &Transaction<'_>, run: RunId) -> Result<MicroUsd> {
+    let total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(cost), 0) FROM model_calls WHERE run_id = ?1",
+        [run.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(MicroUsd(total))
+}
+
+fn read_spec(tx: &Transaction<'_>, run: RunId) -> Result<AgentSpec> {
+    let spec: Option<String> = tx
+        .query_row(
+            "SELECT spec FROM run_specs WHERE run_id = ?1",
+            [run.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match spec {
+        Some(s) => Ok(serde_json::from_str(&s)?),
+        None => Err(StoreError::NotFound(run)),
+    }
+}
+
+fn read_limit(tx: &Transaction<'_>, run: RunId) -> Result<MicroUsd> {
+    Ok(read_spec(tx, run)?.budget.limit)
+}
+
+fn write_limit(tx: &Transaction<'_>, run: RunId, limit: MicroUsd) -> Result<()> {
+    let mut spec = read_spec(tx, run)?;
+    spec.budget.limit = limit;
+    tx.execute(
+        "UPDATE run_specs SET spec = ?1 WHERE run_id = ?2",
+        params![serde_json::to_string(&spec)?, run.to_string()],
+    )?;
+    Ok(())
+}
+
+fn parent_of(tx: &Transaction<'_>, run: RunId) -> Result<Option<RunId>> {
+    Ok(tx.query_row(
+        "SELECT parent_run_id FROM runs WHERE id = ?1",
+        [run.to_string()],
+        |r| opt_run_id_col(r, 0),
+    )?)
+}
+
+fn status_of(tx: &Transaction<'_>, run: RunId) -> Result<RunStatus> {
+    let status: String = tx.query_row(
+        "SELECT status FROM runs WHERE id = ?1",
+        [run.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(serde_json::from_str(&status)?)
+}
+
+/// Gives a spawned run that just ended its unspent budget back to its parent. The run keeps a
+/// limit equal to what it spent, so a second call returns nothing. When the parent has ended too,
+/// the amount passes on up to the nearest run still going, or to the root, which keeps it. A root
+/// keeps its own limit: there is no one to return it to. A run that spent more than its limit
+/// returns nothing and takes nothing.
+fn return_unspent(tx: &Transaction<'_>, run: RunId) -> Result<()> {
+    let Some(mut parent) = parent_of(tx, run)? else {
+        return Ok(());
+    };
+    let limit = read_limit(tx, run)?;
+    let spent = spent_in(tx, run)?;
+    let mut amount = left(limit, spent);
+    if amount.0 == 0 {
+        return Ok(());
+    }
+    write_limit(tx, run, spent)?;
+    loop {
+        let to = read_limit(tx, parent)?;
+        let grandparent = parent_of(tx, parent)?;
+        let ended = status_of(tx, parent)?.is_terminal();
+        let Some(next) = grandparent.filter(|_| ended) else {
+            // Still going, or a root: it keeps the amount.
+            return write_limit(tx, parent, MicroUsd(to.0.saturating_add(amount.0)));
+        };
+        // An ended run in the middle passes the amount on, keeping only what it spent.
+        let total = MicroUsd(to.0.saturating_add(amount.0));
+        let spent = spent_in(tx, parent)?;
+        amount = left(total, spent);
+        write_limit(tx, parent, if amount.0 > 0 { spent } else { total })?;
+        if amount.0 == 0 {
+            return Ok(());
+        }
+        parent = next;
+    }
 }
 
 /// Fails with [`StoreError::NotFound`] unless `run` exists, so no orphan rows are written.
