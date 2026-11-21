@@ -4,6 +4,7 @@
 //! and never spawn a real process.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -13,12 +14,18 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, Stream};
-use kestrel_types::GATEWAY_KEY_PLACEHOLDER;
+use kestrel_types::{GATEWAY_KEY_PLACEHOLDER, RunId};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use url::Url;
 
 mod bridge;
+mod subnet;
+use bridge::is_container_name;
 pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
+pub use subnet::{
+    DEFAULT_SUBNET_POOL, Ipv4Cidr, SUBNET_BLOCK_PREFIX, Subnet, SubnetError, SubnetPool,
+    docker_subnets, docker_subnets_except_instance, host_routes,
+};
 
 /// Errors from sandbox drivers and host detection.
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +73,17 @@ pub enum SandboxError {
     /// The bridge port is 0.
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
+    /// Docker refused a run network's block because another network already uses it ("Pool
+    /// overlaps"). The engine excludes the block and tries another one.
+    #[error("subnet {subnet} is taken by another docker network")]
+    SubnetTaken { subnet: Ipv4Cidr },
+    /// A step of making a run network failed. `step` is `create`, `connect` or `inspect`.
+    #[error("run network `{network}`: step `{step}` failed: {stderr}")]
+    RunNetwork {
+        step: &'static str,
+        network: String,
+        stderr: String,
+    },
     /// The workspace directory could not be inspected (missing, no permission, ...), so the
     /// host user to run the sandbox as is unknown.
     #[error("cannot read the owner of workspace `{path}`: {source}")]
@@ -83,8 +101,23 @@ pub type Result<T> = std::result::Result<T, SandboxError>;
 pub enum NetworkPolicy {
     /// No network at all.
     None,
-    /// Only the Kestrel gateway is reachable.
+    /// Only the Kestrel gateway is reachable, through the shared internal network `kestrel-gw`.
+    /// Sandboxes on it can reach each other, so the engine uses it only for drivers without run
+    /// networks (no bridge, that is `gateway.advertise_url` set, or Apple `container`).
     GatewayOnly { gateway: Url },
+    /// Only the Kestrel gateway is reachable, through the run's own internal network made by
+    /// [`SandboxDriver::prepare_network`]. The sandbox is attached to that network only.
+    RunNetwork { network: String, gateway: Url },
+}
+
+/// A run's own network, made by [`SandboxDriver::prepare_network`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedNetwork {
+    /// Docker network name, `kestrel-gw-<last 12 hex chars of the run id>`.
+    pub name: String,
+    /// The bridge's IP on this network: the gateway host of the run's launch plan.
+    pub gateway_host: Ipv4Addr,
+    pub subnet: Subnet,
 }
 
 /// Returns the `(uid, gid)` that owns a workspace directory. Injected into drivers so tests do
@@ -335,6 +368,39 @@ pub trait SandboxDriver: Send + Sync {
     async fn leftovers(&self) -> Result<Vec<SandboxHandle>> {
         Ok(Vec::new())
     }
+    /// Creates `run`'s own internal network on `subnet` and joins the gateway bridge to it.
+    /// `None` when the driver has no run networks (the default): the run then uses
+    /// [`NetworkPolicy::GatewayOnly`]. A docker answer that the block is in use is
+    /// [`SandboxError::SubnetTaken`]; any other failure removes what was made and names the step.
+    /// A network of the run's own name that is already there (left by a prepare that was cut
+    /// short) is removed and made again, once.
+    async fn prepare_network(
+        &self,
+        run: RunId,
+        subnet: &Subnet,
+    ) -> Result<Option<PreparedNetwork>> {
+        let _ = (run, subnet);
+        Ok(None)
+    }
+    /// Disconnects the bridge from `network` and removes it. Idempotent: a network or a bridge
+    /// that is already gone is fine. The default does nothing.
+    async fn release_network(&self, network: &PreparedNetwork) -> Result<()> {
+        let _ = network;
+        Ok(())
+    }
+    /// Removes every leftover run network (labelled [`RUN_LABEL`], and [`INSTANCE_LABEL`] set to
+    /// the driver's instance id when it has one), whether or not this process made it. Networks
+    /// without the label are never touched. The default does nothing.
+    async fn sweep_networks(&self) -> Result<()> {
+        Ok(())
+    }
+    /// The IPv4 subnets other networks use right now, leaving out the run networks of this
+    /// driver's instance (see [`docker_subnets_except_instance`]). The engine excludes them all
+    /// from its pool after one [`SandboxError::SubnetTaken`], instead of finding them one refused
+    /// block at a time. The default knows of none.
+    async fn taken_subnets(&self) -> Result<Vec<Ipv4Cidr>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.
@@ -395,6 +461,17 @@ impl Cli {
         argv: &[String],
         tolerated: Option<&str>,
     ) -> Result<String> {
+        self.run_tolerating(runner, argv, tolerated.as_slice())
+            .await
+    }
+
+    /// Runs `argv`. A non-zero exit whose stderr contains any of `tolerated` counts as success.
+    async fn run_tolerating(
+        &self,
+        runner: &dyn CommandRunner,
+        argv: &[String],
+        tolerated: &[&str],
+    ) -> Result<String> {
         let out = runner
             .run(argv)
             .await
@@ -402,7 +479,7 @@ impl Cli {
                 program: self.program.to_string(),
                 source,
             })?;
-        if out.status == 0 || tolerated.is_some_and(|t| out.stderr.contains(t)) {
+        if out.status == 0 || tolerated.iter().any(|t| out.stderr.contains(t)) {
             return Ok(out.stdout);
         }
         Err(SandboxError::CommandFailed {
@@ -425,9 +502,10 @@ impl Cli {
 
     fn create_argv(&self, spec: &LaunchSpec, user: Option<(u32, u32)>) -> Vec<String> {
         let suffix = if self.apple { "M" } else { "m" };
-        let network = match spec.network {
+        let network = match &spec.network {
             NetworkPolicy::None => "none",
             NetworkPolicy::GatewayOnly { .. } => GATEWAY_NETWORK,
+            NetworkPolicy::RunNetwork { network, .. } => network.as_str(),
         };
         let mut argv = self.argv(&["create"]);
         argv.extend(self.runtime.map(str::to_string));
@@ -452,7 +530,7 @@ impl Cli {
         }
         let gateway = match &spec.network {
             NetworkPolicy::None => None,
-            NetworkPolicy::GatewayOnly { gateway } => {
+            NetworkPolicy::GatewayOnly { gateway } | NetworkPolicy::RunNetwork { gateway, .. } => {
                 Some(("KESTREL_GATEWAY_URL", gateway.as_str()))
             }
         };
@@ -527,9 +605,15 @@ impl Cli {
             // Root-owned workspace: Kestrel runs as root, nothing to map.
             user = (ids != (0, 0)).then_some(ids);
         }
-        if let NetworkPolicy::GatewayOnly { .. } = spec.network {
-            let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
-            self.run(runner, &argv, Some("already exists")).await?;
+        match &spec.network {
+            NetworkPolicy::GatewayOnly { .. } => {
+                let argv = self.argv(&["network", "create", "--internal", GATEWAY_NETWORK]);
+                self.run(runner, &argv, Some("already exists")).await?;
+            }
+            NetworkPolicy::RunNetwork { network, .. } => {
+                check_network_name(network)?;
+            }
+            NetworkPolicy::None => {}
         }
         let stdout = self
             .run(runner, &self.create_argv(spec, user), None)
@@ -610,6 +694,269 @@ impl Cli {
             .await
             .map(drop)
     }
+
+    /// See [`SandboxDriver::prepare_network`]. `bridge` is the bridge container name; without
+    /// one, and for Apple `container`, there are no run networks. A network of the run's name
+    /// that already exists and carries this run's labels was left by a prepare that was cut
+    /// short: it is removed and the create runs once more. One without them is left alone.
+    async fn prepare_network(
+        &self,
+        runner: &dyn CommandRunner,
+        net: NetworkContext<'_>,
+        run: RunId,
+        subnet: &Subnet,
+    ) -> Result<Option<PreparedNetwork>> {
+        let Some(bridge) = net.bridge.filter(|_| !self.apple) else {
+            return Ok(None);
+        };
+        check_network_name(bridge)?;
+        let name = run_network_name(run);
+        let cidr = subnet.cidr().to_string();
+        let gateway = subnet.gateway().to_string();
+        let run_label = format!("{RUN_LABEL}={run}");
+        let instance_label = match net.instance {
+            Some(id) => Some(format!("{INSTANCE_LABEL}={}", check_id(id)?)),
+            None => None,
+        };
+        let mut args = vec![
+            "network",
+            "create",
+            "--internal",
+            // No host address on the network's bridge, so a sandbox cannot reach host services
+            // through docker's gateway address. The bridge container is the only way out.
+            "-o",
+            "com.docker.network.bridge.inhibit_ipv4=true",
+            "--subnet",
+            &cidr,
+            "--gateway",
+            &gateway,
+            "--label",
+            &run_label,
+        ];
+        args.extend(instance_label.iter().flat_map(|l| ["--label", l.as_str()]));
+        args.push(&name);
+        let step = |step: &'static str| {
+            let network = name.clone();
+            move |e: SandboxError| SandboxError::RunNetwork {
+                step,
+                network,
+                stderr: match e {
+                    SandboxError::CommandFailed { stderr, .. } => stderr,
+                    other => other.to_string(),
+                },
+            }
+        };
+        let create = self.argv(&args);
+        let mut created = self.run(runner, &create, None).await;
+        if let Err(SandboxError::CommandFailed { stderr, .. }) = &created
+            && is_left_behind(stderr, &name)
+            && self
+                .is_this_runs(runner, &name, &run_label, instance_label.as_deref())
+                .await
+        {
+            // A prepare cut short (its actor aborted) left this run's network behind, unrecorded.
+            // Docker confirmed it is this run's own, so it goes, and the create runs once more.
+            let removed = self.remove_network(runner, Some(bridge), &name).await;
+            created = self.run(runner, &create, None).await;
+            if let (Err(SandboxError::CommandFailed { stderr, .. }), Err(rm)) =
+                (&mut created, removed)
+            {
+                let rm = match rm {
+                    SandboxError::CommandFailed { stderr, .. } => stderr,
+                    other => other.to_string(),
+                };
+                stderr.push_str(&format!(
+                    "; removing the network left behind failed first: {rm}"
+                ));
+            }
+        }
+        match created {
+            Err(SandboxError::CommandFailed { stderr, .. }) if stderr.contains("Pool overlaps") => {
+                return Err(SandboxError::SubnetTaken {
+                    subnet: subnet.cidr(),
+                });
+            }
+            other => other.map_err(step("create"))?,
+        };
+        let joined = async {
+            let connect = self.argv(&["network", "connect", &name, bridge]);
+            self.run(runner, &connect, None)
+                .await
+                .map_err(step("connect"))?;
+            let format = format!("{{{{(index .NetworkSettings.Networks \"{name}\").IPAddress}}}}");
+            // `container inspect`: a network or image named like the bridge cannot match.
+            let inspect = self.argv(&["container", "inspect", "--format", &format, bridge]);
+            let answer = self
+                .run(runner, &inspect, None)
+                .await
+                .map_err(step("inspect"))?;
+            answer.trim().parse::<Ipv4Addr>().map_err(|_| {
+                step("inspect")(SandboxError::CommandFailed {
+                    program: self.program.to_string(),
+                    code: 0,
+                    stderr: format!("the bridge has no single IPv4 address on {name}: {answer:?}"),
+                })
+            })
+        }
+        .await;
+        match joined {
+            Ok(gateway_host) => Ok(Some(PreparedNetwork {
+                name,
+                gateway_host,
+                subnet: subnet.clone(),
+            })),
+            Err(e) => {
+                // Best effort: the failed step is the error worth reporting.
+                let _ = self.remove_network(runner, Some(bridge), &name).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether docker lists network `name` with label `run_label` (`kestrel.run=<run id>`) and,
+    /// when given, `instance_label` (`kestrel.instance=<id>`): a network of this run's name that
+    /// is this run's own. A listing that fails confirms nothing.
+    async fn is_this_runs(
+        &self,
+        runner: &dyn CommandRunner,
+        name: &str,
+        run_label: &str,
+        instance_label: Option<&str>,
+    ) -> bool {
+        let name_filter = format!("name=^{name}$");
+        let run_filter = format!("label={run_label}");
+        let instance_filter = instance_label.map(|l| format!("label={l}"));
+        let mut args = vec![
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            &name_filter,
+            "--filter",
+            &run_filter,
+        ];
+        args.extend(
+            instance_filter
+                .iter()
+                .flat_map(|f| ["--filter", f.as_str()]),
+        );
+        match self.run(runner, &self.argv(&args), None).await {
+            Ok(ids) => ids.lines().any(|id| !id.trim().is_empty()),
+            Err(_) => false,
+        }
+    }
+
+    /// Disconnects `bridge` (when given) from network `name`, then removes the network. A
+    /// network or connection that is already gone is fine. Both steps always run. The result is
+    /// the `network rm` one: once the network is gone its block is free, whatever the disconnect
+    /// said (for example that the bridge container is gone); if `rm` fails, that is the error.
+    async fn remove_network(
+        &self,
+        runner: &dyn CommandRunner,
+        bridge: Option<&str>,
+        name: &str,
+    ) -> Result<()> {
+        if self.apple {
+            return Ok(());
+        }
+        check_network_name(name)?;
+        if let Some(bridge) = bridge {
+            let disconnect = self.argv(&["network", "disconnect", "--force", name, bridge]);
+            // A disconnect that failed for a reason that matters also makes `rm` fail.
+            let _ = self
+                .run_tolerating(runner, &disconnect, &NETWORK_GONE)
+                .await;
+        }
+        let rm = self.argv(&["network", "rm", name]);
+        self.run_tolerating(runner, &rm, &NETWORK_GONE)
+            .await
+            .map(drop)
+    }
+
+    /// See [`SandboxDriver::taken_subnets`]. Apple `container` has no run networks: nothing.
+    async fn taken_subnets(
+        &self,
+        runner: &dyn CommandRunner,
+        instance: Option<&str>,
+    ) -> Result<Vec<Ipv4Cidr>> {
+        if self.apple {
+            return Ok(Vec::new());
+        }
+        docker_subnets_except_instance(runner, instance).await
+    }
+
+    /// See [`SandboxDriver::sweep_networks`]. Without a bridge the networks are only removed.
+    async fn sweep_networks(
+        &self,
+        runner: &dyn CommandRunner,
+        net: NetworkContext<'_>,
+    ) -> Result<()> {
+        if self.apple {
+            return Ok(());
+        }
+        let run_filter = format!("label={RUN_LABEL}");
+        let mut args = vec!["network", "ls", "--filter", run_filter.as_str()];
+        let instance_filter = match net.instance {
+            Some(id) => Some(format!("label={INSTANCE_LABEL}={}", check_id(id)?)),
+            None => None,
+        };
+        args.extend(
+            instance_filter
+                .iter()
+                .flat_map(|f| ["--filter", f.as_str()]),
+        );
+        args.extend(["--format", "{{.Name}}"]);
+        let names = self.run(runner, &self.argv(&args), None).await?;
+        let mut first = Ok(());
+        // Names are data from docker: one that is not a plain name never reaches the CLI.
+        for name in names
+            .lines()
+            .map(str::trim)
+            .filter(|n| is_container_name(n))
+        {
+            let removed = self.remove_network(runner, net.bridge, name).await;
+            if first.is_ok() {
+                first = removed;
+            }
+        }
+        first
+    }
+}
+
+/// Docker's answers for a network, or a connection to one, that is already gone. Shared with the
+/// subnet plan, where a network removed between `ls` and `inspect` is skipped.
+const NETWORK_GONE: [&str; 3] = ["not found", "No such network", "is not connected"];
+
+/// Whether `stderr` is docker's answer that network `name` itself already exists ("network with
+/// name <name> already exists"), not some other object.
+fn is_left_behind(stderr: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    stderr.contains("already exists") && stderr.split(|c: char| !word(c)).any(|w| w == name)
+}
+
+/// What a driver knows about networks: its gateway bridge container and its instance id.
+#[derive(Clone, Copy)]
+struct NetworkContext<'a> {
+    bridge: Option<&'a str>,
+    instance: Option<&'a str>,
+}
+
+/// `kestrel-gw-<last 12 hex chars of the run id>`.
+fn run_network_name(run: RunId) -> String {
+    let id = run.to_string();
+    let tail = id.get(id.len().saturating_sub(12)..).unwrap_or(&id);
+    format!("{GATEWAY_NETWORK}-{tail}")
+}
+
+/// A network or container name passed to the CLI: docker's name charset, so it can never be
+/// read as an option.
+fn check_network_name(name: &str) -> Result<&str> {
+    if is_container_name(name) {
+        return Ok(name);
+    }
+    Err(SandboxError::InvalidId {
+        id: name.to_string(),
+    })
 }
 
 type SharedExit = Shared<BoxFuture<'static, std::result::Result<i32, Arc<std::io::Error>>>>;
@@ -711,6 +1058,29 @@ macro_rules! cli_driver {
                     exits: Exits::default(),
                     owner: default_owner(),
                     instance: None,
+                    bridge: None,
+                }
+            }
+
+            /// Gives every run its own internal network, joined to the gateway bridge container
+            /// `name` (see [`SandboxDriver::prepare_network`]). Without it there are no run
+            /// networks. Apple `container` ignores it.
+            pub fn with_bridge(mut self, name: impl Into<String>) -> Self {
+                self.bridge = Some(name.into());
+                self
+            }
+
+            fn bridged(self, bridge: Option<&str>) -> Self {
+                match bridge {
+                    Some(name) => self.with_bridge(name),
+                    None => self,
+                }
+            }
+
+            fn network_context(&self) -> NetworkContext<'_> {
+                NetworkContext {
+                    bridge: self.bridge.as_deref(),
+                    instance: self.instance.as_deref(),
                 }
             }
 
@@ -765,6 +1135,26 @@ macro_rules! cli_driver {
                 $cli.leftovers(self.runner.as_ref(), self.instance.as_deref())
                     .await
             }
+            async fn prepare_network(
+                &self,
+                run: RunId,
+                subnet: &Subnet,
+            ) -> Result<Option<PreparedNetwork>> {
+                $cli.prepare_network(self.runner.as_ref(), self.network_context(), run, subnet)
+                    .await
+            }
+            async fn release_network(&self, network: &PreparedNetwork) -> Result<()> {
+                $cli.remove_network(self.runner.as_ref(), self.bridge.as_deref(), &network.name)
+                    .await
+            }
+            async fn sweep_networks(&self) -> Result<()> {
+                $cli.sweep_networks(self.runner.as_ref(), self.network_context())
+                    .await
+            }
+            async fn taken_subnets(&self) -> Result<Vec<Ipv4Cidr>> {
+                $cli.taken_subnets(self.runner.as_ref(), self.instance.as_deref())
+                    .await
+            }
         }
     };
 }
@@ -775,6 +1165,7 @@ pub struct GvisorDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 /// Apple `container` CLI (macOS 26+, Apple Silicon).
@@ -787,6 +1178,7 @@ pub struct AppleContainerDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 /// Plain docker with runc. Weak isolation, trusted runtimes only.
@@ -795,6 +1187,7 @@ pub struct DockerRuncDriver {
     exits: Exits,
     owner: OwnerLookup,
     instance: Option<String>,
+    bridge: Option<String>,
 }
 
 cli_driver!(GvisorDriver, GVISOR);
@@ -903,22 +1296,42 @@ pub fn detect_for(
     allow_weak: bool,
     instance: Option<&str>,
 ) -> Result<Vec<Box<dyn SandboxDriver>>> {
+    detect_with(host, allow_weak, instance, None)
+}
+
+/// Like [`detect_for`], with the docker drivers joined to the gateway bridge container `bridge`
+/// (see `with_bridge`), so every run gets its own network.
+pub fn detect_with(
+    host: &HostInfo,
+    allow_weak: bool,
+    instance: Option<&str>,
+    bridge: Option<&str>,
+) -> Result<Vec<Box<dyn SandboxDriver>>> {
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessRunner);
     let has_docker_runtime = |name: &str| host.docker_runtimes.iter().any(|r| r == name);
     let mut drivers: Vec<Box<dyn SandboxDriver>> = Vec::new();
     if host.os == Os::Linux && has_docker_runtime("runsc") {
-        drivers.push(Box::new(GvisorDriver::new(runner.clone()).tag(instance)));
+        drivers.push(Box::new(
+            GvisorDriver::new(runner.clone())
+                .tag(instance)
+                .bridged(bridge),
+        ));
     }
     if matches!(host.os, Os::MacOs { major } if major >= 26)
         && host.arch == Arch::Aarch64
         && host.apple_container
     {
+        // Apple `container` has no run networks; the bridge is ignored there.
         drivers.push(Box::new(
-            AppleContainerDriver::new(runner.clone()).tag(instance),
+            AppleContainerDriver::new(runner.clone())
+                .tag(instance)
+                .bridged(bridge),
         ));
     }
     if allow_weak && has_docker_runtime("runc") {
-        drivers.push(Box::new(DockerRuncDriver::new(runner).tag(instance)));
+        drivers.push(Box::new(
+            DockerRuncDriver::new(runner).tag(instance).bridged(bridge),
+        ));
     }
     if drivers.is_empty() {
         return Err(SandboxError::NoSecureSandbox {

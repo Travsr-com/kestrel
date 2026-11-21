@@ -16,6 +16,7 @@ pub mod workspace;
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -24,7 +25,8 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use kestrel_agent::{ParsedLine, RunContext, RuntimeAdapter};
 use kestrel_sandbox::{
-    INSTANCE_LABEL, LaunchSpec, NetworkPolicy, RUN_LABEL, SandboxDriver, SandboxHandle,
+    INSTANCE_LABEL, Ipv4Cidr, LaunchSpec, NetworkPolicy, PreparedNetwork, RUN_LABEL, SandboxDriver,
+    SandboxError, SandboxHandle, Subnet, SubnetPool,
 };
 use kestrel_store::{ControlCommand, RunFilter, Store, StoreError};
 use kestrel_types::{
@@ -60,6 +62,31 @@ pub enum EngineError {
     /// `recover` was called while `run_forever` is active.
     #[error("the engine is already running; wait until run_forever has returned")]
     AlreadyRunning,
+    /// No block of the subnet pool could be used for the run's network: this run found `taken`
+    /// of its blocks taken by networks Kestrel did not know about when it planned the pool, and
+    /// no block is free. `held` blocks are held by this engine's own runs and come back to the
+    /// pool when those end (a held block under a network made outside Kestrel is not counted);
+    /// when there are any, the run can be started again once one of them ends.
+    #[error("{}", no_subnet(.pool, *.taken, *.held))]
+    NoSubnet {
+        pool: Ipv4Cidr,
+        taken: usize,
+        held: usize,
+    },
+}
+
+/// The text of [`EngineError::NoSubnet`].
+fn no_subnet(pool: &Ipv4Cidr, taken: usize, held: usize) -> String {
+    let head = format!(
+        "no free network block in subnet pool {pool}: this run found {taken} of the pool's blocks taken by networks made outside Kestrel"
+    );
+    if held > 0 {
+        format!(
+            "{head}, and this Kestrel's own runs hold the rest ({held} in use). Start the run again once one of them ends"
+        )
+    } else {
+        format!("{head}, and none is free. Set gateway.subnet_pool to a free range")
+    }
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -146,8 +173,9 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 ///
 /// Resuming a run whose sandbox is stopped needs a free slot (a `Resume`, or an `Approve` after a
 /// restart). If none is free the command stays pending: the run stays suspended and the command
-/// is not dropped. `SetBudget` and `Cancel` still apply at once, and a `Cancel` removes the
-/// pending resume. A resume still pending when the engine stops is lost and must be sent again
+/// is not dropped (the one exception is an exhausted subnet pool, see "Run networks" below).
+/// `SetBudget` and `Cancel` still apply at once, and a `Cancel` removes the pending resume. A
+/// resume still pending when the engine stops is lost and must be sent again
 /// (the run stays suspended). After [`Engine::recover`] no run holds a slot, and commands for the
 /// recovered runs wait for one like any other.
 ///
@@ -155,6 +183,36 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// order. Each waiter gets an arrival number. Within one scheduler tick, newly seen `Queued` runs
 /// are numbered first (in creation order), then newly claimed resume commands (in control id
 /// order). Slots go to the lowest arrival number first.
+///
+/// # Run networks
+///
+/// With [`Engine::with_subnets`] every run that is about to get a NEW sandbox (a `Queued` run, or
+/// a resume of a run that has no sandbox, as after a restart) also needs a `/29` block of the
+/// subnet pool. The scheduler reserves it together with the slot, in the same FIFO line. A waiter
+/// that gets a slot but no block gives the slot back and stays where it is (the run stays
+/// `Queued`, the resume stays pending). It gets one `AgentLog` naming the subnet pool for the
+/// whole wait, not one per tick. Waiters behind it that also need a block wait too; ones that
+/// need none (a resume of a run whose stopped sandbox still exists) may take a free slot, so
+/// runs that hold blocks while suspended can always be resumed.
+///
+/// When the pool is exhausted ([`SubnetPool::exhausted`]: nothing is free and no block in use will
+/// come back until the next start), waiting would never end. Then each waiter that needs a block
+/// stops waiting as soon as it reaches a free slot (at once when slots are free, else when one
+/// frees up): a queued run fails with a message naming the pool, and a resume or approve is
+/// dropped with a log line naming it while the run stays suspended.
+///
+/// The run actor turns the block into the run's network with `SandboxDriver::prepare_network`
+/// before it builds the launch plan, and the gateway URL of the run points at the bridge on that
+/// network. A block docker says is taken by another network is excluded from the pool, together
+/// with every block the driver's `taken_subnets` lists in use, and another one is tried, until
+/// the pool has no free block left; only then does the run fail. Its failure message says how
+/// many blocks the run found taken and whether this engine's own runs hold the rest. A run
+/// that already has a network (its stopped sandbox outlived a `run_forever` that was stopped and
+/// started again) reuses it. A driver without run networks gives the block back at once, and the
+/// run uses the shared network as before. When the run ends, its sandbox is destroyed, then its
+/// network removed, then its block freed. A suspended run keeps its network
+/// and block while its stopped sandbox exists. [`Engine::shutdown`] removes the networks of the
+/// sandboxes it destroys, and [`Engine::recover`] removes every leftover labelled run network.
 ///
 /// # Stopping and starting again
 ///
@@ -185,6 +243,8 @@ const WALL_CLOCK_EXCEEDED: &str = "wall clock exceeded";
 /// * A run resumed by a new engine after a restart gets a fresh sandbox, and its wall clock starts
 ///   over.
 /// * The wall clock counts only time spent `Provisioning` or `Running`, not time suspended.
+/// * A run that hits taken blocks while the rest of the pool is held by its own runs fails with
+///   a message saying so, instead of waiting for a block.
 pub struct Engine {
     inner: Arc<Inner>,
 }
@@ -203,6 +263,8 @@ struct Inner {
     slots: Mutex<Slots>,
     /// Instance id for the `kestrel.instance` label, see [`Engine::with_instance`].
     instance: Option<String>,
+    /// Blocks for run networks, see [`Engine::with_subnets`].
+    subnets: Option<Arc<SubnetPool>>,
     /// What lives outside the run actors, which are aborted when `run_forever` returns.
     live: Mutex<Live>,
     /// Signals a change of `live`.
@@ -218,6 +280,11 @@ struct Live {
     creating: HashSet<RunId>,
     /// Sandboxes created and not yet destroyed: (driver index, sandbox id) to run.
     sandboxes: BTreeMap<(usize, String), RunId>,
+    /// Blocks of the subnet pool held by a run: reserved by the scheduler, then used by the run's
+    /// network.
+    blocks: HashMap<RunId, Subnet>,
+    /// Run networks made and not yet removed, with the index of the driver that made them.
+    networks: HashMap<RunId, (usize, PreparedNetwork)>,
 }
 
 /// Control channels of the run actors, by run.
@@ -238,6 +305,8 @@ struct Waiter {
     run: RunId,
     /// `None` for a `Queued` run to start.
     resume: Option<ControlCommand>,
+    /// Whether the run was told it waits for a network block, so it is told once per wait.
+    told: bool,
 }
 
 impl Waiter {
@@ -286,6 +355,7 @@ impl Engine {
                 models,
                 workspaces: None,
                 instance: None,
+                subnets: None,
                 live: Mutex::default(),
                 changed: Notify::new(),
             }),
@@ -318,6 +388,18 @@ impl Engine {
         debug_assert!(inner.is_some(), "engine state is shared");
         if let Some(inner) = inner {
             inner.instance = Some(id.into());
+        }
+        self
+    }
+
+    /// Gives every run its own network on a `/29` block of `pool`, see the [`Engine`] docs.
+    /// Drivers that return `None` from `prepare_network` keep the shared network. Takes the
+    /// engine by value, like [`Engine::with_workspaces`].
+    pub fn with_subnets(mut self, pool: Arc<SubnetPool>) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.subnets = Some(pool);
         }
         self
     }
@@ -399,6 +481,23 @@ impl Engine {
                 Err(e) => report.failed.push((run, e.to_string())),
             }
         }
+        drop(pending);
+        // Best effort, in what is left of the grace period: the networks no sandbox uses any more.
+        let unused: Vec<RunId> = {
+            let live = inner.live();
+            live.networks
+                .keys()
+                .filter(|run| {
+                    !live.creating.contains(run) && !live.sandboxes.values().any(|r| r == *run)
+                })
+                .copied()
+                .collect()
+        };
+        let mut releases: FuturesUnordered<_> = unused
+            .into_iter()
+            .map(|run| inner.release_network(run))
+            .collect();
+        while let Ok(Some(_)) = timeout_at(deadline, releases.next()).await {}
         report.timed_out.extend(left);
         report
     }
@@ -407,7 +506,8 @@ impl Engine {
     ///
     /// `Running` runs become `Suspended(Error("engine restarted"))`, `Provisioning` runs fail,
     /// `Suspended` runs stay suspended and `Queued` runs stay queued. Sandboxes left behind by the
-    /// previous engine are destroyed; a resumed run gets a fresh one.
+    /// previous engine are destroyed; a resumed run gets a fresh one. Then every leftover run
+    /// network the drivers find is removed (best effort, like the sandboxes).
     ///
     /// Refused with [`EngineError::AlreadyRunning`] while `run_forever` is active.
     pub async fn recover(&self) -> Result<RecoveryReport> {
@@ -416,6 +516,8 @@ impl Engine {
         }
         let store = &self.inner.store;
         self.inner.sweep_leftovers().await;
+        // After the sandboxes: docker refuses to remove a network a container still uses.
+        self.inner.sweep_networks().await;
         let mut report = RecoveryReport::default();
         for run in store.list_runs(RunFilter::default())? {
             if run.status.is_terminal() || run.status == RunStatus::Queued {
@@ -462,9 +564,21 @@ impl Inner {
         Ok(Active(self))
     }
 
-    /// Every slot free again, as the actors that held them are gone.
+    /// Every slot free again, as the actors that held them are gone, and so are the blocks they
+    /// had reserved but not made a network on.
     fn reset_slots(&self) {
         *self.slots() = Slots::new(self.limits.max_concurrent_runs);
+        let reserved: Vec<RunId> = {
+            let live = self.live();
+            live.blocks
+                .keys()
+                .filter(|run| !live.networks.contains_key(run))
+                .copied()
+                .collect()
+        };
+        for run in reserved {
+            self.free_block(run);
+        }
     }
 
     /// Resolves once `run_forever` is not active and no `create` is in flight.
@@ -527,6 +641,131 @@ impl Inner {
         }
     }
 
+    /// Best effort: removes every leftover run network the drivers find (see
+    /// `SandboxDriver::sweep_networks`). Every block this engine held goes back to the pool: the
+    /// networks on them are gone, and docker refuses (then the engine excludes) any that is not.
+    async fn sweep_networks(&self) {
+        for driver in &self.drivers {
+            let _ = driver.sweep_networks().await;
+        }
+        let blocks: Vec<RunId> = {
+            let mut live = self.live();
+            live.networks.clear();
+            live.blocks.keys().copied().collect()
+        };
+        for run in blocks {
+            self.free_block(run);
+        }
+    }
+
+    /// Whether `run` needs a block before it can go on: the engine has a pool, the run holds no
+    /// block, and it has no sandbox, so it is about to get a new one.
+    fn needs_block(&self, run: RunId) -> bool {
+        if self.subnets.is_none() {
+            return false;
+        }
+        let live = self.live();
+        !live.blocks.contains_key(&run) && !live.sandboxes.values().any(|r| *r == run)
+    }
+
+    /// The block `run` holds, reserving one if it holds none. `None` when the pool has no free
+    /// block (or the engine has no pool).
+    fn block_for(&self, run: RunId) -> Option<Subnet> {
+        if let Some(block) = self.live().blocks.get(&run) {
+            return Some(block.clone());
+        }
+        let block = self.subnets.as_ref()?.reserve()?;
+        self.live().blocks.insert(run, block.clone());
+        Some(block)
+    }
+
+    /// Gives `run`'s block back to the pool, if it holds one.
+    fn free_block(&self, run: RunId) {
+        let block = self.live().blocks.remove(&run);
+        if let (Some(block), Some(pool)) = (block, &self.subnets) {
+            pool.release(&block);
+        }
+    }
+
+    /// Gives `run`'s block back if no network was made on it (a reservation not used).
+    fn free_unused_block(&self, run: RunId) {
+        if !self.live().networks.contains_key(&run) {
+            self.free_block(run);
+        }
+    }
+
+    /// Removes `run`'s network, if it has one, then frees its block. A network the driver could
+    /// not remove retires its block (excluded until the next start), so the block is never handed
+    /// out while the network may still use it, and it no longer counts as held by a run.
+    async fn release_network(&self, run: RunId) -> kestrel_sandbox::Result<()> {
+        let found = self.live().networks.remove(&run);
+        let Some((driver, network)) = found else {
+            self.free_block(run);
+            return Ok(());
+        };
+        let released = self.drivers[driver].release_network(&network).await;
+        if released.is_ok() {
+            self.free_block(run);
+        } else {
+            let block = self.live().blocks.remove(&run);
+            if let (Some(pool), Some(block)) = (&self.subnets, block) {
+                pool.exclude(&[block.cidr()]);
+            }
+        }
+        released
+    }
+
+    /// True when the subnet pool has no free block and no block held by a run that will come
+    /// back: every block is excluded (taken by networks outside Kestrel, or retired because a
+    /// network could not be removed) until the next start.
+    fn pool_is_dead(&self) -> bool {
+        self.subnets.as_ref().is_some_and(|p| p.exhausted())
+    }
+
+    /// Ends the wait of `run` for a block from a dead pool ([`Inner::pool_is_dead`]). A queued run
+    /// (`cmd` is `None`) fails; for a resume or approve, the command is dropped with a log line
+    /// naming it and the run stays suspended.
+    fn give_up_on_pool(&self, run: RunId, cmd: Option<&ControlCommand>) -> Result<()> {
+        let pool = self.subnets.as_ref().map(|p| p.pool().to_string());
+        let why = format!(
+            "no block of subnet pool {} can be used until kestrel serve restarts: every block is \
+             taken by networks outside Kestrel or by run networks that could not be removed. Set \
+             gateway.subnet_pool to a free range, or restart",
+            pool.unwrap_or_default()
+        );
+        match cmd {
+            Some(cmd) => {
+                let what = match cmd {
+                    ControlCommand::Approve(_) => "approve",
+                    ControlCommand::Resume => "resume",
+                    // Only resumes and approves wait for a slot (see `route`); anything else is
+                    // named generically rather than mislabelled.
+                    _ => "command",
+                };
+                let line = format!("kestrel: {what} not possible: {why}");
+                self.store.append(run, EventKind::AgentLog { line })?;
+            }
+            None => {
+                // The run may have been cancelled meanwhile; then there is nothing to fail. Any
+                // other store error leaves the run `Queued`, so the next tick lines it up and
+                // tries again.
+                let _ = self
+                    .store
+                    .transition(run, &RunStatus::Queued, RunStatus::Failed(why));
+            }
+        }
+        Ok(())
+    }
+
+    /// The line a run waiting for a block gets, once per wait.
+    fn pool_note(&self) -> String {
+        let pool = self.subnets.as_ref().map(|p| p.pool().to_string());
+        format!(
+            "kestrel: waiting for a network block: every /29 block of subnet pool {} is in use",
+            pool.unwrap_or_default()
+        )
+    }
+
     /// One scheduler tick: forget finished actors, route control commands, line up the queued
     /// runs and the commands that need a slot, then hand out the free slots in that order.
     fn poll(self: &Arc<Self>, s: &mut Scheduler) -> Result<()> {
@@ -578,6 +817,7 @@ impl Inner {
                 resumes.push(Waiter {
                     run,
                     resume: Some(cmd),
+                    told: false,
                 });
             }
             return Ok(());
@@ -607,32 +847,68 @@ impl Inner {
             s.waiting.push_back(Waiter {
                 run: run.id,
                 resume: None,
+                told: false,
             });
         }
         Ok(())
     }
 
-    /// Gives free slots to the waiters, first come first served. When the head of the line finds
-    /// no slot, nobody behind it can: every waiter needs exactly one.
+    /// Gives free slots to the waiters, first come first served. When a waiter finds no slot,
+    /// nobody behind it can: every waiter needs exactly one.
+    ///
+    /// A waiter that also needs a network block ([`Inner::needs_block`]) and finds none gives its
+    /// slot back and stays in line, told once. Behind it, only waiters that need no block may go
+    /// on: no block is free for the others either.
     fn grant(self: &Arc<Self>, s: &mut Scheduler) -> Result<()> {
-        while let Some(waiter) = s.waiting.pop_front() {
+        let mut i = 0;
+        let mut starved = false;
+        while let Some(waiter) = s.waiting.get_mut(i) {
+            let (run, resume) = (waiter.run, waiter.resume.is_some());
+            let needs_block = self.needs_block(run);
+            if starved && needs_block {
+                i += 1;
+                continue;
+            }
             let got = {
                 let mut slots = self.slots();
-                match waiter.resume {
-                    Some(_) => slots.reacquire(waiter.run),
-                    None => slots.try_acquire(waiter.run),
+                if resume {
+                    slots.reacquire(run)
+                } else {
+                    slots.try_acquire(run)
                 }
             };
             if !got {
-                s.waiting.push_front(waiter);
                 break;
             }
-            let started = match &waiter.resume {
-                None => self.start_queued(waiter.run, s)?,
-                Some(cmd) => self.start_resume(waiter.run, cmd.clone(), s)?,
+            if needs_block && self.block_for(run).is_none() {
+                self.slots().release(run);
+                if self.pool_is_dead() {
+                    // Nothing is free and no run holds a block that will come back: waiting would
+                    // never end. A queued run fails; a resume or approve is dropped and the run
+                    // stays suspended.
+                    let dropped = s.waiting.remove(i).and_then(|w| w.resume);
+                    self.give_up_on_pool(run, dropped.as_ref())?;
+                    continue;
+                }
+                starved = true;
+                if !waiter.told {
+                    waiter.told = true;
+                    let line = self.pool_note();
+                    self.store.append(run, EventKind::AgentLog { line })?;
+                }
+                i += 1;
+                continue;
+            }
+            let Some(waiter) = s.waiting.remove(i) else {
+                break;
+            };
+            let started = match waiter.resume {
+                None => self.start_queued(run, s)?,
+                Some(cmd) => self.start_resume(run, cmd, s)?,
             };
             if !started {
-                self.slots().release(waiter.run);
+                self.slots().release(run);
+                self.free_unused_block(run);
             }
         }
         Ok(())
@@ -762,11 +1038,13 @@ impl Inner {
         self.drivers.iter().position(|d| d.name() == name)
     }
 
-    /// The per-run gateway URL, `{gateway}/r/{token}`.
-    fn run_gateway(&self, token: &str) -> Url {
+    /// The gateway URL for a sandbox on `network`: the configured one, with its host replaced by
+    /// the bridge's address on the run's own network when there is one.
+    fn gateway_for(&self, network: Option<&PreparedNetwork>) -> Url {
         let mut url = self.gateway_url.clone();
-        if let Ok(mut path) = url.path_segments_mut() {
-            path.pop_if_empty().push("r").push(token);
+        if let Some(net) = network {
+            // Only a URL that cannot have a host refuses this; it then stays as configured.
+            let _ = url.set_ip_host(IpAddr::V4(net.gateway_host));
         }
         url
     }
@@ -822,6 +1100,15 @@ impl Drop for Active<'_> {
         self.0.live().active = None;
         self.0.changed.notify_waiters();
     }
+}
+
+/// The per-run gateway URL, `{gateway}/r/{token}`.
+fn run_gateway(gateway: &Url, token: &str) -> Url {
+    let mut url = gateway.clone();
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().push("r").push(token);
+    }
+    url
 }
 
 /// An `AgentLog` noting that `cmd` does not apply to a run in `status`.
@@ -907,6 +1194,10 @@ impl Actor {
         if let Some(sb) = self.sandbox.take() {
             let _ = self.inner.destroy_tracked(sb.driver, &sb.handle).await;
         }
+        // After the sandbox: docker refuses to remove a network a container still uses.
+        if let Err(e) = self.inner.release_network(self.id).await {
+            let _ = self.log(&format!("kestrel: removing the run network failed: {e}"));
+        }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
     }
@@ -961,12 +1252,18 @@ impl Actor {
     /// While suspended: applies one command. True when the run should run again.
     async fn wait_for_resume(&mut self) -> Result<bool> {
         let cmd = recv(&mut self.cmds).await;
+        // Only these may have been given a slot (and a block) by the scheduler. Any other command
+        // leaves both alone: a resume it arrived with may be right behind it, and its slot and
+        // block must still be there when it is read.
+        let resumes = matches!(cmd, ControlCommand::Resume | ControlCommand::Approve(_));
         let next = self.on_command(cmd)?;
         // An approval granted after a restart leaves the run `Running` with nothing attached.
         let go = matches!(next, Next::Resume) || self.status == RunStatus::Running;
-        if !go {
-            // A resume that was declined, or a cancel: nothing here needs the slot taken for it.
+        if !go && resumes {
+            // A resume that was declined: nothing here needs the slot (or a block) taken for it.
+            // A cancel or a reject ends the run, which gives both back.
             self.sync_slot();
+            self.inner.free_unused_block(self.id);
         }
         Ok(go)
     }
@@ -979,7 +1276,9 @@ impl Actor {
             .driver_for(self.spec.sandbox.tier)
             .ok_or(EngineError::NoDriver)?;
         let driver = &inner.drivers[idx];
-        let mut launch = self.launch_spec()?;
+        // The network first: the launch plan holds the bridge's address on it.
+        let network = self.prepare_network(idx).await?;
+        let mut launch = self.launch_spec(network.as_ref())?;
         launch.workspace = self.workspace().await?;
         let mut create = inner.start_create(self.id, idx, launch);
         let created = loop {
@@ -1027,10 +1326,93 @@ impl Actor {
         Ok(Some(workspaces.prepare(self.id, spec).await?))
     }
 
-    fn launch_spec(&self) -> Result<LaunchSpec> {
+    /// The run's own network on a block of the engine's pool, when the engine has one and the
+    /// driver makes run networks. Registered with the engine so it is removed when the run ends
+    /// (or by `shutdown`). A run that already has a network reuses it. A block docker says is
+    /// taken is excluded from the pool together with every block the driver's
+    /// `taken_subnets` reports in use, and another one is tried, until the pool has no free
+    /// block left ([`EngineError::NoSubnet`]); any other failure frees the block and fails the
+    /// run.
+    async fn prepare_network(&mut self, idx: usize) -> Result<Option<PreparedNetwork>> {
+        let inner = self.inner.clone();
+        let Some(pool) = &inner.subnets else {
+            return Ok(None);
+        };
+        // A run that has a network keeps it: its stopped sandbox outlived the actor that made
+        // it (`run_forever` stopped and started again without `recover`). The run's spec picks
+        // the same driver, and docker would refuse a second network of that name.
+        let existing = inner.live().networks.get(&self.id).cloned();
+        if let Some((_, net)) = existing {
+            return Ok(Some(net));
+        }
+        let driver = &inner.drivers[idx];
+        // Blocks this run found taken, for the message if none is left.
+        let mut taken_blocks = 0;
+        // Every taken block is excluded, so each attempt leaves one block fewer and this ends
+        // when the pool has none free. The bound is only a safety net.
+        for _ in 0..pool.capacity() {
+            let Some(subnet) = inner.block_for(self.id) else {
+                break;
+            };
+            match driver.prepare_network(self.id, &subnet).await {
+                Ok(Some(net)) => {
+                    inner.live().networks.insert(self.id, (idx, net.clone()));
+                    return Ok(Some(net));
+                }
+                Ok(None) => {
+                    inner.free_block(self.id);
+                    return Ok(None);
+                }
+                Err(SandboxError::SubnetTaken { subnet: taken }) => {
+                    // Counted even if another run excluded it meanwhile: docker refused it.
+                    taken_blocks += pool.exclude(&[taken]).max(1);
+                    taken_blocks += self.exclude_listed(pool, driver.as_ref()).await;
+                    inner.free_block(self.id);
+                }
+                Err(e) => {
+                    inner.free_block(self.id);
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(EngineError::NoSubnet {
+            pool: pool.pool(),
+            taken: taken_blocks,
+            held: pool.in_use(),
+        })
+    }
+
+    /// Best effort: excludes from `pool` every block the subnets the driver reports in use
+    /// (`SandboxDriver::taken_subnets`) cover, except the blocks other runs of this engine hold
+    /// ([`SubnetPool::exclude_except`]). A held block stays theirs: one under a network made
+    /// outside Kestrel is excluded once its run gives it back, and a subnet inside one held
+    /// block (that run's own network, listed by a driver without an instance id) is ignored.
+    /// Returns how many blocks were newly found taken. An error lists nothing.
+    ///
+    /// Known limit, only without an instance id (`serve` always sets one): the listing is read
+    /// before the held blocks. If another run removes its network and frees its block in between,
+    /// that run's /29 is still listed but no longer held, so the block is excluded until the next
+    /// start. Conservative: a block is lost, never handed out twice.
+    async fn exclude_listed(&self, pool: &SubnetPool, driver: &dyn SandboxDriver) -> usize {
+        let Ok(listed) = driver.taken_subnets().await else {
+            return 0;
+        };
+        let held: Vec<Subnet> = self
+            .inner
+            .live()
+            .blocks
+            .iter()
+            .filter(|(run, _)| **run != self.id)
+            .map(|(_, block)| block.clone())
+            .collect();
+        pool.exclude_except(&listed, &held)
+    }
+
+    fn launch_spec(&self, network: Option<&PreparedNetwork>) -> Result<LaunchSpec> {
+        let gateway = self.inner.gateway_for(network);
         let ctx = RunContext {
             run_id: self.id,
-            gateway_url: self.inner.run_gateway(&self.token),
+            gateway_url: run_gateway(&gateway, &self.token),
             model: self.inner.model(self.spec.model_policy.default),
         };
         let plan = self.adapter.launch_plan(&self.spec, &self.input, &ctx)?;
@@ -1045,8 +1427,12 @@ impl Actor {
             workspace: None,
             cpu_millis: self.spec.sandbox.cpu_millis,
             memory_mb: self.spec.sandbox.memory_mb,
-            network: NetworkPolicy::GatewayOnly {
-                gateway: self.inner.gateway_url.clone(),
+            network: match network {
+                Some(net) => NetworkPolicy::RunNetwork {
+                    network: net.name.clone(),
+                    gateway,
+                },
+                None => NetworkPolicy::GatewayOnly { gateway },
             },
             labels,
         })
