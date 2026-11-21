@@ -59,10 +59,17 @@ fn up_serves_the_api_with_the_printed_token_and_stops_on_sigint() {
     let ready = common::json_line(&lines.next_line("up ready line"));
     let api = ready["api"].as_str().expect("api address").to_string();
     let url = ready["url"].as_str().expect("ui url").to_string();
-    assert!(api.starts_with("127.0.0.1:") && !api.ends_with(":0"), "{ready}");
+    assert!(
+        api.starts_with("127.0.0.1:") && !api.ends_with(":0"),
+        "{ready}"
+    );
     assert!(ready["gateway"].is_string(), "{ready}");
 
-    let token = url.split("?token=").nth(1).expect("token in the url").to_string();
+    let token = url
+        .split("?token=")
+        .nth(1)
+        .expect("token in the url")
+        .to_string();
     assert_eq!(url, format!("http://{api}/?token={token}"));
     let stored = std::fs::read_to_string(f.db.with_file_name("server.token")).unwrap();
     assert_eq!(stored.trim(), token);
@@ -76,7 +83,11 @@ fn up_serves_the_api_with_the_printed_token_and_stops_on_sigint() {
 
     up.interrupt();
     let status = up.wait_exit("up to stop after SIGINT");
-    assert!(status.success(), "up exit {status:?}, stderr: {}", up.stderr());
+    assert!(
+        status.success(),
+        "up exit {status:?}, stderr: {}",
+        up.stderr()
+    );
     // The port is free again.
     std::net::TcpListener::bind(&api).unwrap();
 }
@@ -100,7 +111,10 @@ fn up_reuses_the_token_across_starts() {
     ]);
     let mut up = ChildGuard::spawn(cmd);
     let ready = common::json_line(&up.stdout_lines().next_line("up ready line"));
-    assert!(ready["url"].as_str().unwrap().ends_with("?token=feedface"), "{ready}");
+    assert!(
+        ready["url"].as_str().unwrap().ends_with("?token=feedface"),
+        "{ready}"
+    );
     up.interrupt();
     assert!(up.wait_exit("up to stop").success());
 }
