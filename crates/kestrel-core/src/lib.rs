@@ -1172,13 +1172,14 @@ impl Inner {
         if self.is_cancelling(run) {
             return Ok(());
         }
-        // Read first, so a store error leaves no run marked as cancelling for good.
+        // Read first, and hold the cancel back before going down: a store error on the way leaves
+        // the run held back (`cancel_ready` looks below it again), never just marked.
         let below = self.live_below(run)?;
         self.cancelling_insert(run);
+        s.pending_cancels.push(run);
         for run_below in below {
             self.cancel_tree(run_below, s)?;
         }
-        s.pending_cancels.push(run);
         Ok(())
     }
 
@@ -1336,17 +1337,22 @@ impl Inner {
         if !self.slots().reacquire(run) {
             return Ok(false);
         }
-        // The slot is back: nothing is on its way any more.
-        joins.remove(&run);
-        drop(joins);
-        if let Some(Waiter {
-            rejoin: Some(Rejoin::Told(tx)),
-            ..
-        }) = s.waiting.remove(i)
-            && tx.send(()).is_err()
-        {
-            // The join went away just now; it lined up a detached waiter, which takes the slot.
+        // The joins lock is still held, so no join can start until the state below is settled.
+        let handed = match s.waiting.remove(i) {
+            Some(Waiter {
+                rejoin: Some(Rejoin::Told(tx)),
+                ..
+            }) => tx.send(()).is_ok(),
+            _ => true,
+        };
+        if handed {
+            // The slot is back: nothing is on its way any more.
+            joins.remove(&run);
+        } else {
+            // The join went away just now. The slot is still owed: its detached waiter, or a join
+            // that starts meanwhile, takes it back.
             self.slots().release(run);
+            joins.entry(run).or_default().regaining = true;
         }
         Ok(true)
     }
