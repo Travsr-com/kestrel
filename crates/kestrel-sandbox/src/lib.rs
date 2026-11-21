@@ -315,6 +315,37 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
+/// Like [`ProcessRunner`], except that [`run`](CommandRunner::run) and
+/// [`run_with_env`](CommandRunner::run_with_env) kill their process when their future is
+/// dropped (a timeout gave up on it, say), so a command given up on stops writing. `spawn` is
+/// [`ProcessRunner`]'s: a spawned process is reaped on its own, however its handle is dropped.
+#[derive(Debug, Clone, Default)]
+pub struct KillOnDropRunner;
+
+#[async_trait]
+impl CommandRunner for KillOnDropRunner {
+    async fn run(&self, argv: &[String]) -> std::io::Result<CommandOutput> {
+        let mut cmd = command(argv)?;
+        cmd.kill_on_drop(true);
+        output_of(cmd).await
+    }
+
+    async fn run_with_env(
+        &self,
+        argv: &[String],
+        env: &EnvScrub,
+    ) -> std::io::Result<CommandOutput> {
+        let mut cmd = command(argv)?;
+        cmd.kill_on_drop(true);
+        env.apply(&mut cmd);
+        output_of(cmd).await
+    }
+
+    async fn spawn(&self, argv: &[String]) -> std::io::Result<SpawnedProcess> {
+        ProcessRunner.spawn(argv).await
+    }
+}
+
 impl EnvScrub {
     /// Applies `remove` (exact names, or prefixes ending in `*`), then `set`, to `cmd`.
     fn apply(&self, cmd: &mut tokio::process::Command) {
