@@ -725,33 +725,33 @@ impl Engine {
         // Whether the run recorded the question: one that stopped running first refuses it unasked.
         let mut asked = false;
         loop {
-            // Every new event, page after page, so a long log is read once, not a page per poll.
-            let mut page = store.events_page(run, cursor, 256)?;
-            let mut more = page.len() == 256;
-            while more {
-                let last = page.last().map_or(cursor, |e| e.seq);
-                let next = store.events_page(run, last, 256)?;
-                more = next.len() == 256;
-                page.extend(next);
-            }
-            for event in page {
-                cursor = event.seq;
-                match event.kind {
-                    EventKind::ApprovalRequested { id: requested, .. } if requested == id => {
-                        asked = true;
+            // Every new event, a page at a time until a short one, so a long log is read once
+            // (not a page per poll) and never held whole.
+            loop {
+                let page = store.events_page(run, cursor, 256)?;
+                let full = page.len() == 256;
+                for event in page {
+                    cursor = event.seq;
+                    match event.kind {
+                        EventKind::ApprovalRequested { id: requested, .. } if requested == id => {
+                            asked = true;
+                        }
+                        EventKind::ApprovalResolved {
+                            id: resolved,
+                            approved,
+                            payload,
+                        } if resolved == id => {
+                            return match (asked, approved) {
+                                (false, _) => Err(AskError::NotRunning),
+                                (true, true) => Ok(payload.unwrap_or_default()),
+                                (true, false) => Err(AskError::Declined(payload)),
+                            };
+                        }
+                        _ => {}
                     }
-                    EventKind::ApprovalResolved {
-                        id: resolved,
-                        approved,
-                        payload,
-                    } if resolved == id => {
-                        return match (asked, approved) {
-                            (false, _) => Err(AskError::NotRunning),
-                            (true, true) => Ok(payload.unwrap_or_default()),
-                            (true, false) => Err(AskError::Declined(payload)),
-                        };
-                    }
-                    _ => {}
+                }
+                if !full {
+                    break;
                 }
             }
             if let Some(row) = store.get_run(run)?
@@ -1050,12 +1050,9 @@ impl Engine {
                             },
                         )?;
                     }
-                    let next = RunStatus::Failed(format!(
-                        "{ENGINE_RESTARTED} while its question waited; run it again"
-                    ));
-                    store.transition(run.id, &run.status, next)?;
                     // No orphans, as for any run that ends: its live children are cancelled when
-                    // the engine starts, unless its spec keeps them.
+                    // the engine starts, unless its spec keeps them. Queued before the run fails,
+                    // so a stop in between leaves the run to this same path again.
                     let keeps = store.run_spec(run.id)?.is_some_and(|s| {
                         s.capabilities
                             .spawn
@@ -1069,6 +1066,10 @@ impl Engine {
                             }
                         }
                     }
+                    let next = RunStatus::Failed(format!(
+                        "{ENGINE_RESTARTED} while its question waited; run it again"
+                    ));
+                    store.transition(run.id, &run.status, next)?;
                 }
                 _ => report.suspended.push(run.id),
             }

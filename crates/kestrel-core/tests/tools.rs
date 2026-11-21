@@ -397,3 +397,61 @@ async fn an_approval_the_agent_asked_for_still_stops_the_clock() {
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     assert!(h.is(id, &RunStatus::Suspended(SuspendReason::Approval(aid))));
 }
+
+// Review 3 of PR 76.
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_cancels_a_running_child_and_its_queued_grandchild_of_a_failed_question_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let (child, grandchild) = {
+        let first = Harness::on(&db, 4);
+        let parent = first.submit(agent("{ mcp: [kestrel.ask_human] }")).await;
+        left_waiting(&first.store, parent, ApprovalId::new());
+        let st = &first.store;
+        let child = st
+            .create_child_run(parent, &agent("{ mcp: [] }"), "help")
+            .unwrap();
+        st.transition(child, &RunStatus::Queued, RunStatus::Provisioning)
+            .unwrap();
+        st.transition(child, &RunStatus::Provisioning, RunStatus::Running)
+            .unwrap();
+        let grandchild = st
+            .create_child_run(child, &agent("{ mcp: [] }"), "more")
+            .unwrap();
+        (child, grandchild)
+    };
+    let mut h = Harness::on(&db, 4);
+    h.engine.recover().await.unwrap();
+    let _s = h.driver.live();
+    h.start();
+    until("the child cancelled", || h.is(child, &RunStatus::Cancelled)).await;
+    until("the grandchild cancelled", || {
+        h.is(grandchild, &RunStatus::Cancelled)
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_that_keeps_its_children_keeps_them_after_a_restart_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let child = {
+        let first = Harness::on(&db, 4);
+        let parent = first
+            .submit(agent(
+                "{ mcp: [kestrel.ask_human], spawn: { max_children: 2, max_depth: 1, agents: [lead], keep_children: true } }",
+            ))
+            .await;
+        left_waiting(&first.store, parent, ApprovalId::new());
+        first
+            .store
+            .create_child_run(parent, &agent("{ mcp: [] }"), "help")
+            .unwrap()
+    };
+    let mut h = Harness::on(&db, 4);
+    h.engine.recover().await.unwrap();
+    let _s = h.driver.live();
+    h.start();
+    until("the child runs", || h.is(child, &RunStatus::Running)).await;
+}
