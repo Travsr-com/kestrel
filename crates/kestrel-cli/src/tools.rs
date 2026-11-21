@@ -11,7 +11,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use kestrel_core::caps::RootKey;
@@ -42,20 +41,22 @@ pub(crate) fn load_or_create_root_key(path: &Path) -> Result<RootKey, Failure> {
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let key = RootKey::generate();
-            // Written whole to a file of this process first, then linked into place: a link never
-            // replaces a file, so another serve starting at the same moment reads a whole key,
-            // never a half-written one.
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let tmp = path.with_file_name(format!("root.key.{}.{n}.tmp", std::process::id()));
-            write_new(&tmp, &hex(&key.to_bytes())).map_err(|e| named(e.to_string()))?;
+            let text = hex(&key.to_bytes());
+            // Written whole and flushed to disk under a name of its own (from the new key, so no
+            // leftover of a crashed start is in the way), then linked into place: a link never
+            // replaces a file, so the key file is never seen half written.
+            let tmp =
+                path.with_file_name(format!("root.key.{}.tmp", text.get(..16).unwrap_or("new")));
+            write_new(&tmp, &text).map_err(|e| named(e.to_string()))?;
             let linked = std::fs::hard_link(&tmp, path);
             let _ = std::fs::remove_file(&tmp);
             match linked {
                 Ok(()) => Ok(key),
                 // Another process made it first: use theirs.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => load_or_create_root_key(path),
-                Err(e) => Err(named(e.to_string())),
+                Err(e) => Err(named(format!(
+                    "could not put the new root key in place ({e}); the data directory needs a filesystem with hard links"
+                ))),
             }
         }
         Err(e) => Err(named(e.to_string())),
@@ -70,7 +71,9 @@ fn write_new(path: &Path, text: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(text.as_bytes())
+    let mut file = options.open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 fn hex(bytes: &[u8]) -> String {
