@@ -1972,8 +1972,9 @@ impl Inner {
 
     /// Removes `run`'s config directory, if there is one (best effort). Like writing, never
     /// through a root that is a link. The owner is not checked here, and a root swapped for a link
-    /// between the check and the removal is not caught: a root another user can rename is a
-    /// misconfiguration that writing already refuses.
+    /// between the check and the removal is not caught. That is accepted because the root is
+    /// meant to sit in a directory only its owner can write (the default one does, in the sticky
+    /// temp dir); nothing checks the parent of a configured root.
     fn remove_run_config(&self, run: RunId) {
         let real_dir = std::fs::symlink_metadata(&self.run_config).is_ok_and(|m| m.is_dir());
         if real_dir {
