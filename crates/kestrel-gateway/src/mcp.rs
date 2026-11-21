@@ -12,7 +12,8 @@
 //!   records the denial.
 //! * **Calls survive a dropped connection**: each call runs in its own task, keyed by the run and
 //!   the JSON-RPC id. Calling again with the same id waits for the same result, so a client that
-//!   reconnects gets it without a second spawn or a second wait. Results are kept for an hour.
+//!   reconnects gets it without a second spawn or a second wait. Results are kept for at least an
+//!   hour, and dropped by the first call that comes after that.
 //! * **Limits**, so a sandbox cannot make the gateway hold much: bodies up to 1 MiB (413), ids a
 //!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
 //!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
@@ -59,6 +60,8 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_CHILDREN: usize = 256;
 /// Runs whose call allowance is remembered before full ones are forgotten.
 const MAX_BUCKETS: usize = 1024;
+/// How often expired results are looked for.
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// Longest a join may wait.
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -213,6 +216,8 @@ struct RunCalls {
 pub(crate) struct McpState {
     calls: Mutex<HashMap<RunId, RunCalls>>,
     buckets: Mutex<HashMap<RunId, (f64, Instant)>>,
+    /// When expired results were last dropped.
+    pruned: Mutex<Option<Instant>>,
 }
 
 /// The run already has [`MAX_WAITING`] calls waiting.
@@ -508,16 +513,26 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
         .calls
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    // Results older than an hour go, for every run, so ended runs leave nothing behind.
+    // Results older than an hour go, for every run, so ended runs leave nothing behind. At most
+    // once a minute: it looks at every kept result.
     let now = Instant::now();
-    calls.retain(|_, runs| {
-        runs.by_id.retain(|_, (r, _)| {
-            r.borrow()
-                .as_ref()
-                .is_none_or(|(_, at)| now.duration_since(*at) < KEEP_RESULT)
+    let mut pruned = state
+        .mcp
+        .pruned
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if pruned.is_none_or(|at| now.duration_since(at) >= PRUNE_EVERY) {
+        *pruned = Some(now);
+        calls.retain(|_, runs| {
+            runs.by_id.retain(|_, (r, _)| {
+                r.borrow()
+                    .as_ref()
+                    .is_none_or(|(_, at)| now.duration_since(*at) < KEEP_RESULT)
+            });
+            !runs.by_id.is_empty()
         });
-        !runs.by_id.is_empty()
-    });
+    }
+    drop(pruned);
     let mine = calls.entry(run).or_default();
     if let Some((existing, _)) = mine.by_id.get(&key) {
         return Ok(existing.clone());

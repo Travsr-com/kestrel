@@ -1115,3 +1115,38 @@ async fn the_allowance_of_runs_that_went_quiet_is_forgotten() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test(start_paused = true)]
+async fn no_task_stays_behind_for_a_finished_call() {
+    let s = setup(&KestrelTool::ALL);
+    let tasks = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let before = tasks();
+    for i in 0..300u64 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(i, "kestrel.ask_human", json!({ "question": "q" }))
+                    .to_string()
+                    .into_bytes(),
+                false,
+            )
+            .await,
+        )
+        .await;
+    }
+    // Let finished tasks wind down.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tasks() <= before + 2,
+        "{} tasks alive, {before} before",
+        tasks()
+    );
+}
