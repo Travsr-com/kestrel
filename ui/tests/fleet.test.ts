@@ -54,13 +54,27 @@ function serve(runs: RunSummary[], fail = { list: 0 }) {
 function show(runs: RunSummary[], fail = { list: 0 }) {
   const { api, calls } = serve(runs, fail);
   const sockets = fakeSockets();
+  const onUnauthorized = vi.fn();
   const result = render(Fleet, {
     api,
-    onUnauthorized: () => {},
+    onUnauthorized,
     sockets: sockets.factory,
     base: 'ws://kestrel.test',
   });
-  return { ...result, sockets, calls };
+  return { ...result, sockets, calls, onUnauthorized };
+}
+
+function cost(runId: string, micro: number): Event['kind'] {
+  return {
+    kind: 'model_call', run_id: runId, provider: 'p', model: 'm', tokens_in: 1, tokens_out: 1,
+    tokens_cache_read: 0, tokens_cache_write: 0, cost: micro, latency_ms: 1, status: 200,
+  };
+}
+
+function socketFor(sockets: ReturnType<typeof fakeSockets>, id: string) {
+  const found = sockets.made.find((s) => s.url.includes(id));
+  if (!found) throw new Error(`no socket for ${id}`);
+  return found;
 }
 
 function event(runId: string, kind: Event['kind'], s = 1): Event {
@@ -103,14 +117,12 @@ describe('Fleet', () => {
 
   // 2
   it('a cost event updates only its own card', async () => {
-    const a = run({ agent: 'alpha' });
+    const a = run({ agent: 'alpha', spent: 0 });
     const b = run({ agent: 'beta' });
     const { sockets } = show([a, b]);
     await screen.findByRole('link', { name: 'alpha' });
-    const socket = sockets.made.find((s) => s.url.includes(a.id));
-    if (!socket) throw new Error('no socket for alpha');
+    const socket = socketFor(sockets, a.id);
     socket.open();
-    // The socket replays the tree from the start, so cost is rebuilt from its events.
     socket.event(1, event(a.id, { kind: 'run_created', agent: 'alpha' }, 1));
     await vi.advanceTimersByTimeAsync(0);
     const others: MutationRecord[] = [];
@@ -145,7 +157,7 @@ describe('Fleet', () => {
     await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
     expect(cards()).toHaveLength(6);
     const child = card('child-0');
-    expect(within(child).getByRole('link', { name: /parent/i })).toHaveAttribute('href', `#/runs/${root.id}`);
+    expect(within(child).getByRole('link', { name: 'Parent: lead' })).toHaveAttribute('href', `#/runs/${root.id}`);
   });
 
   // 4
@@ -183,27 +195,113 @@ describe('Fleet', () => {
   });
 
   // 7
-  it('says it is reconnecting when a socket drops, and fills in what it missed', async () => {
+  it('says it is reconnecting until the socket is back, resumes after its cursor and counts each event once', async () => {
     const a = run({ agent: 'alpha', spent: 0 });
     const { sockets } = show([a]);
     await screen.findByRole('link', { name: 'alpha' });
     const first = sockets.made[0];
     if (!first) throw new Error('no socket');
     first.open();
+    first.event(1, event(a.id, cost(a.id, 10_000), 1));
+    first.event(2, event(a.id, cost(a.id, 20_000), 2));
     first.drop();
     expect(await screen.findByText(/Reconnecting/)).toBeInTheDocument();
     await vi.advanceTimersByTimeAsync(600);
     const second = sockets.made[1];
     if (!second) throw new Error('no reconnect');
-    expect(second.url).toContain('after=0');
+    expect(second.url).toContain('after=2');
+    // Connecting is not connected: the banner stays.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
     second.open();
-    second.event(3, event(a.id, {
-      kind: 'model_call', run_id: a.id, provider: 'p', model: 'm', tokens_in: 1, tokens_out: 1,
-      tokens_cache_read: 0, tokens_cache_write: 0, cost: 70_000, latency_ms: 1, status: 200,
-    }, 3));
+    second.event(2, event(a.id, cost(a.id, 20_000), 2));
+    second.event(3, event(a.id, cost(a.id, 40_000), 3));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.queryByText(/Reconnecting/)).not.toBeInTheDocument();
     expect(card('alpha')).toHaveTextContent('$0.07 / $2.00');
+  });
+
+  it('keeps the cost of a child created while it was away', async () => {
+    const root = run({ agent: 'lead', spent: 0 });
+    // The server has not seen the child's cost yet when the view asks for it.
+    const child = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1, spent: 0 });
+    const { api } = serve([root, child]);
+    const sockets = fakeSockets();
+    render(Fleet, {
+      api: { ...api, listRuns: async () => [root] },
+      onUnauthorized: () => {},
+      sockets: sockets.factory,
+      base: 'ws://kestrel.test',
+    });
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    // A replay delivers the child's creation and its cost in one burst, before any fetch returns.
+    socket.event(1, event(child.id, { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
+    socket.event(2, event(child.id, cost(child.id, 30_000), 2));
+    await vi.advanceTimersByTimeAsync(0);
+    await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    expect(card('kid')).toHaveTextContent('$0.03 / $2.00');
+  });
+
+  it('asks for a token when a socket is refused', async () => {
+    const a = run({ agent: 'alpha' });
+    const { sockets, onUnauthorized } = show([a]);
+    await screen.findByRole('link', { name: 'alpha' });
+    socketFor(sockets, a.id).drop(4401);
+    expect(onUnauthorized).toHaveBeenCalledWith(null);
+  });
+
+  it('closes the socket of a tree once all of it has ended and lingered', async () => {
+    const a = run({ agent: 'alpha' });
+    const { sockets } = show([a]);
+    await screen.findByRole('link', { name: 'alpha' });
+    const socket = socketFor(sockets, a.id);
+    socket.open();
+    socket.event(1, event(a.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }, 1));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(socket.closed).toBe(false);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(socket.closed).toBe(true);
+    expect(sockets.made).toHaveLength(1);
+  });
+
+  it('follows a live child under a root that already ended', async () => {
+    const root = run({ agent: 'lead', status: 'Cancelled' });
+    const { sockets } = show([root, run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 })]);
+    await screen.findByRole('checkbox', { name: 'Roots only' });
+    expect(sockets.made.map((s) => s.url)).toEqual([`ws://kestrel.test/ws/tree/${root.id}?after=0`]);
+  });
+
+  it('asks for a parent once at a time, however many spawns a replay brings', async () => {
+    const root = run({ agent: 'lead' });
+    const { sockets, calls } = show([root]);
+    await screen.findByRole('link', { name: 'lead' });
+    const socket = socketFor(sockets, root.id);
+    socket.open();
+    for (let i = 1; i <= 20; i++) {
+      socket.event(i, event(root.id, { kind: 'child_spawned', child: `c${i}`, agent: 'kid', budget: 1 }, i));
+    }
+    const asks = () => calls.filter((c) => c === `/api/runs/${root.id}`);
+    // One request, then one more for everything that came in while it ran.
+    await vi.waitFor(() => expect(asks()).toHaveLength(2));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(asks()).toHaveLength(2);
+  });
+
+  it('a finished status filter shows finished runs without "Show finished"', async () => {
+    show([run({ agent: 'done', status: 'Completed' }), run({ agent: 'live' })]);
+    await screen.findByRole('link', { name: 'live' });
+    await user().selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'completed');
+    expect(cards()).toHaveLength(1);
+    expect(card('done')).toBeInTheDocument();
+  });
+
+  it('says when no run matches the filters', async () => {
+    show([run({ agent: 'live' })]);
+    await screen.findByRole('link', { name: 'live' });
+    await user().selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'failed');
+    expect(screen.getByText('No run matches these filters.')).toBeInTheDocument();
   });
 
   // 8
@@ -244,6 +342,18 @@ describe('Fleet', () => {
     expect(cards()).toHaveLength(50);
     expect(screen.getByText('Showing 51 to 100 of 200')).toBeInTheDocument();
     await u.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('Showing 1 to 50 of 200')).toBeInTheDocument();
+    // At an end the button stays focusable, so keyboard focus is not dropped.
+    const previous = screen.getByRole('button', { name: 'Previous' });
+    expect(previous).toHaveAttribute('aria-disabled', 'true');
+    previous.focus();
+    await u.keyboard('{Enter}');
+    expect(document.activeElement).toBe(previous);
+    expect(screen.getByText('Showing 1 to 50 of 200')).toBeInTheDocument();
+    // A filter change starts again at the first page.
+    await u.click(screen.getByRole('button', { name: 'Next' }));
+    await u.click(screen.getByRole('button', { name: 'Next' }));
+    await u.selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'running');
     expect(screen.getByText('Showing 1 to 50 of 200')).toBeInTheDocument();
     // Tab order: the filters, then the cards' links in order.
     const links = screen.getAllByRole('link');

@@ -21,59 +21,111 @@ function summary(id: string, over: Partial<RunSummary> = {}): RunSummary {
 }
 
 function ev(runId: string, kind: Event['kind']): Event {
-  return { run_id: runId, seq: 1, ts: '2026-11-21T10:00:00Z', kind };
+  return { run_id: runId, seq: 1, ts: '2026-11-21T10:00:05Z', kind };
 }
+
+const call = (run: string, cost: number | null): Event['kind'] => ({
+  kind: 'model_call', run_id: run, provider: 'x', model: 'm', tokens_in: 1, tokens_out: 1,
+  tokens_cache_read: 0, tokens_cache_write: 0, cost, latency_ms: 1, status: 200,
+});
 
 describe('FleetState', () => {
   it('a spawn and a child that ends both ask for the parent again (its limit moved)', () => {
     const fleet = new FleetState();
     fleet.load([summary('p'), summary('c', { parent: 'p', root: 'p', depth: 1 })]);
     const asked: string[] = [];
-    fleet.apply(ev('p', { kind: 'child_spawned', child: 'c', agent: 'a', budget: 10 }), 0, (id) => asked.push(id));
-    fleet.apply(ev('c', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 5, (id) => asked.push(id));
+    fleet.apply(ev('p', { kind: 'child_spawned', child: 'c', agent: 'a', budget: 10 }), 0, (id) => asked.push(id), 'p');
+    fleet.apply(ev('c', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 5, (id) => asked.push(id), 'p');
     expect(asked).toEqual(['p', 'p']);
     expect(fleet.runs.c?.endedAt).toBe(5);
   });
 
-  it('takes a fresh limit only for a run it knows', () => {
+  it('creates a run from its run_created event, so its cost events count at once', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p', { depth: 2, root: 'r', parent: 'q' })]);
+    const asked: string[] = [];
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, (id) => asked.push(id), 'r');
+    fleet.apply(ev('c', call('c', 30)), 0, () => {}, 'r');
+    expect(asked).toEqual(['c']);
+    expect(fleet.runs.c).toMatchObject({
+      agent: 'kid', parent: 'p', root: 'r', depth: 3, status: 'Queued', spent: 30, limit: null,
+      created_at: '2026-11-21T10:00:05Z', endedAt: null,
+    });
+  });
+
+  it('a run_created for an unknown parent or no parent takes the socket root and depth from it', () => {
+    const fleet = new FleetState();
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'gone' }), 0, () => {}, 'r');
+    fleet.apply(ev('r', { kind: 'run_created', agent: 'lead' }), 0, () => {}, 'r');
+    expect(fleet.runs.c).toMatchObject({ root: 'r', depth: 1, parent: 'gone' });
+    expect(fleet.runs.r).toMatchObject({ root: 'r', depth: 0, parent: null });
+  });
+
+  it('a run_created for a run it has asks for nothing and changes nothing', () => {
     const fleet = new FleetState();
     fleet.load([summary('p')]);
-    fleet.setLimit('p', 500);
-    fleet.setLimit('ghost', 1);
-    expect(fleet.runs.p?.limit).toBe(500);
+    const asked: string[] = [];
+    fleet.apply(ev('p', { kind: 'run_created', agent: 'other' }), 0, (id) => asked.push(id), 'p');
+    expect(asked).toEqual([]);
+    expect(fleet.runs.p?.agent).toBe('a');
+  });
+
+  it('a fetch fills in limit, tier and start time, and never lowers the cost', () => {
+    const fleet = new FleetState();
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
+    fleet.apply(ev('c', call('c', 30)), 0, () => {}, 'p');
+    fleet.update(summary('c', { spent: 0, limit: 500, sandbox_tier: 'gvisor', created_at: '2026-11-21T09:00:00Z' }), 0);
+    expect(fleet.runs.c).toMatchObject({ spent: 30, limit: 500, sandbox_tier: 'gvisor', created_at: '2026-11-21T09:00:00Z' });
+    fleet.update(summary('c', { spent: 80 }), 0);
+    expect(fleet.runs.c?.spent).toBe(80);
+    fleet.update(summary('ghost'), 0);
     expect(fleet.runs.ghost).toBeUndefined();
   });
 
-  it('adds a run once, with its cost starting at 0, and asks only for unknown runs', () => {
+  it('a fetch sets the status of a run only known from its run_created event', () => {
     const fleet = new FleetState();
-    fleet.load([summary('p')]);
-    fleet.add(summary('c', { parent: 'p', spent: 999 }));
-    fleet.add(summary('c', { parent: 'p', spent: 5 }));
-    expect(fleet.runs.c?.spent).toBe(0);
-    const asked: string[] = [];
-    fleet.apply(ev('c', { kind: 'run_created', agent: 'a', parent: 'p' }), 0, (id) => asked.push(id));
-    fleet.apply(ev('n', { kind: 'run_created', agent: 'a', parent: 'p' }), 0, (id) => asked.push(id));
-    expect(asked).toEqual(['n']);
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
+    fleet.update(summary('c', { status: 'Completed' }), 9);
+    expect(fleet.runs.c).toMatchObject({ status: 'Completed', endedAt: 9 });
+    // Once a status is known, a fetch (which may be older than the events) does not move it.
+    fleet.update(summary('c', { status: 'Running' }), 10);
+    expect(fleet.runs.c?.status).toBe('Completed');
+  });
+
+  it('after a status event, a fetch does not move the status of an event-made run', () => {
+    const fleet = new FleetState();
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
+    fleet.apply(ev('c', { kind: 'status_changed', from: 'Queued', to: 'Running' }), 0, () => {}, 'p');
+    fleet.update(summary('c', { status: 'Provisioning' }), 0);
+    expect(fleet.runs.c?.status).toBe('Running');
+    fleet.apply(ev('d', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, () => {}, 'p');
+    fleet.update(summary('d', { status: 'Running' }), 0);
+    expect(fleet.runs.d).toMatchObject({ status: 'Running', endedAt: null });
   });
 
   it('counts unpriced calls as nothing and ignores events for runs it does not have', () => {
     const fleet = new FleetState();
     fleet.load([summary('p')]);
-    const call = (run: string, cost: number | null): Event['kind'] => ({
-      kind: 'model_call', run_id: run, provider: 'x', model: 'm', tokens_in: 1, tokens_out: 1,
-      tokens_cache_read: 0, tokens_cache_write: 0, cost, latency_ms: 1, status: 200,
-    });
-    fleet.apply(ev('p', call('p', null)), 0, () => {});
-    fleet.apply(ev('ghost', call('ghost', 5)), 0, () => {});
-    fleet.apply(ev('p', { kind: 'agent_log', line: 'x' }), 0, () => {});
+    fleet.apply(ev('p', call('p', null)), 0, () => {}, 'p');
+    fleet.apply(ev('ghost', call('ghost', 5)), 0, () => {}, 'p');
+    fleet.apply(ev('p', { kind: 'agent_log', line: 'x' }), 0, () => {}, 'p');
     expect(fleet.runs.p?.spent).toBe(100);
+  });
+
+  it('shows the larger of the reported cost and the cost counted from events, so a replay never drops it', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p', { spent: 100 })]);
+    fleet.apply(ev('p', call('p', 60)), 0, () => {}, 'p');
+    expect(fleet.runs.p?.spent).toBe(100);
+    fleet.apply(ev('p', call('p', 60)), 0, () => {}, 'p');
+    expect(fleet.runs.p?.spent).toBe(120);
   });
 
   it('a root that ends asks for nothing, and an ended run keeps the time it was first seen to end', () => {
     const fleet = new FleetState();
     fleet.load([summary('p'), summary('done', { status: 'Completed' })]);
     const asked: string[] = [];
-    fleet.apply(ev('p', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }), 7, (id) => asked.push(id));
+    fleet.apply(ev('p', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }), 7, (id) => asked.push(id), 'p');
     expect(asked).toEqual([]);
     expect(fleet.runs.p?.endedAt).toBe(7);
     expect(fleet.runs.done?.endedAt).toBe(0);
@@ -88,5 +140,25 @@ describe('FleetState', () => {
       summary('g', { parent: 'a' }),
     ]);
     expect(fleet.children()).toEqual({ p: { total: 2, running: 1 }, a: { total: 1, running: 1 } });
+  });
+
+  it('a tree is over once every run in it ended at least `linger` ago', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('r'), summary('c', { parent: 'r', root: 'r', status: 'Completed' })]);
+    expect(fleet.over('r', 100, 10)).toBe(false);
+    fleet.apply(ev('r', { kind: 'status_changed', from: 'Running', to: 'Completed' }), 95, () => {}, 'r');
+    expect(fleet.over('r', 100, 10)).toBe(false);
+    expect(fleet.over('r', 105, 10)).toBe(true);
+  });
+
+  it('lists the roots that still have a live run, including a live child under an ended root', () => {
+    const fleet = new FleetState();
+    fleet.load([
+      summary('r', { status: 'Cancelled' }),
+      summary('c', { parent: 'r', root: 'r' }),
+      summary('s', { status: { Failed: 'boom' } }),
+      summary('t'),
+    ]);
+    expect(fleet.liveRoots().sort()).toEqual(['r', 't']);
   });
 });

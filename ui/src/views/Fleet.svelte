@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Api } from '../lib/api';
   import { FleetState, type FleetRun } from '../lib/fleet.svelte';
-  import { isTerminal, statusName } from '../lib/format';
+  import { statusName } from '../lib/format';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { getToken } from '../lib/token';
   import type { RunId } from '../lib/types';
@@ -45,11 +45,16 @@
   let showFinished = $state(false);
   let page = $state(0);
 
-  /** The connection state of each root's tree socket. */
-  let connections: Record<RunId, ConnectionState> = $state({});
-  // Bookkeeping only, never rendered: a reactive map would re-run the effect that fills it.
+  /** Trees whose socket dropped and is not open again yet. */
+  let down: Record<RunId, true> = $state({});
+  // Bookkeeping only, never rendered: reactive ones would re-run the effects that fill them.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const streams = new Map<RunId, EventStream>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const asking = new Set<RunId>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const askAgain = new Set<RunId>();
+  let mounted = true;
 
   $effect(() => {
     // Read so that Retry, which bumps it, loads again.
@@ -70,16 +75,30 @@
     return () => clearInterval(tick);
   });
 
-  /** Fetches a run the view needs: a new one is added, a known one gets its fresh limit. */
+  /**
+   * Fetches a run's limit, tier and cost. One request per run at a time: whatever asks while one is
+   * out gets a single request after it, so a replay of many spawns costs two requests, and answers
+   * never arrive out of order.
+   */
   function refresh(id: RunId) {
-    api.getRun(id).then(
-      (summary) => (fleet.runs[id] ? fleet.setLimit(id, summary.limit) : fleet.add(summary)),
-      () => {},
-    );
+    if (asking.has(id)) {
+      askAgain.add(id);
+      return;
+    }
+    asking.add(id);
+    api
+      .getRun(id)
+      .then(
+        (summary) => mounted && fleet.update(summary, Date.now()),
+        () => {},
+      )
+      .finally(() => {
+        asking.delete(id);
+        if (askAgain.delete(id) && mounted) refresh(id);
+      });
   }
 
   function follow(root: RunId) {
-    let cursor = 0;
     streams.set(
       root,
       connectEvents({
@@ -88,43 +107,53 @@
         after: 0,
         getToken,
         socketFactory: sockets,
-        onEvent: (event, at) => {
-          cursor = at;
-          fleet.apply(event, Date.now(), refresh);
-        },
-        onState: (state) => {
-          connections[root] = state;
-          // Only a replay from the start rebuilds costs; a reconnect resumes from its cursor.
-          if (state === 'open' && cursor === 0) fleet.rebuild(root);
+        onEvent: (event) => fleet.apply(event, Date.now(), refresh, root),
+        onState: (state: ConnectionState) => {
+          if (state === 'reconnecting') down[root] = true;
+          else if (state !== 'connecting') delete down[root];
+          if (state === 'unauthorized') onUnauthorized(getToken());
         },
       }),
     );
   }
 
-  // One tree socket per live root, opened once the list has loaded.
+  function unfollow(root: RunId) {
+    streams.get(root)?.close();
+    streams.delete(root);
+  }
+
+  // One tree socket per tree with a live run, once the list has loaded. A tree's socket closes once
+  // all of it has ended and lingered, so its last events still arrive.
   $effect(() => {
     if (!loaded) return;
-    for (const run of Object.values(fleet.runs)) {
-      if (run.parent === null && !isTerminal(run.status) && !streams.has(run.id)) follow(run.id);
+    for (const root of fleet.liveRoots()) {
+      if (!streams.has(root)) follow(root);
+    }
+    for (const root of [...streams.keys()]) {
+      if (fleet.over(root, now, LINGER_MS)) unfollow(root);
     }
   });
 
   $effect(() => () => {
-    for (const stream of streams.values()) stream.close();
-    streams.clear();
+    mounted = false;
+    for (const root of [...streams.keys()]) unfollow(root);
   });
 
-  const reconnecting = $derived(Object.values(connections).includes('reconnecting'));
+  const reconnecting = $derived(Object.keys(down).length > 0);
   const agents = $derived([...new Set(Object.values(fleet.runs).map((r) => r.agent))].sort());
   const children = $derived(fleet.children());
+  /** A filter on a finished status shows those runs however long ago they ended. */
+  const finishedFilter = $derived(['completed', 'failed', 'cancelled'].includes(status));
 
   function shown(run: FleetRun): boolean {
     if (rootsOnly && run.parent !== null) return false;
     if (agent && run.agent !== agent) return false;
     if (status && statusName(run.status) !== status) return false;
-    if (!showFinished && run.endedAt !== null && now - run.endedAt >= LINGER_MS) return false;
+    if (!showFinished && !finishedFilter && run.endedAt !== null && now - run.endedAt >= LINGER_MS) return false;
     return true;
   }
+
+  const firstPage = () => (page = 0);
 
   const visible = $derived(
     Object.values(fleet.runs)
@@ -138,9 +167,8 @@
 
 <h1>Fleet</h1>
 
-{#if reconnecting}
-  <p class="banner" role="status">Reconnecting to live updates.</p>
-{/if}
+<!-- Always in the page, so screen readers announce the text when it appears. -->
+<p class:banner={reconnecting} role="status">{reconnecting ? 'Reconnecting to live updates.' : ''}</p>
 
 {#if error !== null}
   <div class="banner error" role="alert" data-testid="ready">
@@ -157,22 +185,22 @@
     {:else}
       <div class="filters" role="group" aria-label="Filters">
         <label for="fleet-agent">Agent</label>
-        <select id="fleet-agent" bind:value={agent}>
+        <select id="fleet-agent" bind:value={agent} onchange={firstPage}>
           <option value="">All</option>
           {#each agents as name (name)}
             <option value={name}>{name}</option>
           {/each}
         </select>
         <label for="fleet-status">Status</label>
-        <select id="fleet-status" bind:value={status}>
+        <select id="fleet-status" bind:value={status} onchange={firstPage}>
           <option value="">All</option>
           {#each STATUSES as name (name)}
             <option value={name}>{name}</option>
           {/each}
         </select>
-        <input id="fleet-roots" type="checkbox" bind:checked={rootsOnly} />
+        <input id="fleet-roots" type="checkbox" bind:checked={rootsOnly} onchange={firstPage} />
         <label for="fleet-roots">Roots only</label>
-        <input id="fleet-finished" type="checkbox" bind:checked={showFinished} />
+        <input id="fleet-finished" type="checkbox" bind:checked={showFinished} onchange={firstPage} />
         <label for="fleet-finished">Show finished</label>
       </div>
 
@@ -181,16 +209,32 @@
       {:else}
         <ul class="cards">
           {#each onPage as run (run.id)}
-            <li><RunCard {run} {now} children={children[run.id]} /></li>
+            <li>
+              <RunCard
+                {run}
+                {now}
+                children={children[run.id]}
+                parentAgent={run.parent === null ? undefined : fleet.runs[run.parent]?.agent}
+              />
+            </li>
           {/each}
         </ul>
         <nav class="pager" aria-label="Pages">
-          <span>
+          <span aria-live="polite">
             Showing {current * PAGE + 1} to {Math.min(visible.length, (current + 1) * PAGE)} of {visible.length}
           </span>
           {#if pages > 1}
-            <button type="button" disabled={current === 0} onclick={() => (page = current - 1)}>Previous</button>
-            <button type="button" disabled={current >= pages - 1} onclick={() => (page = current + 1)}>Next</button>
+            <!-- aria-disabled, not disabled: a disabled button would drop the keyboard focus on it. -->
+            <button type="button" aria-disabled={current === 0} onclick={() => (page = Math.max(0, current - 1))}>
+              Previous
+            </button>
+            <button
+              type="button"
+              aria-disabled={current >= pages - 1}
+              onclick={() => (page = Math.min(pages - 1, current + 1))}
+            >
+              Next
+            </button>
           {/if}
         </nav>
       {/if}
@@ -238,5 +282,9 @@
   button,
   select {
     font: inherit;
+  }
+  button[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
   }
 </style>
