@@ -676,7 +676,8 @@ impl Engine {
     /// when the run's sandbox goes. `root` is made its owner's only, so no other host user reaches
     /// a run's token; a run's directory is readable by any user, so the sandbox can read it
     /// whichever user its image runs as. A `root` that is a link, not a directory, or owned by
-    /// another user fails the run.
+    /// another user fails the run. Put it where no other user can rename or replace it: its
+    /// parent is not checked.
     ///
     /// Without this, a temp directory with a random name, of this engine only. It is left behind
     /// when the engine goes, and a later engine's [`Engine::recover`] cannot find what a killed
@@ -1973,8 +1974,8 @@ impl Inner {
     /// Removes `run`'s config directory, if there is one (best effort). Like writing, never
     /// through a root that is a link. The owner is not checked here, and a root swapped for a link
     /// between the check and the removal is not caught. That is accepted because the root is
-    /// meant to sit in a directory only its owner can write (the default one does, in the sticky
-    /// temp dir); nothing checks the parent of a configured root.
+    /// meant to sit where no other user can rename or replace it (the default one does: it is
+    /// ours, in the sticky temp dir); nothing checks the parent of a configured root.
     fn remove_run_config(&self, run: RunId) {
         let real_dir = std::fs::symlink_metadata(&self.run_config).is_ok_and(|m| m.is_dir());
         if real_dir {
