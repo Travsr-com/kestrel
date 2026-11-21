@@ -398,7 +398,7 @@ impl AdapterLog {
 ///
 /// * `msg:TEXT` gives `AgentMessage { text }`
 /// * `ok:SUMMARY` / `fail:SUMMARY` give `Finished { ok, summary }`
-/// * `approval:UUID:ACTION` gives `ApprovalRequested { id, action }`
+/// * `approval:UUID:ACTION` gives `ApprovalRequested { id, action, question: false }`
 /// * an empty line is ignored, anything else is an `AgentLog`
 pub struct FakeAdapter {
     instance: usize,
@@ -464,6 +464,7 @@ fn parse(line: &str) -> ParsedLine {
         return ParsedLine::Events(vec![EventKind::ApprovalRequested {
             id,
             action: action.into(),
+            question: false,
         }]);
     }
     ParsedLine::Events(vec![EventKind::AgentLog { line: line.into() }])

@@ -321,6 +321,7 @@ fn waiting(store: &kestrel_store::Store) -> (RunId, ApprovalId) {
             EventKind::ApprovalRequested {
                 id: aid,
                 action: "git push".into(),
+                question: false,
             },
         )
         .unwrap();

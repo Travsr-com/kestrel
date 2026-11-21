@@ -32,10 +32,15 @@ export type SocketFactory = (url: string, protocols: string[]) => SocketLike;
 export interface EventStreamOptions {
   /** `ws://host` or `wss://host`; see `socketBase`. */
   base: string;
-  /** `/ws/runs/<id>` or `/ws/tree/<root>`. */
+  /** `/ws/runs/<id>`, `/ws/tree/<root>` or `/ws/events`. */
   path: string;
-  /** Start after this cursor (0 for everything). */
-  after: number;
+  /** More query parameters, such as `kinds` for `/ws/events`. */
+  query?: Record<string, string>;
+  /**
+   * Start after this cursor (0 for everything). `null` sends none, which `/ws/events` reads as
+   * "from the newest event"; once an event arrives, a reconnect resumes after it.
+   */
+  after: number | null;
   getToken: () => string | null;
   onEvent: (event: Event, cursor: number) => void;
   onState?: (state: ConnectionState) => void;
@@ -130,7 +135,9 @@ export function connectEvents(opts: EventStreamOptions): EventStream {
     if (stopped) return;
     let s: SocketLike;
     try {
-      s = factory(`${opts.base}${opts.path}?after=${cursor}`, protocols);
+      const params = new URLSearchParams(opts.query);
+      if (cursor !== null) params.set('after', String(cursor));
+      s = factory(`${opts.base}${opts.path}?${params.toString()}`, protocols);
     } catch {
       socket = null;
       // `new WebSocket` throws on a malformed subprotocol. With a token, the token is what is
@@ -148,7 +155,7 @@ export function connectEvents(opts: EventStreamOptions): EventStream {
     s.onmessage = (ev) => {
       armIdle();
       const frame = parseFrame(ev.data);
-      if (frame?.type !== 'event' || frame.cursor <= cursor) return;
+      if (frame?.type !== 'event' || (cursor !== null && frame.cursor <= cursor)) return;
       cursor = frame.cursor;
       opts.onEvent(frame.event, frame.cursor);
     };

@@ -95,6 +95,7 @@ pub fn router(
         .route("/api/{*rest}", any(api::not_found))
         .route("/ws/runs/{id}", get(ws::run_socket))
         .route("/ws/tree/{id}", get(ws::tree_socket))
+        .route("/ws/events", get(ws::events_socket))
         .route("/ws/{*rest}", any(api::not_found))
         .route_layer(middleware::from_fn_with_state(state.clone(), guard::auth));
     Router::new()

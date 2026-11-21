@@ -101,6 +101,7 @@ curl -X POST -H "Authorization: Bearer $T" -d '{"reason":"not on main"}' "$K/api
 | :--- | :--- |
 | `GET /ws/runs/{id}?after=<seq>` | One run's events after `seq`, then live ones. |
 | `GET /ws/tree/{id}?after=<cursor>` | Events of every run in the tree of `{id}`'s root, after the global `cursor`, then live ones, in commit order. |
+| `GET /ws/events?after=<cursor>&kinds=<kind,...>` | Events of every run after the global `cursor`, then live ones, in commit order. Without `after`, only events from now on. `kinds` keeps only those event kinds, such as `approval_requested,approval_resolved`. |
 
 * **Frames** are JSON: `{"type": "event", "cursor": 17, "event": {...}}`, and
   `{"type": "heartbeat"}` every 15 s.

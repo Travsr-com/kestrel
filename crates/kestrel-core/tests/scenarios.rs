@@ -329,7 +329,8 @@ async fn run_to_approval(h: &mut Harness) -> (RunId, ApprovalId, SessionCtl) {
     assert!(h.has_event(id, |k| *k
         == EventKind::ApprovalRequested {
             id: aid,
-            action: "gh.comment".into()
+            action: "gh.comment".into(),
+            question: false,
         }));
     (id, aid, s)
 }

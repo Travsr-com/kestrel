@@ -97,8 +97,12 @@ fn kind_with_tag() -> impl Strategy<Value = (EventKind, &'static str)> {
             EventKind::BudgetWarning { spent, limit },
             "budget_warning"
         )),
-        (approval_id(), text()).prop_map(|(id, action)| (
-            EventKind::ApprovalRequested { id, action },
+        (approval_id(), text(), any::<bool>()).prop_map(|(id, action, question)| (
+            EventKind::ApprovalRequested {
+                id,
+                action,
+                question
+            },
             "approval_requested"
         )),
         (approval_id(), any::<bool>()).prop_map(|(id, approved)| (

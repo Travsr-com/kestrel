@@ -30,7 +30,7 @@ pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response 
         .into_response()
 }
 
-fn internal(e: StoreError) -> Response {
+pub(crate) fn internal(e: StoreError) -> Response {
     error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
@@ -307,6 +307,7 @@ pub(crate) async fn approvals(State(s): State<AppState>, Query(q): Params) -> Re
                 run_id: r.run_id,
                 action: r.action,
                 requested_at: r.requested_at,
+                question: r.question,
             });
         }
     }

@@ -1,5 +1,6 @@
 //! Event sockets: `/ws/runs/{id}?after=<seq>` follows one run, `/ws/tree/{id}?after=<cursor>`
-//! follows the whole tree of `id`'s root on the global event cursor.
+//! follows the whole tree of `id`'s root on the global event cursor, and
+//! `/ws/events?after=<cursor>&kinds=<kind,...>` follows every run, optionally only some kinds.
 //!
 //! A socket first replays what is after the cursor, then sends new events as they are committed,
 //! each as a [`WsFrame::Event`] with the cursor to resume from. It reads the store from its own
@@ -11,6 +12,7 @@
 //! never grows without bound. When the server stops, every socket sends a close frame and ends.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
@@ -24,15 +26,18 @@ use tokio::time::{MissedTickBehavior, interval, interval_at, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::AppState;
-use crate::api::{after, find_run};
+use crate::api::{Reject, after, error, find_run, internal};
+use axum::http::StatusCode;
 
 /// What a socket follows.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Source {
     /// One run; the cursor is the event `seq`.
     Run(RunId),
     /// A whole tree by its root; the cursor is the global event cursor.
     Tree(RunId),
+    /// Every run, only the given kinds (all when empty); the cursor is the global event cursor.
+    All(Arc<[String]>),
 }
 
 /// How a socket ended, for its close frame.
@@ -84,6 +89,59 @@ pub(crate) async fn tree_socket(
     }
 }
 
+/// `GET /ws/events?after=<cursor>&kinds=<kind,...>`: every run's events on the global cursor. Without
+/// `after` it starts at the newest event, so a client that only wants what comes next does not
+/// replay the whole history. `kinds` are event kind names such as `approval_requested`.
+pub(crate) async fn events_socket(
+    State(s): State<AppState>,
+    Query(q): Params,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let kinds = match kinds(&q) {
+        Ok(kinds) => kinds,
+        Err(res) => return *res,
+    };
+    let cursor = if q.contains_key("after") {
+        match after(&q) {
+            Ok(cursor) => cursor,
+            Err(res) => return *res,
+        }
+    } else {
+        match s.store.latest_cursor() {
+            Ok(cursor) => cursor,
+            Err(e) => return internal(e),
+        }
+    };
+    upgrade(ws, s, Source::All(kinds), cursor)
+}
+
+/// The `kinds` filter: a comma-separated list of event kind names. Empty items are skipped; a name
+/// that is not lower-case letters and underscores, or a list that names none, is a 400. A
+/// well-formed name of no kind simply matches nothing.
+fn kinds(q: &HashMap<String, String>) -> Result<Arc<[String]>, Reject> {
+    let Some(list) = q.get("kinds") else {
+        return Ok(Arc::from(Vec::new()));
+    };
+    let bad = || {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "kinds must be event kind names like approval_requested, separated by commas",
+        ))
+    };
+    let mut kinds = Vec::new();
+    for kind in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        if !kind.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            return Err(bad());
+        }
+        kinds.push(kind.to_owned());
+    }
+    // `kinds=` naming nothing is a mistake, not "every kind".
+    if kinds.is_empty() {
+        return Err(bad());
+    }
+    Ok(Arc::from(kinds))
+}
+
 fn upgrade(ws: WebSocketUpgrade, s: AppState, source: Source, cursor: u64) -> Response {
     // Echoes `kestrel.v1` when the client offers it; the token subprotocol is never echoed.
     // Tracked, so `serve` lets the socket send its close frame before the server goes.
@@ -95,20 +153,28 @@ fn upgrade(ws: WebSocketUpgrade, s: AppState, source: Source, cursor: u64) -> Re
 /// Events read from the store per step, so a socket never holds a whole history at once.
 const PAGE: usize = 256;
 
-/// Events after `cursor`, each with its cursor.
+/// Events after `cursor`, each with its cursor, and where to read from next (past events a
+/// filter skipped, so they are not scanned again).
 fn read(
     store: &Store,
-    source: Source,
+    source: &Source,
     cursor: u64,
-) -> Result<Vec<(u64, kestrel_types::Event)>, StoreError> {
-    match source {
-        Source::Run(run) => Ok(store
-            .events_page(run, cursor, PAGE)?
+) -> Result<(Vec<(u64, kestrel_types::Event)>, u64), StoreError> {
+    let events = match source {
+        Source::Run(run) => store
+            .events_page(*run, cursor, PAGE)?
             .into_iter()
             .map(|e| (e.seq, e))
-            .collect()),
-        Source::Tree(root) => store.events_since_global_page(root, cursor, PAGE),
-    }
+            .collect(),
+        Source::Tree(root) => store.events_since_global_page(*root, cursor, PAGE)?,
+        Source::All(kinds) => {
+            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            let page = store.events_after_page(cursor, &kinds, PAGE)?;
+            return Ok((page.events, page.next));
+        }
+    };
+    let next = events.last().map_or(cursor, |(at, _)| *at);
+    Ok((events, next))
 }
 
 fn text(frame: &WsFrame) -> Option<Message> {
@@ -161,7 +227,7 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
         .await;
     });
 
-    let end = pump(&s, source, &mut cursor, &tx, &mut incoming).await;
+    let end = pump(&s, &source, &mut cursor, &tx, &mut incoming).await;
     let _ = end_tx.send(end);
     stop.cancel();
     let _ = writer.await;
@@ -170,7 +236,7 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
 /// Feeds the queue until the socket should end, and says why.
 async fn pump(
     s: &AppState,
-    source: Source,
+    source: &Source,
     cursor: &mut u64,
     tx: &mpsc::Sender<Message>,
     incoming: &mut futures::stream::SplitStream<WebSocket>,
@@ -194,8 +260,8 @@ async fn pump(
                 }
             }
             _ = poll.tick() => {
-                let events = match read(&s.store, source, *cursor) {
-                    Ok(events) => events,
+                let (events, next) = match read(&s.store, source, *cursor) {
+                    Ok(read) => read,
                     Err(_) => return End::Error,
                 };
                 let full = events.len() == PAGE;
@@ -205,6 +271,7 @@ async fn pump(
                     }
                     *cursor = at;
                 }
+                *cursor = (*cursor).max(next);
                 // A full page means more is waiting: read the next one without waiting a tick.
                 if full {
                     poll.reset_immediately();

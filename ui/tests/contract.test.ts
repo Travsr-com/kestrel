@@ -45,6 +45,7 @@ const APPROVAL_KEYS = {
   action: true,
   status: true,
   requested_at: true,
+  question: true,
 } satisfies Record<keyof Approval, true>;
 const EVENT_KEYS = { run_id: true, seq: true, ts: true, kind: true } satisfies Record<keyof Event, true>;
 
@@ -80,7 +81,7 @@ const EVENT_KIND_KEYS = {
     status: true,
   },
   budget_warning: { kind: true, spent: true, limit: true },
-  approval_requested: { kind: true, id: true, action: true },
+  approval_requested: { kind: true, id: true, action: true, question: true },
   approval_resolved: { kind: true, id: true, approved: true, payload: true },
   agent_log: { kind: true, line: true },
   run_finished: { kind: true, summary: true },
@@ -175,8 +176,11 @@ describe('contract fixture', () => {
     for (const k of contract.event_kinds) {
       const expected = EVENT_KIND_KEYS[k.kind as EventKind['kind']];
       expect(expected, `unknown kind ${k.kind}`).toBeDefined();
-      // `parent` is the one optional field: Rust leaves it out of a root's `run_created`.
-      const required = Object.keys(expected).filter((key) => !(k.kind === 'run_created' && key === 'parent'));
+      // Optional fields Rust leaves out: `parent` of a root's `run_created`, and `question` of an
+      // `approval_requested` that is an action.
+      const optional = (key: string) =>
+        (k.kind === 'run_created' && key === 'parent') || (k.kind === 'approval_requested' && key === 'question');
+      const required = Object.keys(expected).filter((key) => !optional(key));
       expect(keys(k).filter((key) => !required.includes(key) && !(key in expected))).toEqual([]);
       for (const key of required) expect(k).toHaveProperty(key);
       seen.add(k.kind);

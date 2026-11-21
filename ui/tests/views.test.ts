@@ -30,7 +30,7 @@ describe('empty lists', () => {
 
   it('Approvals says there is nothing pending', async () => {
     show('#/approvals', fixed(200, []));
-    expect(await screen.findByText('No pending approvals.')).toBeInTheDocument();
+    expect(await screen.findByText('Nothing waiting for you')).toBeInTheDocument();
   });
 });
 
@@ -82,7 +82,7 @@ describe('Approvals view', () => {
     show('#/approvals', createMockServer().fetch);
     expect(await screen.findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
     expect(screen.queryByText('delete branch old-work')).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: `Run ${CHILD}` })).toHaveAttribute('href', `#/runs/${CHILD}`);
+    expect(screen.getByRole('link', { name: `Run ${CHILD.slice(-8)}` })).toHaveAttribute('href', `#/runs/${CHILD}`);
   });
 });
 

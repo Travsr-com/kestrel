@@ -1,6 +1,6 @@
 <script lang="ts">
   import { FleetState, type FleetRun } from '../lib/fleet.svelte';
-  import { statusName } from '../lib/format';
+  import { newestFirst, statusName } from '../lib/format';
   import { Unauthorized, type Api } from '../lib/api';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { getToken } from '../lib/token';
@@ -147,17 +147,6 @@
   const children = $derived(fleet.children());
   /** A filter on a finished status shows those runs however long ago they ended. */
   const finishedFilter = $derived(['completed', 'failed', 'cancelled'].includes(status));
-
-  /**
-   * Newest first. The server writes UTC times with a fraction of varying length (`...09Z`,
-   * `...09.5Z`), so whole seconds compare as text and only a tie is parsed.
-   */
-  function newestFirst(a: string, b: string): number {
-    const sa = a.slice(0, 19);
-    const sb = b.slice(0, 19);
-    if (sa !== sb) return sa < sb ? 1 : -1;
-    return Date.parse(b) - Date.parse(a);
-  }
 
   function shown(run: FleetRun): boolean {
     if (rootsOnly && run.parent !== null) return false;

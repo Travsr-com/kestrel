@@ -57,6 +57,10 @@ pub enum EventKind {
     ApprovalRequested {
         id: ApprovalId,
         action: String,
+        /// A question for a person (`ask_human`): `action` holds the question, and the answer comes
+        /// back as the approval's text. Left out of the JSON when `false`, so older events decode.
+        #[serde(default, skip_serializing_if = "is_false")]
+        question: bool,
     },
     ApprovalResolved {
         id: ApprovalId,
@@ -100,4 +104,10 @@ pub struct Event {
     #[serde(with = "time::serde::rfc3339")]
     pub ts: OffsetDateTime,
     pub kind: EventKind,
+}
+
+/// For `skip_serializing_if`: a `false` flag is left out of the JSON.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }

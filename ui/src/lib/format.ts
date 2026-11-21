@@ -41,6 +41,17 @@ export function formatUsd(micro: MicroUsd | null): string {
 
 const two = (n: number) => String(n).padStart(2, '0');
 
+/**
+ * Newest first, for RFC 3339 UTC times. The server writes fractions of varying length (`...09Z`,
+ * `...09.5Z`), so whole seconds compare as text and only a tie is parsed.
+ */
+export function newestFirst(a: string, b: string): number {
+  const sa = a.slice(0, 19);
+  const sb = b.slice(0, 19);
+  if (sa !== sb) return sa < sb ? 1 : -1;
+  return Date.parse(b) - Date.parse(a);
+}
+
 /** A duration in milliseconds as `45s`, `2m 05s` or `1h 02m`. */
 export function formatElapsed(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));

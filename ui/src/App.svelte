@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createApi } from './lib/api';
+  import { ApprovalsState, followApprovals } from './lib/approvals.svelte';
   import { href, parseRoute, type Route } from './lib/router';
   import { clearToken, getToken, isCurrent, setToken } from './lib/token';
   import Approvals from './views/Approvals.svelte';
@@ -7,7 +8,7 @@
   import NotFound from './views/NotFound.svelte';
   import Run from './views/Run.svelte';
   import TokenRequired from './views/TokenRequired.svelte';
-  import type { SocketFactory } from './lib/ws';
+  import { socketBase, type SocketFactory } from './lib/ws';
 
   let {
     fetch: fetchImpl = (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
@@ -22,6 +23,17 @@
   // Bumped after a token is entered, so the current view mounts again and retries its request.
   let attempt = $state(0);
   let main: HTMLElement | undefined = $state();
+
+  // Pending approvals across all runs: the Approvals view lists them, the nav counts them.
+  const approvals = new ApprovalsState();
+  let retryApprovals = $state(() => {});
+  $effect(() => {
+    // Read so that a new token starts again.
+    void attempt;
+    const follow = followApprovals({ api, state: approvals, onUnauthorized, base: socketBase(window.location), sockets });
+    retryApprovals = follow.retry;
+    return () => follow.stop();
+  });
 
   $effect(() => {
     const onHash = () => (route = parseRoute(window.location.hash));
@@ -51,8 +63,8 @@
   }
 
   const nav = [
-    { label: 'Fleet', to: href({ name: 'fleet' }), active: (r: Route) => r.name === 'fleet' },
-    { label: 'Approvals', to: href({ name: 'approvals' }), active: (r: Route) => r.name === 'approvals' },
+    { label: 'Fleet', to: href({ name: 'fleet' }), active: (r: Route) => r.name === 'fleet', count: false },
+    { label: 'Approvals', to: href({ name: 'approvals' }), active: (r: Route) => r.name === 'approvals', count: true },
   ];
 </script>
 
@@ -63,7 +75,11 @@
     <ul>
       {#each nav as item (item.to)}
         <li>
-          <a href={item.to} aria-current={item.active(route) ? 'page' : undefined}>{item.label}</a>
+          <a href={item.to} aria-current={item.active(route) ? 'page' : undefined}
+            >{item.label}{#if item.count && approvals.count > 0}&nbsp;<span class="count"
+                  >{approvals.count}<span class="hidden">&nbsp;pending</span></span
+                >{/if}</a
+          >
         </li>
       {/each}
     </ul>
@@ -77,7 +93,7 @@
       {#if route.name === 'fleet'}
         <Fleet {api} {onUnauthorized} {sockets} />
       {:else if route.name === 'approvals'}
-        <Approvals {api} {onUnauthorized} />
+        <Approvals {approvals} {api} {onUnauthorized} onRetry={() => retryApprovals()} />
       {:else if route.name === 'run'}
         <!-- Not keyed by id: moving between runs of one tree keeps the tree as it is. -->
         <Run id={route.id} {api} {onUnauthorized} {sockets} />
@@ -137,5 +153,25 @@
   }
   main:focus {
     outline: none;
+  }
+  .count {
+    display: inline-block;
+    min-width: 1.25rem;
+    margin-left: var(--space-1);
+    padding: 0 var(--space-1);
+    border-radius: 999px;
+    background: var(--color-accent);
+    color: var(--color-on-accent);
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-align: center;
+  }
+  .hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 </style>
