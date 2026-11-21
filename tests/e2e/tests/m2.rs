@@ -200,6 +200,15 @@ fn fan_out_and_commit(same: bool) {
         let top = std::fs::canonicalize(top.trim()).expect("clone top level");
         assert_eq!(top, std::fs::canonicalize(&ws).expect("workspace"));
         assert!(clones.insert(top), "two children share a working directory");
+        // A real clone with its own objects, not one that borrows the source repo's.
+        assert!(
+            !ws.join(".git")
+                .join("objects")
+                .join("info")
+                .join("alternates")
+                .exists(),
+            "kid {n}'s clone borrows objects through .git/objects/info/alternates"
+        );
         let branch = branch_of(&id);
         assert!(
             branches.insert(branch.clone()),
