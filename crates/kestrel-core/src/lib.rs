@@ -456,7 +456,8 @@ struct Scheduler {
     tasks: JoinSet<()>,
     /// Everything waiting for a slot, in arrival order (the front is served first).
     waiting: VecDeque<Waiter>,
-    /// Cancels held back until the runs below have ended, deepest runs first.
+    /// Cancels held back. Each is delivered once nothing live is below its run, so a tree is
+    /// cancelled from the leaves up whatever the order here.
     pending_cancels: Vec<RunId>,
     /// Set by `run_forever`: when the scheduler goes (the loop ended, or its future was
     /// dropped), the held-back cancels go back into the store for the next start.
