@@ -457,6 +457,33 @@ async fn approving_for_a_run_no_longer_waiting_is_409() {
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+// An approval whose run ended without deciding it (cancelled, failed) can never be resolved: it
+// is listed as expired, not pending, and approving it is 409.
+#[tokio::test]
+async fn an_approval_whose_run_ended_is_expired_not_pending() {
+    let store = store();
+    let (id, aid) = waiting(&store);
+    store
+        .transition(
+            id,
+            &RunStatus::Suspended(SuspendReason::Approval(aid)),
+            RunStatus::Cancelled,
+        )
+        .unwrap();
+    let app = app(store);
+    let (_, pending) = json(&app, get("/api/approvals?status=pending")).await;
+    assert_eq!(pending, serde_json::json!([]));
+    let (_, expired) = json(&app, get("/api/approvals?status=expired")).await;
+    assert_eq!(expired[0]["id"], aid.to_string());
+    assert_eq!(expired[0]["status"], "expired");
+    let (status, _) = json(
+        &app,
+        req("POST", &format!("/api/approvals/{aid}/approve"), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
 #[tokio::test]
 async fn approvals_are_listed_by_status() {
     let store = store();
@@ -492,6 +519,8 @@ async fn approvals_are_listed_by_status() {
     let (_, all) = json(&app, get("/api/approvals")).await;
     assert_eq!(all.as_array().unwrap().len(), 2);
     assert_eq!(all[0]["action"], "git push");
+    let (_, e) = json(&app, get("/api/approvals?status=expired")).await;
+    assert_eq!(e, serde_json::json!([]));
     let (status, _) = json(&app, get("/api/approvals?status=maybe")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

@@ -257,25 +257,36 @@ pub(crate) async fn command(
     }
 }
 
-fn approval_status(record: &ApprovalRecord) -> ApprovalStatus {
-    match record.resolved {
-        None => ApprovalStatus::Pending,
+/// An undecided approval is pending only while its run waits on it; once the run has moved on
+/// (cancelled, failed), it can never be decided and is expired.
+fn approval_status(store: &Store, record: &ApprovalRecord) -> Result<ApprovalStatus, StoreError> {
+    Ok(match record.resolved {
         Some(true) => ApprovalStatus::Approved,
         Some(false) => ApprovalStatus::Rejected,
-    }
+        None => {
+            let waiting = RunStatus::Suspended(SuspendReason::Approval(record.id));
+            let run = store.get_run(record.run_id)?;
+            if run.is_some_and(|r| r.status == waiting) {
+                ApprovalStatus::Pending
+            } else {
+                ApprovalStatus::Expired
+            }
+        }
+    })
 }
 
-/// `GET /api/approvals?status=pending|approved|rejected`, in request order.
+/// `GET /api/approvals?status=pending|approved|rejected|expired`, in request order.
 pub(crate) async fn approvals(State(s): State<AppState>, Query(q): Params) -> Response {
     let wanted = match q.get("status").map(String::as_str) {
         None => None,
         Some("pending") => Some(ApprovalStatus::Pending),
         Some("approved") => Some(ApprovalStatus::Approved),
         Some("rejected") => Some(ApprovalStatus::Rejected),
+        Some("expired") => Some(ApprovalStatus::Expired),
         Some(other) => {
             return error(
                 StatusCode::BAD_REQUEST,
-                format!("unknown status `{other}` (one of pending, approved, rejected)"),
+                format!("unknown status `{other}` (one of pending, approved, rejected, expired)"),
             );
         }
     };
@@ -283,17 +294,22 @@ pub(crate) async fn approvals(State(s): State<AppState>, Query(q): Params) -> Re
         Ok(records) => records,
         Err(e) => return internal(e),
     };
-    let list: Vec<Approval> = records
-        .into_iter()
-        .map(|r| Approval {
-            status: approval_status(&r),
-            id: r.id,
-            run_id: r.run_id,
-            action: r.action,
-            requested_at: r.requested_at,
-        })
-        .filter(|a| wanted.is_none_or(|w| a.status == w))
-        .collect();
+    let mut list = Vec::new();
+    for r in records {
+        let status = match approval_status(&s.store, &r) {
+            Ok(status) => status,
+            Err(e) => return internal(e),
+        };
+        if wanted.is_none_or(|w| status == w) {
+            list.push(Approval {
+                status,
+                id: r.id,
+                run_id: r.run_id,
+                action: r.action,
+                requested_at: r.requested_at,
+            });
+        }
+    }
     Json(list).into_response()
 }
 

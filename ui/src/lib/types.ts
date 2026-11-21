@@ -42,7 +42,8 @@ export interface TreeNode {
   limit: MicroUsd | null;
 }
 
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+/** `expired`: never decided, and its run no longer waits on it. */
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 
 export interface Approval {
   id: ApprovalId;

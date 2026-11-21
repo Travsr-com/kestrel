@@ -76,6 +76,13 @@
       "action": "send email to the team",
       "status": "rejected",
       "requested_at": "2026-11-21T07:40:00Z"
+    },
+    {
+      "id": "7d8e9f0a-1b2c-4d3e-8f4a-5b6c7d8e9f0a",
+      "run_id": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+      "action": "open a pull request",
+      "status": "expired",
+      "requested_at": "2026-11-20T17:50:00Z"
     }
   ],
   "events": [

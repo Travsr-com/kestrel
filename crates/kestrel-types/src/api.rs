@@ -52,6 +52,9 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Rejected,
+    /// Never decided, and its run no longer waits on it (the run was cancelled or failed), so it
+    /// can no longer be decided.
+    Expired,
 }
 
 /// One approval, as `GET /api/approvals` returns it.
