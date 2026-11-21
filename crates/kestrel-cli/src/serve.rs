@@ -15,7 +15,7 @@ use kestrel_gateway::{
 };
 use kestrel_sandbox::{
     BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
-    ProcessRunner, SandboxDriver, SubnetPool, detect_with, docker_subnets_except_instance,
+    ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots, docker_subnets_except_instance,
     host_routes,
 };
 use kestrel_store::Store;
@@ -40,6 +40,8 @@ struct RawConfig {
     #[serde(default)]
     engine: RawEngine,
     #[serde(default)]
+    sandbox: RawSandbox,
+    #[serde(default)]
     providers: RawProviders,
     /// Tier name (`cheap`, `mid`, `frontier`) to provider model name.
     #[serde(default)]
@@ -60,6 +62,13 @@ struct RawGateway {
     docker_host: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key.
     subnet_pool: Option<toml::Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSandbox {
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    allowed_roots: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -111,6 +120,9 @@ struct Config {
     subnet_pool: Ipv4Cidr,
     /// `engine.shutdown_grace_secs`: how long a stop may take, in total. Default 10s.
     shutdown_grace: Duration,
+    /// `sandbox.allowed_roots`: where workspaces may be mounted from. `None` means the default,
+    /// the `workspaces` directory next to the database (see [`effective_allowed_roots`]).
+    allowed_roots: Option<Vec<PathBuf>>,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
@@ -189,6 +201,11 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .transpose()?
         .unwrap_or_default();
     let subnet_pool = subnet_pool(raw.gateway.subnet_pool)?;
+    let allowed_roots = raw
+        .sandbox
+        .allowed_roots
+        .map(allowed_roots_setting)
+        .transpose()?;
     Ok(Config {
         listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
@@ -197,6 +214,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         docker_host,
         subnet_pool,
         shutdown_grace,
+        allowed_roots,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -224,6 +242,40 @@ fn shutdown_grace_secs(value: toml::Value) -> Result<Duration, Failure> {
         .ok_or_else(|| {
             Failure::usage("engine.shutdown_grace_secs must be a whole number from 1 to 3600")
         })
+}
+
+/// `sandbox.allowed_roots`: a non-empty array of absolute path strings. Anything else is a usage
+/// error that names `sandbox.allowed_roots` and never echoes the value.
+fn allowed_roots_setting(value: toml::Value) -> Result<Vec<PathBuf>, Failure> {
+    let bad = || {
+        Failure::usage("sandbox.allowed_roots must be a non-empty array of absolute path strings")
+    };
+    let items = value.as_array().filter(|a| !a.is_empty()).ok_or_else(bad)?;
+    items
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .ok_or_else(bad)
+        })
+        .collect()
+}
+
+/// The roots drivers enforce: the configured ones, else `<db dir>/workspaces`, where per-run
+/// clones live.
+fn effective_allowed_roots(
+    configured: Option<&[PathBuf]>,
+    db: &Path,
+) -> Result<Vec<PathBuf>, Failure> {
+    if let Some(roots) = configured {
+        return Ok(roots.to_vec());
+    }
+    let abs = std::path::absolute(db)
+        .map_err(|e| Failure::runtime(format!("cannot resolve the database directory: {e}")))?;
+    Ok(vec![
+        abs.parent().unwrap_or(Path::new("/")).join("workspaces"),
+    ])
 }
 
 /// `gateway.port`: an integer from 1 to 65535.
@@ -424,6 +476,8 @@ const CONFIG_NAMES: &[&str] = &[
     "advertise_url",
     "docker_host",
     "subnet_pool",
+    "sandbox",
+    "allowed_roots",
     "engine",
     "max_concurrent_runs",
     "shutdown_grace_secs",
@@ -921,7 +975,8 @@ async fn run(
             let Some(host) = until_stopped(&shutdown, HostInfo::current()).await else {
                 return Ok(());
             };
-            detect_with(&host, false, Some(&instance), bridge)
+            let roots = effective_allowed_roots(config.allowed_roots.as_deref(), &db)?;
+            detect_with_roots(&host, false, Some(&instance), bridge, Some(roots))
                 .map_err(|e| Failure::runtime(e.to_string()))?
         }
     };
@@ -1915,6 +1970,60 @@ budget: { usd: 0.000010, wall_clock: 10m }
             assert!(msg.contains("gateway.advertise_url"), "{msg}");
             assert!(!msg.contains("secret-host"), "{msg}");
         }
+    }
+
+    #[test]
+    fn allowed_roots_default_to_none_and_are_read_as_absolute_paths() {
+        let (_dir, path) = write(ANTHROPIC);
+        assert_eq!(load_config(&path).expect("config").allowed_roots, None);
+        let (_dir, path) = write(&format!(
+            "[sandbox]\nallowed_roots = [\"/data/a\", \"/data/b\"]\n{ANTHROPIC}"
+        ));
+        assert_eq!(
+            load_config(&path).expect("config").allowed_roots,
+            Some(vec![PathBuf::from("/data/a"), PathBuf::from("/data/b")])
+        );
+    }
+
+    #[test]
+    fn bad_allowed_roots_name_the_key_and_never_echo_the_value() {
+        for bad in [
+            "\"/secret-root-x\"",
+            "[\"relative-secret-x/dir\"]",
+            "[\"/ok\", \"secret-x\"]",
+            "[42]",
+            "[[\"/secret-root-x\"]]",
+            "[]",
+            "[\"\"]",
+            "42",
+            "true",
+        ] {
+            let msg = err(&format!("[sandbox]\nallowed_roots = {bad}\n{ANTHROPIC}"));
+            assert!(msg.contains("sandbox.allowed_roots"), "{bad}: {msg}");
+            assert!(!msg.contains("secret"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn effective_roots_are_the_configured_ones_or_the_workspaces_dir_next_to_the_db() {
+        let db = Path::new("/var/lib/kestrel/kestrel.db");
+        assert_eq!(
+            effective_allowed_roots(None, db).expect("default"),
+            vec![PathBuf::from("/var/lib/kestrel/workspaces")]
+        );
+        let set = [PathBuf::from("/data/ws")];
+        assert_eq!(
+            effective_allowed_roots(Some(&set), db).expect("set"),
+            vec![PathBuf::from("/data/ws")]
+        );
+    }
+
+    #[test]
+    fn a_relative_db_path_still_gives_an_absolute_default_root() {
+        let roots = effective_allowed_roots(None, Path::new("rel/kestrel.db")).expect("default");
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].is_absolute(), "{roots:?}");
+        assert!(roots[0].ends_with("rel/workspaces"), "{roots:?}");
     }
 
     struct Recorder {
