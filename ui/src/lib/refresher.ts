@@ -3,7 +3,8 @@
 // One request per run at a time: whatever asks while one is out gets a single request after it, so
 // a replay of many spawns costs two requests, and answers never arrive out of order. A failure the
 // caller wants retried is tried again after 5 s, doubling up to 60 s; asks while a retry waits wait
-// with it. `stop` ends it all: no answer is handed on and no retry runs after it.
+// with it. `lookUp` is for a run just seen: any answer will do, so it asks for nothing more while
+// one is out. `stop` ends it all: no answer is handed on and no retry runs after it.
 
 import type { RunId, RunSummary } from './types';
 
@@ -52,6 +53,11 @@ export class Refresher {
         this.asking.delete(id);
         if (this.again.delete(id)) this.refresh(id);
       });
+  }
+
+  /** Fetches `id` unless a fetch of it is out or waiting to be tried again. */
+  lookUp(id: RunId): void {
+    if (!this.asking.has(id)) this.refresh(id);
   }
 
   stop(): void {

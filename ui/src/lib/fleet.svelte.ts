@@ -101,17 +101,23 @@ export class FleetState {
   }
 
   /**
-   * Applies one event from the tree socket of `root`. `refresh` is asked to fetch a run that is
-   * new, or whose limit changed.
+   * Applies one event from the tree socket of `root`. `lookUp` is asked to fetch a run that is new
+   * (any answer will do), and `refresh` one whose limit changed (an answer asked for before is old).
    */
-  apply(event: Event, now: number, refresh: (id: RunId) => void, root: RunId): void {
+  apply(
+    event: Event,
+    now: number,
+    refresh: (id: RunId) => void,
+    root: RunId,
+    lookUp: (id: RunId) => void = refresh,
+  ): void {
     const run = this.runs[event.run_id];
     const kind = event.kind;
     switch (kind.kind) {
       case 'run_created':
         if (!run) {
           this.seen(event.run_id, kind.agent, kind.parent ?? null, null, event.ts, root);
-          refresh(event.run_id);
+          lookUp(event.run_id);
         }
         break;
       case 'status_changed':
@@ -144,7 +150,7 @@ export class FleetState {
         // the rest. The parent's limit went down by that budget.
         if (!this.runs[kind.child]) {
           this.seen(kind.child, kind.agent, event.run_id, kind.budget, event.ts, root);
-          refresh(kind.child);
+          lookUp(kind.child);
         }
         refresh(event.run_id);
         break;

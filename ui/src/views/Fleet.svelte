@@ -110,41 +110,27 @@
     return () => clearTimeout(timer);
   });
 
-  // A run the server has not answered for yet still needs its limit: its failed fetch is retried.
+  // Every fetch of one run goes through here: those the tree sockets ask for (a new run's limit, a
+  // parent's after a spawn) and the look-ups of runs the events socket brings. So a new run is
+  // fetched once, whichever socket brings it first. A run the server has not answered for yet (not
+  // known, or known only from its events) still needs its limit: its failed fetch is retried.
   const refresher = new Refresher({
     fetch: (id) => api.getRun(id),
-    answered: (summary) => fleet.update(summary, Date.now()),
+    answered: (summary) => (fleet.runs[summary.id] ? fleet.update(summary, Date.now()) : fleet.add(summary)),
     failed: (e) => failureText(e, onUnauthorized),
-    retry: (id, e) => !(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false,
+    retry: (id, e) => !(e instanceof Unauthorized) && !fleet.runs[id]?.fetched,
   });
   const refresh = (id: RunId) => refresher.refresh(id);
+  const lookUp = (id: RunId) => refresher.lookUp(id);
 
   // A run started after the list loaded, in a tree not followed yet, reaches this view only through
-  // the app's events socket. Each one not known here is looked up once (again after a failure, at
-  // the next change to the live runs) and then shows and is followed like the rest.
-  /** Look-ups in flight or done: bookkeeping only, never rendered. */
-  const lookedUp: Record<RunId, true> = {};
-  let gone = false;
-  $effect(() => () => {
-    gone = true;
-  });
+  // the app's events socket. Each one not known here is looked up (a failure is tried again by
+  // itself), and then shows and is followed like the rest.
   $effect(() => {
     if (!loaded || !liveRuns) return;
     const ids = liveRuns.ids;
     untrack(() => {
-      for (const id of ids) {
-        if (fleet.runs[id] || lookedUp[id]) continue;
-        lookedUp[id] = true;
-        api.getRun(id).then(
-          (summary) => {
-            if (!gone) fleet.add(summary);
-          },
-          (e: unknown) => {
-            delete lookedUp[id];
-            if (!gone) failureText(e, onUnauthorized);
-          },
-        );
-      }
+      for (const id of ids) if (!fleet.runs[id]) lookUp(id);
     });
   });
 
@@ -157,7 +143,7 @@
         after: 0,
         getToken,
         socketFactory: sockets,
-        onEvent: (event) => fleet.apply(event, Date.now(), refresh, root),
+        onEvent: (event) => fleet.apply(event, Date.now(), refresh, root, lookUp),
         onState: (state: ConnectionState) => {
           if (state === 'reconnecting') {
             down[root] = true;
