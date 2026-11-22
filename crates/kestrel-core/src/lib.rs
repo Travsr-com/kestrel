@@ -192,11 +192,21 @@ pub struct LoweredDepth {
 }
 
 impl LoweredDepth {
+    /// What was lowered, the part [`LoweredDepth::note`] and [`LoweredDepth::log_line`] share.
+    fn lowered(&self) -> String {
+        format!("max_depth lowered from {} to {}", self.asked, self.granted)
+    }
+
     /// What the spawning agent is told.
     pub fn note(&self) -> String {
+        format!("{} (the most this parent can give)", self.lowered())
+    }
+
+    /// The `AgentLog` line recorded on the child.
+    pub fn log_line(&self) -> String {
         format!(
-            "max_depth lowered from {} to {} (the most this parent can give)",
-            self.asked, self.granted
+            "kestrel: spawn {} (the most its parent can give)",
+            self.lowered()
         )
     }
 }
@@ -1045,10 +1055,7 @@ impl Engine {
         let lowered_depth = lowered_depth(&wanted, &narrowed);
         if let Some(lowered) = lowered_depth {
             child_events.push(EventKind::AgentLog {
-                line: format!(
-                    "kestrel: spawn max_depth lowered from {} to {} (the most its parent can give)",
-                    lowered.asked, lowered.granted
-                ),
+                line: lowered.log_line(),
             });
         }
         if !dropped.is_empty() {
