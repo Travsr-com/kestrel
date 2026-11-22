@@ -37,31 +37,42 @@
   let decidedFailed = $state(false);
   /** Bumped to ask for the decided list again. */
   let decidedAsk = $state(0);
+  /** Numbers the decided-list requests: the newest sent, and the newest whose answer was taken. */
+  let decidedSent = 0;
+  let decidedTaken = 0;
+  let mounted = true;
+  $effect(() => () => {
+    mounted = false;
+  });
+  // A new ask does not drop a request on its way: with a slow server and steady changes, no answer
+  // would ever be taken. Answers are taken in order instead: one older than the last taken is
+  // dropped, and none after the view is gone.
   $effect(() => {
     void decidedAsk;
-    let alive = true;
+    decidedSent += 1;
+    const asked = decidedSent;
+    const newest = () => mounted && asked > decidedTaken;
     // Every approval in one request (the API filters one status at a time), less the pending ones.
     api.approvals().then(
       (list) => {
-        if (!alive) return;
+        if (!newest()) return;
+        decidedTaken = asked;
         decided = list.filter((a) => a.status !== 'pending');
         decidedFailed = false;
       },
       (e: unknown) => {
-        if (!alive) return;
+        if (!newest()) return;
+        decidedTaken = asked;
         // A refused token is handed on; the pending list asked at the same time says the rest.
         failureText(e, onUnauthorized);
         decidedFailed = true;
       },
     );
-    return () => {
-      alive = false;
-    };
   });
 
   // When the decided approvals may have changed (approvals resolved here or elsewhere, rows ended
   // with their run, an ended row dismissed), the list is asked for again a moment later. A change
-  // while one is already due does not push it back, so a steady stream of changes still refreshes
+  // while one is already due does not push it back, so a steady stream of changes still asks for
   // the list every REFETCH_MS, and the last change is always followed by one.
   let changesSeen = untrack(() => approvals.decidedChanges);
   let refetch: ReturnType<typeof setTimeout> | null = null;
