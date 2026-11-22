@@ -17,7 +17,8 @@ use common::{FakeBudget, FakeSink, config};
 use futures::StreamExt;
 use kestrel_gateway::{
     DEFAULT_WAITING_CALLS, GatewayDeps, GatewayLimits, GatewayTimeouts, JoinCall, JoinWait,
-    KestrelTool, Liveness, RunResolver, SpawnCall, ToolHost, ToolsError, router, router_with_limits,
+    KestrelTool, Liveness, RunResolver, SpawnCall, ToolHost, ToolsError, router,
+    router_with_limits,
 };
 use kestrel_types::{MicroUsd, RunId};
 use serde_json::{Value, json};

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, Liveness, MeterSink, ModelPrice, NoTools, ProviderConfig,
-    RunResolver, router,
+    BudgetGuard, GatewayConfig, GatewayDeps, Liveness, MeterSink, ModelPrice, NoTools,
+    ProviderConfig, RunResolver, router,
 };
 use kestrel_types::{MicroUsd, ModelCallRecord, RunId};
 use url::Url;

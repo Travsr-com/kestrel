@@ -12,8 +12,8 @@ use kestrel_core::{
     default_models,
 };
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, GatewayLimits, GatewayTimeouts, MeterSink, ModelPrice,
-    ProviderConfig, RunResolver,
+    BudgetGuard, GatewayConfig, GatewayDeps, GatewayLimits, GatewayTimeouts, Liveness, MeterSink,
+    ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
     BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
@@ -1640,9 +1640,14 @@ impl RunResolver for StoreDeps {
         self.0.run_by_token(token).ok().flatten()
     }
 
-    /// Ended unless the store says the run is live: a run it cannot read lets nothing through.
-    async fn ended(&self, run: RunId) -> bool {
-        !matches!(self.0.get_run(run), Ok(Some(row)) if !row.status.is_terminal())
+    /// Live until the run ends; a run the store does not have counts as ended. A store error is
+    /// `Unknown`, so the call is refused for now but may be retried.
+    async fn liveness(&self, run: RunId) -> Liveness {
+        match self.0.get_run(run) {
+            Ok(Some(row)) if !row.status.is_terminal() => Liveness::Live,
+            Ok(_) => Liveness::Ended,
+            Err(_) => Liveness::Unknown,
+        }
     }
 }
 
@@ -1677,7 +1682,7 @@ impl MeterSink for StoreDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kestrel_gateway::Liveness;
+
     use kestrel_types::{AgentSpec, RunStatus, SuspendReason};
 
     // #37 scenario 2: the API server binds 127.0.0.1 by default; another address starts it and

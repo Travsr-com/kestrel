@@ -19,8 +19,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{FakeBudget, FakeSink, config};
 use kestrel_gateway::{
-    GatewayDeps, KestrelTool, Liveness, NoTools, RunResolver, TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS, ToolsError,
-    TravsrHost, router,
+    GatewayDeps, KestrelTool, Liveness, NoTools, RunResolver, TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS,
+    ToolsError, TravsrHost, router,
 };
 use kestrel_types::RunId;
 use serde_json::{Value, json};
@@ -226,7 +226,10 @@ fn setup_with(allowed_a: &[&str], timeout: Duration) -> Setup {
     host.allowed.lock().unwrap().insert(a, names(allowed_a));
     host.allowed.lock().unwrap().insert(b, names(&TRAVSR_TOOLS));
     // Allowed everything, so only the ended check can refuse it.
-    host.allowed.lock().unwrap().insert(ended, names(&TRAVSR_TOOLS));
+    host.allowed
+        .lock()
+        .unwrap()
+        .insert(ended, names(&TRAVSR_TOOLS));
     host.gone.lock().unwrap().push(done);
     host.unavailable.lock().unwrap().push(broken);
     let deps = GatewayDeps {
@@ -757,7 +760,10 @@ async fn get_is_405() {
 async fn s11_without_travsr_the_route_is_404_and_mcp_lists_no_travsr_tool() {
     let run = RunId::new();
     let deps = GatewayDeps {
-        resolver: Arc::new(Tokens(HashMap::from([(TOKEN_A.to_string(), run)]), Vec::new())),
+        resolver: Arc::new(Tokens(
+            HashMap::from([(TOKEN_A.to_string(), run)]),
+            Vec::new(),
+        )),
         budget: Arc::new(FakeBudget::new(true)),
         meter: Arc::new(FakeSink::default()),
         tools: Arc::new(AllKestrel),
