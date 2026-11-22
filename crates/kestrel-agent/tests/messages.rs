@@ -63,6 +63,10 @@ fn tells_to_check(note: &str) {
     // Review of #95: the agent passes the last seq it got as `after`, so a retry loses nothing.
     assert!(note.contains("after"), "{note}");
     assert!(note.contains("seq"), "{note}");
+    assert!(
+        note.contains("If you do not know the last seq you got, leave out after."),
+        "{note}"
+    );
 }
 
 #[test]
