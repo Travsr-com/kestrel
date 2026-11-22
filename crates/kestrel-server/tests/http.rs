@@ -1078,9 +1078,18 @@ async fn i95_s3_a_run_that_is_not_running_is_409_with_the_reason() {
         .unwrap();
     let app = app(store.clone());
     for (id, says) in [
-        (queued, "a queued run cannot take a message, only a running one"),
-        (paused, "a suspended run cannot take a message, only a running one"),
-        (done, "the run has ended (completed), so it cannot take a message"),
+        (
+            queued,
+            "a queued run cannot take a message, only a running one",
+        ),
+        (
+            paused,
+            "a suspended run cannot take a message, only a running one",
+        ),
+        (
+            done,
+            "the run has ended (completed), so it cannot take a message",
+        ),
     ] {
         let (status, body) = json(&app, post_message(id, r#"{"text":"hi"}"#)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");

@@ -10,8 +10,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kestrel_store::{ApprovalRecord, ControlCommand, RunRow, Store, StoreError};
 use kestrel_types::{
-    ApiError, Approval, ApprovalId, ApprovalStatus, MicroUsd, RunId, RunStatus, RunSummary,
-    SuspendReason, TreeNode,
+    AgentSpec, ApiError, Approval, ApprovalId, ApprovalStatus, MAX_MESSAGE_BYTES, MicroUsd, RunId,
+    RunStatus, RunSummary, SuspendReason, TreeNode, message_problem,
 };
 use serde::Deserialize;
 
@@ -64,6 +64,7 @@ const STATUS_NAMES: [&str; 7] = [
 
 fn summary(store: &Store, row: RunRow) -> Result<RunSummary, StoreError> {
     let spec = store.run_spec(row.id)?;
+    let takes_messages = spec.as_ref().is_some_and(AgentSpec::takes_messages);
     Ok(RunSummary {
         id: row.id,
         spent: store.spent(row.id)?,
@@ -75,6 +76,7 @@ fn summary(store: &Store, row: RunRow) -> Result<RunSummary, StoreError> {
         root: row.root,
         depth: row.depth,
         created_at: row.created_at,
+        takes_messages,
     })
 }
 
@@ -203,7 +205,8 @@ struct BudgetBody {
 }
 
 /// `POST /api/runs/{id}/{pause|resume|cancel|budget|message}`: 202 once the command is in the
-/// store's control channel, 409 with the reason when the run's status does not allow it.
+/// store's control channel, 409 with the reason when the run's status does not allow it. A
+/// message goes to the run's inbox instead, see [`message`].
 pub(crate) async fn command(
     State(s): State<AppState>,
     Path((id, action)): Path<(String, String)>,
@@ -231,12 +234,7 @@ pub(crate) async fn command(
                 }
             }
         }
-        "message" => {
-            return error(
-                StatusCode::CONFLICT,
-                "this run's runtime does not take injected messages",
-            );
-        }
+        "message" => return message(&s.store, &row, &body),
         other => return error(StatusCode::NOT_FOUND, format!("no command `{other}`")),
     };
     // Refused up front, so the caller hears why instead of a 202 the engine then ignores. A cancel
@@ -248,6 +246,39 @@ pub(crate) async fn command(
     }
     match s.store.push_control(row.id, cmd) {
         Ok(_) => accepted(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MessageBody {
+    text: String,
+}
+
+/// `POST /api/runs/{id}/message` with `{"text": ...}`: 202 once the message is stored for the agent
+/// to take (`kestrel.messages`). The body is checked first: 400 when it is not a message, 413 when
+/// the text is over [`MAX_MESSAGE_BYTES`]. Then 409 with the reason for a run that cannot take one
+/// now. The text is never logged.
+fn message(store: &Store, row: &RunRow, body: &Bytes) -> Response {
+    let Ok(MessageBody { text }) = serde_json::from_slice::<MessageBody>(body) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            r#"the body must be {"text": "<message>"}"#,
+        );
+    };
+    if let Some(problem) = message_problem(&text) {
+        let status = if text.len() > MAX_MESSAGE_BYTES {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return error(status, problem);
+    }
+    match store.send_message(row.id, &text) {
+        Ok(_) => accepted(),
+        Err(StoreError::MessageRefused(why)) => {
+            error(StatusCode::CONFLICT, format!("run {}: {why}", row.id))
+        }
         Err(e) => internal(e),
     }
 }
