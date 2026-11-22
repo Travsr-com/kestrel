@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kestrel_store::{ControlCommand, RunFilter, RunRow, Store};
+use kestrel_store::{ControlCommand, RunFilter, RunRow, Store, StoreError};
 use kestrel_types::{
     AgentSpec, ApprovalId, Event, EventKind, RunId, RunStatus, SuspendReason, WorkspaceSpec,
 };
@@ -190,6 +190,11 @@ fn describe(kind: &EventKind) -> String {
                 .collect();
             format!("not granted by the parent: {}", parts.join("; "))
         }
+        EventKind::MessageSent { text } => format!("message to the agent: {text}"),
+        EventKind::MessageDelivered { seqs } => match seqs.len() {
+            1 => "the agent read 1 message".to_string(),
+            n => format!("the agent read {n} messages"),
+        },
     }
 }
 
@@ -285,6 +290,27 @@ pub(crate) fn steer(
         return Err(Failure::runtime(format!("run {id}: {why}")));
     }
     send(store, id, cmd, out)
+}
+
+/// `kestrel message`: stores `text` as a message to running run `id`, for its agent to take with
+/// `kestrel.messages`. A run that cannot take one is refused with the reason and nothing is
+/// written. The text is never printed back.
+pub(crate) fn message(store: &Store, id: RunId, text: &str, out: Output) -> Result<(), Failure> {
+    let sent = match store.send_message(id, text) {
+        Ok(event) => event,
+        Err(StoreError::NotFound(_)) => {
+            return Err(Failure::runtime(format!("no such run: {id}")));
+        }
+        Err(StoreError::MessageRefused(why)) => {
+            return Err(Failure::runtime(format!("run {id}: {why}")));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if out.json {
+        say(&json!({ "run_id": id.to_string(), "sent": "message", "seq": sent.seq }).to_string())
+    } else {
+        say(&format!("sent message to {id}"))
+    }
 }
 
 /// `kestrel approve`: resolves the approval a suspended run is waiting on.

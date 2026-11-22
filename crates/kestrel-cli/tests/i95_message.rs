@@ -167,6 +167,8 @@ fn watch_shows_a_message_and_its_delivery() {
         .args(["watch", &id.to_string()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("message to the agent: also fix the docs"))
+        .stdout(predicate::str::contains(
+            "message to the agent: also fix the docs",
+        ))
         .stdout(predicate::str::contains("the agent read 1 message"));
 }

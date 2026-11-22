@@ -208,6 +208,15 @@ impl ToolHost for EngineTools {
             .map_err(|e| e.to_string())
     }
 
+    async fn messages(&self, run: RunId) -> Result<Value, String> {
+        let taken = self.engine.take_messages(run).map_err(|e| e.to_string())?;
+        let messages: Vec<Value> = taken
+            .into_iter()
+            .map(|m| json!({ "text": m.text }))
+            .collect();
+        Ok(json!({ "messages": messages }))
+    }
+
     async fn denied(&self, run: RunId, tool: &str) {
         if let Err(e) = self.engine.tool_denied(run, tool) {
             eprintln!("kestrel: recording a refused {tool} call for run {run}: {e}");
