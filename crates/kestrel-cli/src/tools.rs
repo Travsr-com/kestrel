@@ -253,7 +253,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use kestrel_types::MicroUsd;
+    use kestrel_types::{MicroUsd, RunStatus};
 
     #[test]
     fn the_root_key_is_made_once_and_read_back() {
@@ -634,6 +634,10 @@ mod tests {
         };
         let first = tools.spawn(lead, call.clone()).await.unwrap();
         assert!(first.get("existing").is_none(), "{first}");
+        let child: RunId = first["child"].as_str().unwrap().parse().unwrap();
+        store
+            .transition(child, &RunStatus::Queued, RunStatus::Cancelled)
+            .unwrap();
         let restarted = EngineTools {
             engine: Arc::new(
                 Engine::new(
@@ -650,6 +654,9 @@ mod tests {
         let again = restarted.spawn(lead, call).await.unwrap();
         assert_eq!(again["child"], first["child"], "{again}");
         assert_eq!(again["existing"], true, "{again}");
+        // The child may have ended since: the answer says where it is now.
+        assert!(first.get("status").is_none(), "{first}");
+        assert_eq!(again["status"], "cancelled", "{again}");
         assert_eq!(store.children(lead).unwrap().len(), 1);
     }
 
