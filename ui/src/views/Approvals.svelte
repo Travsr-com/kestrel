@@ -91,10 +91,11 @@
   });
 
   /**
-   * The decided approvals shown, at most DECIDED. Those seen resolved since the page was opened
-   * come first, newest decision first; the rest follow by request time, newest first, as the API
-   * has no decision time. One still in the pending rows is left out: an approval of an ended run
-   * comes back from the API as expired, and is shown once, as "Run ended", until dismissed.
+   * The decided approvals shown, at most DECIDED. Those seen resolved (or ended with their run)
+   * since the app loaded come first, newest first; the rest follow by request time, newest first,
+   * as the API has no decision time. One still in the pending rows is left out: an approval of an
+   * ended run comes back from the API as expired, and is shown once, as "Run ended", until
+   * dismissed.
    */
   const recent = $derived.by(() => {
     if (decided === null) return null;
