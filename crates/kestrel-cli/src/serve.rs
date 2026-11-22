@@ -3443,9 +3443,10 @@ budget: { usd: 0.000010, wall_clock: 10m }
         /// What `docker network ls` prints when filtered to the name `kestrel-gw`: by default it
         /// exists, so the bridge takes no block.
         gw: &'static str,
-        /// What `docker network inspect` of `kestrel-gw` prints: attached containers, then its
-        /// subnets. By default a `/24` with one bridge on it.
+        /// What `docker network inspect` of `kestrel-gw` prints: its subnets. By default a `/24`.
         gw_inspect: &'static str,
+        /// What `docker ps -aq --filter network=kestrel-gw` prints. By default one bridge.
+        gw_attached: &'static str,
     }
 
     impl Host {
@@ -3457,7 +3458,8 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 docker_fails: false,
                 ours: "",
                 gw: "kestrel-gw\n",
-                gw_inspect: "1;172.30.0.0/24 ",
+                gw_inspect: "172.30.0.0/24 ",
+                gw_attached: "c0ffee000001\n",
             }
         }
 
@@ -3499,6 +3501,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 }
                 ["docker", "network", "ls", ..] => "1a2b3c4d5e6f\n",
                 ["docker", "network", "inspect", "--format", _, "kestrel-gw"] => self.gw_inspect,
+                ["docker", "ps", "-aq", "--filter", "network=kestrel-gw"] => self.gw_attached,
                 ["docker", "network", "inspect", ..] => self.subnets,
                 _ => "",
             };
@@ -3592,7 +3595,10 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let host = Host::new("", "");
         let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
         let (plan, network) = got.expect("plan");
-        assert_eq!(network, BridgeNetwork::Existing);
+        assert!(
+            matches!(network, BridgeNetwork::Existing { .. }),
+            "{network:?}"
+        );
         assert_eq!(plan.available(), 8192);
         assert!(
             !host
@@ -3644,10 +3650,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
     #[tokio::test]
     async fn a_smaller_kestrel_gw_in_use_is_kept_and_serve_warns_how_to_grow_it() {
         let mut host = Host::new("", "");
-        host.gw_inspect = "2;172.30.0.0/29 ";
+        host.gw_inspect = "172.30.0.0/29 ";
+        host.gw_attached = "c0ffee000001\nc0ffee000002\n";
         let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
         let (plan, network) = got.expect("plan");
-        assert_eq!(network, BridgeNetwork::Existing);
+        assert!(
+            matches!(network, BridgeNetwork::Existing { .. }),
+            "{network:?}"
+        );
         assert_eq!(plan.available(), 8192);
         assert_eq!(line.lines().count(), 2, "{line}");
         let warning = line.lines().next().unwrap_or_default();
@@ -3662,7 +3672,8 @@ budget: { usd: 0.000010, wall_clock: 10m }
     #[tokio::test]
     async fn a_smaller_kestrel_gw_with_nothing_attached_is_recreated_larger() {
         let mut host = Host::new("", "");
-        host.gw_inspect = "0;172.30.0.0/29 ";
+        host.gw_inspect = "172.30.0.0/29 ";
+        host.gw_attached = "";
         let (got, _) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
         let (_, network) = got.expect("plan");
         let BridgeNetwork::Subnet(span) = network else {
@@ -3720,10 +3731,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
 
     #[test]
     fn the_bridge_spec_carries_the_host_the_connections_and_the_network() {
-        let spec = bridge_spec(DockerHost::Vm, 140, BridgeNetwork::Existing);
+        let existing = BridgeNetwork::Existing { fallback: None };
+        let spec = bridge_spec(DockerHost::Vm, 140, existing.clone());
         assert!(!spec.add_host_gateway);
         assert_eq!(spec.connections, 140);
-        assert_eq!(spec.network, BridgeNetwork::Existing);
+        assert_eq!(spec.network, existing);
         assert!(bridge_spec(DockerHost::Native, 1, BridgeNetwork::DockerPools).add_host_gateway);
     }
 
