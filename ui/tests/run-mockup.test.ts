@@ -266,6 +266,8 @@ describe('Run view panels (scenario 11)', () => {
     expect(panel.querySelector('.link')).toHaveTextContent('Connecting');
     expect(within(panel).getByRole('status').textContent).toBe('');
     socket(sockets, `/ws/runs/${kid.id}`).open();
+    // New props re-run the effects that read them, so the tree socket may be a new one too.
+    socket(sockets, `/ws/tree/${root.id}`).open();
     await vi.waitFor(() => expect(panel.querySelector('.link')).toHaveTextContent('Connected'));
     expect(within(panel).getByRole('status').textContent).toBe('');
   });
