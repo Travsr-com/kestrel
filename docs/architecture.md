@@ -166,10 +166,12 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 **How a sandbox calls the tools** (`kestrel-gateway`, MCP protocol version `2025-06-18`, streamable HTTP):
 
 * The tools live on the gateway at `POST {gateway}/r/{run_token}/mcp`, next to the model routes, because the gateway is a sandbox's only way out. The run is the one the token resolves to, never one named in a request. An unknown token is 401, a run that has ended 410; neither echoes the token.
-* Methods: `initialize`, `ping`, `tools/list`, `tools/call`. Tools: `kestrel.spawn(agent, input, budget_usd?, wait?)`, `kestrel.join(children?, mode?, timeout_s?)`, `kestrel.ask_human(question)`. `GET` is 405: the server sends nothing unasked.
+* Methods: `initialize`, `ping`, `tools/list`, `tools/call`. Tools: `kestrel.spawn(agent, input, budget_usd?, wait?)`, `kestrel.join(children?, mode?, timeout_s?)`, `kestrel.ask_human(question)`, `kestrel.messages()`. `GET` is 405: the server sends nothing unasked.
 * `tools/list` shows the tools in the run's capability (`mcp` in its spec); `kestrel.spawn` also needs spawn rights. Calling another is a tool error, "not permitted", and the run's log records it.
 * `kestrel.spawn` finds the agent by name in `engine.agents_dir` (default `agents` next to the database): agent `worker` is `worker.yaml`.
 * `kestrel.ask_human` records a question approval and the run waits on it, as for any approval. The answer is the text a person approves it with (the Approvals view has an Answer box). Declining fails the run.
+* `kestrel.messages` is a run's inbox of messages from a person (#95). A person sends one with `kestrel message`, the UI's Message box or `POST /api/runs/{id}/message`; it is stored as a `message_sent` event, only for a running run whose spec grants the tool (anything else is refused with the reason). The agent note tells the agent to call the tool between steps. A call returns the messages not yet delivered, oldest first, and records a `message_delivered` event with their `seq`s in the same store transaction, so each message is delivered once, also with two calls at once. Messages are text, at most 16 KiB.
+  * **Why an inbox, not stdin.** Claude Code can read user messages from stdin while it works (`--input-format stream-json`), but a sandbox's stdin is closed: drivers attach with `start --attach` and no stdin, and `create` has no `-i`. Feeding stdin would change every driver, and Claude Code in that mode ends only when its stdin closes, so the engine would have to guess when the agent is done. OpenCode has no streaming input at all. The inbox works the same for both runtimes, through the gateway they already reach, and adds no engine state. The cost: the agent sees a message only when it next checks.
 * A long call (`join`, `ask_human`, a `spawn` that waits) is never silent for more than 15 s while it waits, so the bridge (`socat -T 300`) never sees it idle. What the client gets depends on its `Accept` header:
   * With `text/event-stream` (as MCP clients send it): an event stream, a keepalive comment every 15 s, then the result as one `message` event.
   * JSON only: a call that answers within 15 s gets a plain JSON body. A longer one gets `Content-Type: application/json` with a space every 15 s, then the JSON-RPC result. Leading whitespace is valid JSON, so the body parses as the result.
@@ -416,7 +418,7 @@ uPlot for the cost time series.
 | View | Shows |
 | :--- | :--- |
 | **Fleet** | Every active run as a live card: agent, status, elapsed, cost ticker, sandbox tier. Filters by agent, trigger, status. |
-| **Run** | Spawn tree (graph), event timeline, live token stream, tool calls, terminal output, diff viewer, budget bar. Pause, resume, cancel, inject a message. |
+| **Run** | Spawn tree (graph), event timeline, live token stream, tool calls, terminal output, diff viewer, budget bar. Pause, resume, cancel, send a message (to an agent granted `kestrel.messages`). |
 | **Approvals** | Inbox of pending decisions with full context; approve, reject, or edit and approve. |
 | **Agents** | Builder with form and YAML in sync, version history, "test run" button. |
 | **Triggers** | Schedules, webhooks, watchers; next fire time; history. |

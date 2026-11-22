@@ -179,6 +179,7 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 | `kestrel cancel <run-id>` | Stop a run for good. |
 | `kestrel budget <run-id> 5` | Set the run's budget to 5 USD. |
 | `kestrel approve <approval-id>` | Approve an action the agent asked about. Add `--reject` to refuse. |
+| `kestrel message <run-id> "also fix the docs"` | Send a message to a running agent. See [Messages](#messages-to-a-running-agent). |
 
 Add `--json` to any command for machine-readable output.
 
@@ -194,6 +195,32 @@ error: run <queued-run-id>: a queued run cannot be paused, only a running one
 * `cancel` and `budget` work until the run ends.
 * A completed, failed or cancelled run has ended and refuses all four, except `cancel` while a run
   below it still runs (a run that kept its children): that cancels the live runs below it.
+
+## Messages to a running agent
+
+An agent reads messages from a person only when its spec grants the `kestrel.messages` tool:
+
+```yaml
+capabilities: { mcp: [kestrel.messages] }
+```
+
+Such an agent is told to check for messages between steps. Send one while it runs:
+
+```sh
+kestrel message <run-id> "also fix the docs"
+```
+
+* The message waits until the agent next calls `kestrel.messages`. Each message reaches it once.
+* `kestrel watch` shows `message to the agent: ...` when it is sent and `the agent read 1 message`
+  when the agent took it.
+* Only a running run takes a message. Any other status exits 1 with the reason, and so does an
+  agent without the grant (`its agent cannot take messages`).
+* A message is text of up to 16 KiB: lines and tabs, no other control characters. Anything else
+  exits 2.
+* The message is stored in the run's events, which anyone with the API token can read. Do not put
+  secrets in it.
+
+The web UI has the same Message box on the Run page.
 
 ## What happens at the limit
 
