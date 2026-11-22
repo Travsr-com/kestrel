@@ -206,6 +206,11 @@ impl ToolHost for EngineTools {
             eprintln!("kestrel: recording a refused {tool} call for run {run}: {e}");
         }
     }
+    async fn refused(&self, run: RunId, tool: &str, reason: &str) {
+        if let Err(e) = self.engine.tool_refused(run, tool, reason) {
+            eprintln!("kestrel: recording a refused {tool} call for run {run}: {e}");
+        }
+    }
 }
 
 /// Children's results as the model reads them.
@@ -444,6 +449,14 @@ mod tests {
             matches!(e.kind, kestrel_types::EventKind::AgentLog { ref line } if line.contains("kestrel.spawn"))
         });
         assert!(logged);
+        // Issue #80: a call refused for lack of room is recorded with its reason.
+        tools.refused(lead, "kestrel.join", "no room").await;
+        let refused = store.events_page(lead, 0, 1_000).unwrap().into_iter().any(|e| {
+            matches!(e.kind, kestrel_types::EventKind::AgentLog { ref line } if line.contains("kestrel.join") && line.contains("no room"))
+        });
+        assert!(refused);
+        // A run that does not exist is only reported, never a panic.
+        tools.refused(RunId::new(), "kestrel.join", "no room").await;
     }
 
     /// Moves a queued run to `Running` the way the engine would.

@@ -18,10 +18,17 @@
 //!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
 //!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
 //!   most 256 children and a day's timeout per join. An unknown token is 401 and a finished run 410; neither echoes it.
+//! * **Long calls held open, across all runs**: a `join`, a question or a spawn that waits holds
+//!   its connection (through the shared bridge) until it answers, so at most
+//!   [`crate::GatewayLimits::waiting_calls`] are open at once. A call past that gets a tool error
+//!   at once and the host records it ([`ToolHost::refused`]): a new call starts nothing, and one
+//!   called again with the id of a call still running is told so. A finished call is answered
+//!   again whatever the count.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -54,6 +61,9 @@ const BURST: f64 = 20.0;
 const REFILL_PER_SECOND: f64 = 10.0;
 /// Calls of one run that may wait at once, and results of one run kept.
 const MAX_WAITING: usize = 8;
+/// Long tool calls held open at once across all runs when [`crate::GatewayLimits`] is not set:
+/// the engine's default tree limit, so the waiting parents of one tree can never fill it.
+pub const DEFAULT_WAITING_CALLS: usize = 256;
 const MAX_KEPT: usize = 256;
 /// Longest string id, and most children in one join.
 const MAX_ID_BYTES: usize = 128;
@@ -176,6 +186,9 @@ pub trait ToolHost: Send + Sync {
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String>;
     /// Asks a person; the answer text once they decide.
     async fn ask_human(&self, run: RunId, question: String) -> Result<String, String>;
+    /// Records that `run`'s call of `tool` was refused for lack of room, with the reason the
+    /// agent was given. Does nothing unless the host records it.
+    async fn refused(&self, _run: RunId, _tool: &str, _reason: &str) {}
     /// Records that `run` called `tool`, which it may not.
     async fn denied(&self, run: RunId, tool: &str);
 }
@@ -212,18 +225,66 @@ struct RunCalls {
 }
 
 /// Calls in flight or recently finished, by run, and each run's call allowance.
-#[derive(Default)]
 pub(crate) struct McpState {
     calls: Mutex<HashMap<RunId, RunCalls>>,
     buckets: Mutex<HashMap<RunId, (f64, Instant)>>,
     /// When expired results were last dropped.
     pruned: Mutex<Option<Instant>>,
+    /// Tool calls whose answer is still open, across all runs, and the most there may be.
+    held: Arc<AtomicUsize>,
+    max_held: usize,
 }
 
-/// The run already has [`MAX_WAITING`] calls waiting.
-struct Busy;
+/// Why a call could not be started or waited on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRoom {
+    /// The run already has [`MAX_WAITING`] calls waiting.
+    Busy,
+    /// No room for one more call held open, and the call is new: nothing was started.
+    FullNew,
+    /// No room for one more call held open, and the call is already running.
+    FullRunning,
+}
+
+/// Room for one tool call held open; given back when dropped, which is when its answer has been
+/// sent or its client went away.
+struct Held(Arc<AtomicUsize>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl McpState {
+    /// No calls yet; at most `max_held` long calls held open at once (at least 1).
+    pub(crate) fn new(max_held: usize) -> McpState {
+        McpState {
+            calls: Mutex::default(),
+            buckets: Mutex::default(),
+            pruned: Mutex::default(),
+            held: Arc::default(),
+            max_held: max_held.max(1),
+        }
+    }
+
+    /// Room for one more call held open, or `None` when [`McpState::max_held`] are.
+    fn hold(&self) -> Option<Held> {
+        let mut now = self.held.load(Ordering::SeqCst);
+        loop {
+            if now >= self.max_held {
+                return None;
+            }
+            match self
+                .held
+                .compare_exchange(now, now + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(Held(self.held.clone())),
+                Err(actual) => now = actual,
+            }
+        }
+    }
+
     /// Takes one tool call from `run`'s allowance; `false` when it has none left. The Travsr
     /// route draws on the same allowance.
     pub(crate) fn allow(&self, run: RunId) -> bool {
@@ -467,6 +528,17 @@ enum Task {
     Ask(String),
 }
 
+impl Task {
+    /// A call that may wait a long time for its answer: a join, a question, a spawn that waits.
+    /// A spawn without `wait` answers at once.
+    fn is_long(&self) -> bool {
+        match self {
+            Task::Spawn(call) => call.wait,
+            Task::Join(_) | Task::Ask(_) => true,
+        }
+    }
+}
+
 async fn call(
     state: &Arc<AppState>,
     run: RunId,
@@ -515,15 +587,34 @@ async fn call(
             );
         }
     };
-    let Ok(mut result) = start(state, run, &id, task) else {
-        return rpc_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            id,
-            -32000,
-            "too many tool calls waiting for this run, wait for one to finish",
-        );
+    let (mut result, held) = match start(state, run, &id, task) {
+        Ok(started) => started,
+        Err(NoRoom::Busy) => {
+            return rpc_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                id,
+                -32000,
+                "too many tool calls waiting for this run, wait for one to finish",
+            );
+        }
+        Err(full) => {
+            let what = if full == NoRoom::FullRunning {
+                "this call is still running; call again later with the same id for its result"
+            } else {
+                "nothing was started; call again later"
+            };
+            let reason = format!(
+                "too many tool calls are waiting across all runs (the limit is {}, \
+                 gateway.max_waiting_calls): {what}",
+                state.mcp.max_held
+            );
+            state.deps.tools.refused(run, tool.name(), &reason).await;
+            return Json(rpc_result(id, tool_result(Err(reason)))).into_response();
+        }
     };
     let wait = async move {
+        // Given back once the answer is ready, or when the client goes away first.
+        let _held = held;
         loop {
             if let Some((value, _)) = result.borrow_and_update().clone() {
                 return value;
@@ -545,10 +636,19 @@ async fn call(
         .into_response()
 }
 
-/// The call for `(run, id)`: the one already running or done, or a new one in its own task, so a
-/// client that goes away does not cancel it. [`Busy`] when the run has [`MAX_WAITING`] calls
-/// waiting; at [`MAX_KEPT`] results, the oldest finished one is let go.
-fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<CallResult, Busy> {
+/// The call for `(run, id)` and the room it holds while its answer is open: the one already done
+/// (no room needed), the one still running, or a new one in its own task, so a client that goes
+/// away does not cancel it. A long call holds its connection (through the shared bridge) until it
+/// answers, maybe for hours, so those are capped across all runs ([`McpState::hold`]). A running
+/// call needs room whatever the new request asks for, since the client waits on it; a new call
+/// needs room only when it is long. Decided under the lock, so no result can go between looking
+/// and starting. At [`MAX_KEPT`] results, the oldest finished one is let go.
+fn start(
+    state: &Arc<AppState>,
+    run: RunId,
+    id: &Value,
+    task: Task,
+) -> Result<(CallResult, Option<Held>), NoRoom> {
     let key = id.to_string();
     let mut calls = state
         .mcp
@@ -577,7 +677,11 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
     drop(pruned);
     let mine = calls.entry(run).or_default();
     if let Some((existing, _)) = mine.by_id.get(&key) {
-        return Ok(existing.clone());
+        if existing.borrow().is_some() {
+            return Ok((existing.clone(), None));
+        }
+        let held = state.mcp.hold().ok_or(NoRoom::FullRunning)?;
+        return Ok((existing.clone(), Some(held)));
     }
     let waiting = mine
         .by_id
@@ -585,8 +689,13 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
         .filter(|(r, _)| r.borrow().is_none())
         .count();
     if waiting >= MAX_WAITING {
-        return Err(Busy);
+        return Err(NoRoom::Busy);
     }
+    let held = if task.is_long() {
+        Some(state.mcp.hold().ok_or(NoRoom::FullNew)?)
+    } else {
+        None
+    };
     if mine.by_id.len() >= MAX_KEPT {
         let oldest = mine
             .by_id
@@ -619,7 +728,7 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
             .unwrap_or_else(|_| Err("the call failed inside Kestrel; try again".into()));
         let _ = tx.send(Some((tool_result(outcome), Instant::now())));
     });
-    Ok(rx)
+    Ok((rx, held))
 }
 
 /// Checks a tool's arguments.

@@ -848,6 +848,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Records on `run` that its call of `tool` was refused for lack of room (the gateway holds
+    /// too many calls open), with the reason its agent was given.
+    ///
+    /// # Errors
+    /// The store's, when the event cannot be written.
+    pub fn tool_refused(&self, run: RunId, tool: &str, reason: &str) -> Result<()> {
+        self.inner.store.append(
+            run,
+            EventKind::AgentLog {
+                line: format!("kestrel: {tool} was refused: {reason}"),
+            },
+        )?;
+        Ok(())
+    }
+
     /// Asks a person `question` for `run` (`kestrel.ask_human`) and waits for the answer. The run
     /// records it as a question approval and waits on it (its sandbox keeps running, in the tool
     /// call); approving with text answers it. Declining fails the run, as any rejection does.

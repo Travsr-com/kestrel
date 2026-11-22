@@ -198,6 +198,44 @@ fn start_gateway() -> u16 {
     port
 }
 
+/// A test gateway that holds connections, as Kestrel holds a waiting `join`. A request for
+/// `/hold` is never answered (the connection stays open) and counts in `held`; `/count` answers
+/// that count; anything else answers [`BODY`]. Returns its port.
+fn start_holding_gateway(held: Arc<AtomicUsize>) -> u16 {
+    let listener = TcpListener::bind(("0.0.0.0", 0)).expect("bind the test gateway");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let held = held.clone();
+            std::thread::spawn(move || {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0_u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                if path == "/hold" {
+                    held.fetch_add(1, Ordering::SeqCst);
+                    // Held open, silently, well past the test.
+                    std::thread::sleep(Duration::from_secs(300));
+                    return;
+                }
+                let body = if path == "/count" {
+                    held.load(Ordering::SeqCst).to_string()
+                } else {
+                    BODY.to_string()
+                };
+                let reply = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = conn.write_all(reply.as_bytes());
+            });
+        }
+    });
+    port
+}
+
 // the world of one test ---------------------------------------------------------------------------
 
 struct World {
@@ -214,16 +252,21 @@ struct World {
 impl World {
     /// A bridge forwarding to a fresh test gateway, a driver joined to it, and a pool on `range`.
     async fn new(range: &str) -> World {
+        World::with(range, start_gateway(), BridgeSpec::default()).await
+    }
+
+    /// A bridge built from `spec` forwarding to the test gateway on `port`, a driver joined to
+    /// it, and a pool on `range`.
+    async fn with(range: &str, port: u16, spec: BridgeSpec) -> World {
         let dir = tempfile::tempdir().expect("dir");
         let db: PathBuf = dir.path().join("kestrel.db");
         let instance = unique();
         let cleanup = Arc::new(Cleanup::new(&instance));
-        let port = start_gateway();
         let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
         cleanup.container(&bridge_name);
         let bridge = within(
             "bridge start",
-            GatewayBridge::start(Arc::new(ProcessRunner), port, BridgeSpec::default(), &db),
+            GatewayBridge::start(Arc::new(ProcessRunner), port, spec, &db),
         )
         .await
         .expect("bridge starts");
@@ -578,6 +621,47 @@ async fn ten_sandboxes_started_in_parallel_all_reach_the_gateway() {
         subnets.insert(net.subnet.cidr());
     }
     assert_eq!(subnets.len(), 10);
+    w.finish().await;
+}
+
+// #80 ---------------------------------------------------------------------------------------------
+
+/// #80 scenario 2 on a real bridge: sized for 40 waiting calls and one running run (2 * 40 + 4 =
+/// 84 connections, the formula `kestrel serve` uses), a sandbox holds 40 connections open through
+/// it, more than the old fixed limit of 32, and one more request still goes through. With the old
+/// limit the 33rd connection would wait for a free slot, so the count never reaches 40: the poll
+/// gives up within about two minutes and the `held=40` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_held_connections_than_the_old_limit_of_32_still_leave_room_for_a_call() {
+    let _serial = SERIAL.lock().await;
+    let held = Arc::new(AtomicUsize::new(0));
+    let port = start_holding_gateway(held.clone());
+    let spec = BridgeSpec {
+        connections: 84,
+        ..BridgeSpec::default()
+    };
+    let w = World::with("10.231.11.0/24", port, spec).await;
+    let (run, net) = w.prepare().await;
+    let url = w.gateway_url(&net);
+    let script = format!(
+        "i=0; while [ $i -lt 40 ]; do wget -q -T 200 -O /dev/null {url}hold & i=$((i+1)); done; \
+         n=0; t=0; while [ $t -lt 40 ]; do n=$(wget -q -T 2 -O- {url}count); \
+         [ \"$n\" = 40 ] && break; sleep 1; t=$((t+1)); done; echo held=$n; {}",
+        probe("after", &url)
+    );
+    let (lines, code) = run_to_end(&w.driver, &w.cleanup, &w.spec(run, &net, &script)).await;
+    assert_eq!(code, 0, "{lines:?}");
+    assert!(
+        has(&lines, "held=40"),
+        "40 connections held open: {lines:?}"
+    );
+    assert!(
+        has(&lines, "after=open"),
+        "one more call goes through: {lines:?}"
+    );
+    assert!(has(&lines, BODY), "{lines:?}");
+    assert_eq!(held.load(Ordering::SeqCst), 40);
+    w.release(&net).await;
     w.finish().await;
 }
 

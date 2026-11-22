@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use common::{FakeRunner, s};
 use kestrel_sandbox::{
-    BridgeSpec, CommandOutput, DEFAULT_BRIDGE_IMAGE, GatewayBridge, SandboxError,
+    BridgeSpec, CommandOutput, DEFAULT_BRIDGE_CONNECTIONS, DEFAULT_BRIDGE_IMAGE, GatewayBridge,
+    MAX_BRIDGE_CONNECTIONS, SandboxError,
 };
 
 const IMAGE: &str =
@@ -73,15 +74,15 @@ fn run(port: u16) -> Vec<String> {
         "--security-opt",
         "no-new-privileges",
         "--pids-limit",
-        "64",
+        "536",
         "--memory",
-        "64m",
+        "560m",
         "--user",
         "65534:65534",
         IMAGE,
         "-T",
         "300",
-        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=32"),
+        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=528"),
         &format!("TCP:host.docker.internal:{port}"),
     ])
 }
@@ -461,6 +462,71 @@ async fn port_zero_is_rejected_before_any_command() {
     let err = start(&runner, 0).await.expect_err("port 0");
     assert!(matches!(err, SandboxError::InvalidBridgePort), "{err:?}");
     assert!(runner.all_calls().is_empty());
+}
+
+/// Issue #80: the connection limit is a setting. It is socat's `max-children`, and the container's
+/// process and memory limits grow with it: one process per connection plus socat itself and
+/// spare, and 1 MiB per connection on top of 32 MiB.
+#[tokio::test]
+async fn the_connection_limit_sets_socat_children_pids_and_memory() {
+    let runner = happy();
+    let spec = BridgeSpec {
+        connections: 200,
+        ..BridgeSpec::default()
+    };
+    GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
+        .await
+        .expect("bridge starts");
+    let argv = &runner.runs()[2];
+    let value = |flag: &str| {
+        let at = argv.iter().position(|a| a == flag).expect(flag);
+        argv[at + 1].clone()
+    };
+    assert_eq!(value("--pids-limit"), "208");
+    assert_eq!(value("--memory"), "232m");
+    assert!(
+        argv.contains(&"TCP-LISTEN:7070,fork,reuseaddr,max-children=200".to_string()),
+        "{argv:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_default_connection_limit_is_528_and_the_most_is_8192() {
+    assert_eq!(DEFAULT_BRIDGE_CONNECTIONS, 528);
+    assert_eq!(
+        BridgeSpec::default().connections,
+        DEFAULT_BRIDGE_CONNECTIONS
+    );
+    assert_eq!(MAX_BRIDGE_CONNECTIONS, 8192);
+    let runner = happy();
+    let spec = BridgeSpec {
+        connections: MAX_BRIDGE_CONNECTIONS,
+        ..BridgeSpec::default()
+    };
+    GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
+        .await
+        .expect("the most is allowed");
+    assert!(runner.runs()[2].contains(&"--pids-limit".to_string()));
+}
+
+#[tokio::test]
+async fn a_connection_limit_of_0_or_above_8192_is_rejected_before_any_command() {
+    for connections in [0, MAX_BRIDGE_CONNECTIONS + 1, u32::MAX] {
+        let runner = happy();
+        let spec = BridgeSpec {
+            connections,
+            ..BridgeSpec::default()
+        };
+        let err = GatewayBridge::start(runner.clone(), 7070, spec, Path::new(DB))
+            .await
+            .expect_err("out of range");
+        assert!(
+            matches!(err, SandboxError::InvalidBridgeConnections { connections: c } if c == connections),
+            "{connections}: {err:?}"
+        );
+        assert!(err.to_string().contains("1 to 8192"), "{err}");
+        assert!(runner.all_calls().is_empty(), "{connections}");
+    }
 }
 
 #[tokio::test]

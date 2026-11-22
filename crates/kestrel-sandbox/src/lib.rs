@@ -22,7 +22,10 @@ mod bridge;
 mod roots;
 mod subnet;
 use bridge::is_container_name;
-pub use bridge::{BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_IMAGE, GatewayBridge};
+pub use bridge::{
+    BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_CONNECTIONS, DEFAULT_BRIDGE_IMAGE, GatewayBridge,
+    MAX_BRIDGE_CONNECTIONS,
+};
 pub use roots::{RootsError, resolve_workspace};
 pub use subnet::{
     DEFAULT_SUBNET_POOL, Ipv4Cidr, SUBNET_BLOCK_PREFIX, Subnet, SubnetError, SubnetPool,
@@ -81,6 +84,12 @@ pub enum SandboxError {
     /// The bridge port is 0.
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
+    /// The bridge's connection limit is out of range.
+    #[error(
+        "invalid bridge connection limit {connections}: it must be 1 to {}",
+        bridge::MAX_BRIDGE_CONNECTIONS
+    )]
+    InvalidBridgeConnections { connections: u32 },
     /// Docker refused a run network's block because another network already uses it ("Pool
     /// overlaps"). The engine excludes the block and tries another one.
     #[error("subnet {subnet} is taken by another docker network")]

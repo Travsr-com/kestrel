@@ -12,12 +12,13 @@ use kestrel_core::{
     default_models,
 };
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, ProviderConfig, RunResolver,
+    BudgetGuard, GatewayConfig, GatewayDeps, GatewayLimits, GatewayTimeouts, MeterSink, ModelPrice,
+    ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
     BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
-    ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots, docker_subnets_except_instance,
-    host_routes,
+    MAX_BRIDGE_CONNECTIONS, ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots,
+    docker_subnets_except_instance, host_routes,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -76,6 +77,8 @@ struct RawGateway {
     docker_host: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key.
     subnet_pool: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    max_waiting_calls: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -144,9 +147,57 @@ struct Config {
     agents_dir: Option<PathBuf>,
     /// `[travsr]`: `None` without the section, so Travsr is off.
     travsr: Option<TravsrSettings>,
+    /// `gateway.max_waiting_calls`: Kestrel tool calls held open at once across all runs.
+    /// Default [`kestrel_gateway::DEFAULT_WAITING_CALLS`].
+    waiting_calls: u32,
+    /// Connections the bridge holds at once, from [`bridge_connections`].
+    bridge_connections: u32,
     limits: Limits,
     models: ModelMap,
     gateway: GatewayConfig,
+}
+
+/// Connections each run holding a slot may use through the bridge besides long Kestrel tool
+/// calls: a model call, a short tool call or a Travsr call, and room for two more (an agent may
+/// call in parallel).
+const CONNECTIONS_PER_RUN: u32 = 4;
+/// Connections each long call held open may use: its own, and one idle keep-alive connection
+/// its client may keep open while it waits.
+const CONNECTIONS_PER_WAITING_CALL: u32 = 2;
+/// `gateway.max_waiting_calls` when it is not set: the gateway's own default, which is the
+/// engine's default tree limit (checked in the tests).
+const DEFAULT_WAITING_CALLS: u32 = 256;
+/// Largest `gateway.max_waiting_calls`.
+const MAX_WAITING_CALLS: u32 = 4096;
+
+/// The bridge's connection limit (issue #80): [`CONNECTIONS_PER_WAITING_CALL`] for every long
+/// call held open, plus [`CONNECTIONS_PER_RUN`] for each run that holds a slot. A parent waiting
+/// in `join` gives its slot back but keeps its call open, which `waiting_calls` counts. `None`
+/// when that is above [`MAX_BRIDGE_CONNECTIONS`].
+fn bridge_connections(waiting_calls: u32, concurrent_runs: usize) -> Option<u32> {
+    let waiting = waiting_calls.checked_mul(CONNECTIONS_PER_WAITING_CALL)?;
+    u32::try_from(concurrent_runs)
+        .ok()
+        .and_then(|runs| runs.checked_mul(CONNECTIONS_PER_RUN))
+        .and_then(|runs| runs.checked_add(waiting))
+        .filter(|n| *n <= MAX_BRIDGE_CONNECTIONS)
+}
+
+/// `gateway.max_waiting_calls`: a whole number from 1 to [`MAX_WAITING_CALLS`]. The value is
+/// never echoed.
+fn max_waiting_calls(value: Option<toml::Value>) -> Result<u32, Failure> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_WAITING_CALLS);
+    };
+    value
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| (1..=MAX_WAITING_CALLS).contains(n))
+        .ok_or_else(|| {
+            Failure::usage(format!(
+                "gateway.max_waiting_calls must be a whole number from 1 to {MAX_WAITING_CALLS}"
+            ))
+        })
 }
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
@@ -229,8 +280,18 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .map(allowed_roots_setting)
         .transpose()?;
     let travsr = raw.travsr.map(travsr_settings).transpose()?;
+    let waiting_calls = max_waiting_calls(raw.gateway.max_waiting_calls)?;
+    let bridge_connections = bridge_connections(waiting_calls, max).ok_or_else(|| {
+        Failure::usage(format!(
+            "{CONNECTIONS_PER_WAITING_CALL} for each of gateway.max_waiting_calls plus \
+             {CONNECTIONS_PER_RUN} for each of engine.max_concurrent_runs needs more than \
+             {MAX_BRIDGE_CONNECTIONS} bridge connections; lower one of them"
+        ))
+    })?;
     Ok(Config {
         travsr,
+        waiting_calls,
+        bridge_connections,
         listen_explicit: raw.gateway.listen.is_some(),
         listen: raw.gateway.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
         port,
@@ -565,6 +626,7 @@ const CONFIG_NAMES: &[&str] = &[
     "advertise_url",
     "docker_host",
     "subnet_pool",
+    "max_waiting_calls",
     "sandbox",
     "allowed_roots",
     "engine",
@@ -832,6 +894,7 @@ async fn start_bridge(
     docker: bool,
     advertise: Option<&Url>,
     port: u16,
+    connections: u32,
     db: &Path,
 ) -> Result<Option<GatewayBridge>, Failure> {
     if !docker || advertise.is_some() {
@@ -839,6 +902,7 @@ async fn start_bridge(
     }
     let spec = BridgeSpec {
         add_host_gateway: host == DockerHost::Native,
+        connections,
         ..BridgeSpec::default()
     };
     GatewayBridge::start(runner, port, spec, db)
@@ -1135,6 +1199,7 @@ async fn run(
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
+        config.bridge_connections,
         &db,
     )
     .await?;
@@ -1337,7 +1402,10 @@ async fn start_engine(
         None => None,
     };
     let deps = Arc::new(StoreDeps(store));
-    let app = kestrel_gateway::router(
+    let limits = GatewayLimits {
+        waiting_calls: usize::try_from(config.waiting_calls).unwrap_or(usize::MAX),
+    };
+    let app = kestrel_gateway::router_with_limits(
         config.gateway,
         GatewayDeps {
             resolver: deps.clone(),
@@ -1355,6 +1423,8 @@ async fn start_engine(
                 }) as Arc<dyn kestrel_gateway::TravsrHost>
             }),
         },
+        GatewayTimeouts::default(),
+        limits,
     );
     let gateway =
         axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
@@ -1730,6 +1800,95 @@ budget: { usd: 0.000010, wall_clock: 10m }
             std::time::Duration::from_secs(10)
         );
         assert_eq!(grace(ANTHROPIC), std::time::Duration::from_secs(10));
+    }
+
+    fn sizes(config: &str) -> (u32, u32) {
+        let (_dir, path) = write(config);
+        let c = load_config(&path).expect("config loads");
+        (c.waiting_calls, c.bridge_connections)
+    }
+
+    /// Issue #80: by default as many waiting calls as one tree may hold runs (so one tree's
+    /// waiting parents can never fill the cap), and a bridge sized for them (2 each) plus 4
+    /// connections for each of the 4 default concurrent runs.
+    #[test]
+    fn waiting_calls_default_to_the_tree_limit_and_the_bridge_to_528() {
+        assert_eq!(sizes(ANTHROPIC), (256, 528));
+        assert_eq!(sizes(ANTHROPIC).0, kestrel_core::DEFAULT_TREE_LIMIT);
+        assert_eq!(
+            usize::try_from(sizes(ANTHROPIC).0).expect("fits"),
+            kestrel_gateway::DEFAULT_WAITING_CALLS
+        );
+        assert_eq!(
+            sizes(ANTHROPIC).1,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+            "the bridge's own default is the size for the default settings"
+        );
+    }
+
+    /// Issue #80 scenario 1: the bridge allows 2 connections per waiting call plus 4 per
+    /// concurrent run.
+    #[test]
+    fn the_bridge_is_sized_from_the_waiting_calls_and_the_concurrency_cap() {
+        let cfg = |w: u32, c: u32| {
+            format!(
+                "{ANTHROPIC}[gateway]\nmax_waiting_calls = {w}\n[engine]\nmax_concurrent_runs = {c}\n"
+            )
+        };
+        assert_eq!(sizes(&cfg(1, 1)), (1, 6));
+        assert_eq!(sizes(&cfg(100, 10)), (100, 240));
+        assert_eq!(sizes(&cfg(4000, 48)), (4000, 8192));
+        assert_eq!(bridge_connections(256, 4), Some(528));
+        assert_eq!(bridge_connections(4000, 49), None, "above 8192");
+        assert_eq!(bridge_connections(1, usize::MAX), None, "no overflow");
+        assert_eq!(bridge_connections(u32::MAX, 1), None, "no overflow");
+    }
+
+    #[test]
+    fn a_bad_max_waiting_calls_names_the_key_and_never_echoes_the_value() {
+        for bad in ["0", "4097", "-1", "1.5", "\"sekrit-waiting\"", "987654321"] {
+            let e = err(&format!(
+                "{ANTHROPIC}[gateway]\nmax_waiting_calls = {bad}\n"
+            ));
+            assert!(
+                e.contains("gateway.max_waiting_calls must be a whole number from 1 to 4096"),
+                "{bad}: {e}"
+            );
+            assert!(!e.contains("sekrit") && !e.contains("987654321"), "{e}");
+        }
+    }
+
+    #[test]
+    fn settings_that_need_more_than_8192_bridge_connections_are_refused() {
+        let e = err(&format!(
+            "{ANTHROPIC}[gateway]\nmax_waiting_calls = 4096\n[engine]\nmax_concurrent_runs = 1\n"
+        ));
+        assert!(e.contains("gateway.max_waiting_calls"), "{e}");
+        assert!(e.contains("engine.max_concurrent_runs"), "{e}");
+        assert!(e.contains("8192"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_gets_its_connection_limit() {
+        let r = recorder(0);
+        start_bridge(
+            r.clone(),
+            DockerHost::Native,
+            true,
+            None,
+            7070,
+            140,
+            Path::new("/tmp/k.db"),
+        )
+        .await
+        .expect("started")
+        .expect("bridge");
+        let argv = run_call(&r);
+        assert!(
+            argv.iter()
+                .any(|a| a == "TCP-LISTEN:7070,fork,reuseaddr,max-children=140"),
+            "{argv:?}"
+        );
     }
 
     #[test]
@@ -2319,6 +2478,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 docker,
                 advertise,
                 7070,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
                 Path::new("/tmp/k.db"),
             )
             .await;
@@ -2332,6 +2492,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             true,
             None,
             7070,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -2351,6 +2512,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             true,
             None,
             7070,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -3071,10 +3233,18 @@ budget: { usd: 0.000010, wall_clock: 10m }
     async fn the_bridge_run_has_add_host_for_native_and_none_for_vm() {
         for (host, has) in [(DockerHost::Native, true), (DockerHost::Vm, false)] {
             let r = recorder(0);
-            start_bridge(r.clone(), host, true, None, 7070, Path::new("/tmp/k.db"))
-                .await
-                .expect("started")
-                .expect("bridge");
+            start_bridge(
+                r.clone(),
+                host,
+                true,
+                None,
+                7070,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                Path::new("/tmp/k.db"),
+            )
+            .await
+            .expect("started")
+            .expect("bridge");
             let argv = run_call(&r);
             assert_eq!(argv.iter().any(|a| a == "--add-host"), has, "{host:?}");
             assert_eq!(
@@ -3372,10 +3542,18 @@ budget: { usd: 0.000010, wall_clock: 10m }
     #[tokio::test]
     async fn the_bridge_names_the_container_drivers_join_to_run_networks() {
         let db = Path::new("/tmp/k.db");
-        let bridge = start_bridge(recorder(0), DockerHost::Native, true, None, 7070, db)
-            .await
-            .expect("started")
-            .expect("bridge");
+        let bridge = start_bridge(
+            recorder(0),
+            DockerHost::Native,
+            true,
+            None,
+            7070,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+            db,
+        )
+        .await
+        .expect("started")
+        .expect("bridge");
         assert_eq!(
             bridge.name(),
             GatewayBridge::container_name(&GatewayBridge::instance_id(db))
