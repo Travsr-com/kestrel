@@ -1520,7 +1520,8 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
 /// `code`. The trap is set before the ready line, so a SIGTERM right after it is handled.
 fn fake_serve(on_term: &str, code: i32) -> Serve {
     let script = format!(
-        "trap '{on_term}; exit {code}' TERM\n\
+        "on_term() {{ {on_term}; exit {code}; }}\n\
+         trap on_term TERM\n\
          echo '{{\"gateway\": \"127.0.0.1:1\"}}'\n\
          echo 'fake serve is up' >&2\n\
          while :; do sleep 0.1; done\n"
