@@ -806,8 +806,8 @@ async fn keep_children_is_narrowed_by_the_parent() {
     assert!(!keep);
 }
 
-// 13, with a child still running at the restart: it comes back suspended, and once it is resumed
-// and ends, a new join returns its result.
+// 13, with a child still running at the restart: it comes back suspended, the engine resumes it by
+// itself (#92), and once it ends, a new join returns its result.
 #[tokio::test(start_paused = true)]
 async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
     let dir = tempfile::tempdir().unwrap();
@@ -825,12 +825,14 @@ async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
     }
     drop(h);
 
-    let mut again = Harness::on(&db, 4);
+    // One slot: the lead, resumed first, holds it until it joins; then the child runs.
+    let mut again = Harness::on(&db, 1);
     again.rebuild(|e| e.with_root_key(RootKey::from_bytes(&key).unwrap()));
     again.engine.recover().await.unwrap();
+    let _lead = again.driver.live();
     again.driver.script(&["ok:after the restart"], 0);
     again.start();
-    again.control(child, ControlCommand::Resume);
+    until("the lead runs again", || again.is(lead, &RunStatus::Running)).await;
     let results = again
         .engine
         .join(lead, &[child], JoinMode::All, Some(Duration::from_secs(60)))

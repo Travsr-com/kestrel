@@ -40,7 +40,7 @@ async fn agent_that_finishes_while_an_approval_is_pending_completes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn recovery_fails_provisioning_runs_and_restarts_approved_runs() {
+async fn recovery_suspends_provisioning_runs_and_restarts_approved_runs() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("kestrel.db");
     let aid = ApprovalId::new();
@@ -65,12 +65,17 @@ async fn recovery_fails_provisioning_runs_and_restarts_approved_runs() {
         (p, a)
     };
 
+    // Without automatic resume, so only the approval starts a sandbox here (#92 resumes the
+    // provisioning run by default).
     let mut h = Harness::on(&db, 4);
+    h.rebuild(|e| e.with_resume_after_restart(false));
     let report = h.engine.recover().await.expect("recover");
     assert_eq!(report.suspended, vec![approval]);
-    assert!(report.interrupted.is_empty());
-    let msg = h.is_failed(provisioning).unwrap_or_default();
-    assert!(msg.contains("engine restarted"), "{msg}");
+    assert_eq!(report.interrupted, vec![provisioning]);
+    assert!(h.is(
+        provisioning,
+        &Suspended(SuspendReason::Error("engine restarted".into()))
+    ));
     assert_eq!(h.driver.count(&Call::Destroy("old-1".into())), 1);
 
     // Approving after the restart runs the agent again in a fresh sandbox.

@@ -729,7 +729,8 @@ async fn recovery_forgets_the_copies_of_finished_and_unknown_runs_and_keeps_the_
     step(done, RunStatus::Queued, RunStatus::Provisioning);
     step(done, RunStatus::Provisioning, Running);
     step(done, Running, Completed);
-    // A run cut off while provisioning fails on recovery.
+    // A run cut off while provisioning is suspended on recovery, like a running one (#92), so its
+    // copy is kept.
     let provisioning = store.create_run(&spec, "x").unwrap();
     step(provisioning, RunStatus::Queued, RunStatus::Provisioning);
     let running = store.create_run(&spec, "x").unwrap();
@@ -742,8 +743,8 @@ async fn recovery_forgets_the_copies_of_finished_and_unknown_runs_and_keeps_the_
     s.restart(ix);
     s.h.engine.recover().await.unwrap();
     let forgotten: HashSet<RunId> = s.ix.forgotten().into_iter().collect();
-    assert_eq!(forgotten, HashSet::from([done, provisioning, unknown]));
-    assert_eq!(*lock(&s.ix.disk), HashSet::from([running]));
+    assert_eq!(forgotten, HashSet::from([done, unknown]));
+    assert_eq!(*lock(&s.ix.disk), HashSet::from([provisioning, running]));
 }
 
 #[tokio::test(start_paused = true)]
