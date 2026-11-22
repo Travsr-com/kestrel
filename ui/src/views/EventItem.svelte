@@ -24,6 +24,8 @@
     run_finished: 'done',
     child_spawned: 'spawn',
     capabilities_dropped: 'dropped',
+    message_sent: 'sent',
+    message_delivered: 'read',
   };
 
   function colour(kind: EventKind): string {
@@ -41,6 +43,7 @@
       case 'approval_requested':
       case 'approval_resolved':
       case 'budget_warning':
+      case 'message_sent':
         return 'approval';
       default:
         return 'muted';
@@ -97,6 +100,10 @@
       <span>Finished{kind.summary === null ? '' : `: ${kind.summary}`}</span>
     {:else if kind.kind === 'child_spawned'}
       <span>Spawned <a href={href({ name: 'run', id: kind.child })}>{kind.agent}</a> with {formatUsd(kind.budget)}</span>
+    {:else if kind.kind === 'message_sent'}
+      <p class="message">Message to the agent: {kind.text}</p>
+    {:else if kind.kind === 'message_delivered'}
+      <span>The agent read {kind.seqs.length === 1 ? '1 message' : `${kind.seqs.length} messages`}</span>
     {:else}
       <span>Capabilities dropped: {[...kind.tools, ...kind.hosts, ...kind.secrets, ...kind.agents].join(', ')}</span>
     {/if}

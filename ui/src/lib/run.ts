@@ -29,6 +29,20 @@ export function allowed(status: RunStatus, live = 0): Allowed {
   };
 }
 
+/** The most a message to an agent may hold: 16 KiB. The server counts bytes. */
+export const MAX_MESSAGE_BYTES = 16 * 1024;
+
+/**
+ * Why a run cannot take a message from a person now, or `null` when it can: it must be running,
+ * and its agent must take messages (its spec grants `kestrel.messages`).
+ */
+export function messageRefusal(status: RunStatus, takesMessages: boolean): string | null {
+  if (isTerminal(status)) return 'The run has ended, so it takes no more messages.';
+  if (!takesMessages) return 'This agent does not take messages: its spec does not grant kestrel.messages.';
+  if (status !== 'Running') return 'Only a running run takes messages.';
+  return null;
+}
+
 /**
  * Dollars typed by a person as micro-dollars, with no float math: digits, optionally a point and
  * one to six more digits. `null` for anything else (a sign, a comma, an exponent, too many places).
