@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,10 +24,12 @@ pub const CLAUDE_MODEL: &str = "claude-sonnet-4-5";
 pub const OPENAI_MODEL: &str = "gpt-4o-mini";
 pub const UNPRICED_MODEL: &str = "claude-not-in-price-table";
 
-/// Fake `RunResolver`: knows a fixed set of tokens and records every lookup.
+/// Fake `RunResolver`: knows a fixed set of tokens and records every lookup. Its runs are live
+/// until `end` is called.
 pub struct FakeResolver {
     known: HashMap<String, RunId>,
     pub calls: Mutex<Vec<String>>,
+    ended: AtomicBool,
 }
 
 impl FakeResolver {
@@ -36,10 +39,15 @@ impl FakeResolver {
         Self {
             known,
             calls: Mutex::new(Vec::new()),
+            ended: AtomicBool::new(false),
         }
     }
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+    /// The run has ended (completed, failed or cancelled) from now on.
+    pub fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
     }
 }
 
@@ -48,6 +56,9 @@ impl RunResolver for FakeResolver {
     async fn resolve(&self, token: &str) -> Option<RunId> {
         self.calls.lock().unwrap().push(token.to_string());
         self.known.get(token).copied()
+    }
+    async fn ended(&self, _run: RunId) -> bool {
+        self.ended.load(Ordering::SeqCst)
     }
 }
 

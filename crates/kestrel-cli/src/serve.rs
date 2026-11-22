@@ -1672,7 +1672,7 @@ impl MeterSink for StoreDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kestrel_types::AgentSpec;
+    use kestrel_types::{AgentSpec, RunStatus, SuspendReason};
 
     // #37 scenario 2: the API server binds 127.0.0.1 by default; another address starts it and
     // warns.
@@ -1784,6 +1784,49 @@ budget: { usd: 0.000010, wall_clock: 10m }
         store.set_budget(id, MicroUsd(11)).expect("raise");
         assert!(deps.allow(id).await, "a raised budget allows calls again");
         assert!(!deps.allow(RunId::new()).await, "unknown runs are refused");
+    }
+
+    /// Issue #88: a run's token stops working once the run has ended. A live run (queued,
+    /// provisioning, running or suspended, so it can still be resumed) keeps it; a run the store
+    /// cannot read counts as ended, so nothing is let through on a doubt.
+    #[tokio::test]
+    async fn store_deps_say_a_run_has_ended_once_it_completed_failed_or_was_cancelled() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let spec = AgentSpec::from_yaml(YAML).expect("spec");
+        let deps = StoreDeps(store.clone());
+        let walk = |id: RunId, steps: &[RunStatus]| {
+            let mut from = RunStatus::Queued;
+            for next in steps {
+                store.transition(id, &from, next.clone()).expect("walk");
+                from = next.clone();
+            }
+        };
+
+        let live = store.create_run(&spec, "x").expect("create");
+        assert!(!deps.ended(live).await, "queued");
+        walk(live, &[RunStatus::Provisioning, RunStatus::Running]);
+        assert!(!deps.ended(live).await, "running");
+        store
+            .transition(
+                live,
+                &RunStatus::Running,
+                RunStatus::Suspended(SuspendReason::Manual),
+            )
+            .expect("suspend");
+        assert!(!deps.ended(live).await, "a suspended run can be resumed");
+
+        for end in [
+            RunStatus::Completed,
+            RunStatus::Failed("boom".into()),
+            RunStatus::Cancelled,
+        ] {
+            let id = store.create_run(&spec, "x").expect("create");
+            let mut steps = vec![RunStatus::Provisioning, RunStatus::Running];
+            steps.push(end.clone());
+            walk(id, &steps);
+            assert!(deps.ended(id).await, "{end:?}");
+        }
+        assert!(deps.ended(RunId::new()).await, "a run the store does not have");
     }
 
     // Issue #25: bounded shutdown (tests first, failing until implemented).
