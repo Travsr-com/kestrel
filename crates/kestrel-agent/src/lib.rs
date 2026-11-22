@@ -98,9 +98,10 @@ const ASK_NOTE: &str = "\
 
 /// The part of the agent note for a run granted `kestrel.messages`.
 const MESSAGES_NOTE: &str = "\
-* kestrel.messages() returns the messages a person sent you while you work, oldest first, each
-  only once. Call it between steps and once more before you finish, and take what they say into
-  account.
+* kestrel.messages(after) returns the messages a person sent you while you work, oldest first,
+  each with its seq. Call it between steps and once more before you finish, and take what they
+  say into account. Pass as after the seq of the last message you got (0 at first), so a call
+  you repeat loses nothing.
 ";
 
 /// The heading of the agent note.
