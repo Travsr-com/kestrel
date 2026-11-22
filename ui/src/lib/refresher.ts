@@ -3,8 +3,9 @@
 // One request per run at a time: whatever asks while one is out gets a single request after it, so
 // a replay of many spawns costs two requests, and answers never arrive out of order. A failure the
 // caller wants retried is tried again after 5 s, doubling up to 60 s, if the caller still wants it
-// then (its rule is asked again with the same error); asks while a retry waits wait with it. `lookUp` is for a run just seen: any answer will do, so it asks for nothing more while
-// one is out. `stop` ends it all: no answer is handed on and no retry runs after it.
+// then (its rule is asked again with the same error); asks while a retry waits wait with it.
+// `lookUp` is for a run just seen: any answer will do, so it asks for nothing more while one is
+// out. `stop` ends it all: no answer is handed on and no retry runs after it.
 
 import type { RunId, RunSummary } from './types';
 
