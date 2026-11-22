@@ -9,7 +9,9 @@
 //!
 //! Frames go through a queue of `ws_queue` to a writer task. A client that does not read fills
 //! it; once it stays full for `ws_stall`, the client is dropped with a close frame, so memory
-//! never grows without bound. When the server stops, every socket sends a close frame and ends.
+//! never grows without bound. A client that starts reading again within `ws_close_grace` gets
+//! that close frame; one that does not is cut then. When the server stops, every socket sends a
+//! close frame and ends, giving a client that does not take it [`CLOSE_GRACE`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,6 +56,9 @@ enum End {
 }
 
 type Params = Query<HashMap<String, String>>;
+
+/// How long a socket tries to send its close frame when the server stops or the store fails.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// `GET /ws/runs/{id}?after=<seq>`.
 pub(crate) async fn run_socket(
@@ -189,6 +194,7 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
     let stop = CancellationToken::new();
     let ending = stop.clone();
     let (end_tx, end_rx) = tokio::sync::oneshot::channel::<End>();
+    let slow_grace = s.config.ws_close_grace;
     let writer = tokio::spawn(async move {
         let mut end_rx = end_rx;
         loop {
@@ -213,8 +219,14 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
             // frame; closing the sink below flushes it, so the client sees a clean handshake.
             Ok(End::Client) | Err(_) => None,
         };
-        // A client that does not read may never take it: give up after a moment.
-        let _ = timeout(Duration::from_secs(1), async {
+        // A client that does not read may never take it: give up after a while. A slow client
+        // gets `ws_close_grace` to read again, so it learns why it was dropped instead of seeing
+        // the connection reset under it.
+        let grace = match close {
+            Some((code, _)) if code == close_code::POLICY => slow_grace,
+            _ => CLOSE_GRACE,
+        };
+        let _ = timeout(grace, async {
             if let Some((code, reason)) = close {
                 let frame = CloseFrame {
                     code,

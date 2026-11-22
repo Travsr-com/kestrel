@@ -251,6 +251,35 @@ async fn s9_a_client_that_does_not_read_is_dropped() {
     assert!(events < 300, "got all {events} events");
 }
 
+// ...and a client that never reads again is cut once `ws_close_grace` is over: the server holds
+// nothing for it after that.
+#[tokio::test]
+async fn s9_a_client_that_never_reads_is_cut_after_the_close_grace() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    let server = start(store.clone(), |c| {
+        c.ws_queue = 2;
+        c.ws_stall = Duration::from_millis(200);
+        c.ws_close_grace = Duration::from_millis(300);
+    })
+    .await;
+    let _socket = open(&server, &format!("/ws/runs/{id}")).await;
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..300 {
+        log(&store, id, &big);
+    }
+    timeout(Duration::from_secs(10), async {
+        while server.sockets.len() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        while !server.sockets.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the socket task ended while the client still does not read");
+}
+
 // 16. When the server stops, open sockets get a close frame and the port is released.
 #[tokio::test]
 async fn s16_stopping_closes_sockets_and_frees_the_port() {
