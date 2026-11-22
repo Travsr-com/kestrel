@@ -1,14 +1,15 @@
 <script lang="ts">
   // The run's commands, in three parts the Run view places apart: `buttons` (Pause or Resume, and
   // Cancel run after a confirmation that names the live child runs it also cancels), `limit` (the
-  // Change limit panel) and `message` (the Message panel). Each is enabled only when the run's
+  // Change limit panel) and `message` (the Message panel, whose box shows only while the run is running
+  // and its agent takes messages, and which otherwise says why). Each is enabled only when the run's
   // status allows it; Cancel run also stays on for an ended run while `live` runs below it go on. A refused command shows the server's reason in its own part, and
   // `onRefused` fetches the run again so the controls match.
   import type { Api } from '../lib/api';
   import type { FleetRun } from '../lib/fleet.svelte';
   import { isTerminal } from '../lib/format';
   import { failureText, type OnUnauthorized } from '../lib/load';
-  import { allowed, parseUsd } from '../lib/run';
+  import { allowed, MAX_MESSAGE_BYTES, messageRefusal, parseUsd } from '../lib/run';
 
   let {
     part,
@@ -30,12 +31,16 @@
 
   const can = $derived(allowed(run.status, live));
   const ended = $derived(isTerminal(run.status));
+  // The Message box shows only while the run can take a message; otherwise this says why.
+  const noMessage = $derived(messageRefusal(run.status, run.takes_messages));
 
   let refused: string | null = $state(null);
   let confirming = $state(false);
   let budget = $state('');
   let budgetError: string | null = $state(null);
   let message = $state('');
+  /** Said once a message is stored: the agent reads it when it next checks. */
+  let sent = $state('');
   /** A command is on its way: another click sends nothing. */
   let busy = false;
 
@@ -143,7 +148,17 @@
     e.preventDefault();
     const text = message.trim();
     if (text === '') return;
-    if (await send(() => api.message(run.id, text))) message = '';
+    sent = '';
+    // The server counts UTF-8 bytes; the box's maxlength counts characters, so it lets more by.
+    const bytes = new TextEncoder().encode(text).length;
+    if (bytes > MAX_MESSAGE_BYTES) {
+      refused = `This message is ${bytes} bytes; a message may hold at most ${MAX_MESSAGE_BYTES} bytes (16 KiB). Shorten it and send again.`;
+      return;
+    }
+    if (await send(() => api.message(run.id, text))) {
+      message = '';
+      sent = 'Sent. The agent reads it the next time it checks for messages.';
+    }
   }
 
   const children = (n: number) => (n === 1 ? '1 child run' : `${n} child runs`);
@@ -219,16 +234,24 @@
     {/if}
   </form>
 {:else}
-  <form class="panel" onsubmit={sendMessage}>
-    <label for="message-{run.id}">Message</label>
-    <div class="inline">
-      <input id="message-{run.id}" autocomplete="off" bind:value={message} disabled={!can.message} />
-      <button type="submit" disabled={!can.message}>Send</button>
-    </div>
+  <section class="panel message" aria-label="Message to the agent">
+    {#if noMessage === null}
+      <form onsubmit={sendMessage}>
+        <label for="message-{run.id}">Message</label>
+        <div class="inline">
+          <input id="message-{run.id}" autocomplete="off" maxlength={MAX_MESSAGE_BYTES} bind:value={message} />
+          <button type="submit">Send</button>
+        </div>
+      </form>
+    {:else}
+      <p class="title">Message</p>
+      <p class="help">{noMessage}</p>
+    {/if}
+    <p class="help" role="status">{sent}</p>
     {#if refused !== null}
       <p class="error" role="alert">{refused}</p>
     {/if}
-  </form>
+  </section>
 {/if}
 
 <style>
@@ -242,12 +265,20 @@
     flex-wrap: wrap;
     gap: var(--space-2);
   }
-  form {
+  form,
+  .message {
     display: grid;
     gap: var(--space-3);
   }
-  label {
+  label,
+  .title {
     font-weight: 600;
+  }
+  .title {
+    margin: 0;
+  }
+  .help:empty {
+    display: none;
   }
   .inline {
     display: flex;

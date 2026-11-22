@@ -473,3 +473,55 @@ async fn a_run_that_keeps_its_children_keeps_them_after_a_restart_too() {
     h.start();
     until("the child runs", || h.is(child, &RunStatus::Running)).await;
 }
+
+/// Issue #95: `kestrel.messages` is offered to a run whose capability grants it, after the other
+/// tools, and hands over a running run's messages once, recording their delivery.
+#[tokio::test(start_paused = true)]
+async fn messages_are_offered_when_granted_and_handed_over_once() {
+    let mut h = Harness::new(4);
+    let _a = h.driver.live();
+    let _b = h.driver.live();
+    h.start();
+    let a = h
+        .submit(agent("{ mcp: [kestrel.messages, kestrel.join] }"))
+        .await;
+    let b = h.submit(agent("{ mcp: [kestrel.join] }")).await;
+    for run in [a, b] {
+        until("running", || h.is(run, &RunStatus::Running)).await;
+    }
+    assert_eq!(
+        h.engine.kestrel_tools(a).unwrap(),
+        Some(vec!["kestrel.join", "kestrel.messages"])
+    );
+    assert_eq!(
+        h.engine.kestrel_tools(b).unwrap(),
+        Some(vec!["kestrel.join"])
+    );
+
+    assert!(h.engine.take_messages(a, None).unwrap().is_empty());
+    let sent = h.store.send_message(a, "also fix the docs").unwrap();
+    let taken = h.engine.take_messages(a, None).unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].seq, sent.seq);
+    assert_eq!(taken[0].text, "also fix the docs");
+    assert!(h.engine.take_messages(a, None).unwrap().is_empty());
+    // Asked again from before it (a retry with `after`), it comes again, and is not delivered
+    // twice.
+    let again = h.engine.take_messages(a, Some(sent.seq - 1)).unwrap();
+    assert_eq!(again, taken);
+    assert_eq!(
+        h.count_events(
+            a,
+            |k| matches!(k, EventKind::MessageDelivered { seqs } if *seqs == [sent.seq])
+        ),
+        1
+    );
+    // The engine never logs a message's text anywhere but its own event.
+    assert_eq!(
+        h.count_events(
+            a,
+            |k| matches!(k, EventKind::AgentLog { line } if line.contains("also fix the docs"))
+        ),
+        0
+    );
+}

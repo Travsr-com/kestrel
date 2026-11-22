@@ -91,6 +91,7 @@ export class FleetState {
     run.limit = summary.limit;
     run.sandbox_tier = summary.sandbox_tier;
     run.created_at = summary.created_at;
+    run.takes_messages = summary.takes_messages;
     run.reported = Math.max(run.reported, summary.spent);
     run.spent = Math.max(run.reported, run.counted);
     if (run.provisional || takeStatus) {
@@ -173,6 +174,8 @@ export class FleetState {
       limit,
       sandbox_tier: null,
       created_at: ts,
+      // Known only from the server: until it answers, the Message box stays hidden.
+      takes_messages: false,
       endedAt: null,
       finishedAt: null,
       reported: 0,

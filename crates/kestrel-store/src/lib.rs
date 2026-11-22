@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
+mod messages;
+pub use messages::InboxMessage;
+
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
 pub const SCHEMA_VERSION: i64 = 6;
@@ -77,6 +80,10 @@ pub enum StoreError {
         asked: MicroUsd,
         remaining: MicroUsd,
     },
+    /// [`Store::send_message`] refused the message: the text is not one, or the run cannot take
+    /// one now. The reason is for a person to read. Nothing was written.
+    #[error("{0}")]
+    MessageRefused(String),
 }
 
 /// Why [`Store::spawn_child`] refused a spawn.

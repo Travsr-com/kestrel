@@ -31,6 +31,8 @@ export interface RunSummary {
   sandbox_tier: SandboxTier | null;
   /** RFC 3339. */
   created_at: string;
+  /** Whether the run's agent takes messages from a person: its spec grants `kestrel.messages`. */
+  takes_messages: boolean;
 }
 
 export interface TreeNode {
@@ -83,7 +85,10 @@ export type EventKind =
   | { kind: 'agent_log'; line: string }
   | { kind: 'run_finished'; summary: string | null }
   | { kind: 'child_spawned'; child: RunId; agent: string; budget: MicroUsd }
-  | { kind: 'capabilities_dropped'; tools: string[]; hosts: string[]; secrets: string[]; agents: string[] };
+  | { kind: 'capabilities_dropped'; tools: string[]; hosts: string[]; secrets: string[]; agents: string[] }
+  | { kind: 'message_sent'; text: string }
+  /** The agent took messages: the `seq`s of their `message_sent` events. */
+  | { kind: 'message_delivered'; seqs: number[] };
 
 export interface Event {
   run_id: RunId;

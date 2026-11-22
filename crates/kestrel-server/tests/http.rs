@@ -466,9 +466,9 @@ async fn an_unknown_run_command_is_404() {
     assert!(body["error"].is_string());
 }
 
-// `POST message`: no runtime takes injected messages yet, so 409.
+// `POST message` to a queued run whose agent does not take messages: 409 (issue #95).
 #[tokio::test]
-async fn message_is_409_until_a_runtime_supports_it() {
+async fn message_is_409_for_an_agent_without_kestrel_messages() {
     let store = store();
     let id = store.create_run(&agent("a"), "x").unwrap();
     let app = app(store);
@@ -988,4 +988,173 @@ async fn issue97_s2_ui_routes_still_get_the_ui() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(body, INDEX.as_bytes(), "{uri}");
     }
+}
+
+// Issue #95: messages to a running agent.
+
+/// An agent that takes messages (`kestrel.messages`), named `name`.
+fn listener(name: &str) -> kestrel_types::AgentSpec {
+    kestrel_types::AgentSpec::from_yaml(&format!(
+        "name: {name}\nruntime: claude-code\nrole: r\n\
+         capabilities: {{ mcp: [kestrel.messages] }}\n\
+         sandbox: {{ tier: gvisor, cpu: 1, memory: 1Gi, workspace: empty-dir }}\n\
+         budget: {{ usd: 2.00, wall_clock: 10m }}\n"
+    ))
+    .unwrap()
+}
+
+fn post_message(id: RunId, body: &str) -> Request<Body> {
+    req("POST", &format!("/api/runs/{id}/message"), Some(body))
+}
+
+fn sent_texts(store: &kestrel_store::Store, id: RunId) -> Vec<String> {
+    store
+        .events_since(id, 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::MessageSent { text } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+// Scenario 1: 202, and an event records the message. Nothing goes through the control channel:
+// the agent takes it from its inbox.
+#[tokio::test]
+async fn i95_s1_a_message_to_a_running_run_is_accepted_and_recorded() {
+    let store = store();
+    let id = store.create_run(&listener("l"), "x").unwrap();
+    run(&store, id);
+    let app = app(store.clone());
+    let (status, _, body) = send(&app, post_message(id, r#"{"text":"also fix the docs"}"#)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.is_empty());
+    assert_eq!(sent_texts(&store, id), ["also fix the docs"]);
+    assert!(store.take_control().unwrap().is_empty());
+    // A second one is a second message.
+    let (status, _, _) = send(&app, post_message(id, r#"{"text":"and the changelog"}"#)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        sent_texts(&store, id),
+        ["also fix the docs", "and the changelog"]
+    );
+}
+
+// Scenario 2: an agent that cannot take messages is 409, and says why.
+#[tokio::test]
+async fn i95_s2_a_run_whose_agent_cannot_take_messages_is_409_with_why() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    run(&store, id);
+    let app = app(store.clone());
+    let (status, body) = json(&app, post_message(id, r#"{"text":"hi"}"#)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains(&format!("run {id}")), "{error}");
+    assert!(error.contains("cannot take messages"), "{error}");
+    assert!(error.contains("kestrel.messages"), "{error}");
+    assert!(sent_texts(&store, id).is_empty());
+}
+
+// Scenario 3: a run that is not running is refused with the reason.
+#[tokio::test]
+async fn i95_s3_a_run_that_is_not_running_is_409_with_the_reason() {
+    let store = store();
+    let queued = store.create_run(&listener("l"), "x").unwrap();
+    let paused = store.create_run(&listener("l"), "x").unwrap();
+    run(&store, paused);
+    store
+        .transition(
+            paused,
+            &RunStatus::Running,
+            RunStatus::Suspended(SuspendReason::Manual),
+        )
+        .unwrap();
+    let done = store.create_run(&listener("l"), "x").unwrap();
+    run(&store, done);
+    store
+        .transition(done, &RunStatus::Running, RunStatus::Completed)
+        .unwrap();
+    let app = app(store.clone());
+    for (id, says) in [
+        (
+            queued,
+            "a queued run cannot take a message, only a running one",
+        ),
+        (
+            paused,
+            "a suspended run cannot take a message, only a running one",
+        ),
+        (
+            done,
+            "the run has ended (completed), so it cannot take a message",
+        ),
+    ] {
+        let (status, body) = json(&app, post_message(id, r#"{"text":"hi"}"#)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains(says), "{error}");
+        assert!(sent_texts(&store, id).is_empty());
+    }
+}
+
+// Text only, at most 16 KiB: a bad body is 400 and a long one 413, checked before the status.
+#[tokio::test]
+async fn i95_a_message_body_is_checked_first() {
+    let store = store();
+    let id = store.create_run(&listener("l"), "x").unwrap();
+    run(&store, id);
+    let ended = store.create_run(&listener("l"), "x").unwrap();
+    store
+        .transition(ended, &RunStatus::Queued, RunStatus::Cancelled)
+        .unwrap();
+    let app = app(store.clone());
+    let long = format!(r#"{{"text":"{}"}}"#, "x".repeat(16 * 1024 + 1));
+    for (body, want) in [
+        ("", StatusCode::BAD_REQUEST),
+        ("not json", StatusCode::BAD_REQUEST),
+        ("{}", StatusCode::BAD_REQUEST),
+        (r#"{"text":42}"#, StatusCode::BAD_REQUEST),
+        (r#"{"text":"   "}"#, StatusCode::BAD_REQUEST),
+        (r#"{"text":"\u001b[2J"}"#, StatusCode::BAD_REQUEST),
+        (long.as_str(), StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        for target in [id, ended] {
+            let (status, value) = json(&app, post_message(target, body)).await;
+            assert_eq!(status, want, "{body:.40}: {value}");
+            assert!(value["error"].is_string(), "{body:.40}");
+        }
+    }
+    let exactly = format!(r#"{{"text":"{}"}}"#, "x".repeat(16 * 1024));
+    let (status, _, _) = send(&app, post_message(id, &exactly)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(sent_texts(&store, id).len(), 1);
+}
+
+// The UI shows the Message box only for a run whose agent takes messages.
+#[tokio::test]
+async fn i95_a_run_says_whether_it_takes_messages() {
+    let store = store();
+    let yes = store.create_run(&listener("l"), "x").unwrap();
+    let no = store.create_run(&agent("a"), "x").unwrap();
+    let app = app(store);
+    let (_, one) = json(&app, get(&format!("/api/runs/{yes}"))).await;
+    assert_eq!(one["takes_messages"], true);
+    let (_, one) = json(&app, get(&format!("/api/runs/{no}"))).await;
+    assert_eq!(one["takes_messages"], false);
+    let (_, list) = json(&app, get("/api/runs")).await;
+    let flags: Vec<(String, bool)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["takes_messages"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert!(flags.contains(&(yes.to_string(), true)), "{flags:?}");
+    assert!(flags.contains(&(no.to_string(), false)), "{flags:?}");
 }
