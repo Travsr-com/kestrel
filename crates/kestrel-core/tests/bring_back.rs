@@ -7,7 +7,10 @@
 //! 2. six clones that changed the same file: six branches, none overwrites another or the user's
 //! 3. a clone with no new commits: nothing is fetched, nothing fails
 //! 4. a source repo the user changed meanwhile (new commits, a dirty tree): untouched
-//! 5. the hardening of #52 applies (fsck on fetch, scrubbed environment, `.git` checks)
+//! 5. the hardening of #52 applies (fsck on fetch, scrubbed environment, `.git` checks), and the
+//!    clone cannot point the fetch at another repository: git reads exactly `<clone>/.git` with a
+//!    strict upload-pack, `.git` holds no `commondir`, `.git`, alternates or links, the refspec
+//!    names the branch in full, and a git call that hangs is stopped
 //!
 //! Real-git tests skip with a message when `git` is missing. The rest use a scripted runner.
 
@@ -16,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use kestrel_core::workspace::{BroughtBack, WorkspaceError, Workspaces, git_env_scrub};
@@ -179,6 +183,31 @@ async fn s1_bringing_back_twice_reports_already_fetched_and_moves_nothing() {
         }
     );
     assert_eq!(kestrel_refs(&f.repo), refs);
+}
+
+#[tokio::test]
+async fn s1_a_run_branch_the_user_moved_ahead_is_already_fetched_and_kept() {
+    need_git!();
+    let f = fixture();
+    let ws = real(&f);
+    let clone = ws.prepare(run_a(), &clone_spec(&f.repo)).await.unwrap();
+    let tip = commit_file(&clone, "agent.txt", "work\n");
+    ws.bring_back(run_a(), &f.repo).await.unwrap();
+    // The user reviews the branch and adds a commit of their own on top.
+    git(&f.repo, &["checkout", "-q", BRANCH_A]);
+    let mine = commit_file(&f.repo, "review.txt", "fixup\n");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let got = ws.bring_back(run_a(), &f.repo).await.unwrap();
+
+    assert_eq!(
+        got,
+        BroughtBack::AlreadyFetched {
+            branch: BRANCH_A.into(),
+            commit: tip,
+        }
+    );
+    assert_eq!(git(&f.repo, &["rev-parse", BRANCH_A]), mine);
 }
 
 #[tokio::test]
@@ -596,15 +625,24 @@ async fn s5_every_git_call_runs_in_the_source_repo_hardened_and_scrubbed() {
             );
         }
         assert_eq!(env.as_ref(), Some(&git_env_scrub()), "{argv:?}");
-        // The clone is only ever an argument after `--`, never the directory git runs in.
-        let clone = s.clone.to_str().unwrap();
-        if let Some(at) = argv.iter().position(|a| a == clone) {
+        // The clone's git dir is only ever an argument after `--`, never the directory git runs
+        // in, and the clone root is never named: upload-pack would pick a git dir there itself.
+        let clone_git = s.clone.join(".git");
+        let clone_git = clone_git.to_str().unwrap();
+        if let Some(at) = argv.iter().position(|a| a == clone_git) {
             assert!(
                 argv[..at].iter().any(|a| a == "--"),
                 "the clone before `--`: {argv:?}"
             );
         }
+        assert!(
+            !argv.iter().any(|a| a == s.clone.to_str().unwrap()),
+            "the clone root was given to git: {argv:?}"
+        );
     }
+    let clone_git = s.clone.join(".git");
+    let clone_git = clone_git.to_str().unwrap();
+    let run_ref = format!("refs/heads/{BRANCH_A}");
     let fetch = &calls[2].0;
     let at = fetch.iter().position(|a| a == "fetch").unwrap();
     assert_eq!(
@@ -613,9 +651,12 @@ async fn s5_every_git_call_runs_in_the_source_repo_hardened_and_scrubbed() {
             "fetch",
             "--no-tags",
             "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--upload-pack=git-upload-pack --strict",
             "--",
-            s.clone.to_str().unwrap(),
-            &format!("{BRANCH_A}:{BRANCH_A}"),
+            clone_git,
+            &format!("{run_ref}:{run_ref}"),
         ]
     );
     let ls = &calls[0].0;
@@ -624,11 +665,250 @@ async fn s5_every_git_call_runs_in_the_source_repo_hardened_and_scrubbed() {
         ls[at..],
         [
             "ls-remote",
+            "--upload-pack=git-upload-pack --strict",
             "--",
-            s.clone.to_str().unwrap(),
-            &format!("refs/heads/{BRANCH_A}"),
+            clone_git,
+            &run_ref,
         ]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scenario 5, continued: the clone cannot point the fetch at another repository (review of #113).
+// ---------------------------------------------------------------------------------------------
+
+/// A repository elsewhere on the host, and a commit in it the source must never receive.
+fn secret_repo(f: &Fixture) -> (PathBuf, String) {
+    let secret = f.repo.parent().unwrap().join("secret");
+    std::fs::create_dir(&secret).unwrap();
+    git(&secret, &["init", "-q"]);
+    let commit = commit_file(&secret, "secret.txt", "do not leak\n");
+    (secret, commit)
+}
+
+/// `path` as git reads it in a file such as `alternates` or `commondir`: forward slashes.
+fn git_path(path: &Path) -> String {
+    path.to_str().unwrap().replace('\\', "/")
+}
+
+/// Whether `repo` holds the commit `id`.
+fn has_commit(repo: &Path, id: &str) -> bool {
+    git_raw(repo, &["cat-file", "-e", &format!("{id}^{{commit}}")])
+        .status
+        .success()
+}
+
+/// Asserts `bring_back` refused the clone, and the source has no new ref and no `leaked` commit.
+async fn assert_refused_and_untouched(ws: &Workspaces, f: &Fixture, leaked: &str) {
+    let before = git(&f.repo, &["for-each-ref"]);
+
+    let got = ws.bring_back(run_a(), &f.repo).await;
+
+    assert!(got.is_err(), "an unsafe clone was fetched from: {got:?}");
+    assert_eq!(git(&f.repo, &["for-each-ref"]), before);
+    assert!(
+        !has_commit(&f.repo, leaked),
+        "another repository's commit reached the source"
+    );
+}
+
+#[tokio::test]
+async fn s5_a_bare_repo_at_the_clone_root_behind_an_empty_dot_git_is_refused() {
+    need_git!();
+    let f = fixture();
+    let ws = real(&f);
+    let clone = ws.prepare(run_a(), &clone_spec(&f.repo)).await.unwrap();
+    let (secret, leaked) = secret_repo(&f);
+    // The agent turns its clone into a bare repo whose objects come from `secret`, with the run
+    // branch at the secret commit, and leaves an empty `.git` in front of it.
+    std::fs::remove_dir_all(&clone).unwrap();
+    std::fs::create_dir(&clone).unwrap();
+    git(&clone, &["init", "-q", "--bare"]);
+    std::fs::write(
+        clone.join("objects").join("info").join("alternates"),
+        format!("{}\n", git_path(&secret.join(".git").join("objects"))),
+    )
+    .unwrap();
+    git(
+        &clone,
+        &["update-ref", &format!("refs/heads/{BRANCH_A}"), &leaked],
+    );
+    std::fs::create_dir(clone.join(".git")).unwrap();
+
+    assert_refused_and_untouched(&ws, &f, &leaked).await;
+}
+
+#[tokio::test]
+async fn s5_a_commondir_pointing_at_another_repo_is_refused() {
+    need_git!();
+    let f = fixture();
+    let ws = real(&f);
+    let clone = ws.prepare(run_a(), &clone_spec(&f.repo)).await.unwrap();
+    let (secret, leaked) = secret_repo(&f);
+    // With a `commondir`, git reads refs and objects from the other repo, which holds a branch
+    // of the run's name.
+    git(&secret, &["branch", BRANCH_A, &leaked]);
+    std::fs::write(
+        clone.join(".git").join("commondir"),
+        format!("{}\n", git_path(&secret.join(".git"))),
+    )
+    .unwrap();
+
+    assert_refused_and_untouched(&ws, &f, &leaked).await;
+}
+
+#[tokio::test]
+async fn s5_a_planted_ref_or_tag_of_the_branch_name_cannot_shadow_the_run_branch() {
+    need_git!();
+    let f = fixture();
+    let ws = real(&f);
+    let clone = ws.prepare(run_a(), &clone_spec(&f.repo)).await.unwrap();
+    // A short refspec would resolve `refs/<name>` and `refs/tags/<name>` before `refs/heads/`.
+    let planted = commit_file(&clone, "planted.txt", "not the work\n");
+    git(
+        &clone,
+        &["update-ref", &format!("refs/{BRANCH_A}"), &planted],
+    );
+    git(&clone, &["tag", BRANCH_A, &planted]);
+    git(&clone, &["reset", "-q", "--hard", "HEAD^"]);
+    let tip = commit_file(&clone, "agent.txt", "work\n");
+
+    let got = ws.bring_back(run_a(), &f.repo).await.unwrap();
+
+    assert_eq!(
+        got,
+        BroughtBack::Fetched {
+            branch: BRANCH_A.into(),
+            commit: tip.clone(),
+        }
+    );
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{BRANCH_A}")]),
+        tip
+    );
+    assert!(
+        !has_commit(&f.repo, &planted),
+        "the planted commit came home"
+    );
+}
+
+/// Changes the `.git` of a clone that passes every other check with `plant`, then asserts
+/// `bring_back` refuses it before any git call.
+async fn refused_before_any_git_call(case: &str, plant: impl FnOnce(&Path)) {
+    let s = Setup::new();
+    plant(&s.clone.join(".git"));
+
+    let got = s.ws.bring_back(run_a(), &s.repo).await;
+
+    let err = got.expect_err(case);
+    assert!(err.to_string().contains("refusing"), "{case}: {err}");
+    assert!(s.fake.argvs().is_empty(), "{case}: {:?}", s.fake.argvs());
+}
+
+#[tokio::test]
+async fn s5_a_git_dir_that_borrows_another_repo_is_refused_before_any_git_call() {
+    refused_before_any_git_call("commondir", |git_dir| {
+        std::fs::write(git_dir.join("commondir"), "/elsewhere/.git\n").unwrap();
+    })
+    .await;
+    refused_before_any_git_call(".git/.git directory", |git_dir| {
+        std::fs::create_dir(git_dir.join(".git")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call(".git/.git file", |git_dir| {
+        std::fs::write(git_dir.join(".git"), "gitdir: /elsewhere/.git\n").unwrap();
+    })
+    .await;
+    refused_before_any_git_call("http-alternates", |git_dir| {
+        let info = git_dir.join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("http-alternates"), "http://example.invalid/\n").unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn s5_a_head_that_is_not_a_regular_file_is_refused_before_any_git_call() {
+    refused_before_any_git_call("no HEAD", |git_dir| {
+        std::fs::remove_file(git_dir.join("HEAD")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("HEAD is a directory", |git_dir| {
+        std::fs::remove_file(git_dir.join("HEAD")).unwrap();
+        std::fs::create_dir(git_dir.join("HEAD")).unwrap();
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s5_linked_objects_refs_or_packed_refs_are_refused_before_any_git_call() {
+    use std::os::unix::fs::symlink;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let away = elsewhere.path().to_path_buf();
+    std::fs::create_dir_all(away.join("info")).unwrap();
+    std::fs::write(away.join("file"), "x\n").unwrap();
+
+    refused_before_any_git_call("HEAD link", |g| {
+        std::fs::remove_file(g.join("HEAD")).unwrap();
+        symlink(away.join("file"), g.join("HEAD")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("objects link", |g| {
+        symlink(&away, g.join("objects")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("objects/info link", |g| {
+        std::fs::create_dir(g.join("objects")).unwrap();
+        symlink(away.join("info"), g.join("objects").join("info")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("refs link", |g| {
+        symlink(&away, g.join("refs")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("refs/heads/kestrel link", |g| {
+        std::fs::create_dir_all(g.join("refs").join("heads")).unwrap();
+        symlink(&away, g.join("refs").join("heads").join("kestrel")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("a ref file link", |g| {
+        let kestrel = g.join("refs").join("heads").join("kestrel");
+        std::fs::create_dir_all(&kestrel).unwrap();
+        symlink(away.join("file"), kestrel.join("run-123456789abc")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("packed-refs link", |g| {
+        symlink(away.join("file"), g.join("packed-refs")).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn s5_a_clone_with_real_refs_and_objects_directories_passes_the_checks() {
+    let s = Setup::new();
+    let git_dir = s.clone.join(".git");
+    for dir in [
+        "objects/info",
+        "objects/pack",
+        "refs/heads/kestrel",
+        "refs/tags",
+    ] {
+        std::fs::create_dir_all(git_dir.join(dir)).unwrap();
+    }
+    std::fs::write(
+        git_dir.join("refs/heads/kestrel/run-123456789abc"),
+        format!("{NEW}\n"),
+    )
+    .unwrap();
+    std::fs::write(git_dir.join("packed-refs"), "# pack-refs with: peeled\n").unwrap();
+    s.fake
+        .answer("ls-remote", 0, &format!("{NEW}\trefs/heads/{BRANCH_A}\n"));
+    s.fake.answer("rev-parse", 1, "");
+
+    let got = s.ws.bring_back(run_a(), &s.repo).await.unwrap();
+
+    assert!(matches!(got, BroughtBack::Fetched { .. }), "{got:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -637,6 +917,8 @@ async fn s5_every_git_call_runs_in_the_source_repo_hardened_and_scrubbed() {
 
 const NEW: &str = "1111111111111111111111111111111111111111";
 const BASE: &str = "2222222222222222222222222222222222222222";
+const OTHER: &str = "3333333333333333333333333333333333333333";
+const HOUR: Duration = Duration::from_secs(3600);
 
 #[tokio::test]
 async fn scripted_a_tip_the_source_holds_under_its_run_branch_is_already_fetched() {
@@ -660,6 +942,74 @@ async fn scripted_a_tip_the_source_holds_under_its_run_branch_is_already_fetched
         }
     );
     assert!(!s.fake.ran("fetch"));
+}
+
+#[tokio::test]
+async fn scripted_a_run_branch_the_user_moved_past_the_tip_is_already_fetched() {
+    let s = Setup::new();
+    s.fake
+        .answer("ls-remote", 0, &format!("{NEW}\trefs/heads/{BRANCH_A}\n"));
+    s.fake.answer("rev-parse", 0, &format!("{NEW}\n"));
+    s.fake.answer(
+        "for-each-ref",
+        0,
+        &format!("{BASE} refs/heads/main\n{OTHER} refs/heads/{BRANCH_A}\n"),
+    );
+
+    let got = s.ws.bring_back(run_a(), &s.repo).await.unwrap();
+
+    assert_eq!(
+        got,
+        BroughtBack::AlreadyFetched {
+            branch: BRANCH_A.into(),
+            commit: NEW.into(),
+        }
+    );
+    assert!(!s.fake.ran("fetch"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn scripted_a_hung_git_call_is_stopped_after_120_s_and_the_next_fetch_runs() {
+    let s = Setup::new();
+    s.fake
+        .answer("ls-remote", 0, &format!("{NEW}\trefs/heads/{BRANCH_A}\n"));
+    s.fake.answer("rev-parse", 1, "");
+    s.fake.hang("fetch");
+    let start = tokio::time::Instant::now();
+
+    let first = tokio::time::timeout(HOUR, s.ws.bring_back(run_a(), &s.repo))
+        .await
+        .expect("a hung git call held bring_back for an hour");
+
+    let err = first.unwrap_err();
+    assert!(err.to_string().contains("fetch"), "{err}");
+    assert_eq!(start.elapsed().as_secs(), 120, "{err}");
+    // The lock is free again: the next run's fetch is not stuck behind the hung one.
+    s.fake.hang("nothing");
+    let second = tokio::time::timeout(HOUR, s.ws.bring_back(run_a(), &s.repo))
+        .await
+        .expect("the next fetch waited behind the hung one");
+    assert!(
+        matches!(second, Ok(BroughtBack::Fetched { .. })),
+        "{second:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn scripted_the_git_timeout_can_be_changed() {
+    let s = Setup::new();
+    s.fake.hang("ls-remote");
+    let ws = Workspaces::new(s.clone.parent().unwrap().to_path_buf(), s.fake.clone())
+        .with_git_timeout(Duration::from_secs(5));
+    let start = tokio::time::Instant::now();
+
+    let got = tokio::time::timeout(HOUR, ws.bring_back(run_a(), &s.repo))
+        .await
+        .expect("the timeout was not applied");
+
+    let err = got.unwrap_err();
+    assert!(err.to_string().contains("ls-remote"), "{err}");
+    assert_eq!(start.elapsed().as_secs(), 5, "{err}");
 }
 
 #[tokio::test]
@@ -832,11 +1182,13 @@ fn brought_back_names_its_branch_and_commit() {
 type Call = (Vec<String>, Option<EnvScrub>);
 
 /// Answers each git subcommand with a scripted `(status, stdout)`, `(0, "")` when unscripted.
+/// The subcommand set with [`Scripted::hang`] never answers, like a stuck `upload-pack`.
 #[derive(Default)]
 struct Scripted {
     calls: Mutex<Vec<Call>>,
     answers: Mutex<Vec<(String, i32, String)>>,
     broken: Mutex<bool>,
+    hangs: Mutex<String>,
 }
 
 impl Scripted {
@@ -852,6 +1204,14 @@ impl Scripted {
 
     fn cannot_start(&self) {
         *self.broken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    fn hang(&self, subcommand: &str) {
+        *self.hangs.lock().unwrap_or_else(PoisonError::into_inner) = subcommand.into();
+    }
+
+    fn hangs(&self, argv: &[String]) -> bool {
+        *self.hangs.lock().unwrap_or_else(PoisonError::into_inner) == subcommand(argv)
     }
 
     fn calls(&self) -> Vec<Call> {
@@ -918,6 +1278,9 @@ impl CommandRunner for Scripted {
         argv: &[String],
         env: &EnvScrub,
     ) -> std::io::Result<CommandOutput> {
+        if self.hangs(argv) {
+            return std::future::pending().await;
+        }
         self.reply(argv, Some(env.clone()))
     }
 
@@ -941,6 +1304,7 @@ impl Setup {
         let root = tmp.path().join("workspaces");
         let clone = root.join(run_a().to_string());
         std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::fs::write(clone.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let repo = tmp.path().join("source");
         let fake = Scripted::new();
         let ws = Workspaces::new(root, fake.clone());

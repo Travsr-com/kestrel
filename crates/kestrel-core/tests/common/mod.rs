@@ -655,7 +655,7 @@ const MAX_ADVANCE: Duration = Duration::from_secs(20);
 const STEP: Duration = Duration::from_millis(10);
 /// Real-time bound before a wait gives up. The loop never sleeps; it yields and advances the paused
 /// clock, so a passing test finishes in milliseconds.
-pub const REAL_DEADLINE: Duration = Duration::from_secs(10);
+const REAL_DEADLINE: Duration = Duration::from_secs(10);
 
 async fn yield_a_bit() {
     for _ in 0..16 {

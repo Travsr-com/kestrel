@@ -113,10 +113,11 @@ fn is_checkout(argv: &[String]) -> bool {
 }
 
 /// `git clone ... <source> <path>`: the path is the last argument. Imitate git: create it with
-/// a `.git` directory and a checked-out file.
+/// a `.git` directory holding `HEAD`, and a checked-out file.
 fn make_clone_dir(argv: &[String]) -> std::io::Result<()> {
     let path = PathBuf::from(argv.last().expect("clone has a target"));
     std::fs::create_dir_all(path.join(".git"))?;
+    std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
     std::fs::write(path.join("README.md"), "hello\n")
 }
 
@@ -557,6 +558,7 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
     let git = FakeGit::new(Mode::Ok);
     let ws = Workspaces::new(root.clone(), git.clone());
     let path = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+    let clone_git = path.join(".git");
     let before = git.calls().len();
 
     ws.fetch_back(run_a(), &repo()).await.unwrap();
@@ -577,9 +579,12 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
             "fetch",
             "--no-tags",
             "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--upload-pack=git-upload-pack --strict",
             "--",
-            path.to_str().unwrap(),
-            "kestrel/run-123456789abc:kestrel/run-123456789abc",
+            clone_git.to_str().unwrap(),
+            "refs/heads/kestrel/run-123456789abc:refs/heads/kestrel/run-123456789abc",
         ])]
     );
 }
