@@ -206,6 +206,11 @@ impl ToolHost for EngineTools {
             eprintln!("kestrel: recording a refused {tool} call for run {run}: {e}");
         }
     }
+    async fn refused(&self, run: RunId, tool: &str, reason: &str) {
+        if let Err(e) = self.engine.tool_refused(run, tool, reason) {
+            eprintln!("kestrel: recording a refused {tool} call for run {run}: {e}");
+        }
+    }
 }
 
 /// Children's results as the model reads them.

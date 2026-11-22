@@ -651,8 +651,14 @@ async fn more_held_connections_than_the_old_limit_of_32_still_leave_room_for_a_c
     );
     let (lines, code) = run_to_end(&w.driver, &w.cleanup, &w.spec(run, &net, &script)).await;
     assert_eq!(code, 0, "{lines:?}");
-    assert!(has(&lines, "held=40"), "40 connections held open: {lines:?}");
-    assert!(has(&lines, "after=open"), "one more call goes through: {lines:?}");
+    assert!(
+        has(&lines, "held=40"),
+        "40 connections held open: {lines:?}"
+    );
+    assert!(
+        has(&lines, "after=open"),
+        "one more call goes through: {lines:?}"
+    );
     assert!(has(&lines, BODY), "{lines:?}");
     assert_eq!(held.load(Ordering::SeqCst), 40);
     w.release(&net).await;

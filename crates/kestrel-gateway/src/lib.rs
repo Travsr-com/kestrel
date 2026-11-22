@@ -12,7 +12,8 @@ pub mod mcp;
 pub mod travsr;
 
 pub use mcp::{
-    JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools, SpawnCall, ToolHost, ToolsError,
+    DEFAULT_WAITING_CALLS, JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools,
+    SpawnCall, ToolHost, ToolsError,
 };
 pub use travsr::{TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS, TravsrHost};
 
@@ -102,6 +103,24 @@ impl Default for GatewayTimeouts {
         Self {
             connect: Duration::from_secs(10),
             idle: Duration::from_secs(300),
+        }
+    }
+}
+
+/// What the gateway holds open at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayLimits {
+    /// Kestrel tool calls (`/r/{token}/mcp`) whose answer is still open, across all runs. Each
+    /// holds a connection through the bridge, and a `join` or `ask_human` can wait for hours, so
+    /// the bridge is sized for this many plus the runs' own calls. A call past it is refused at
+    /// once with a tool error, and nothing is started.
+    pub waiting_calls: usize,
+}
+
+impl Default for GatewayLimits {
+    fn default() -> Self {
+        Self {
+            waiting_calls: DEFAULT_WAITING_CALLS,
         }
     }
 }
@@ -221,11 +240,21 @@ pub fn router(cfg: GatewayConfig, deps: GatewayDeps) -> axum::Router {
     router_with_timeouts(cfg, deps, GatewayTimeouts::default())
 }
 
-/// Build the gateway router with explicit upstream timeouts.
+/// Build the gateway router with explicit upstream timeouts and the default [`GatewayLimits`].
 pub fn router_with_timeouts(
     cfg: GatewayConfig,
     deps: GatewayDeps,
     timeouts: GatewayTimeouts,
+) -> axum::Router {
+    router_with_limits(cfg, deps, timeouts, GatewayLimits::default())
+}
+
+/// Build the gateway router with explicit upstream timeouts and limits.
+pub fn router_with_limits(
+    cfg: GatewayConfig,
+    deps: GatewayDeps,
+    timeouts: GatewayTimeouts,
+    limits: GatewayLimits,
 ) -> axum::Router {
     // `build` fails only when the TLS backend cannot start, which `Client::new` shares.
     let http = reqwest::Client::builder()
@@ -238,7 +267,7 @@ pub fn router_with_timeouts(
         cfg,
         deps,
         http,
-        mcp: mcp::McpState::default(),
+        mcp: mcp::McpState::new(limits.waiting_calls),
     });
     let mut routes = axum::Router::new();
     if let Some(host) = travsr_host {

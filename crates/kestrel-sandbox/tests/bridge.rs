@@ -493,7 +493,10 @@ async fn the_connection_limit_sets_socat_children_pids_and_memory() {
 #[tokio::test]
 async fn the_default_connection_limit_is_80_and_the_most_is_8192() {
     assert_eq!(DEFAULT_BRIDGE_CONNECTIONS, 80);
-    assert_eq!(BridgeSpec::default().connections, DEFAULT_BRIDGE_CONNECTIONS);
+    assert_eq!(
+        BridgeSpec::default().connections,
+        DEFAULT_BRIDGE_CONNECTIONS
+    );
     assert_eq!(MAX_BRIDGE_CONNECTIONS, 8192);
     let runner = happy();
     let spec = BridgeSpec {

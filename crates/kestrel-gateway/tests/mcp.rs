@@ -845,7 +845,10 @@ async fn calls_held_open_across_runs_are_capped_and_the_next_is_refused_clearly(
     assert!(reason.contains("gateway.max_waiting_calls"), "{reason}");
     assert!(reason.contains('3'), "{reason}");
     assert!(reason.contains("nothing was started"), "{reason}");
-    assert!(host.spawns.lock().unwrap().is_empty(), "nothing was started");
+    assert!(
+        host.spawns.lock().unwrap().is_empty(),
+        "nothing was started"
+    );
     assert_eq!(
         host.refused.lock().unwrap().clone(),
         vec![(b.1, "kestrel.spawn".to_string(), reason.to_string())],
@@ -896,7 +899,10 @@ async fn short_calls_give_their_room_back_when_they_answer() {
 #[tokio::test(start_paused = true)]
 async fn by_default_more_calls_than_the_old_limit_of_32_can_wait() {
     assert_eq!(DEFAULT_WAITING_CALLS, 64);
-    assert_eq!(GatewayLimits::default().waiting_calls, DEFAULT_WAITING_CALLS);
+    assert_eq!(
+        GatewayLimits::default().waiting_calls,
+        DEFAULT_WAITING_CALLS
+    );
     let (app, host, runs) = many(6, GatewayLimits::default());
     let mut held = Vec::new();
     for (token, _) in &runs[..5] {

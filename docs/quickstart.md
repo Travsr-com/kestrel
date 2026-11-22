@@ -36,6 +36,9 @@ Kestrel warns you if other users can read it.
 [gateway]
 # Leave `listen` out. With Docker, Kestrel binds the gateway to the Docker bridge IP
 # (usually 172.17.0.1) on port 7070. Change the port with `port = 7070`.
+# Tool calls held open at once across all runs, from 1 to 4096. Default 64. A waiting
+# `kestrel.join` holds one; past the limit a call is refused with a clear error.
+# max_waiting_calls = 64
 
 [engine]
 max_concurrent_runs = 4

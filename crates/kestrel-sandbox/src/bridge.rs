@@ -19,11 +19,18 @@ pub const DEFAULT_BRIDGE_IMAGE: &str =
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
-/// `--pids-limit` of the container. It counts `socat` itself (PID 1) and every forked child, so
-/// it must stay at least `MAX_CHILDREN + 2`, or the limit trips before `socat` refuses a child.
-const PIDS_LIMIT: u32 = 64;
-/// `max-children` of the `socat` listener.
-const MAX_CHILDREN: u32 = 32;
+/// Connections the bridge holds at once when [`BridgeSpec::connections`] is not set: the size
+/// `kestrel serve` works out for its default settings (64 waiting calls plus 4 connections for
+/// each of 4 concurrent runs).
+pub const DEFAULT_BRIDGE_CONNECTIONS: u32 = 80;
+/// Most connections a bridge may hold at once.
+pub const MAX_BRIDGE_CONNECTIONS: u32 = 8192;
+/// Processes allowed on top of one per connection: `socat` itself (PID 1) and spare, so the
+/// container's process limit never trips before `socat` stops taking connections.
+const SPARE_PIDS: u32 = 8;
+/// Memory for `socat` itself, and for each connection (one forked `socat` each).
+const BASE_MEMORY_MIB: u32 = 32;
+const MEMORY_PER_CONNECTION_MIB: u32 = 1;
 /// `-T`: seconds without data in either direction before `socat` closes a connection. It is an
 /// inactivity timeout, so a model stream that is silent for more than five minutes is cut.
 const IDLE_TIMEOUT_SECS: u32 = 300;
@@ -44,6 +51,10 @@ pub struct BridgeSpec {
     /// default) when the docker daemon runs on the same machine as Kestrel. False when it runs in
     /// a VM, which already resolves `host.docker.internal` to the host (issue #53).
     pub add_host_gateway: bool,
+    /// Connections the bridge holds at once (`socat max-children`), 1 to
+    /// [`MAX_BRIDGE_CONNECTIONS`]. Defaults to [`DEFAULT_BRIDGE_CONNECTIONS`]. A connection past
+    /// it waits for one to close. The container's process and memory limits grow with it.
+    pub connections: u32,
 }
 
 impl Default for BridgeSpec {
@@ -51,6 +62,7 @@ impl Default for BridgeSpec {
         Self {
             image: DEFAULT_BRIDGE_IMAGE.to_string(),
             add_host_gateway: true,
+            connections: DEFAULT_BRIDGE_CONNECTIONS,
         }
     }
 }
@@ -125,6 +137,10 @@ impl GatewayBridge {
         if host_port == 0 {
             return Err(SandboxError::InvalidBridgePort);
         }
+        let connections = spec.connections;
+        if !(1..=MAX_BRIDGE_CONNECTIONS).contains(&connections) {
+            return Err(SandboxError::InvalidBridgeConnections { connections });
+        }
         check_image(&spec.image)?;
 
         let id = Self::instance_id(db);
@@ -162,7 +178,12 @@ impl GatewayBridge {
             _ => {}
         }
 
-        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={MAX_CHILDREN}");
+        let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={connections}");
+        let pids = (connections + SPARE_PIDS).to_string();
+        let memory = format!(
+            "{}m",
+            BASE_MEMORY_MIB + connections * MEMORY_PER_CONNECTION_MIB
+        );
         let target = format!("TCP:host.docker.internal:{host_port}");
         let mut run = argv(&[
             "docker",
@@ -189,9 +210,9 @@ impl GatewayBridge {
             "--security-opt",
             "no-new-privileges",
             "--pids-limit",
-            &PIDS_LIMIT.to_string(),
+            &pids,
             "--memory",
-            "64m",
+            &memory,
             "--user",
             "65534:65534",
             &spec.image,
@@ -292,7 +313,16 @@ mod tests {
 
     #[test]
     fn the_pids_limit_leaves_room_for_socat_and_all_its_children() {
-        const { assert!(PIDS_LIMIT >= MAX_CHILDREN + 2) };
+        const { assert!(SPARE_PIDS >= 2) };
+        // The largest limit still fits in a u32 with its spare processes and memory.
+        const {
+            assert!(MAX_BRIDGE_CONNECTIONS.checked_add(SPARE_PIDS).is_some());
+            assert!(
+                BASE_MEMORY_MIB
+                    .checked_add(MAX_BRIDGE_CONNECTIONS * MEMORY_PER_CONNECTION_MIB)
+                    .is_some()
+            );
+        };
     }
 
     #[test]
