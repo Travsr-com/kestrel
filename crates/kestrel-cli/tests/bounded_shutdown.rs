@@ -25,7 +25,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{ChildGuard, Fixture, path_str, poll, walk};
+use common::{ChildGuard, Fixture, path_str, poll};
 use kestrel_types::{RunId, RunStatus};
 use predicates::prelude::*;
 
@@ -120,7 +120,9 @@ fn start_fake(f: &Fixture, config: &str) -> Serving {
     start(f, config, &["--sandbox-driver", "fake"], None)
 }
 
-/// A new run in the store, for its token. The serve the test started sees it as `Queued`.
+/// A new run in the store, for its token. The serve the test started sees it as `Queued` and
+/// claims it (and fails it: the fixture agent's repo is not absolute). That does not matter: the
+/// test never moves the run itself, so nothing races serve (issue #81).
 fn new_run(f: &Fixture) -> RunId {
     f.store()
         .create_run(&common::agent(), "task")
@@ -129,18 +131,15 @@ fn new_run(f: &Fixture) -> RunId {
 
 /// Starts a streaming model request through the gateway for `run` and returns the open
 /// connection once the upstream has the request, so the request is certainly in flight.
+///
+/// The gateway finds the run by its token and checks only its budget, not its status, so the
+/// request goes through whatever serve has done with the run.
 fn request_in_flight(
     f: &Fixture,
     s: &Serving,
     accepted: &mpsc::Receiver<()>,
     run: RunId,
 ) -> TcpStream {
-    walk(
-        &f.store(),
-        run,
-        RunStatus::Queued,
-        &[RunStatus::Provisioning, RunStatus::Running],
-    );
     let token = f.store().run_token(run).expect("token").expect("has token");
     let body = r#"{"model":"claude-sonnet-5-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
     let mut conn = TcpStream::connect(&s.gateway).expect("connect to gateway");
