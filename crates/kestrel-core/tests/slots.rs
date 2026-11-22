@@ -274,7 +274,10 @@ async fn s4_after_a_restart_suspended_runs_hold_no_slot_and_commands_respect_the
         (r1, r2, r3)
     };
 
+    // Without automatic resume (#92), so only the commands below resume r2 and the order they are
+    // served in is the one under test.
     let mut h = Harness::on(&db, 1);
+    h.rebuild(|e| e.with_resume_after_restart(false));
     let report = h.engine.recover().await.expect("recover");
     assert_eq!(report.suspended, vec![r1, r2, r3]);
     let s_q = h.driver.live();
