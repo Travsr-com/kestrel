@@ -160,8 +160,9 @@ impl KestrelTool {
                 "Get the messages a person sent you, oldest first, each with its seq. Check \
                  between steps and before you finish, and take what they say into account. Pass \
                  after, the seq of the last message you got (0 at first), to get every later \
-                 one: a call you repeat with the same after loses nothing. Without after, you \
-                 get each message once.",
+                 one: a call you repeat with the same after loses nothing. If you do not know \
+                 the last seq you got, leave out after. Without after, you get each message \
+                 once.",
                 json!({
                     "type": "object",
                     "properties": {
