@@ -386,3 +386,124 @@ fn s8_agent_spawns_a_child_through_its_mcp_config() {
     assert!(text.contains(&child), "{text}");
     env.wait_status(&child, "Completed");
 }
+
+/// Polls `check` until it is true, or panics with `what` after `limit`.
+fn wait_until(limit: Duration, what: &str, mut check: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !check() {
+        assert!(start.elapsed() < limit, "{what} not true after {limit:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The texts of every `kestrel.messages` answer in `out`, one JSON-RPC message per line, in order.
+fn taken_texts(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .flat_map(|l| {
+            let msg: Value =
+                serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}"));
+            assert_eq!(msg["result"]["isError"], false, "{msg}");
+            msg["result"]["structuredContent"]["messages"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no messages list: {msg}"))
+                .iter()
+                .map(|m| m["text"].as_str().expect("a text").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Issue #95: a message sent to a running run, from the API and from the CLI, reaches its agent
+/// in a gVisor sandbox through `kestrel.messages`, once each, and events record every message and
+/// its delivery. Once the run has ended, a message is refused with the reason.
+#[test]
+fn i95_a_message_reaches_the_running_agent_once() {
+    let env = Env::new();
+    let up = env.up();
+    let agent = env.root_agent("listener", "5", "mcp: [kestrel.messages]");
+    let id = env.submit_file(&agent, "listen inbox=300");
+    let workspace = env.dir.path().join("workspaces").join(&id);
+    wait_until(RUN_DEADLINE, "the agent polls its inbox", || {
+        workspace.join("inbox-ready.out").exists()
+    });
+
+    let run = up.get_json(&format!("/api/runs/{id}"));
+    assert_eq!(run["takes_messages"], true, "{run}");
+    assert_eq!(run["status"], "Running", "{run}");
+
+    let delivered = |n: usize| {
+        env.events_now(&id)
+            .iter()
+            .filter(|e| e["kind"]["kind"] == "message_delivered")
+            .count()
+            >= n
+    };
+    let (status, body) = up.http(
+        "POST",
+        &format!("/api/runs/{id}/message"),
+        Some(r#"{"text":"from the api"}"#),
+    );
+    assert_eq!(status, 202, "{body}");
+    wait_until(RUN_DEADLINE, "the API message is delivered", || delivered(1));
+    env.ok(&["message", &id, "from the cli"]);
+    wait_until(RUN_DEADLINE, "the CLI message is delivered", || delivered(2));
+    std::fs::write(workspace.join("inbox-go"), "go").expect("tell the agent to finish");
+    env.wait_status(&id, "Completed");
+
+    // The agent got each message once, in order, and nothing after.
+    let got = taken_texts(&env.read_out(&id, "inbox.out"));
+    assert_eq!(got, ["from the api", "from the cli"]);
+    assert_eq!(taken_texts(&env.read_out(&id, "inbox-last.out")), Vec::<String>::new());
+
+    let events = env.events(&id);
+    let sent: Vec<(u64, &str)> = events
+        .iter()
+        .filter(|e| e["kind"]["kind"] == "message_sent")
+        .map(|e| {
+            (
+                e["seq"].as_u64().expect("seq"),
+                e["kind"]["text"].as_str().expect("text"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+        ["from the api", "from the cli"]
+    );
+    let mut delivered_seqs: Vec<u64> = events
+        .iter()
+        .filter(|e| e["kind"]["kind"] == "message_delivered")
+        .flat_map(|e| {
+            e["kind"]["seqs"]
+                .as_array()
+                .expect("seqs")
+                .iter()
+                .map(|s| s.as_u64().expect("a seq"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    delivered_seqs.sort_unstable();
+    assert_eq!(
+        delivered_seqs,
+        sent.iter().map(|(s, _)| *s).collect::<Vec<_>>()
+    );
+
+    // An ended run takes no more messages, from the API or the CLI.
+    let (status, body) = up.http(
+        "POST",
+        &format!("/api/runs/{id}/message"),
+        Some(r#"{"text":"too late"}"#),
+    );
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("the run has ended (completed)"), "{body}");
+    let out = env
+        .cmd(&["message", &id, "too late"])
+        .output()
+        .expect("run kestrel message");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has ended"),
+        "{out:?}"
+    );
+}
