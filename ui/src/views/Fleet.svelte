@@ -391,9 +391,17 @@
   }
   .tiles {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(12rem, calc(50% - var(--space-4))), 1fr));
     gap: var(--space-4);
     margin: 0 0 var(--space-5);
+  }
+  @media (max-width: 48rem) {
+    .tiles :global(.panel) {
+      padding: var(--space-3) var(--space-4);
+    }
+    .big {
+      font-size: 1.5rem;
+    }
   }
   .tile dd {
     margin: 0;
