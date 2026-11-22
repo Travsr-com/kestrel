@@ -899,7 +899,7 @@ describe('Run view: messages to the agent', () => {
     await fireEvent.input(box, { target: { value: fits } });
     await u.click(screen.getByRole('button', { name: 'Send' }));
     await vi.waitFor(() => expect(posts()).toHaveLength(1));
-    expect(posts()[0].body).toEqual({ text: fits });
+    expect(posts()[0]?.body).toEqual({ text: fits });
     expect(within(panel).queryByRole('alert')).not.toBeInTheDocument();
   });
 
