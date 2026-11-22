@@ -1,7 +1,7 @@
-// Rules for the Run view: what a status allows, budget input, and tree sums.
+// Rules for the Run view: what a status allows, budget input, tree sums and token totals.
 
 import { isTerminal } from './format';
-import type { MicroUsd, RunId, RunStatus } from './types';
+import type { Event, MicroUsd, RunId, RunStatus } from './types';
 
 export interface Allowed {
   pause: boolean;
@@ -70,4 +70,24 @@ export function liveBelow(runs: Node[], id: RunId): number {
 /** What `id` has carved out to its direct children: the sum of their limits. */
 export function carved(runs: Node[], id: RunId): MicroUsd {
   return runs.reduce((sum, run) => (run.parent === id ? sum + (run.limit ?? 0) : sum), 0);
+}
+
+export interface Tokens {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** The tokens of the model calls among `events`, summed. */
+export function tokenTotals(events: Event[]): Tokens {
+  const sum: Tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const { kind } of events) {
+    if (kind.kind !== 'model_call') continue;
+    sum.input += kind.tokens_in;
+    sum.output += kind.tokens_out;
+    sum.cacheRead += kind.tokens_cache_read;
+    sum.cacheWrite += kind.tokens_cache_write;
+  }
+  return sum;
 }

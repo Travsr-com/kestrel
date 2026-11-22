@@ -1,22 +1,26 @@
 <script lang="ts">
-  // Pause, Resume, Cancel (after a confirmation that names the live child runs it also cancels),
-  // Set budget and Send message. Each is enabled only when the run's status allows it. A refused
-  // command shows the server's reason, and `onRefused` fetches the run again so the buttons match.
+  // The run's commands, in three parts the Run view places apart: `buttons` (Pause or Resume, and
+  // Cancel run after a confirmation that names the live child runs it also cancels), `limit` (the
+  // Change limit panel) and `message` (the Message panel). Each is enabled only when the run's
+  // status allows it. A refused command shows the server's reason in its own part, and
+  // `onRefused` fetches the run again so the controls match.
   import type { Api } from '../lib/api';
   import type { FleetRun } from '../lib/fleet.svelte';
   import { failureText, type OnUnauthorized } from '../lib/load';
   import { allowed, parseUsd } from '../lib/run';
 
   let {
+    part,
     run,
-    live,
+    live = 0,
     api,
     onUnauthorized,
     onRefused,
     onBudget = () => {},
   }: {
+    part: 'buttons' | 'limit' | 'message';
     run: FleetRun;
-    live: number;
+    live?: number;
     api: Api;
     onUnauthorized: OnUnauthorized;
     onRefused: () => void;
@@ -56,6 +60,12 @@
     }
   }
 
+  // One button that turns from Pause into Resume and back, so focus stays on it when the status
+  // changes under it.
+  function pauseOrResume() {
+    void send(() => (can.resume ? api.resume(run.id) : api.pause(run.id)));
+  }
+
   $effect(() => {
     if (confirming) keepButton?.focus();
   });
@@ -65,7 +75,7 @@
     if (confirming && !can.cancel) close();
   });
 
-  /** Closes the dialog; focus goes back to Cancel, or to the controls if Cancel is now off. */
+  /** Closes the dialog; focus goes back to Cancel run, or to the controls if it is now off. */
   function close() {
     confirming = false;
     if (cancelButton && !cancelButton.disabled) cancelButton.focus();
@@ -128,81 +138,114 @@
 
 <svelte:window onkeydown={onKey} onfocusin={onFocusIn} />
 
-<div class="controls" role="group" aria-label="Controls" tabindex="-1" bind:this={group}>
-  <div class="buttons">
-    <button type="button" disabled={!can.pause} onclick={() => send(() => api.pause(run.id))}>Pause</button>
-    <button type="button" disabled={!can.resume} onclick={() => send(() => api.resume(run.id))}>Resume</button>
-    <button type="button" bind:this={cancelButton} disabled={!can.cancel} onclick={() => (confirming = true)}>
-      Cancel
-    </button>
+{#if part === 'buttons'}
+  <div class="controls" role="group" aria-label="Controls" tabindex="-1" bind:this={group}>
+    <div class="buttons">
+      <button type="button" disabled={!can.pause && !can.resume} onclick={pauseOrResume}>
+        {can.resume ? 'Resume' : 'Pause'}
+      </button>
+      <button
+        type="button"
+        class="danger"
+        bind:this={cancelButton}
+        disabled={!can.cancel}
+        onclick={() => (confirming = true)}>Cancel run</button
+      >
+    </div>
+    {#if refused !== null}
+      <p class="error" role="alert">{refused}</p>
+    {/if}
   </div>
 
-  <form class="inline" onsubmit={setBudget} novalidate>
-    <label for="budget-{run.id}">New budget (USD)</label>
-    <input
-      id="budget-{run.id}"
-      inputmode="decimal"
-      autocomplete="off"
-      bind:value={budget}
-      disabled={!can.budget}
-      aria-invalid={budgetError !== null}
-      aria-describedby={budgetError === null ? undefined : `budget-error-${run.id}`}
-    />
-    <button type="submit" disabled={!can.budget}>Set budget</button>
-  </form>
-  {#if budgetError !== null}
-    <p id="budget-error-{run.id}" class="error" role="alert">{budgetError}</p>
-  {/if}
-
-  <form class="inline" onsubmit={sendMessage}>
-    <label for="message-{run.id}">Message</label>
-    <input id="message-{run.id}" autocomplete="off" bind:value={message} disabled={!can.message} />
-    <button type="submit" disabled={!can.message}>Send</button>
-  </form>
-
-  {#if refused !== null}
-    <p class="error" role="alert">{refused}</p>
-  {/if}
-</div>
-
-{#if confirming}
-  <div class="backdrop">
-    <div
-      class="dialog"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="cancel-title-{run.id}"
-      aria-describedby="cancel-text-{run.id}"
-      tabindex="-1"
-      bind:this={dialog}
-    >
-      <h2 id="cancel-title-{run.id}">Cancel this run?</h2>
-      <p id="cancel-text-{run.id}">
-        {live === 0 ? `This cancels ${run.agent}.` : `This cancels ${run.agent} and ${children(live)}.`}
-      </p>
-      <div class="buttons">
-        <button type="button" bind:this={keepButton} onclick={close}>Keep running</button>
-        <button type="button" class="danger" bind:this={confirmButton} onclick={confirmCancel}>Cancel run</button>
+  {#if confirming}
+    <div class="backdrop">
+      <div
+        class="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cancel-title-{run.id}"
+        aria-describedby="cancel-text-{run.id}"
+        tabindex="-1"
+        bind:this={dialog}
+      >
+        <h2 id="cancel-title-{run.id}">Cancel this run?</h2>
+        <p id="cancel-text-{run.id}">
+          {live === 0 ? `This cancels ${run.agent}.` : `This cancels ${run.agent} and ${children(live)}.`}
+        </p>
+        <div class="buttons">
+          <button type="button" bind:this={keepButton} onclick={close}>Keep running</button>
+          <button type="button" class="danger" bind:this={confirmButton} onclick={confirmCancel}>Yes, cancel it</button>
+        </div>
       </div>
     </div>
-  </div>
+  {/if}
+{:else if part === 'limit'}
+  <form class="panel" onsubmit={setBudget} novalidate>
+    <label for="budget-{run.id}">Change limit (USD)</label>
+    <div class="inline">
+      <input
+        id="budget-{run.id}"
+        class="mono"
+        inputmode="decimal"
+        autocomplete="off"
+        bind:value={budget}
+        disabled={!can.budget}
+        aria-invalid={budgetError !== null}
+        aria-describedby={budgetError === null ? `budget-help-${run.id}` : `budget-error-${run.id} budget-help-${run.id}`}
+      />
+      <button type="submit" class="primary" disabled={!can.budget}>Set</button>
+    </div>
+    {#if budgetError !== null}
+      <p id="budget-error-{run.id}" class="error" role="alert">{budgetError}</p>
+    {/if}
+    <p id="budget-help-{run.id}" class="help">Sub-agents draw from this limit. Their total can never go above it.</p>
+    {#if refused !== null}
+      <p class="error" role="alert">{refused}</p>
+    {/if}
+  </form>
+{:else}
+  <form class="panel" onsubmit={sendMessage}>
+    <label for="message-{run.id}">Message</label>
+    <div class="inline">
+      <input id="message-{run.id}" autocomplete="off" bind:value={message} disabled={!can.message} />
+      <button type="submit" disabled={!can.message}>Send</button>
+    </div>
+    {#if refused !== null}
+      <p class="error" role="alert">{refused}</p>
+    {/if}
+  </form>
 {/if}
 
 <style>
   .controls {
     display: grid;
+    justify-items: end;
     gap: var(--space-2);
   }
-  .buttons,
-  .inline {
+  .buttons {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
     gap: var(--space-2);
   }
-  button,
-  input {
-    font: inherit;
+  form {
+    display: grid;
+    gap: var(--space-3);
+  }
+  label {
+    font-weight: 600;
+  }
+  .inline {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .inline input {
+    flex: 1;
+    min-width: 0;
+  }
+  .help {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: 0.9rem;
   }
   .error {
     margin: 0;
@@ -215,21 +258,22 @@
     z-index: 10;
     display: grid;
     place-items: center;
-    background: rgb(0 0 0 / 40%);
+    background: rgb(0 0 0 / 55%);
   }
   .dialog {
     max-width: 28rem;
-    padding: var(--space-4);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
-    background: var(--color-bg);
+    margin: var(--space-4);
+    padding: var(--space-5);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
+    background: var(--color-surface);
     color: var(--color-text);
   }
   .dialog h2 {
     margin-top: 0;
     font-size: 1.125rem;
   }
-  .danger {
-    color: var(--color-danger);
+  .dialog .buttons {
+    justify-content: flex-end;
   }
 </style>

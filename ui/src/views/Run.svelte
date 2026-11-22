@@ -1,6 +1,7 @@
 <script lang="ts">
-  // One run in detail, and its tree. Top: status, budget bar and controls. Left: the spawn tree.
-  // Center: the run's event stream.
+  // One run in detail, and its tree. Header: breadcrumb, agent, status pill, Pause or Resume and
+  // Cancel run. Left column: the spawn tree, the budget, Change limit and Message. Right column:
+  // the run's live event stream.
   //
   // The tree comes from `GET /api/runs?root=` and a tree socket that replays the tree and stays
   // open, so new children, statuses and costs show live (the same state the Fleet view keeps). The
@@ -10,13 +11,13 @@
   import { untrack } from 'svelte';
   import { ApiFailure, Unauthorized, type Api } from '../lib/api';
   import { FleetState } from '../lib/fleet.svelte';
-  import { statusLabel, statusName } from '../lib/format';
+  import { statusPill, statusTone } from '../lib/format';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { Refresher } from '../lib/refresher';
   import { href } from '../lib/router';
-  import { carved, liveBelow } from '../lib/run';
+  import { carved, liveBelow, tokenTotals } from '../lib/run';
   import { getToken } from '../lib/token';
-  import type { Event, RunId } from '../lib/types';
+  import type { Event, RunId, RunStatus } from '../lib/types';
   import { browserSocket, connectEvents, socketBase, type ConnectionState, type SocketFactory } from '../lib/ws';
   import BudgetBar from './BudgetBar.svelte';
   import Controls from './Controls.svelte';
@@ -198,74 +199,122 @@
   const run = $derived(shown === null ? undefined : fleet.runs[shown]);
   const all = $derived(Object.values(fleet.runs));
   const reconnecting = $derived(Object.keys(down).length > 0);
+  const tokens = $derived(tokenTotals(events));
+  const failedWith = (status: RunStatus) => (typeof status === 'object' && 'Failed' in status ? status.Failed : null);
 </script>
 
-<h1>{run ? run.agent : `Run ${id}`}</h1>
-
-<!-- Always in the page, so screen readers announce the text when it appears. -->
-<p class:banner={reconnecting} role="status">{reconnecting ? 'Reconnecting to live updates.' : ''}</p>
-
-{#if error !== null}
-  <div class="banner error" role="alert" data-testid="ready">
-    <p>{error}</p>
-    <button type="button" onclick={() => (attempt += 1)}>Retry</button>
-  </div>
-{:else if missing}
-  <div data-testid="ready">
-    <p>Run not found.</p>
-    <p><a href={href({ name: 'fleet' })}>Back to Fleet</a></p>
-  </div>
-{:else if run === undefined || root === null}
-  <p>Loading run.</p>
-{:else}
-  <div class="layout" data-testid="ready">
+{#if error === null && !missing && run !== undefined && root !== null}
+  {@const why = failedWith(run.status)}
+  <div class="page" data-testid="ready">
     <header class="top">
-      <p class="facts">
-        <span class="badge status-{statusName(run.status)}">{statusLabel(run.status)}</span>
-        {#if run.parent !== null}
-          <a href={href({ name: 'run', id: run.parent })}>Parent: {fleet.runs[run.parent]?.agent ?? 'run'}</a>
-        {/if}
-      </p>
-      <BudgetBar spent={run.spent} limit={run.limit} carved={carved(all, run.id)} />
+      <div class="title">
+        <nav aria-label="Breadcrumb" class="crumbs">
+          <a href={href({ name: 'fleet' })}>Fleet</a>
+          <span aria-hidden="true">/</span>
+          <span>{run.agent}</span>
+        </nav>
+        <div class="heading">
+          <h1>{run.agent}</h1>
+          <span class="pill tone-{statusTone(run.status)}">{statusPill(run.status)}</span>
+        </div>
+        <p class="facts">
+          <span class="mono">run {run.id.slice(-8)}</span>
+          {#if run.sandbox_tier !== null}
+            <span>{run.sandbox_tier}</span>
+          {/if}
+          {#if run.parent !== null}
+            <a href={href({ name: 'run', id: run.parent })}>Parent: {fleet.runs[run.parent]?.agent ?? 'run'}</a>
+          {/if}
+          {#if why !== null}
+            <span class="why">{why}</span>
+          {/if}
+        </p>
+      </div>
       <!-- Keyed by run: nothing typed, refused or open for one run carries over to another. -->
       {#key run.id}
         <Controls
+          part="buttons"
           {run}
           live={liveBelow(all, run.id)}
           {api}
           {onUnauthorized}
           onRefused={() => reload(run.id)}
-          onBudget={() => afterBudget(run.id)}
         />
       {/key}
     </header>
-    <SpawnTree runs={fleet.runs} {root} selected={run.id} />
-    <section class="stream">
-      <!-- A named region, focusable so keyboard users can scroll it. -->
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <div class="scroll" role="region" aria-label="Event stream" bind:this={box} onscroll={onScroll} tabindex="0">
-        <ul aria-label="Events">
-          {#each events as event (event.seq)}
-            <EventItem {event} />
-          {/each}
-        </ul>
-        {#if events.length === 0}
-          <p class="empty">No events yet.</p>
-        {/if}
+
+    <div class="layout">
+      <div class="side">
+        <section class="panel" aria-labelledby="tree-title">
+          <h2 id="tree-title" class="eyebrow">Spawn tree</h2>
+          <SpawnTree runs={fleet.runs} {root} selected={run.id} />
+        </section>
+        <BudgetBar spent={run.spent} limit={run.limit} carved={carved(all, run.id)} {tokens} />
+        {#key run.id}
+          <Controls
+            part="limit"
+            {run}
+            {api}
+            {onUnauthorized}
+            onRefused={() => reload(run.id)}
+            onBudget={() => afterBudget(run.id)}
+          />
+          <Controls part="message" {run} {api} {onUnauthorized} onRefused={() => reload(run.id)} />
+        {/key}
       </div>
-      {#if !stick}
-        <button type="button" class="jump" onclick={jump}>Jump to latest</button>
-      {/if}
-    </section>
+
+      <section class="panel stream" aria-labelledby="events-title">
+        <div class="stream-head">
+          <h2 id="events-title" class="eyebrow">Live events</h2>
+          <!-- A live region, so screen readers hear when updates stop and start again. -->
+          <p class="link" class:down={reconnecting} role="status">
+            <span class="dot" aria-hidden="true"></span>{reconnecting ? 'Reconnecting' : 'Connected'}
+          </p>
+        </div>
+        <!-- A named region, focusable so keyboard users can scroll it. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <div class="scroll" role="region" aria-label="Event stream" bind:this={box} onscroll={onScroll} tabindex="0">
+          <ul aria-label="Events">
+            {#each events as event (event.seq)}
+              <EventItem {event} />
+            {/each}
+          </ul>
+          {#if events.length === 0}
+            <p class="empty">No events yet.</p>
+          {/if}
+        </div>
+        {#if !stick}
+          <button type="button" class="jump primary" onclick={jump}>Jump to latest</button>
+        {/if}
+      </section>
+    </div>
   </div>
+{:else}
+  <h1>Run {id}</h1>
+  {#if error !== null}
+    <div class="banner error" role="alert" data-testid="ready">
+      <p>{error}</p>
+      <button type="button" onclick={() => (attempt += 1)}>Retry</button>
+    </div>
+  {:else if missing}
+    <div data-testid="ready">
+      <p>Run not found.</p>
+      <p><a href={href({ name: 'fleet' })}>Back to Fleet</a></p>
+    </div>
+  {:else}
+    <p>Loading run.</p>
+  {/if}
 {/if}
 
 <style>
   h1 {
+    margin: 0;
+    font-size: 2rem;
+    line-height: 1.2;
     overflow-wrap: anywhere;
   }
   .banner {
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-3) var(--space-4);
     border: 1px solid var(--color-border);
     border-radius: var(--radius);
     background: var(--color-surface);
@@ -274,65 +323,97 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    border-color: var(--color-danger);
+    border-color: var(--color-danger-border);
   }
   .error p {
     margin: 0;
   }
-  .layout {
+  .page {
     display: grid;
-    grid-template-columns: minmax(12rem, 18rem) 1fr;
-    grid-template-areas:
-      'top top'
-      'tree stream';
-    gap: var(--space-3);
+    gap: var(--space-5);
   }
   .top {
-    grid-area: top;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+  .title {
     display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+  .crumbs {
+    display: flex;
     gap: var(--space-2);
+    color: var(--color-muted);
+  }
+  .crumbs a {
+    color: inherit;
+    text-decoration: none;
+  }
+  .crumbs a:hover {
+    color: var(--color-text);
+    text-decoration: underline;
+  }
+  .heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
   }
   .facts {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--space-3);
+    gap: var(--space-1) var(--space-4);
     margin: 0;
-  }
-  .badge {
-    padding: 0 var(--space-2);
-    border: 1px solid currentColor;
-    border-radius: var(--radius);
-  }
-  .status-running,
-  .status-provisioning {
-    color: var(--color-status-running);
-  }
-  .status-suspended {
-    color: var(--color-status-suspended);
-  }
-  .status-failed {
-    color: var(--color-danger);
-  }
-  .status-queued,
-  .status-completed,
-  .status-cancelled {
     color: var(--color-muted);
   }
-  .layout > :global(.tree) {
-    grid-area: tree;
+  .why {
+    color: var(--color-danger);
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(20rem, 30rem) 1fr;
+    align-items: start;
+    gap: var(--space-5);
+  }
+  .side {
+    display: grid;
+    gap: var(--space-5);
+    min-width: 0;
   }
   .stream {
-    grid-area: stream;
     position: relative;
     min-width: 0;
   }
+  .stream-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .link {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    color: var(--color-done);
+    font-size: 0.9rem;
+  }
+  .link.down {
+    color: var(--color-approval);
+  }
+  .dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: currentColor;
+  }
   .scroll {
-    max-height: 70vh;
+    max-height: 75vh;
     overflow: auto;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
   }
   .scroll ul {
     margin: 0;
@@ -340,21 +421,17 @@
     list-style: none;
   }
   .empty {
+    margin: 0;
     color: var(--color-muted);
   }
   .jump {
     position: absolute;
-    right: var(--space-3);
-    bottom: var(--space-3);
-    font: inherit;
+    right: var(--space-5);
+    bottom: var(--space-5);
   }
-  @media (max-width: 48rem) {
+  @media (max-width: 60rem) {
     .layout {
       grid-template-columns: 1fr;
-      grid-template-areas:
-        'top'
-        'tree'
-        'stream';
     }
   }
 </style>

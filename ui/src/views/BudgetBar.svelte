@@ -1,20 +1,31 @@
 <script lang="ts">
-  // Spent over limit as a meter (warning style from 80%), with what is carved to children and what
-  // is left to spend, all from micro-dollar integers.
-  import { formatUsd } from '../lib/format';
+  // The Budget panel: spent of the limit with a meter (warning colour from 80%), the token totals of
+  // the run's model calls, what is carved to children and what is left to spend. Money comes in
+  // micro-dollar integers.
+  import { formatUsd, percentUsed } from '../lib/format';
+  import type { Tokens } from '../lib/run';
   import type { MicroUsd } from '../lib/types';
 
-  let { spent, limit, carved }: { spent: MicroUsd; limit: MicroUsd | null; carved: MicroUsd } = $props();
+  let {
+    spent,
+    limit,
+    carved,
+    tokens,
+  }: { spent: MicroUsd; limit: MicroUsd | null; carved: MicroUsd; tokens: Tokens } = $props();
 
-  const percent = $derived(limit === null ? 0 : limit === 0 ? 100 : Math.min(100, Math.floor((spent * 100) / limit)));
+  const percent = $derived(percentUsed(spent, limit));
+  const count = (n: number) => n.toLocaleString('en-US');
 </script>
 
-<div class="budget">
-  {#if limit === null}
-    <p>{formatUsd(spent)} spent, no limit</p>
+<section class="panel budget" aria-labelledby="budget-title">
+  <h2 id="budget-title" class="eyebrow">Budget</h2>
+  <p class="spent mono">{formatUsd(spent)}</p>
+  {#if percent === null}
+    <p class="of">no limit</p>
   {:else}
+    <p class="of">of {formatUsd(limit)} limit, {percent}% used</p>
     <div
-      class="meter"
+      class="track"
       class:warn={percent >= 80}
       role="meter"
       aria-label="Budget used"
@@ -25,28 +36,49 @@
     >
       <div class="fill" style:width="{percent}%"></div>
     </div>
-    <p>{formatUsd(spent)} of {formatUsd(limit)}, {formatUsd(carved)} carved to children</p>
-    <p>{formatUsd(Math.max(0, limit - spent))} left to spend</p>
   {/if}
-</div>
+  <dl>
+    <dt>Input tokens</dt>
+    <dd>{count(tokens.input)}</dd>
+    <dt>Output tokens</dt>
+    <dd>{count(tokens.output)}</dd>
+    <dt>Cache reads</dt>
+    <dd>{count(tokens.cacheRead)}</dd>
+    <dt>Cache writes</dt>
+    <dd>{count(tokens.cacheWrite)}</dd>
+    <dt>Carved to children</dt>
+    <dd>{formatUsd(carved)}</dd>
+    <dt>Left to spend</dt>
+    <dd>{formatUsd(limit === null ? null : Math.max(0, limit - spent))}</dd>
+  </dl>
+</section>
 
 <style>
-  .budget p {
-    margin: var(--space-1) 0 0;
-    font-variant-numeric: tabular-nums;
+  .spent {
+    margin: 0;
+    font-size: 2.25rem;
+    font-weight: 700;
+    line-height: 1.2;
   }
-  .meter {
-    height: 0.5rem;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
-    background: var(--color-surface);
-    overflow: hidden;
+  .of {
+    margin: 0 0 var(--space-3);
+    color: var(--color-muted);
   }
-  .fill {
-    height: 100%;
-    background: var(--color-status-running);
+  .warn {
+    --tone: var(--color-approval);
   }
-  .warn .fill {
-    background: var(--color-status-suspended);
+  dl {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: var(--space-1) var(--space-4);
+    margin: var(--space-4) 0 0;
+  }
+  dt {
+    color: var(--color-muted);
+  }
+  dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    text-align: right;
   }
 </style>
