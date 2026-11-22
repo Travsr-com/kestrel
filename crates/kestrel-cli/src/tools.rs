@@ -165,20 +165,27 @@ impl ToolHost for EngineTools {
 
     async fn spawn(&self, run: RunId, call: SpawnCall) -> Result<Value, String> {
         let spec = self.agents.load(&call.agent)?;
-        let child = self
+        let spawned = self
             .engine
-            .spawn_child(run, &spec, &call.input, call.budget)
+            .spawn_child_with_report(run, &spec, &call.input, call.budget)
             .await
             .map_err(|e| e.to_string())?;
-        if !call.wait {
-            return Ok(json!({ "child": child.to_string() }));
+        let child = spawned.id;
+        let mut answer = json!({ "child": child.to_string() });
+        // A spec that asked for more spawn depth than this run can give: say what it got.
+        if let Some(lowered) = spawned.lowered_depth {
+            answer["depth"] = json!(lowered.granted);
+            answer["note"] = json!(lowered.note());
         }
-        let results = self
-            .engine
-            .join(run, &[child], JoinMode::All, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(json!({ "child": child.to_string(), "result": results_json(&results).pop() }))
+        if call.wait {
+            let results = self
+                .engine
+                .join(run, &[child], JoinMode::All, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            answer["result"] = json!(results_json(&results).pop());
+        }
+        Ok(answer)
     }
 
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String> {

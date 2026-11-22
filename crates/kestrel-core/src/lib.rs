@@ -174,6 +174,33 @@ impl From<StoreError> for SpawnError {
     }
 }
 
+/// A child made by [`Engine::spawn_child_with_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedChild {
+    pub id: RunId,
+    /// Set when the child's spec asked for more spawn depth than the parent could give.
+    pub lowered_depth: Option<LoweredDepth>,
+}
+
+/// A child spec's spawn `max_depth` lowered to what its parent could give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoweredDepth {
+    /// What the spec asked for.
+    pub asked: u32,
+    /// What the child got: the parent's `max_depth` minus one.
+    pub granted: u32,
+}
+
+impl LoweredDepth {
+    /// What the spawning agent is told.
+    pub fn note(&self) -> String {
+        format!(
+            "max_depth lowered from {} to {} (the most this parent can give)",
+            self.asked, self.granted
+        )
+    }
+}
+
 /// Default for [`Engine::with_tree_limit`]: the most runs one spawn tree may hold.
 pub const DEFAULT_TREE_LIMIT: u32 = 256;
 
@@ -224,6 +251,16 @@ fn authorise(
         caps::Decision::Allow => Ok(()),
         caps::Decision::Deny(reason) => Err(SpawnError::NotPermitted(reason)),
     }
+}
+
+/// The spawn depth `wanted` asked for and what `granted` holds, when `granted` holds less.
+fn lowered_depth(wanted: &caps::Capability, granted: &caps::Capability) -> Option<LoweredDepth> {
+    let asked = wanted.spawn.as_ref()?.max_depth;
+    let got = granted.spawn.as_ref()?.max_depth;
+    (got < asked).then_some(LoweredDepth {
+        asked,
+        granted: got,
+    })
 }
 
 /// The log line for a `kestrel budget` raise its parent cannot cover.
@@ -944,6 +981,9 @@ impl Engine {
     ///   ([`Engine::with_tree_limit`]).
     /// * **Model tier**: a child spec without `model_policy` runs one tier below its parent.
     /// * **Workspace**: a `git-clone` child with a relative repo clones its parent's repo.
+    /// * **Depth**: a spec asking for more spawn `max_depth` than the parent can give (its own
+    ///   minus one) gets what the parent can give. The child records it in an `AgentLog`, and
+    ///   [`Engine::spawn_child_with_report`] returns it, so the caller can tell the agent.
     pub async fn spawn_child(
         &self,
         parent: RunId,
@@ -951,6 +991,19 @@ impl Engine {
         input: &str,
         budget: Option<MicroUsd>,
     ) -> std::result::Result<RunId, SpawnError> {
+        self.spawn_child_with_report(parent, child, input, budget)
+            .await
+            .map(|spawned| spawned.id)
+    }
+
+    /// [`Engine::spawn_child`], also saying whether the child's spawn depth was lowered.
+    pub async fn spawn_child_with_report(
+        &self,
+        parent: RunId,
+        child: &AgentSpec,
+        input: &str,
+        budget: Option<MicroUsd>,
+    ) -> std::result::Result<SpawnedChild, SpawnError> {
         let inner = &self.inner;
         let key = inner.root_key.as_ref().ok_or(SpawnError::NoRootKey)?;
         let store = &inner.store;
@@ -989,6 +1042,15 @@ impl Engine {
         let keep = keeps(&spec) && keeps(&parent_spec);
         spec.capabilities = granted_capabilities(&narrowed, keep);
         let mut child_events = Vec::new();
+        let lowered_depth = lowered_depth(&wanted, &narrowed);
+        if let Some(lowered) = lowered_depth {
+            child_events.push(EventKind::AgentLog {
+                line: format!(
+                    "kestrel: spawn max_depth lowered from {} to {} (the most its parent can give)",
+                    lowered.asked, lowered.granted
+                ),
+            });
+        }
         if !dropped.is_empty() {
             child_events.push(EventKind::CapabilitiesDropped {
                 tools: dropped.tools,
@@ -1014,7 +1076,10 @@ impl Engine {
                 .map(|t| Some(t.as_bytes().to_vec()))
                 .map_err(|e| StoreError::Capability(e.to_string()))
         })?;
-        Ok(spawned.id)
+        Ok(SpawnedChild {
+            id: spawned.id,
+            lowered_depth,
+        })
     }
 
     /// The parent's capability token. A root run without one gets one from its spec; any other
