@@ -176,7 +176,7 @@ impl From<StoreError> for SpawnError {
 }
 
 /// A child made by [`Engine::spawn_child_with_report`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnedChild {
     pub id: RunId,
     /// Set when the child's spec asked for more spawn depth than the parent could give.
@@ -184,6 +184,9 @@ pub struct SpawnedChild {
     /// True when the spawn matched one the parent made before its agent started again, so this
     /// is that child, returned again rather than spawned (#92).
     pub existing: bool,
+    /// The child's status when the call returned: `Queued` for a new child; an existing one may
+    /// be running or already ended.
+    pub status: RunStatus,
 }
 
 /// A child spec's spawn `max_depth` lowered to what its parent could give.
@@ -362,11 +365,12 @@ pub fn default_models() -> ModelMap {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Runs that were `Suspended` and stay that way, resumable as before. One an earlier start
-    /// suspended for its restart also gets a resume queued, as in `interrupted`.
+    /// suspended for its restart and queued a resume for, which was lost, gets it queued again.
     pub suspended: Vec<RunId>,
     /// Runs that were `Running` or `Provisioning` when the previous engine stopped. Their sandbox
     /// is gone, so they are now `Suspended(Error("engine restarted"))`, with a resume queued
-    /// unless [`Engine::with_resume_after_restart`] turned that off.
+    /// unless [`Engine::with_resume_after_restart`] turned that off or more than three restarts
+    /// stopped the run.
     pub interrupted: Vec<RunId>,
     /// Why the Travsr copies kept from before could not be listed, so none was forgotten (see
     /// [`Engine::with_indexer`]). `None` when they were, or there is no indexer.
@@ -557,8 +561,9 @@ struct Inner {
     resume_after_restart: bool,
     /// Spawns each parent made since its agent last started, by spawn key ([`spawn_key`]): the
     /// count picks which earlier child a repeated spawn returns ([`Store::spawn_child_once`]).
-    /// Held across the store call, so two spawns with one key never take the same count.
-    spawn_counts: Mutex<HashMap<RunId, HashMap<String, usize>>>,
+    /// One lock per parent, held across its store call, so two spawns with one key never take the
+    /// same count.
+    spawn_counts: Mutex<HashMap<RunId, SpawnCounts>>,
     /// Signals a change of `live`.
     changed: Notify,
 }
@@ -578,6 +583,9 @@ struct Live {
     /// Run networks made and not yet removed, with the index of the driver that made them.
     networks: HashMap<RunId, (usize, PreparedNetwork)>,
 }
+
+/// One parent's spawns since its agent last started, by spawn key.
+type SpawnCounts = Arc<Mutex<HashMap<String, usize>>>;
 
 /// Control channels of the run actors, by run.
 type Actors = HashMap<RunId, mpsc::UnboundedSender<ControlCommand>>;
@@ -1103,17 +1111,12 @@ impl Engine {
             child_events,
         };
         // The nth spawn with this key since the parent's agent started is the nth child it
-        // spawned with it before, if there is one (#92). The lock is held across the store call,
-        // which does not wait, so two spawns with one key never take the same count.
-        let mut counts = inner
-            .spawn_counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let made = counts
-            .entry(parent)
-            .or_default()
-            .entry(spawn_key(&spec.name, input))
-            .or_default();
+        // spawned with it before, if there is one (#92). The parent's counts stay locked across
+        // the store call (one short SQLite transaction), so two of its spawns with one key never
+        // take the same count; other parents' spawns do not wait on it.
+        let parent_counts = inner.spawn_counts(parent);
+        let mut counts = parent_counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let made = counts.entry(spawn_key(&spec.name, input)).or_default();
         let outcome = store.spawn_child_once(parent, plan, *made, |id, carve| {
             let mut cap = narrowed.clone();
             cap.run = id;
@@ -1125,8 +1128,8 @@ impl Engine {
         })?;
         *made += 1;
         drop(counts);
-        let (id, existing) = match outcome {
-            SpawnOnce::New(spawned) => (spawned.id, false),
+        let (id, existing, status) = match outcome {
+            SpawnOnce::New(spawned) => (spawned.id, false, RunStatus::Queued),
             SpawnOnce::Existing(id) => {
                 let line = format!(
                     "kestrel: kestrel.spawn of {} returned child {id}, spawned with the same \
@@ -1134,13 +1137,15 @@ impl Engine {
                     spec.name
                 );
                 store.append(parent, EventKind::AgentLog { line })?;
-                (id, true)
+                let status = store.get_run(id)?.ok_or(StoreError::NotFound(id))?.status;
+                (id, true, status)
             }
         };
         Ok(SpawnedChild {
             id,
             lowered_depth,
             existing,
+            status,
         })
     }
 
@@ -1321,8 +1326,11 @@ impl Engine {
     ///
     /// `Running` and `Provisioning` runs become `Suspended(Error("engine restarted"))`, and a
     /// resume is queued for each (#92), which `run_forever` delivers in line with everything else.
-    /// A run already suspended that way by an earlier start gets one too, unless one waits. So a
-    /// tree carries on by itself; [`Engine::with_resume_after_restart`] turns this off. Other
+    /// So a tree carries on by itself; [`Engine::with_resume_after_restart`] turns this off. A run
+    /// more than three restarts stopped is left suspended, saying why, in case it is what takes
+    /// the engine down. A run already suspended that way gets its resume again only when the
+    /// start that stopped it had queued one (it was lost to a second stop); one stopped by an
+    /// engine without automatic resume (an older version, or this off) stays suspended. Other
     /// `Suspended` runs stay suspended and `Queued` runs stay queued, except a run waiting on its
     /// own question (`kestrel.ask_human`): nobody waits for that answer any more, so the question is
     /// declined (unless already answered), the run fails, and its live children are cancelled
@@ -1358,10 +1366,16 @@ impl Engine {
                     report.interrupted.push(run.id);
                     self.resume_after_restart(run.id)?;
                 }
-                // Suspended by an earlier start for its restart, and never got going again (its
-                // resume was lost, or this was off then).
-                RunStatus::Suspended(SuspendReason::Error(ref why)) if why == ENGINE_RESTARTED => {
-                    self.resume_after_restart(run.id)?;
+                // Suspended for its restart by a start that queued its resume, which was lost
+                // (claimed, then serve stopped again before a slot freed): queued again. A run an
+                // engine without automatic resume stopped (an older version, or this turned off)
+                // is left for a person.
+                RunStatus::Suspended(SuspendReason::Error(ref why))
+                    if why == ENGINE_RESTARTED && self.resume_was_queued(run.id)? =>
+                {
+                    if self.inner.resume_after_restart {
+                        store.push_control_once(run.id, ControlCommand::Resume)?;
+                    }
                     report.suspended.push(run.id);
                 }
                 // A question (`kestrel.ask_human`) was asked from inside a tool call that is gone
@@ -1410,18 +1424,64 @@ impl Engine {
         Ok(report)
     }
 
-    /// Queues a resume of `run`, which the restart stopped, unless that is turned off
-    /// ([`Engine::with_resume_after_restart`]) or one already waits. `run_forever` delivers it when
-    /// a slot is free, in line with everything else.
+    /// Queues a resume of `run`, which the restart just stopped, unless that is turned off
+    /// ([`Engine::with_resume_after_restart`]) or one already waits, and marks the run with
+    /// [`RESUMING`] so a later start can tell a lost resume from a run left for a person.
+    /// `run_forever` delivers it when a slot is free, in line with everything else.
+    ///
+    /// A run that takes serve down would otherwise be resumed on every start: once more than
+    /// [`MAX_RESTART_RESUMES`] restarts have stopped it, it is left suspended, and its log says
+    /// why. A person can still resume it.
     fn resume_after_restart(&self, run: RunId) -> Result<()> {
-        if self.inner.resume_after_restart {
-            self.inner
-                .store
-                .push_control_once(run, ControlCommand::Resume)?;
+        if !self.inner.resume_after_restart {
+            return Ok(());
         }
+        let store = &self.inner.store;
+        let stops = store
+            .events_since(run, 0)?
+            .into_iter()
+            .filter(
+                |e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if *to == restarted()),
+            )
+            .count();
+        if stops > MAX_RESTART_RESUMES {
+            let line = format!(
+                "kestrel: not resumed automatically: {stops} restarts of the engine stopped this \
+                 run, so it may be what takes the engine down; resume it by hand"
+            );
+            store.append(run, EventKind::AgentLog { line })?;
+            return Ok(());
+        }
+        store.append(
+            run,
+            EventKind::AgentLog {
+                line: RESUMING.into(),
+            },
+        )?;
+        store.push_control_once(run, ControlCommand::Resume)?;
         Ok(())
     }
+
+    /// Whether the start that suspended `run` for its restart queued a resume for it: its last
+    /// stop by a restart is followed by [`RESUMING`].
+    fn resume_was_queued(&self, run: RunId) -> Result<bool> {
+        let events = self.inner.store.events_since(run, 0)?;
+        let last_stop = events.iter().rposition(
+            |e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if *to == restarted()),
+        );
+        Ok(last_stop.is_some_and(|at| {
+            events[at..]
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::AgentLog { line } if line == RESUMING))
+        }))
+    }
 }
+
+/// How many restarts may stop a run and still have it resumed automatically.
+const MAX_RESTART_RESUMES: usize = 3;
+
+/// Logged by a start that stopped a run and queued its resume.
+const RESUMING: &str = "kestrel: the engine restarted; this run resumes when a slot is free";
 
 /// The status of a run the restart stopped.
 fn restarted() -> RunStatus {
@@ -1437,6 +1497,16 @@ impl Inner {
     /// The sandbox registry and scheduler flag.
     fn live(&self) -> MutexGuard<'_, Live> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `parent`'s spawn counts, made empty the first time.
+    fn spawn_counts(&self, parent: RunId) -> SpawnCounts {
+        self.spawn_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(parent)
+            .or_default()
+            .clone()
     }
 
     /// Starts counting `run`'s spawns afresh: its agent starts again, or it ended.
