@@ -21,6 +21,8 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `start_paused`: the wait for a removal already in progress runs in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # Tests that need a real sandbox runtime (gVisor). Run with `--features integration`.
