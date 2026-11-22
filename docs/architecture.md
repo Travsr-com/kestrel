@@ -454,6 +454,17 @@ clients. It is an explicit `AUTOINCREMENT` primary key, not SQLite's implicit ro
 cannot renumber it and a value is never handed out twice. Schema v5 added it; the migration copies
 every existing event with its old rowid as its cursor.
 
+The first open at v5 rewrites the whole `events` table in one transaction (create `events_new`,
+copy, drop `events`, rename, recreate the indexes):
+
+* It takes time in proportion to the number of events.
+* The WAL grows to about the size of the table. Leave roughly twice the events data free on disk.
+* Other kestrel processes, an older `kestrel serve` included, are blocked meanwhile and may fail
+  with "database is locked" after the 30 s busy timeout. Stop them before upgrading.
+* If it fails (a full disk, say), nothing changes and the database stays at v4.
+
+See [Upgrading](quickstart.md#upgrading).
+
 Traces for future training are a view over `events` + `model_calls` + `approvals`, not a separate pipeline.
 
 ## 6. Workspace layout

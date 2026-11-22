@@ -292,21 +292,27 @@ CREATE INDEX events_run ON events (run_id);
 /// `events`, which `VACUUM` may renumber; an `INTEGER PRIMARY KEY` is kept as is, and
 /// `AUTOINCREMENT` never hands out a value again, even if its row is gone. SQLite cannot add a
 /// primary key to a table, so the table is rebuilt: every row is copied with its rowid as its
-/// cursor (which also starts the `AUTOINCREMENT` counter at the newest one). The old table is
-/// renamed first so the new one, its unique index and `events_run` keep their names.
+/// cursor (which also starts the `AUTOINCREMENT` counter at the newest one).
+///
+/// The order is SQLite's recommended one (<https://sqlite.org/lang_altertable.html>, "Making
+/// Other Kinds Of Table Schema Changes"): create `events_new`, copy, drop `events`, rename
+/// `events_new` to `events`, recreate the indexes. Renaming the old table first instead would
+/// silently move any trigger or view on `events` onto the old table, which is then dropped. It all
+/// runs in the migration's one transaction, so a failure (a full disk, say) leaves v4 as it was.
+/// The copy rewrites the whole table, so the first v5 open takes time and WAL space in proportion
+/// to the number of events (see `docs/quickstart.md`, "Upgrading").
 const SCHEMA_V5: &str = "
-ALTER TABLE events RENAME TO events_v4;
-DROP INDEX events_run;
-CREATE TABLE events (
+CREATE TABLE events_new (
     cursor INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     seq    INTEGER NOT NULL,
     body   TEXT NOT NULL,
     UNIQUE (run_id, seq)
 );
-INSERT INTO events (cursor, run_id, seq, body)
-    SELECT rowid, run_id, seq, body FROM events_v4 ORDER BY rowid;
-DROP TABLE events_v4;
+INSERT INTO events_new (cursor, run_id, seq, body)
+    SELECT rowid, run_id, seq, body FROM events ORDER BY rowid;
+DROP TABLE events;
+ALTER TABLE events_new RENAME TO events;
 CREATE INDEX events_run ON events (run_id);
 ";
 

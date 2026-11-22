@@ -194,6 +194,22 @@ kestrel resume <run-id>
 
 A resumed run starts the agent command again in the same workspace.
 
+## Upgrading
+
+Stop every kestrel process (`serve`, `up`, any `run --watch`), install the new binary, then start
+it. The first open migrates the database to the new schema; an older binary refuses a database
+that a newer one migrated.
+
+The upgrade to schema v5 rewrites the whole event log once, in one transaction:
+
+* It takes longer the more events the database holds.
+* The WAL file grows to about the size of the event log. Leave roughly twice the size of the
+  events data free on disk.
+* Any kestrel process still running, an older `serve` included, is blocked until it finishes and
+  may fail with `database is locked` after 30 seconds. That is why you stop them first.
+* If it fails (a full disk, say), nothing is changed: the database stays as it was. Free some
+  space and start again.
+
 ## Known limits in M1
 
 * Resuming a paused run restarts the agent from the beginning.
