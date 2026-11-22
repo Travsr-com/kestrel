@@ -1483,4 +1483,107 @@ mod tests {
         ));
         assert!(matches!(store.take_control(), Err(StoreError::Serde(_))));
     }
+
+    /// Every `events` row by rowid, as v4 stored it.
+    type RawEvent = (i64, String, i64, String);
+
+    fn raw_events(conn: &Connection) -> Vec<RawEvent> {
+        let mut stmt = conn
+            .prepare("SELECT rowid, run_id, seq, body FROM events ORDER BY rowid")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows")
+    }
+
+    /// The whole schema: every table, index and trigger with its SQL.
+    fn raw_schema(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows")
+    }
+
+    fn version_of(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version")
+    }
+
+    // #98: the v4 to v5 rebuild of `events` is all or nothing. When the disk fills up while the
+    // rows are copied, the migration fails and the database is still the v4 one, untouched.
+    #[test]
+    fn a_v5_migration_that_fails_partway_leaves_the_v4_database_as_it_was() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("kestrel.db");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.db");
+        std::fs::copy(&fixture, &path).expect("copy the v4 fixture");
+        let mut conn = Connection::open(&path).expect("raw open");
+        assert_eq!(version_of(&conn), 4, "the fixture must be a v4 database");
+
+        // Enough events that copying them needs far more pages than the limit leaves free.
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400)
+             INSERT INTO events (run_id, seq, body)
+                 SELECT 'padding', i, hex(zeroblob(500)) FROM n;",
+        )
+        .expect("pad the event log");
+        let events = raw_events(&conn);
+        let schema = raw_schema(&conn);
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .expect("page_count");
+        // Room for the new table and its index, not for the rows.
+        conn.query_row(
+            &format!("PRAGMA max_page_count = {}", pages + 4),
+            [],
+            |_| Ok(()),
+        )
+        .expect("cap the file size");
+
+        match migrate(&mut conn) {
+            Err(StoreError::Sqlite(e)) => {
+                assert_eq!(e.sqlite_error_code(), Some(ErrorCode::DiskFull), "{e}");
+            }
+            other => panic!("expected a disk-full error, got {other:?}"),
+        }
+
+        assert_eq!(
+            version_of(&conn),
+            4,
+            "a failed migration must not bump the version"
+        );
+        let has_cursor: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'cursor'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("table_info");
+        assert!(
+            !has_cursor,
+            "a failed migration must not leave a cursor column"
+        );
+        assert_eq!(
+            raw_events(&conn),
+            events,
+            "a failed migration changed events"
+        );
+        assert_eq!(
+            raw_schema(&conn),
+            schema,
+            "a failed migration changed the schema (events, events_run or a leftover table)"
+        );
+        drop(conn);
+
+        // With room again, the next open migrates as usual and keeps every cursor.
+        let store = Store::open(&path).expect("open migrates");
+        drop(store);
+        let conn = Connection::open(&path).expect("raw open");
+        assert_eq!(version_of(&conn), SCHEMA_VERSION);
+        assert_eq!(raw_events(&conn), events);
+    }
 }

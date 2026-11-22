@@ -1,5 +1,6 @@
 //! Issue #32, scenario 8: `events_since_global` streams the events of one whole run tree in commit
-//! order, with the `events` rowid as the cursor.
+//! order, with the `events.cursor` column (an explicit `INTEGER PRIMARY KEY` since #98) as the
+//! cursor.
 
 // Test helpers outside `#[test]` fns are not covered by `allow-expect-in-tests`; a panic is the
 // right way to fail here.
@@ -49,11 +50,11 @@ fn events(stream: &[(u64, Event)]) -> Vec<Event> {
     stream.iter().map(|(_, event)| event.clone()).collect()
 }
 
-/// `(rowid, run_id, seq)` of every row in `events`, in rowid order, read with a raw connection.
+/// `(cursor, run_id, seq)` of every row in `events`, in cursor order, read with a raw connection.
 fn raw_events(path: &Path) -> Vec<(u64, RunId, u64)> {
     let conn = rusqlite::Connection::open(path).expect("raw open");
     let mut stmt = conn
-        .prepare("SELECT rowid, run_id, seq FROM events ORDER BY rowid")
+        .prepare("SELECT cursor, run_id, seq FROM events ORDER BY cursor")
         .expect("prepare");
     let raw = stmt
         .query_map([], |r| {
@@ -67,9 +68,9 @@ fn raw_events(path: &Path) -> Vec<(u64, RunId, u64)> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("rows");
     raw.into_iter()
-        .map(|(rowid, run, seq)| {
+        .map(|(cursor, run, seq)| {
             (
-                u64::try_from(rowid).expect("rowid is positive"),
+                u64::try_from(cursor).expect("cursor is positive"),
                 run.parse().expect("run id parses"),
                 u64::try_from(seq).expect("seq is positive"),
             )
@@ -219,9 +220,10 @@ fn s8_global_read_returns_only_tree_a_in_commit_order_then_nothing_from_the_last
     assert_eq!(both.len(), 16, "every event has its own cursor");
 }
 
-// 8. "... using the `events` rowid as the cursor": the cursors are the rowids of the tree's rows.
+// 8. "... using the `events` rowid as the cursor", which #98 made the explicit `events.cursor`
+//    column: the stream hands out the `cursor` values of the tree's rows.
 #[test]
-fn s8_the_cursor_is_the_events_rowid() {
+fn s8_the_cursor_is_the_events_cursor_column() {
     let dir = TempDir::new().expect("tempdir");
     let f = forest(&dir);
     let tree_a = f.tree_a();
@@ -269,7 +271,7 @@ fn s8_reading_from_a_cursor_returns_only_later_events() {
     assert!(!later.is_empty() && later.len() < all.len());
     assert_eq!(global(&f.store, f.root_a, b_cursor), later);
 
-    // A cursor past the end, even one no rowid can reach, is an empty read and not an error.
+    // A cursor past the end, even one no event can have, is an empty read and not an error.
     let last = all.last().expect("tree A has events").0;
     assert!(global(&f.store, f.root_a, last + 1_000).is_empty());
     assert!(global(&f.store, f.root_a, u64::MAX).is_empty());

@@ -296,6 +296,33 @@ fn s1_events_has_an_explicit_autoincrement_cursor_column() {
     }
 }
 
+// 1. The rebuild leaves no trace: no temporary table, and `events` has exactly the indexes a new
+//    database has (the unique `(run_id, seq)` index under its own name, and `events_run`).
+#[test]
+fn s1_the_rebuild_leaves_the_same_tables_and_indexes_as_a_new_database() {
+    let v4 = TempDir::new().expect("tempdir");
+    let new = TempDir::new().expect("tempdir");
+    let migrated = migrated_v4(&v4);
+    let fresh = fresh(&new);
+    let tables = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name";
+    let indexes = "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'
+                   ORDER BY name";
+    let want: Vec<Vec<Value>> = ["events_run", "sqlite_autoindex_events_1"]
+        .iter()
+        .map(|n| vec![Value::Text((*n).into())])
+        .collect();
+    assert_eq!(rows(&migrated, indexes), want);
+    assert_eq!(rows(&fresh, indexes), want);
+    assert_eq!(rows(&migrated, tables), rows(&fresh, tables));
+    let names: Vec<Value> = rows(&migrated, tables).into_iter().flatten().collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| matches!(n, Value::Text(t) if t.starts_with("events_"))),
+        "a rebuild table was left behind: {names:?}"
+    );
+}
+
 // 1. A v3 database goes through v4 to v5 in one open and keeps its cursors 1 to 10.
 #[test]
 fn s1_v3_database_migrates_to_v5_and_keeps_its_cursors() {
