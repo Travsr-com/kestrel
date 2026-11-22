@@ -393,6 +393,48 @@ async fn i90_s3_an_ended_run_answers_409_on_every_command() {
     );
 }
 
+// PR #108 review: an ended root that kept a live child still takes a cancel (202, the engine
+// cancels the live tree below it); other commands are 409, and so is cancel once nothing below
+// is live.
+#[tokio::test]
+async fn i90_cancel_on_an_ended_root_with_a_live_kept_child_is_accepted() {
+    let store = store();
+    let root = store.create_run(&agent("lead"), "x").unwrap();
+    run(&store, root);
+    let kid = store.create_child_run(root, &agent("lead"), "kid").unwrap();
+    run(&store, kid);
+    store
+        .transition(root, &RunStatus::Running, RunStatus::Completed)
+        .unwrap();
+    let app = app(store.clone());
+
+    let (status, _, _) = send(&app, req("POST", &format!("/api/runs/{root}/cancel"), None)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let cmds: Vec<(RunId, ControlCommand)> = store
+        .take_control()
+        .unwrap()
+        .into_iter()
+        .map(|(_, run, cmd)| (run, cmd))
+        .collect();
+    assert_eq!(cmds, [(root, ControlCommand::Cancel)]);
+    let (status, body) = json(&app, req("POST", &format!("/api/runs/{root}/pause"), None)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    store
+        .transition(kid, &RunStatus::Running, RunStatus::Cancelled)
+        .unwrap();
+    let (status, body) = json(&app, req("POST", &format!("/api/runs/{root}/cancel"), None)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("the run has ended (completed)"),
+        "{body}"
+    );
+    assert!(store.take_control().unwrap().is_empty());
+}
+
 // Issue #90: a bad budget body is still 400 on an ended run; the body is checked first.
 #[tokio::test]
 async fn i90_a_bad_budget_on_an_ended_run_is_still_400() {

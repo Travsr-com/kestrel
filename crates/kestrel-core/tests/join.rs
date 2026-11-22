@@ -477,6 +477,25 @@ async fn a_parent_that_keeps_its_children_leaves_them_running() {
     assert!(h.is(child, &RunStatus::Running));
 }
 
+// PR #108 review: the CLI and the API let a cancel through to an ended root that kept a live
+// child, because the engine cancels the live tree below it. The root itself stays as it ended.
+#[tokio::test(start_paused = true)]
+async fn cancelling_an_ended_root_that_kept_its_children_cancels_them() {
+    let mut h = harness(4);
+    let (lead, session) = parent(&mut h, true).await;
+    let _c = h.driver.live();
+    let child = spawn(&h, lead).await;
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    session.exit(0);
+    until("parent completed", || h.is(lead, &RunStatus::Completed)).await;
+    assert_eq!(h.store.live_below(lead).unwrap(), vec![child]);
+
+    h.control(lead, ControlCommand::Cancel);
+    until("child cancelled", || h.is(child, &RunStatus::Cancelled)).await;
+    assert!(h.is(lead, &RunStatus::Completed), "the root keeps its end");
+    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+}
+
 // 12. A cancel that reaches a child still `Queued` means it never starts and leaves no sandbox.
 #[tokio::test(start_paused = true)]
 async fn s12_a_queued_child_that_is_cancelled_never_starts() {

@@ -324,3 +324,49 @@ fn i90_a_run_waiting_on_an_approval_is_not_resumed_but_can_be_cancelled() {
         ]
     );
 }
+
+// PR #108 review: a root that ended and kept its children (`spawn.keep_children`) is still the
+// handle on its live tree. Cancel is accepted (the engine cancels every live run below it); every
+// other command is still refused, and so is cancel once nothing below is live.
+#[test]
+fn i90_cancel_on_an_ended_root_with_a_live_kept_child_is_sent() {
+    let f = Fixture::new();
+    let store = f.store();
+    let root = running_run(&store);
+    let kid = store
+        .create_child_run(root, &agent(), "kid")
+        .expect("create child");
+    walk(
+        &store,
+        kid,
+        RunStatus::Queued,
+        &[RunStatus::Provisioning, RunStatus::Running],
+    );
+    walk(&store, root, RunStatus::Running, &[RunStatus::Completed]);
+    let run = root.to_string();
+
+    f.kestrel()
+        .args(["cancel", &run])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("sent cancel to {run}")));
+    assert_eq!(commands(&store), vec![(root, ControlCommand::Cancel)]);
+    for args in [
+        vec!["pause", run.as_str()],
+        vec!["budget", run.as_str(), "3"],
+    ] {
+        f.kestrel()
+            .args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("the run has ended (completed)"));
+    }
+
+    walk(&store, kid, RunStatus::Running, &[RunStatus::Cancelled]);
+    f.kestrel()
+        .args(["cancel", &run])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("the run has ended (completed)"));
+    assert!(commands(&store).is_empty());
+}
