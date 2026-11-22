@@ -159,8 +159,20 @@ jobs:
       # The real-Travsr tests build only with `integration`, so the checks job does not lint them.
       - name: Clippy with the integration tests
         run: cargo clippy -p kestrel-cli --features integration --all-targets -- -D warnings
-      - name: Real-Travsr tests
-        run: cargo test -p kestrel-cli --features integration --lib travsr::tests -- --nocapture
+      # By its full path, and checked to have run, so a rename or a cfg change cannot leave this
+      # job passing with no real-Travsr run.
+      - name: The real-Travsr test
+        run: |
+          set -o pipefail
+          test=travsr::tests::with_fake::s12_the_index_answers_from_the_private_copy_and_never_sees_the_workspace
+          cargo test -p kestrel-cli --features integration --lib -- --exact "$test" --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/real-travsr.log"
+          if ! grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/real-travsr.log"; then
+            echo "error: $test did not run and pass" >&2
+            exit 1
+          fi
+      - name: The other Travsr tests
+        run: cargo test -p kestrel-cli --features integration --lib travsr::tests -- --skip s12_the_index_answers_from_the_private_copy_and_never_sees_the_workspace --nocapture
 
   e2e:
     name: end-to-end (gVisor, M1)
