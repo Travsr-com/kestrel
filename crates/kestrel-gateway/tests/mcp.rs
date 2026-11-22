@@ -642,6 +642,194 @@ async fn a_json_only_client_gets_a_json_answer() {
     assert_eq!(content(&message(response).await), json!("release/2.4"));
 }
 
+/// The bridge (`socat -T 300`) cuts a connection that is idle for 300 s; a join longer than that.
+const PAST_THE_BRIDGE: Duration = Duration::from_secs(330);
+
+/// Every chunk of a response body, with when it came (counted from `started`).
+async fn chunks(
+    response: axum::response::Response,
+    started: tokio::time::Instant,
+) -> Vec<(Duration, String)> {
+    let mut stream = response.into_body().into_data_stream();
+    let mut seen = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+        seen.push((started.elapsed(), chunk));
+    }
+    seen
+}
+
+/// The longest stretch with no bytes, from `started` to the last chunk.
+fn longest_silence(seen: &[(Duration, String)]) -> Duration {
+    let mut last = Duration::ZERO;
+    let mut longest = Duration::ZERO;
+    for (at, _) in seen {
+        longest = longest.max(*at - last);
+        last = *at;
+    }
+    longest
+}
+
+/// Issue #91 scenario 1: a JSON-only client's join that outlasts the bridge's idle timeout gets a
+/// space at least every 15 s, then a body that parses as the JSON-RPC result.
+#[tokio::test(start_paused = true)]
+async fn a_json_only_long_join_is_kept_alive_with_whitespace_then_its_result() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_takes.lock().unwrap() = PAST_THE_BRIDGE;
+    let started = tokio::time::Instant::now();
+    let response = send(
+        &s.app,
+        TOKEN_A,
+        call(7, "kestrel.join", json!({})).to_string().into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let seen = chunks(response, started).await;
+    assert!(
+        longest_silence(&seen) <= Duration::from_secs(15),
+        "{seen:?}"
+    );
+    let (ended, _) = seen.last().expect("a body");
+    assert!(*ended >= PAST_THE_BRIDGE, "{seen:?}");
+    let body: String = seen.iter().map(|(_, c)| c.as_str()).collect();
+    let json_at = body.find('{').expect("a JSON body");
+    let (padding, _) = body.split_at(json_at);
+    assert!(padding.len() >= 20, "{} bytes of padding", padding.len());
+    assert!(padding.bytes().all(|b| b == b' '), "{padding:?}");
+    let msg: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(msg["jsonrpc"], json!("2.0"));
+    assert_eq!(msg["id"], json!(7));
+    assert_eq!(content(&msg)["children"][0]["outcome"], json!("completed"));
+    assert_eq!(s.host.joins.lock().unwrap().len(), 1);
+}
+
+/// Issue #91: a JSON-only client that goes away after its padded body started gives its room back
+/// (the next long call fits under a cap of 1), and calling again with the same id gets the one
+/// join's result, never a second join.
+#[tokio::test(start_paused = true)]
+async fn a_json_only_client_that_leaves_mid_padding_gives_its_room_back_and_its_call_is_kept() {
+    let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 1 });
+    let token = &runs[0].0;
+    let join = call(300, "kestrel.join", json!({}))
+        .to_string()
+        .into_bytes();
+    let response = send(&app, token, join.clone(), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.expect("the padding started").unwrap();
+    assert!(first.iter().all(|b| *b == b' '), "{first:?}");
+    // The client goes away mid-padding.
+    drop(body);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let ask = send(
+        &app,
+        token,
+        call(301, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(
+        message(ask).await["result"]["isError"],
+        json!(false),
+        "the room came back when the client left"
+    );
+    assert!(host.refused.lock().unwrap().is_empty());
+
+    let again = message(send(&app, token, join, true).await).await;
+    assert_eq!(
+        content(&again)["children"][0]["outcome"],
+        json!("completed")
+    );
+    assert_eq!(host.joins.lock().unwrap().len(), 1, "one join, never two");
+}
+
+/// Issue #91 scenario 2: an SSE client's long join still gets a keepalive comment every 15 s,
+/// never bare whitespace, then its result as an event.
+#[tokio::test(start_paused = true)]
+async fn an_sse_long_join_keeps_its_15_s_keepalive_comments() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_takes.lock().unwrap() = PAST_THE_BRIDGE;
+    let started = tokio::time::Instant::now();
+    let response = send(
+        &s.app,
+        TOKEN_A,
+        call(8, "kestrel.join", json!({})).to_string().into_bytes(),
+        true,
+    )
+    .await;
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let seen = chunks(response, started).await;
+    assert!(
+        longest_silence(&seen) <= Duration::from_secs(15),
+        "{seen:?}"
+    );
+    let (comments, events): (Vec<_>, Vec<_>) = seen.iter().partition(|(_, c)| c.starts_with(':'));
+    assert!(comments.len() >= 20, "{seen:?}");
+    assert!(
+        comments
+            .iter()
+            .all(|(at, _)| *at >= Duration::from_secs(15)),
+        "{seen:?}"
+    );
+    assert_eq!(events.len(), 1, "{seen:?}");
+    let data = events[0]
+        .1
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .expect("an SSE data line");
+    let msg: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(msg["id"], json!(8));
+    assert_eq!(content(&msg)["children"][0]["summary"], json!("done"));
+}
+
+/// Issue #91: a JSON call that answers within 15 s is unchanged, a plain JSON body with no
+/// leading whitespace: a spawn that does not wait, and a join that answers quickly.
+#[tokio::test(start_paused = true)]
+async fn a_json_call_answered_within_15_s_has_no_leading_whitespace() {
+    let s = setup(&KestrelTool::ALL);
+    *s.host.join_takes.lock().unwrap() = Duration::from_secs(14);
+    let calls = [
+        call(
+            20,
+            "kestrel.spawn",
+            json!({ "agent": "worker", "input": "x" }),
+        ),
+        call(21, "kestrel.join", json!({})),
+    ];
+    for request in calls {
+        let response = send(&s.app, TOKEN_A, request.to_string().into_bytes(), false).await;
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        assert!(
+            response.headers().contains_key(header::CONTENT_LENGTH),
+            "a quick answer keeps its Content-Length"
+        );
+        let body = text(response).await;
+        assert!(body.starts_with('{'), "{body:?}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    }
+}
+
 #[tokio::test]
 async fn ping_answers_with_an_empty_result() {
     let s = setup(&KestrelTool::ALL);

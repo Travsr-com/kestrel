@@ -4,7 +4,10 @@
 //! same run token. The protocol is MCP's streamable HTTP ([`MCP_PROTOCOL_VERSION`]): one JSON-RPC
 //! message per `POST`. `initialize`, `ping` and `tools/list` answer with JSON. `tools/call` answers
 //! with an event stream when the client accepts one, and sends a keepalive comment every 15 s while
-//! a long call (`join`, `ask_human`) waits, so the connection through the bridge stays up.
+//! a long call (`join`, `ask_human`, a spawn that waits) waits, so the connection through the
+//! bridge (idle timeout 300 s) stays up. A JSON-only client gets a plain JSON body when the call
+//! answers within 15 s, else a space every 15 s and then the result (leading whitespace is valid
+//! JSON).
 //!
 //! * **Who acts**: the run is the one the token resolves to, never one named in the request.
 //! * **What it may call**: [`ToolHost::tools`] lists the tools the run's capability allows.
@@ -27,6 +30,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -38,6 +43,8 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures::StreamExt;
 use kestrel_types::{MicroUsd, RunId};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -629,7 +636,13 @@ async fn call(
         }
     };
     if !events {
-        return Json(rpc_result(id, wait.await)).into_response();
+        // A call that answers within one keepalive period gets a plain JSON body. A longer one
+        // gets a space every period, so the bridge never sees it idle, then the result.
+        let mut wait = Box::pin(wait);
+        return match tokio::time::timeout(KEEPALIVE, &mut wait).await {
+            Ok(value) => Json(rpc_result(id, value)).into_response(),
+            Err(_) => padded(id, wait),
+        };
     }
     let stream = futures::stream::once(async move {
         let message = rpc_result(id, wait.await);
@@ -637,6 +650,32 @@ async fn call(
     });
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(KEEPALIVE))
+        .into_response()
+}
+
+/// A JSON answer for a client that does not accept an event stream, to a call still waiting: a
+/// space at once and every [`KEEPALIVE`] after, then the JSON-RPC result. Leading whitespace is
+/// valid JSON, so the body still parses as the result.
+fn padded<F>(id: Value, wait: Pin<Box<F>>) -> Response
+where
+    F: Future<Output = Value> + Send + 'static,
+{
+    let mut ticks = tokio::time::interval(KEEPALIVE);
+    // A client that stopped reading for a while gets one space when it reads again, not a burst.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let stream = futures::stream::unfold(Some((wait, ticks, id)), |open| async move {
+        let (mut wait, mut ticks, id) = open?;
+        tokio::select! {
+            biased;
+            value = &mut wait => Some((Bytes::from(rpc_result(id, value).to_string()), None)),
+            _ = ticks.tick() => Some((Bytes::from_static(b" "), Some((wait, ticks, id)))),
+        }
+    })
+    .map(Ok::<_, Infallible>);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from_stream(stream),
+    )
         .into_response()
 }
 
