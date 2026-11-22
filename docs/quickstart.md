@@ -2,8 +2,8 @@
 
 Run one AI coding agent in a sandbox, with a spending limit, and watch it work.
 
-This is the M1 slice. It works on Linux with Docker and gVisor. The web UI, schedules, chat and
-meeting agents come in later milestones (see [architecture](architecture.md)).
+It works on Linux with Docker and gVisor. The web UI comes with `kestrel up` (step 4). Schedules,
+chat and meeting agents come in later milestones (see [architecture](architecture.md)).
 
 ## What you need
 
@@ -39,8 +39,9 @@ Kestrel warns you if other users can read it.
 # Long tool calls (a waiting `kestrel.join`, a question) held open at once across all runs,
 # from 1 to 4096. Default 256. Past the limit a call is refused with a clear error.
 # max_waiting_calls = 256
-# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24) get their
-# addresses. Default 10.200.0.0/16. Change it if that range is already used on your network.
+# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24, less in a
+# small pool) get their addresses. An IPv4 CIDR string, default "10.200.0.0/16". Change it if that
+# range is already used on your network.
 # subnet_pool = "10.200.0.0/16"
 
 [engine]
@@ -302,12 +303,11 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
 ## Known limits in M1
 
 * Resuming a paused run restarts the agent from the beginning.
-* The agent cannot run `git` inside the sandbox yet ([#22](https://github.com/Travsr-com/kestrel/issues/22)).
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
 * With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
   Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`), and the
-  bridge's `kestrel-gw` network gets a `/24` of it the first time serve creates it.
+  bridge's `kestrel-gw` network gets a `/24` of it (less in a small pool) the first time serve creates it.
 
 ## If something goes wrong
 
