@@ -2409,6 +2409,29 @@ budget: { usd: 0.000010, wall_clock: 10m }
         }
     }
 
+    // Issue #92: runs the restart stopped are resumed by default; `false` leaves them suspended.
+    #[test]
+    fn resume_after_restart_defaults_to_on_and_must_be_true_or_false() {
+        let (_dir, path) = write(ANTHROPIC);
+        assert!(load_config(&path).expect("config").resume_after_restart);
+        let (_dir, path) = write(&format!(
+            "[engine]\nresume_after_restart = false\n{ANTHROPIC}"
+        ));
+        assert!(!load_config(&path).expect("config").resume_after_restart);
+        let (_dir, path) = write(&format!(
+            "[engine]\nresume_after_restart = true\n{ANTHROPIC}"
+        ));
+        assert!(load_config(&path).expect("config").resume_after_restart);
+        for bad in ["'secret-x'", "1", "['true']"] {
+            let (_dir, path) = write(&format!(
+                "[engine]\nresume_after_restart = {bad}\n{ANTHROPIC}"
+            ));
+            let err = load_config(&path).expect_err(bad).message;
+            assert!(err.contains("engine.resume_after_restart"), "{bad}: {err}");
+            assert!(!err.contains("secret-x"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn agents_dir_defaults_to_none_and_must_be_an_absolute_path() {
         let (_dir, path) = write(ANTHROPIC);
