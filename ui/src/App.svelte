@@ -147,7 +147,7 @@
   {:else}
     {#key attempt}
       {#if route.name === 'fleet'}
-        <Fleet {api} {onUnauthorized} {sockets} {approvals} />
+        <Fleet {api} {onUnauthorized} {sockets} {approvals} liveRuns={active} />
       {:else if route.name === 'approvals'}
         <Approvals {approvals} {api} {onUnauthorized} onRetry={() => retryApprovals()} />
       {:else if route.name === 'run'}

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { FleetState, type FleetRun } from '../lib/fleet.svelte';
+  import type { ActiveRuns } from '../lib/active.svelte';
   import type { ApprovalsState } from '../lib/approvals.svelte';
   import { formatUsd, newestFirst, statusTone } from '../lib/format';
   import { Unauthorized, type Api } from '../lib/api';
@@ -24,6 +25,7 @@
     sockets = browserSocket,
     base = socketBase(window.location),
     approvals,
+    liveRuns,
   }: {
     api: Api;
     onUnauthorized: OnUnauthorized;
@@ -31,6 +33,8 @@
     base?: string;
     /** The pending approvals App.svelte keeps; without it, Needs you counts the runs waiting. */
     approvals?: ApprovalsState;
+    /** The live runs App.svelte keeps from its events socket: how a run started later is found. */
+    liveRuns?: ActiveRuns;
   } = $props();
 
   /** Cards per page: the list never holds more at once. */
@@ -114,6 +118,35 @@
     retry: (id, e) => !(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false,
   });
   const refresh = (id: RunId) => refresher.refresh(id);
+
+  // A run started after the list loaded, in a tree not followed yet, reaches this view only through
+  // the app's events socket. Each one not known here is looked up once (again after a failure, at
+  // the next change to the live runs) and then shows and is followed like the rest.
+  /** Look-ups in flight or done: bookkeeping only, never rendered. */
+  const lookedUp: Record<RunId, true> = {};
+  let gone = false;
+  $effect(() => () => {
+    gone = true;
+  });
+  $effect(() => {
+    if (!loaded || !liveRuns) return;
+    const ids = liveRuns.ids;
+    untrack(() => {
+      for (const id of ids) {
+        if (fleet.runs[id] || lookedUp[id]) continue;
+        lookedUp[id] = true;
+        api.getRun(id).then(
+          (summary) => {
+            if (!gone) fleet.add(summary);
+          },
+          (e: unknown) => {
+            delete lookedUp[id];
+            if (!gone) failureText(e, onUnauthorized);
+          },
+        );
+      }
+    });
+  });
 
   function follow(root: RunId) {
     streams.set(

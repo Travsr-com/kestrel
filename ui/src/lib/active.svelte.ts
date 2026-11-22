@@ -21,6 +21,11 @@ export class ActiveRuns {
     return Object.keys(this.live).length;
   }
 
+  /** The runs that have not ended, so a view can look up one it has not seen yet. */
+  get ids(): RunId[] {
+    return Object.keys(this.live);
+  }
+
   /** Starts a sync; pass the token to `load` with the list it fetched. */
   begin(): number {
     this.gen += 1;
