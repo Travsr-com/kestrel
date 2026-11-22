@@ -135,7 +135,7 @@ fn the_bridge_span_is_a_24_by_default() {
 
 #[test]
 fn a_span_of_the_size_asked_for_is_claimed_aligned_and_no_run_block_overlaps_it() {
-    let plan = pool("10.200.0.0/16");
+    let plan = pool("10.200.0.0/20");
     plan.exclude(&[cidr("10.200.0.8/29")]);
     let held = plan.reserve().expect("a run block");
     assert_eq!(held.cidr(), cidr("10.200.0.0/29"));
@@ -143,19 +143,19 @@ fn a_span_of_the_size_asked_for_is_claimed_aligned_and_no_run_block_overlaps_it(
     let span = plan.claim_span(24).expect("a span");
     assert_eq!(span.cidr(), cidr("10.200.1.0/24"));
     assert_eq!(span.gateway().to_string(), "10.200.1.1");
-    assert_eq!(plan.available(), 8192 - 2 - 32);
+    assert_eq!(plan.available(), 512 - 2 - 32);
     assert_eq!(plan.in_use(), 1, "the span is not a run's block");
 
     // Releasing the span, as a run would, changes nothing.
     plan.release(&span);
-    assert_eq!(plan.available(), 8192 - 2 - 32);
+    assert_eq!(plan.available(), 512 - 2 - 32);
     plan.release(&held);
     let mut runs = 0;
     while let Some(run) = plan.reserve() {
         assert!(!run.cidr().overlaps(&span.cidr()), "{:?}", run.cidr());
         runs += 1;
     }
-    assert_eq!(runs, 8192 - 1 - 32);
+    assert_eq!(runs, 512 - 1 - 32);
 }
 
 #[test]

@@ -3570,7 +3570,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
             Some(cidr("10.200.0.8/29")),
             "runs still get the blocks around it"
         );
-        while let Some(run) = plan.reserve() {
+        // The next 40 runs pass the span: blocks 2 to 31, then 64 on.
+        for _ in 0..40 {
+            let run = plan.reserve().expect("a run block");
             assert!(!run.cidr().overlaps(&span.cidr()), "{:?}", run.cidr());
         }
         assert_eq!(line.lines().count(), 1, "{line}");
@@ -3743,7 +3745,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
             !host
                 .calls()
                 .iter()
-                .any(|a| a.get(2).map(String::as_str) == Some("inspect")),
+                // kestrel-gw is read by name: the bridge planning, not the subnet listing.
+                .any(|a| a.get(2).map(String::as_str) == Some("inspect")
+                    && a.last().map(String::as_str) != Some("kestrel-gw")),
             "our leftover is not inspected: {:?}",
             host.calls()
         );
