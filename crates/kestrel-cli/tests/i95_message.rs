@@ -160,7 +160,7 @@ fn watch_shows_a_message_and_its_delivery() {
     let store = f.store();
     let id = running_listener(&store);
     store.send_message(id, "also fix the docs").expect("send");
-    let taken = store.take_messages(id).expect("take");
+    let taken = store.take_messages(id, None).expect("take");
     assert_eq!(taken.len(), 1);
     walk(&store, id, RunStatus::Running, &[RunStatus::Completed]);
     f.kestrel()

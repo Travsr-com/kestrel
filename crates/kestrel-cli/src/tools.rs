@@ -657,7 +657,8 @@ mod tests {
     }
 
     /// Issue #95: `kestrel.messages` hands a running run its messages once, oldest first, as
-    /// `{"messages": [{"text": ...}]}`.
+    /// `{"messages": [{"seq": ..., "text": ...}]}`. With `after`, every later one comes again, so
+    /// a retry is safe.
     #[tokio::test]
     async fn the_engine_tools_hand_over_messages_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -670,18 +671,118 @@ mod tests {
         run(&store, lead);
         assert_eq!(tools.tools(lead).await, Ok(vec![KestrelTool::Messages]));
         assert_eq!(
-            tools.messages(lead).await.unwrap(),
+            tools.messages(lead, None).await.unwrap(),
             json!({ "messages": [] })
         );
-        store.send_message(lead, "first").unwrap();
-        store.send_message(lead, "second\nline").unwrap();
+        let first = store.send_message(lead, "first").unwrap();
+        let second = store.send_message(lead, "second\nline").unwrap();
         assert_eq!(
-            tools.messages(lead).await.unwrap(),
-            json!({ "messages": [{ "text": "first" }, { "text": "second\nline" }] })
+            tools.messages(lead, None).await.unwrap(),
+            json!({ "messages": [
+                { "seq": first.seq, "text": "first" },
+                { "seq": second.seq, "text": "second\nline" },
+            ] })
         );
         assert_eq!(
-            tools.messages(lead).await.unwrap(),
+            tools.messages(lead, None).await.unwrap(),
             json!({ "messages": [] })
         );
+        assert_eq!(
+            tools.messages(lead, Some(first.seq)).await.unwrap(),
+            json!({ "messages": [{ "seq": second.seq, "text": "second\nline" }] })
+        );
+    }
+
+    /// Review of #95: a child asks for `kestrel.messages`, but its parent does not hold it, so the
+    /// child is spawned without it. It takes no messages (`takes_messages` is false), a message
+    /// to it is 409 with why, and its tool list has no `kestrel.messages`.
+    #[tokio::test]
+    async fn a_child_whose_parent_lacks_the_grant_takes_no_messages() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let chatty = "name: chatty\nruntime: claude-code\nrole: r\n\
+             capabilities: { mcp: [kestrel.messages, kestrel.ask_human] }\n\
+             sandbox: { tier: auto, cpu: 1, memory: 512Mi, workspace: empty-dir }\n\
+             budget: { usd: \"1\", wall_clock: 1h }\n";
+        std::fs::write(dir.path().join("chatty.yaml"), chatty).unwrap();
+        let (store, tools) = engine_tools(dir.path());
+        let lead = tools
+            .engine
+            .submit(
+                with_caps(
+                    "lead",
+                    "{ mcp: [kestrel.spawn, kestrel.ask_human], spawn: { max_children: 1, max_depth: 1, agents: [chatty] } }",
+                ),
+                "x".into(),
+            )
+            .await
+            .unwrap();
+        run(&store, lead);
+        let spawned = tools
+            .spawn(
+                lead,
+                SpawnCall {
+                    agent: "chatty".into(),
+                    input: "help".into(),
+                    budget: Some(MicroUsd(100_000)),
+                    wait: false,
+                },
+            )
+            .await
+            .unwrap();
+        let child: RunId = spawned["child"].as_str().unwrap().parse().unwrap();
+        run(&store, child);
+
+        assert!(!store.takes_messages(child).unwrap());
+        assert_eq!(tools.tools(child).await, Ok(vec![KestrelTool::AskHuman]));
+
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        const HOST: &str = "127.0.0.1:7171";
+        let app = kestrel_server::router(
+            store.clone(),
+            kestrel_server::Config::new(TOKEN, HOST.parse().unwrap()),
+            Arc::new(kestrel_server::EmbeddedUi),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let ask = |method: &str, path: String, body: Option<&str>| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", HOST)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap()
+        };
+        let answer = |response: axum::response::Response| async move {
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        };
+        let (status, summary) = answer(
+            app.clone()
+                .oneshot(ask("GET", format!("/api/runs/{child}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        assert_eq!(summary["takes_messages"], json!(false), "{summary}");
+        let (status, body) = answer(
+            app.oneshot(ask(
+                "POST",
+                format!("/api/runs/{child}/message"),
+                Some(r#"{"text":"hi"}"#),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("cannot take messages"), "{error}");
     }
 }
