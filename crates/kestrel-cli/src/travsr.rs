@@ -1114,6 +1114,54 @@ mod tests {
         }
     }
 
+    /// What the real-Travsr test does: run the binary, or skip, saying why.
+    #[derive(Debug)]
+    enum RealTravsr {
+        Run(PathBuf),
+        Skip(String),
+    }
+
+    /// The travsr the real-Travsr test runs. `wanted` is `TRAVSR_BIN` (default `travsr`),
+    /// resolved on `path` as `serve` resolves `travsr.command`; `version` runs `--version`.
+    /// `pinned` is `KESTREL_TRAVSR_VERSION`: without it a travsr that is missing or does not
+    /// run is a `Skip`; with it, as in CI, that is an `Err`, and so is any other version.
+    fn real_travsr(
+        wanted: Option<std::ffi::OsString>,
+        path: Option<&OsStr>,
+        pinned: Option<&str>,
+        version: impl Fn(&Path) -> io::Result<String>,
+    ) -> Result<RealTravsr, String> {
+        let wanted = wanted.map_or_else(|| PathBuf::from("travsr"), PathBuf::from);
+        if !acceptable_command(&wanted) {
+            return Err(format!(
+                "TRAVSR_BIN must be an absolute path or a bare command name, not {}",
+                wanted.display()
+            ));
+        }
+        let missing = |why: String| match pinned {
+            Some(v) => Err(format!("{why}, but KESTREL_TRAVSR_VERSION is {v}")),
+            None => Ok(RealTravsr::Skip(format!("{why} (set TRAVSR_BIN)"))),
+        };
+        let Ok(bin) = resolve_command(&wanted, path) else {
+            return missing("no travsr binary in an absolute PATH entry".into());
+        };
+        let Ok(out) = version(&bin) else {
+            return missing(format!("{} does not run", bin.display()));
+        };
+        if let Some(v) = pinned
+            && !out
+                .split_whitespace()
+                .any(|w| w.trim_start_matches('v') == v)
+        {
+            return Err(format!(
+                "{} reports {:?}, not the pinned version {v}",
+                bin.display(),
+                out.trim()
+            ));
+        }
+        Ok(RealTravsr::Run(bin))
+    }
+
     // Issue #96, scenario 2: the real-Travsr test picks its binary with `real_travsr`. With no
     // pinned version (a developer's machine) a missing or broken travsr skips it; with one (CI)
     // that is a failure, and so is any other version than the pinned one.
@@ -1133,9 +1181,12 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let path = std::env::join_paths([empty.path()]).unwrap();
         let picked = real_travsr(None, Some(&path), None, reports("travsr 1.4.0"));
-        assert!(matches!(picked, Ok(RealTravsr::Skip(_))), "{picked:?}");
-        let err = real_travsr(None, Some(&path), Some("1.4.0"), reports("travsr 1.4.0"))
-            .unwrap_err();
+        assert!(
+            matches!(picked, Ok(RealTravsr::Skip(ref why)) if why.contains("set TRAVSR_BIN")),
+            "{picked:?}"
+        );
+        let err =
+            real_travsr(None, Some(&path), Some("1.4.0"), reports("travsr 1.4.0")).unwrap_err();
         assert!(err.contains("KESTREL_TRAVSR_VERSION"), "{err}");
         // No PATH at all is the same as an empty one.
         let picked = real_travsr(None, None, None, reports("travsr 1.4.0"));
@@ -1146,9 +1197,11 @@ mod tests {
     fn real_travsr_that_does_not_run_skips_unpinned_and_fails_pinned() {
         let bin = std::env::temp_dir().join("kestrel-no-such-travsr");
         let picked = real_travsr(Some(bin.clone().into()), None, None, does_not_run);
-        assert!(matches!(picked, Ok(RealTravsr::Skip(_))), "{picked:?}");
-        let err =
-            real_travsr(Some(bin.into()), None, Some("1.4.0"), does_not_run).unwrap_err();
+        assert!(
+            matches!(picked, Ok(RealTravsr::Skip(ref why)) if why.contains("does not run")),
+            "{picked:?}"
+        );
+        let err = real_travsr(Some(bin.into()), None, Some("1.4.0"), does_not_run).unwrap_err();
         assert!(err.contains("does not run"), "{err}");
     }
 
@@ -1167,8 +1220,16 @@ mod tests {
             assert!(err.contains("1.4.0"), "{other:?}: {err}");
         }
         // Unpinned, any version runs.
-        let picked = real_travsr(Some(bin.clone().into()), None, None, reports("travsr 0.1.0"));
-        assert!(matches!(picked, Ok(RealTravsr::Run(ref b)) if *b == bin), "{picked:?}");
+        let picked = real_travsr(
+            Some(bin.clone().into()),
+            None,
+            None,
+            reports("travsr 0.1.0"),
+        );
+        assert!(
+            matches!(picked, Ok(RealTravsr::Run(ref b)) if *b == bin),
+            "{picked:?}"
+        );
     }
 
     #[test]
