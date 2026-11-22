@@ -279,7 +279,7 @@ fn s1_branch_name_uses_the_run_id_tail() {
 // Scenario 2: git-clone gives each run its own clone and branch (fake git, exact argv).
 // ---------------------------------------------------------------------------------------------
 
-/// `git clone --local --no-hardlinks <extra> -- <repo> <path>` (`extra` goes before the `--`), then the branch checkout inside the fresh clone with host hooks disabled.
+/// `git clone --local --no-hardlinks --template= <extra> -- <repo> <path>` (`extra` goes before the `--`), then the branch checkout inside the fresh clone with host hooks disabled.
 fn expected_calls(
     repo: &str,
     source: &str,
@@ -288,7 +288,7 @@ fn expected_calls(
     branch: &str,
 ) -> Vec<Vec<String>> {
     let p = path.to_str().unwrap();
-    let mut clone = s(&["git", "clone", "--local", "--no-hardlinks"]);
+    let mut clone = s(&["git", "clone", "--local", "--no-hardlinks", "--template="]);
     clone.extend(s(extra));
     clone.extend(s(&["--", source, p]));
     vec![

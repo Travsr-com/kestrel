@@ -272,6 +272,32 @@ async fn s1_a_completed_run_with_a_commit_brings_its_branch_home() {
     assert_eq!(git(&s.repo, &["status", "--porcelain"]), "");
 }
 
+/// A host git template (`init.templateDir`) may hold links, say hooks linked from a dotfiles
+/// repo. Copied into the clone, any link in `.git` makes the fetch refuse the clone, so the clone
+/// gets no template at all and its branch still comes home.
+#[tokio::test(start_paused = true)]
+async fn s1_the_clone_gets_no_git_template_and_its_branch_still_comes_home() {
+    need_git!();
+    let s = setup(4);
+    let (id, clone, ctl) = running(&s).await;
+    for from_template in ["hooks", "description", "info/exclude"] {
+        assert!(
+            !clone.join(".git").join(from_template).exists(),
+            "`.git/{from_template}` came from the host's git template"
+        );
+    }
+    let tip = commit_file(&clone, "agent.txt", "work\n");
+
+    ctl.line("ok:done");
+    ctl.exit(0);
+    wait("run completed", || s.h.is(id, &RunStatus::Completed)).await;
+    fetched(&s.h, id).await;
+
+    let branch = Workspaces::branch_for(id);
+    assert_eq!(branch_tip(&s.repo, &branch), Some(tip));
+    assert_eq!(warning(&s.h, id), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn s1_a_failed_run_with_a_commit_brings_its_branch_home_and_stays_failed() {
     need_git!();
