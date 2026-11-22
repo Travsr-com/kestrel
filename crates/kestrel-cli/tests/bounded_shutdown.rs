@@ -25,7 +25,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{ChildGuard, Fixture, path_str, running_run};
+use common::{ChildGuard, Fixture, path_str, poll, walk};
+use kestrel_types::{RunId, RunStatus};
 use predicates::prelude::*;
 
 const GRACE: u64 = 2;
@@ -119,10 +120,27 @@ fn start_fake(f: &Fixture, config: &str) -> Serving {
     start(f, config, &["--sandbox-driver", "fake"], None)
 }
 
-/// Starts a streaming model request through the gateway and returns the open connection once
-/// the upstream has the request, so the request is certainly in flight.
-fn request_in_flight(f: &Fixture, s: &Serving, accepted: &mpsc::Receiver<()>) -> TcpStream {
-    let run = running_run(&f.store());
+/// A new run in the store, for its token. The serve the test started sees it as `Queued`.
+fn new_run(f: &Fixture) -> RunId {
+    f.store()
+        .create_run(&common::agent(), "task")
+        .expect("create run")
+}
+
+/// Starts a streaming model request through the gateway for `run` and returns the open
+/// connection once the upstream has the request, so the request is certainly in flight.
+fn request_in_flight(
+    f: &Fixture,
+    s: &Serving,
+    accepted: &mpsc::Receiver<()>,
+    run: RunId,
+) -> TcpStream {
+    walk(
+        &f.store(),
+        run,
+        RunStatus::Queued,
+        &[RunStatus::Provisioning, RunStatus::Running],
+    );
     let token = f.store().run_token(run).expect("token").expect("has token");
     let body = r#"{"model":"claude-sonnet-5-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
     let mut conn = TcpStream::connect(&s.gateway).expect("connect to gateway");
@@ -156,7 +174,7 @@ fn sigint_with_a_streaming_request_in_flight_exits_within_the_grace_period() {
         &f,
         &config(Some(port), &format!("shutdown_grace_secs = {GRACE}")),
     );
-    let _conn = request_in_flight(&f, &s, &accepted);
+    let _conn = request_in_flight(&f, &s, &accepted, new_run(&f));
 
     let t = Instant::now();
     signal(&s.serve, "INT");
@@ -184,11 +202,46 @@ fn the_default_grace_is_ten_seconds_so_a_held_request_does_not_outlive_it() {
     let f = Fixture::new();
     let (port, accepted) = stalled_upstream();
     let mut s = start_fake(&f, &config(Some(port), ""));
-    let _conn = request_in_flight(&f, &s, &accepted);
+    let _conn = request_in_flight(&f, &s, &accepted, new_run(&f));
     signal(&s.serve, "INT");
     // Not yet exited after 5s only if serve waits for the grace; must be gone by 10s + slack.
     let status = exits_within(&mut s.serve, Duration::from_secs(10) + SLACK).expect("exit");
     assert_eq!(status.code(), Some(0));
+}
+
+/// Issue #81: serve claims every `Queued` run, and the test's run is no exception. Here serve has
+/// already claimed it, and failed it (the fixture agent's repo is not an absolute path), before
+/// the request is sent: the order that once lost the race. The request is still in flight and
+/// the shutdown still waits for it.
+#[test]
+fn a_run_serve_has_already_claimed_still_holds_a_request_in_flight() {
+    let f = Fixture::new();
+    let (port, accepted) = stalled_upstream();
+    let mut s = start_fake(
+        &f,
+        &config(Some(port), &format!("shutdown_grace_secs = {GRACE}")),
+    );
+    let run = new_run(&f);
+    poll("serve to claim the run", || {
+        let row = f
+            .store()
+            .get_run(run)
+            .expect("read run")
+            .expect("run exists");
+        matches!(row.status, RunStatus::Failed(_)).then_some(())
+    });
+    let _conn = request_in_flight(&f, &s, &accepted, run);
+
+    let t = Instant::now();
+    signal(&s.serve, "INT");
+    let status = exits_within(&mut s.serve, Duration::from_secs(GRACE) + SLACK)
+        .unwrap_or_else(|| panic!("serve did not exit within the grace period (+slack)"));
+    assert!(
+        t.elapsed() >= Duration::from_millis(GRACE * 1000 - 500),
+        "serve waited for the request in flight"
+    );
+    assert_eq!(status.code(), Some(0), "everything was cleaned up");
+    assert_summary(&s.serve.stderr());
 }
 
 #[test]
@@ -223,7 +276,7 @@ fn second_signal_aborts(first: &str, second: &str) {
     let (port, accepted) = stalled_upstream();
     // A long grace, so the first signal's shutdown is still waiting on the held request.
     let mut s = start_fake(&f, &config(Some(port), "shutdown_grace_secs = 60"));
-    let _conn = request_in_flight(&f, &s, &accepted);
+    let _conn = request_in_flight(&f, &s, &accepted, new_run(&f));
 
     signal(&s.serve, first);
     thread::sleep(Duration::from_millis(700));
@@ -264,7 +317,7 @@ fn sigterm_behaves_like_the_first_sigint_with_a_request_in_flight() {
         &f,
         &config(Some(port), &format!("shutdown_grace_secs = {GRACE}")),
     );
-    let _conn = request_in_flight(&f, &s, &accepted);
+    let _conn = request_in_flight(&f, &s, &accepted, new_run(&f));
     signal(&s.serve, "TERM");
     let status = exits_within(&mut s.serve, Duration::from_secs(GRACE) + SLACK)
         .expect("exit within the grace period");
