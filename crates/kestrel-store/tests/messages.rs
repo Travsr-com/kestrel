@@ -187,7 +187,7 @@ fn a_message_to_an_unknown_run_is_not_found() {
 fn messages_are_taken_once_in_order_and_their_delivery_is_recorded() {
     let store = Store::open_in_memory().unwrap();
     let id = running(&store, &listener());
-    assert_eq!(store.take_messages(id).unwrap(), []);
+    assert_eq!(store.take_messages(id, None).unwrap(), []);
     assert!(
         message_events(&store, id).is_empty(),
         "nothing to deliver writes nothing"
@@ -195,7 +195,7 @@ fn messages_are_taken_once_in_order_and_their_delivery_is_recorded() {
 
     let first = store.send_message(id, "first").unwrap();
     let second = store.send_message(id, "second").unwrap();
-    let taken = store.take_messages(id).unwrap();
+    let taken = store.take_messages(id, None).unwrap();
     assert_eq!(
         taken,
         [
@@ -209,11 +209,11 @@ fn messages_are_taken_once_in_order_and_their_delivery_is_recorded() {
             },
         ]
     );
-    assert_eq!(store.take_messages(id).unwrap(), []);
+    assert_eq!(store.take_messages(id, None).unwrap(), []);
 
     let third = store.send_message(id, "third").unwrap();
     assert_eq!(
-        store.take_messages(id).unwrap(),
+        store.take_messages(id, None).unwrap(),
         [InboxMessage {
             seq: third.seq,
             text: "third".into()
@@ -247,8 +247,8 @@ fn messages_of_one_run_never_reach_another() {
     let a = running(&store, &listener());
     let b = running(&store, &listener());
     store.send_message(a, "for a").unwrap();
-    assert_eq!(store.take_messages(b).unwrap(), []);
-    assert_eq!(store.take_messages(a).unwrap().len(), 1);
+    assert_eq!(store.take_messages(b, None).unwrap(), []);
+    assert_eq!(store.take_messages(a, None).unwrap().len(), 1);
 }
 
 // Two takers at once (two calls of the tool, or two engines on one file) never get the same
@@ -275,7 +275,7 @@ fn takers_racing_on_one_file_deliver_each_message_exactly_once() {
                 let store = Store::open(&path).unwrap();
                 let mut got = Vec::new();
                 for _ in 0..200 {
-                    got.extend(store.take_messages(id).unwrap());
+                    got.extend(store.take_messages(id, None).unwrap());
                 }
                 got
             })
@@ -283,10 +283,105 @@ fn takers_racing_on_one_file_deliver_each_message_exactly_once() {
         .collect();
     senders.join().unwrap();
     let mut got: Vec<InboxMessage> = takers.into_iter().flat_map(|t| t.join().unwrap()).collect();
-    got.extend(store.take_messages(id).unwrap());
+    got.extend(store.take_messages(id, None).unwrap());
     let mut texts: Vec<String> = got.into_iter().map(|m| m.text).collect();
     texts.sort();
     let mut want: Vec<String> = (0..N).map(|i| format!("m{i}")).collect();
     want.sort();
     assert_eq!(texts, want);
+}
+
+// Review of #95: with `after`, the agent names the last message it got, and gets every later one,
+// delivered or not. A retry with the same `after` (the answer was lost on the way) gets the same
+// messages again, so delivery is at least once. Only messages not delivered before are recorded.
+#[test]
+fn taking_after_a_seq_returns_every_later_message_so_a_retry_is_safe() {
+    let store = Store::open_in_memory().unwrap();
+    let id = running(&store, &listener());
+    let first = store.send_message(id, "first").unwrap();
+    let second = store.send_message(id, "second").unwrap();
+    let both = [
+        InboxMessage {
+            seq: first.seq,
+            text: "first".into(),
+        },
+        InboxMessage {
+            seq: second.seq,
+            text: "second".into(),
+        },
+    ];
+    // From the start: everything, now delivered.
+    assert_eq!(store.take_messages(id, Some(0)).unwrap(), both);
+    // The same call again (a retry): the same messages, and no second delivery.
+    assert_eq!(store.take_messages(id, Some(0)).unwrap(), both);
+    assert_eq!(store.take_messages(id, Some(first.seq)).unwrap(), both[1..]);
+    assert_eq!(store.take_messages(id, Some(second.seq)).unwrap(), []);
+    // Without `after`, they were delivered already.
+    assert_eq!(store.take_messages(id, None).unwrap(), []);
+
+    let third = store.send_message(id, "third").unwrap();
+    let only_third = [InboxMessage {
+        seq: third.seq,
+        text: "third".into(),
+    }];
+    assert_eq!(
+        store.take_messages(id, Some(second.seq)).unwrap(),
+        only_third
+    );
+    assert_eq!(
+        store.take_messages(id, Some(second.seq)).unwrap(),
+        only_third
+    );
+    assert_eq!(store.take_messages(id, None).unwrap(), []);
+    assert_eq!(
+        message_events(&store, id),
+        [
+            EventKind::MessageSent {
+                text: "first".into()
+            },
+            EventKind::MessageSent {
+                text: "second".into()
+            },
+            EventKind::MessageDelivered {
+                seqs: vec![first.seq, second.seq]
+            },
+            EventKind::MessageSent {
+                text: "third".into()
+            },
+            EventKind::MessageDelivered {
+                seqs: vec![third.seq]
+            },
+        ]
+    );
+}
+
+// `after` counts only messages: a seq past the newest message gets nothing, and records nothing.
+#[test]
+fn taking_after_the_newest_message_gets_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    let id = running(&store, &listener());
+    let sent = store.send_message(id, "only").unwrap();
+    assert_eq!(store.take_messages(id, Some(sent.seq + 100)).unwrap(), []);
+    assert_eq!(message_events(&store, id).len(), 1);
+}
+
+// Review of #95: a message to a run that ends before its agent reads it stays sent, with no
+// delivery. Nothing hands it over later, and the ended run takes no new one.
+#[test]
+fn a_message_to_a_run_that_ends_before_reading_it_stays_sent_with_no_delivery() {
+    let store = Store::open_in_memory().unwrap();
+    let id = running(&store, &listener());
+    store.send_message(id, "too late to read").unwrap();
+    store
+        .transition(id, &RunStatus::Running, RunStatus::Completed)
+        .unwrap();
+    assert_eq!(
+        message_events(&store, id),
+        [EventKind::MessageSent {
+            text: "too late to read".into()
+        }]
+    );
+    let why = refusal(store.send_message(id, "and another").unwrap_err());
+    assert!(why.contains("ended"), "{why}");
+    assert_eq!(message_events(&store, id).len(), 1);
 }
