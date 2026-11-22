@@ -213,13 +213,16 @@ Such an agent is told to check for messages between steps. Send one while it run
 kestrel message <run-id> "also fix the docs"
 ```
 
-* The message waits until the agent next calls `kestrel.messages`. Each message reaches it once.
+* The message waits until the agent next calls `kestrel.messages`. The agent passes the `seq` of
+  the last message it got, so a retried call loses nothing.
+* A run that ends before its agent reads a message never gets it: the message stays sent, with no
+  delivery.
 * `kestrel watch` shows `message to the agent: ...` when it is sent and `the agent read 1 message`
   when the agent took it.
 * Only a running run takes a message. Any other status exits 1 with the reason, and so does an
   agent without the grant (`its agent cannot take messages`).
-* A message is text of up to 16 KiB: lines and tabs, no other control characters. Anything else
-  exits 2.
+* A message is text of up to 16 KiB: newlines and tabs, no other control characters (no carriage
+  return). Anything else exits 2.
 * The message is stored in the run's events, which anyone with the API token can read. Do not put
   secrets in it.
 
