@@ -28,7 +28,7 @@ fn a_message_is_text_of_1_to_16_kib() {
     assert_eq!(message_problem("also fix the docs"), None);
     // Lines, tabs and any language are text.
     assert_eq!(
-        message_problem("first\nsecond\r\n\tthird, \u{00e9}t\u{00e9}"),
+        message_problem("first\nsecond\n\tthird, \u{00e9}t\u{00e9}"),
         None
     );
     assert_eq!(message_problem(&"x".repeat(MAX_MESSAGE_BYTES)), None);
@@ -46,7 +46,15 @@ fn a_message_is_text_of_1_to_16_kib() {
 
 #[test]
 fn a_message_holds_no_control_characters_but_lines_and_tabs() {
-    for bad in ["ring \u{7}", "\u{1b}[31mred", "nul \0 byte", "del \u{7f}"] {
+    for bad in [
+        "ring \u{7}",
+        "\u{1b}[31mred",
+        "nul \0 byte",
+        "del \u{7f}",
+        // A carriage return moves the cursor back over the `kestrel watch` prefix.
+        "fine\rforged line",
+        "windows\r\nline",
+    ] {
         let why = message_problem(bad).unwrap();
         assert!(why.contains("text"), "{bad:?}: {why}");
     }
