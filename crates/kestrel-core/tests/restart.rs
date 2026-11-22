@@ -182,7 +182,11 @@ async fn s1_a_tree_in_a_join_carries_on_after_a_restart_without_a_resume() {
     assert_eq!(results.len(), 3, "{results:?}");
     for kid in &kids {
         assert!(completed(&results, *kid), "{kid}: {results:?}");
-        assert_eq!(provisioned(&again, *kid), 2, "one sandbox before, one after");
+        assert_eq!(
+            provisioned(&again, *kid),
+            2,
+            "one sandbox before, one after"
+        );
         assert_eq!(ignored_commands(&again, *kid), 0);
     }
     assert_eq!(again.store.children(lead).unwrap().len(), 3);
@@ -208,14 +212,20 @@ async fn s2_a_parent_resumed_by_hand_gets_its_children_back() {
     assert_eq!(again.driver.starts(), 0);
 
     again.control(lead, ControlCommand::Resume);
-    until("the lead runs again", || again.is(lead, &RunStatus::Running)).await;
+    until("the lead runs again", || {
+        again.is(lead, &RunStatus::Running)
+    })
+    .await;
     for kid in &kids {
         let spawned = spawn_help(&again, lead).await;
         assert_eq!((spawned.id, spawned.existing), (*kid, true));
     }
     assert_eq!(again.store.children(lead).unwrap().len(), 3);
     for kid in &kids {
-        assert!(again.is(*kid, &restarted()), "a child returned again stays as it was");
+        assert!(
+            again.is(*kid, &restarted()),
+            "a child returned again stays as it was"
+        );
     }
 }
 
@@ -315,7 +325,10 @@ async fn s3_a_child_provisioning_at_the_restart_starts_once_and_is_joined() {
     assert!(report.interrupted.contains(&child), "{report:?}");
     assert!(again.is(child, &restarted()));
     again.start();
-    until("the lead runs again", || again.is(lead, &RunStatus::Running)).await;
+    until("the lead runs again", || {
+        again.is(lead, &RunStatus::Running)
+    })
+    .await;
     let spawned = spawn_help(&again, lead).await;
     assert_eq!((spawned.id, spawned.existing), (child, true));
     let results = again

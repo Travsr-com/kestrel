@@ -832,7 +832,10 @@ async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
     let _lead = again.driver.live();
     again.driver.script(&["ok:after the restart"], 0);
     again.start();
-    until("the lead runs again", || again.is(lead, &RunStatus::Running)).await;
+    until("the lead runs again", || {
+        again.is(lead, &RunStatus::Running)
+    })
+    .await;
     let results = again
         .engine
         .join(lead, &[child], JoinMode::All, Some(Duration::from_secs(60)))
