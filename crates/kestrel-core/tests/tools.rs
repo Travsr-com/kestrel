@@ -506,12 +506,18 @@ async fn messages_are_offered_when_granted_and_handed_over_once() {
     assert_eq!(taken[0].text, "also fix the docs");
     assert!(h.engine.take_messages(a).unwrap().is_empty());
     assert_eq!(
-        h.count_events(a, |k| matches!(k, EventKind::MessageDelivered { seqs } if *seqs == [sent.seq])),
+        h.count_events(
+            a,
+            |k| matches!(k, EventKind::MessageDelivered { seqs } if *seqs == [sent.seq])
+        ),
         1
     );
     // The engine never logs a message's text anywhere but its own event.
     assert_eq!(
-        h.count_events(a, |k| matches!(k, EventKind::AgentLog { line } if line.contains("also fix the docs"))),
+        h.count_events(
+            a,
+            |k| matches!(k, EventKind::AgentLog { line } if line.contains("also fix the docs"))
+        ),
         0
     );
 }

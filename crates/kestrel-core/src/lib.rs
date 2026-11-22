@@ -35,7 +35,12 @@ pub enum AskError {
 }
 
 /// The Kestrel tools, by the names a capability's `mcp` list uses.
-const KESTREL_TOOLS: [&str; 3] = ["kestrel.spawn", "kestrel.join", "kestrel.ask_human"];
+const KESTREL_TOOLS: [&str; 4] = [
+    "kestrel.spawn",
+    "kestrel.join",
+    "kestrel.ask_human",
+    kestrel_types::MESSAGES_TOOL,
+];
 pub use workspace::{WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -52,7 +57,7 @@ use kestrel_sandbox::{
     SandboxError, SandboxHandle, Subnet, SubnetPool,
 };
 use kestrel_store::{
-    ChildPlan, ControlCommand, RunFilter, RunRow, SpawnRefusal, Store, StoreError,
+    ChildPlan, ControlCommand, InboxMessage, RunFilter, RunRow, SpawnRefusal, Store, StoreError,
 };
 use kestrel_types::{
     AgentSpec, ApprovalId, EventKind, MicroUsd, RunId, RunStatus, Runtime, SandboxTier,
@@ -842,8 +847,8 @@ impl Engine {
         self.inner.indexing.as_ref().is_some_and(|ix| ix.ready(run))
     }
 
-    /// The Kestrel tools `run` may call, in the order spawn, join, ask_human; `None` once it has
-    /// ended (or for an unknown run). A tool must be in the run's capability, and
+    /// The Kestrel tools `run` may call, in the order spawn, join, ask_human, messages; `None` once
+    /// it has ended (or for an unknown run). A tool must be in the run's capability, and
     /// `kestrel.spawn` also needs spawn rights. A spawned run's stored spec holds only what it was
     /// granted, so its capability is read from that spec; spawning itself checks the token.
     pub fn kestrel_tools(&self, run: RunId) -> Result<Option<Vec<&'static str>>> {
@@ -908,6 +913,16 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    /// The messages a person sent `run` that its agent has not taken yet, oldest first, now
+    /// recorded as delivered (`kestrel.messages`, #95). Each is handed over once. The text goes to
+    /// the agent and stays in its event: it is never logged.
+    ///
+    /// # Errors
+    /// The store's.
+    pub fn take_messages(&self, run: RunId) -> Result<Vec<InboxMessage>> {
+        Ok(self.inner.store.take_messages(run)?)
     }
 
     /// Asks a person `question` for `run` (`kestrel.ask_human`) and waits for the answer. The run
