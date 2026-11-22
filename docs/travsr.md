@@ -232,9 +232,9 @@ Known limits on Kestrel's side:
 
 The security model above rests on these places in Travsr's source, checked at Travsr commit
 `c1305034`. Paths are relative to the travsr repo; line numbers move, so search for the code
-quoted. The release CI pins, v1.4.0 (`3649dc6e`), is older than that commit. It has `init --no-connect`,
-`mcp --stdio --db`, and the `CI`, `TRAVSR_SKIP_DOWNLOAD` and `TRAVSR_DISABLE_REGISTRY` checks, in
-the same functions.
+quoted. The release CI pins, v1.4.0 (`3649dc6e`), is older than that commit. It has
+`init --no-connect`, `mcp --stdio --db`, and the `CI`, `TRAVSR_SKIP_DOWNLOAD` and
+`TRAVSR_DISABLE_REGISTRY` checks, in the same functions.
 
 | What Kestrel relies on | Where |
 |---|---|
