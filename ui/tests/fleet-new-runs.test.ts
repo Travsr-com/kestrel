@@ -178,7 +178,7 @@ describe('Fleet and runs started after it loaded', () => {
 
   it('asks again by itself after a failed look-up, with no further socket events (PR #85 review)', async () => {
     const old = run({ agent: 'old' });
-    const fresh = run({ agent: 'fresh' });
+    const fresh = run({ agent: 'fresh', created_at: new Date(NOW).toISOString() });
     const server = show([old], [old, fresh], { failOnce: [`/api/runs/${fresh.id}`] });
     await vi.waitFor(() => expect(agents()).toEqual(['old']));
     const s = feed(server.sockets);
