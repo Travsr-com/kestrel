@@ -242,8 +242,8 @@ fn s5_watch_mid_run_replays_from_start_and_follows() {
 }
 
 /// Scenario 6 (issue #22): the agent runs `git status`, `git add` and `git commit` inside its
-/// gVisor sandbox. The commit lands on `kestrel/run-<id tail>` in the run's clone only; the source
-/// repo gets nothing until `fetch_back` brings the branch home.
+/// gVisor sandbox. The commit lands on `kestrel/run-<id tail>` in the run's clone, and when the run
+/// ends Kestrel brings that branch home into the source repo by itself (#93).
 #[test]
 fn s6_agent_can_commit_in_its_clone() {
     let env = Env::new();
@@ -271,27 +271,18 @@ fn s6_agent_can_commit_in_its_clone() {
         "no `agent commit` in git log:\n{report}"
     );
 
-    // The source repo is untouched: still only `main`, still only the initial commit.
-    let source_branches = git(&env.repo, &["branch", "--format=%(refname:short)"]);
-    assert_eq!(source_branches.trim(), "main");
-    assert_eq!(
-        git(&env.repo, &["rev-list", "--all", "--count"]).trim(),
-        "1"
-    );
+    // When the run ends, Kestrel brings the commit home as the run branch by itself (#93), from
+    // the source repo with hooks off. The user's `main` keeps only the initial commit.
+    let start = Instant::now();
+    while !has_branch(&env.repo, &branch) {
+        assert!(
+            start.elapsed() < RUN_DEADLINE,
+            "{branch} never came home into the source repo"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(git(&env.repo, &["rev-list", "--count", "main"]).trim(), "1");
     assert!(!env.repo.join("agent-commit.txt").exists());
-
-    // fetch_back (from the source repo, hooks off) brings the commit home as the run branch.
-    let run: kestrel_types::RunId = id.parse().expect("run id");
-    let workspaces = kestrel_core::Workspaces::new(
-        env.dir.path().join("workspaces"),
-        std::sync::Arc::new(kestrel_sandbox::ProcessRunner),
-    );
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(workspaces.fetch_back(run, &env.repo))
-        .expect("fetch_back");
     assert_eq!(
         git(&env.repo, &["show", &format!("{branch}:agent-commit.txt")]).trim(),
         "agent work"
@@ -307,7 +298,7 @@ fn s6_agent_can_commit_in_its_clone() {
     assert_eq!(
         git(&env.repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
         "main",
-        "fetch_back must not move the user's checkout"
+        "bringing the branch home must not move the user's checkout"
     );
 }
 
@@ -385,4 +376,15 @@ fn s8_agent_spawns_a_child_through_its_mcp_config() {
     // The call waited for the child, so its id is in the answer the agent got.
     assert!(text.contains(&child), "{text}");
     env.wait_status(&child, "Completed");
+}
+
+/// Whether `repo` has the branch `branch`.
+fn has_branch(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
