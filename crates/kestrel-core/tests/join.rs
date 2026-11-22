@@ -5,13 +5,21 @@
 
 mod common;
 
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::*;
 use kestrel_core::caps::RootKey;
-use kestrel_core::{ChildResult, JoinError, JoinMode, JoinOutcome};
+use kestrel_core::{ChildResult, Engine, JoinError, JoinMode, JoinOutcome, Limits};
+use kestrel_sandbox::{
+    ExitStatus, LaunchSpec, OutputStream, PreparedNetwork, SandboxDriver, SandboxHandle, Subnet,
+    SubnetPool,
+};
 use kestrel_store::ControlCommand;
 use kestrel_types::{AgentSpec, EventKind, MicroUsd, RunId, RunStatus};
+use url::Url;
 
 const DOLLAR: i64 = 1_000_000;
 
@@ -35,6 +43,131 @@ fn harness(max: usize) -> Harness {
     let key = RootKey::generate().to_bytes();
     h.rebuild(|e| e.with_root_key(RootKey::from_bytes(&key).unwrap()));
     h
+}
+
+/// The run networks a [`NetFake`] made and removed, by name.
+#[derive(Clone, Default)]
+struct Networks(Arc<Mutex<(Vec<String>, Vec<String>)>>);
+
+impl Networks {
+    fn made(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .clone()
+    }
+
+    /// Networks made and not removed.
+    fn left(&self) -> Vec<String> {
+        let nets = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        nets.0
+            .iter()
+            .filter(|n| !nets.1.contains(n))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The shared fake driver, with a run network for every run that gets a subnet block, so the
+/// cancel scenarios can check that no network is left behind.
+struct NetFake {
+    inner: FakeDriver,
+    networks: Networks,
+}
+
+#[async_trait]
+impl SandboxDriver for NetFake {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn is_strong(&self) -> bool {
+        true
+    }
+
+    async fn create(&self, spec: &LaunchSpec) -> kestrel_sandbox::Result<SandboxHandle> {
+        self.inner.create(spec).await
+    }
+
+    async fn start(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<OutputStream> {
+        self.inner.start(h).await
+    }
+
+    async fn wait(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<ExitStatus> {
+        self.inner.wait(h).await
+    }
+
+    async fn stop(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<()> {
+        self.inner.stop(h).await
+    }
+
+    async fn destroy(&self, h: &SandboxHandle) -> kestrel_sandbox::Result<()> {
+        self.inner.destroy(h).await
+    }
+
+    async fn prepare_network(
+        &self,
+        run: RunId,
+        subnet: &Subnet,
+    ) -> kestrel_sandbox::Result<Option<PreparedNetwork>> {
+        let name = format!("net-{run}");
+        let mut nets = self
+            .networks
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        nets.0.push(name.clone());
+        Ok(Some(PreparedNetwork {
+            name,
+            gateway_host: Ipv4Addr::from(u32::from(subnet.cidr().addr()) + 2),
+            subnet: subnet.clone(),
+        }))
+    }
+
+    async fn release_network(&self, network: &PreparedNetwork) -> kestrel_sandbox::Result<()> {
+        let mut nets = self
+            .networks
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        nets.1.push(network.name.clone());
+        Ok(())
+    }
+}
+
+/// [`harness`] with run networks: every run gets a block of a `/24` pool and its own network.
+fn networked(max: usize) -> (Harness, Networks) {
+    let mut h = Harness::new(max);
+    let networks = Networks::default();
+    let driver = NetFake {
+        inner: h.driver.clone(),
+        networks: networks.clone(),
+    };
+    let pool = Arc::new(SubnetPool::parse("10.200.0.0/24").expect("pool"));
+    let key = RootKey::generate().to_bytes();
+    let engine = Engine::new(
+        h.store.clone(),
+        vec![Box::new(driver)],
+        adapter_factory(h.adapters.clone()),
+        Url::parse(GATEWAY).expect("gateway url"),
+        Limits {
+            max_concurrent_runs: max,
+            poll_interval: POLL,
+        },
+    )
+    .with_subnets(pool)
+    .with_root_key(RootKey::from_bytes(&key).unwrap());
+    h.engine = Arc::new(engine);
+    (h, networks)
+}
+
+/// After a cancel scenario: no sandbox and no network is left, and `runs` networks were made
+/// (so the check saw real networks).
+async fn nothing_left_behind(h: &Harness, networks: &Networks, runs: usize) {
+    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+    until("networks removed", || networks.left().is_empty()).await;
+    assert_eq!(networks.made().len(), runs, "{:?}", networks.made());
 }
 
 /// Starts the engine and a running parent; returns it and its session.
@@ -79,20 +212,51 @@ fn join_in_background(
 }
 
 // 1. Cap 1, a parent spawns one child and joins: the child runs and the parent resumes when it
-//    finishes. The minimal deadlock case.
-async fn scenario_1() {
+//    finishes. The minimal deadlock case. `seed` varies the timing: the ticks the child waits
+//    queued before the join (it must stay queued, the parent holds the only slot), whether the
+//    child's agent ends the moment it starts (before the test sees it running) or after some
+//    ticks of running. `None` takes the plain path: join at once, end once it runs.
+async fn scenario_1(seed: Option<u64>) {
+    let random = seed.is_some();
+    let mut rng = Lcg(seed.unwrap_or(0));
     let mut h = harness(1);
     let (lead, _s) = parent(&mut h, false).await;
     let child_session = h.driver.live();
     let child = spawn(&h, lead).await;
+    if random {
+        settle_for(rng.next(4) as u32).await;
+        assert!(
+            h.is(child, &RunStatus::Queued) && h.engine.holds_slot(lead),
+            "the child waits while the parent holds the only slot"
+        );
+    }
+    let ends_at_start = random && rng.next(2) == 0;
+    let child_session = if ends_at_start {
+        child_session.exit(0);
+        None
+    } else {
+        Some(child_session)
+    };
     let join = join_in_background(&h, lead, vec![child], JoinMode::All, None);
-    until("child running", || h.is(child, &RunStatus::Running)).await;
-    assert!(
-        !h.engine.holds_slot(lead),
-        "the waiting parent holds no slot"
-    );
-    child_session.exit(0);
+    if let Some(session) = child_session {
+        until("child running", || h.is(child, &RunStatus::Running)).await;
+        assert!(
+            !h.engine.holds_slot(lead),
+            "the waiting parent holds no slot"
+        );
+        if random {
+            settle_for(rng.next(4) as u32).await;
+            assert!(!join.is_finished(), "the join waits for the running child");
+            assert!(h.engine.slots_in_use() <= 1, "over the cap");
+        }
+        session.exit(0);
+    }
     let results = join.await.unwrap().unwrap();
+    assert_eq!(
+        h.driver.starts(),
+        2,
+        "the parent and the child each started once"
+    );
     assert!(matches!(
         outcome(&results, child),
         JoinOutcome::Completed { .. }
@@ -103,7 +267,7 @@ async fn scenario_1() {
 
 #[tokio::test(start_paused = true)]
 async fn s1_cap_one_parent_and_child_do_not_deadlock() {
-    scenario_1().await;
+    scenario_1(None).await;
 }
 
 /// A small deterministic generator, so each loop iteration takes a different, repeatable path.
@@ -190,10 +354,11 @@ async fn s2_s3_fan_out_over_the_cap_finishes_and_never_overshoots() {
 }
 
 // Scenarios 1 to 3 as a loop-tested race, 200 times each (two tests, so they run in parallel).
+// Each iteration has its own seed, so the loop takes 200 different, repeatable paths.
 #[tokio::test(start_paused = true)]
 async fn s1_repeated_200_times() {
-    for _ in 0..200 {
-        scenario_1().await;
+    for seed in 0..200 {
+        scenario_1(Some(seed)).await;
     }
 }
 
@@ -368,10 +533,10 @@ fn cancelled_at(h: &Harness, root: RunId, run: RunId) -> u64 {
 }
 
 // 9. Cancelling a root cancels every descendant, children before their parents, stops every
-//    sandbox and records what was spent.
+//    sandbox, leaves no sandbox or network behind and records what was spent.
 #[tokio::test(start_paused = true)]
 async fn s9_cancelling_a_root_cancels_the_whole_tree_children_first() {
-    let mut h = harness(8);
+    let (mut h, networks) = networked(8);
     let (root, _s) = parent(&mut h, false).await;
     let _c = h.driver.live();
     let child = h
@@ -401,15 +566,16 @@ async fn s9_cancelling_a_root_cancels_the_whole_tree_children_first() {
     assert!(cancelled_at(&h, root, grand_a) < cancelled_at(&h, root, child));
     assert!(cancelled_at(&h, root, grand_b) < cancelled_at(&h, root, child));
     assert!(cancelled_at(&h, root, child) < cancelled_at(&h, root, root));
-    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+    nothing_left_behind(&h, &networks, 4).await;
     assert_eq!(h.store.spent(grand_a).unwrap(), MicroUsd(DOLLAR / 50));
 }
 
 // 10. Cancelling a run in the middle cancels its subtree only; the root and siblings keep
-//     running, and the root's join sees `Cancelled`.
+//     running, and the root's join sees `Cancelled`. The subtree leaves no sandbox or network
+//     behind; the root keeps its own.
 #[tokio::test(start_paused = true)]
 async fn s10_cancelling_mid_tree_leaves_the_root_and_siblings_running() {
-    let mut h = harness(8);
+    let (mut h, networks) = networked(8);
     let (root, _s) = parent(&mut h, false).await;
     let _m = h.driver.live();
     let mid = h
@@ -438,13 +604,25 @@ async fn s10_cancelling_mid_tree_leaves_the_root_and_siblings_running() {
         outcome(&results, sibling),
         JoinOutcome::Completed { .. }
     ));
+    // Only the root, still running, has a sandbox and a network.
+    let root_sandbox = h.sandbox_id(root).expect("the root's sandbox");
+    until(
+        "the subtree's and the sibling's sandboxes destroyed",
+        || h.driver.leaked() == [root_sandbox.clone()],
+    )
+    .await;
+    until("the subtree's and the sibling's networks removed", || {
+        networks.left() == [format!("net-{root}")]
+    })
+    .await;
+    assert_eq!(networks.made().len(), 4, "{:?}", networks.made());
 }
 
 // 11. A parent that completes while a child still runs cancels the child first; the parent's
-//     `RunFinished` comes after.
+//     `RunFinished` comes after, and no sandbox or network is left behind.
 #[tokio::test(start_paused = true)]
 async fn s11_a_parent_that_finishes_cancels_its_live_children_first() {
-    let mut h = harness(4);
+    let (mut h, networks) = networked(4);
     let (lead, session) = parent(&mut h, false).await;
     let _c = h.driver.live();
     let child = spawn(&h, lead).await;
@@ -461,7 +639,7 @@ async fn s11_a_parent_that_finishes_cancels_its_live_children_first() {
         .map(|(c, _)| c)
         .unwrap();
     assert!(cancelled_at(&h, lead, child) < finished_at);
-    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+    nothing_left_behind(&h, &networks, 2).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -496,11 +674,12 @@ async fn cancelling_an_ended_root_that_kept_its_children_cancels_them() {
     until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
 }
 
-// 12. A cancel that reaches a child still `Queued` means it never starts and leaves no sandbox.
+// 12. A cancel that reaches a child still `Queued` means it never starts and leaves no sandbox
+//     or network.
 #[tokio::test(start_paused = true)]
 async fn s12_a_queued_child_that_is_cancelled_never_starts() {
     // One slot, held by the parent: the child stays queued.
-    let mut h = harness(1);
+    let (mut h, networks) = networked(1);
     let (lead, _s) = parent(&mut h, false).await;
     let child = spawn(&h, lead).await;
     settle().await;
@@ -515,7 +694,40 @@ async fn s12_a_queued_child_that_is_cancelled_never_starts() {
         1,
         "only the parent's sandbox was created"
     );
-    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+    // The queued child never got a network either: only the parent's was made.
+    nothing_left_behind(&h, &networks, 1).await;
+}
+
+// 12. A tree cancel that reaches a child still `Provisioning` (its network made, its `create` in
+//     flight) means its agent never starts, and its sandbox, once `create` returns, and its
+//     network are removed.
+#[tokio::test(start_paused = true)]
+async fn s12_a_provisioning_child_that_is_cancelled_never_starts() {
+    let (mut h, networks) = networked(4);
+    let (lead, _s) = parent(&mut h, false).await;
+    let gate = h.driver.gate_create();
+    let _c = h.driver.live();
+    let child = spawn(&h, lead).await;
+    until("child provisioning", || {
+        h.is(child, &RunStatus::Provisioning) && h.driver.count(&Call::Create) == 2
+    })
+    .await;
+    assert_eq!(
+        networks.made().len(),
+        2,
+        "the child has its network already"
+    );
+    h.control(lead, ControlCommand::Cancel);
+    until("both cancelled", || {
+        h.is(child, &RunStatus::Cancelled) && h.is(lead, &RunStatus::Cancelled)
+    })
+    .await;
+    // `create` returns after the cancel: the sandbox it made is destroyed, never started.
+    gate.notify_one();
+    nothing_left_behind(&h, &networks, 2).await;
+    settle().await;
+    assert_eq!(h.driver.starts(), 1, "only the parent's agent ever started");
+    assert!(h.is(child, &RunStatus::Cancelled));
 }
 
 // 13. After a restart, a join returns the results of children that finished, at once.
