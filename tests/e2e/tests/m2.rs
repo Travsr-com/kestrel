@@ -7,7 +7,7 @@
 //! Every test runs `kestrel up` (serve plus the HTTP API) and reads real state: `kestrel ps`,
 //! `kestrel watch` events, the store (parents, budgets, capability tokens), `git` in the source repo
 //! and the clones, and `docker ps` / `docker network ls` filtered by the `kestrel.instance` label.
-//! Scenario 11 (Travsr) lands with issue #44; scenarios 12 and 13 (the UI) are in `tests/ui.rs`.
+//! Scenario 11 runs a fake Travsr on the host; scenarios 12 and 13 (the UI) are in `tests/ui.rs`.
 //!
 //! Needs what `tests/e2e.rs` needs. Run with
 //! `cargo test -p kestrel-e2e --features e2e --test m2 -- --test-threads=1 --nocapture`.
@@ -1200,6 +1200,192 @@ fn m2_s10_each_run_gets_its_own_network_and_twenty_start() {
         most, 20,
         "the 20 short sandboxes had their networks at once"
     );
+}
+
+/// The symbol scenario 11 looks for: in the source repo's `src/seeded.rs`, and in the file the
+/// child writes.
+const SYMBOL: &str = "kestrel_e2e_seeded";
+
+/// Scenario 11's Travsr. `init` logs `init <dir> <commit>` and writes an empty index. `mcp` logs
+/// `mcp <dir> <db>` and every request (`req <line>`), lists `search_symbol` (with a `repo`
+/// argument, as Travsr's own schema has), and answers a call with the files of the repo it
+/// serves that hold the symbol: `root=<repo> head=<commit> hits=<paths>`. The repo is the one
+/// its `--db` is in, as for the real Travsr. Every path is a physical one (`pwd -P`).
+const FAKE_TRAVSR: &str = r#"#!/bin/sh
+d='@DIR@'
+case "$1" in
+  init)
+    [ -d .git ] || { echo "error: not a git repository" >&2; exit 2; }
+    echo "init $(pwd -P) $(git rev-parse HEAD)" >> "$d/log"
+    mkdir -p .travsr && : > .travsr/graph.db
+    echo indexed
+    ;;
+  mcp)
+    db=$4
+    echo "mcp $(pwd -P) $db" >> "$d/log"
+    root=$(cd "$(dirname "$db")/.." && pwd -P)
+    while IFS= read -r line; do
+      echo "req $line" >> "$d/log"
+      id=$(printf '%s\n' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+      [ -n "$id" ] || continue
+      case "$line" in
+        *'"method":"tools/list"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_symbol","description":"Where a symbol is defined and used","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"repo":{"type":"string"}},"required":["name"]}}]}}\n' "$id" ;;
+        *'"method":"tools/call"'*)
+          sym=$(printf '%s\n' "$line" | sed -n 's/.*"arguments":{[^}]*"name":"\([A-Za-z0-9_]*\)".*/\1/p')
+          hits=$(cd "$root" && grep -rl --exclude-dir=.git --exclude-dir=.travsr -e "${sym:-no symbol given}" . | sed 's|^\./||' | sort | tr '\n' ' ')
+          head=$(git -C "$root" rev-parse HEAD)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"root=%s head=%s hits=%s"}]}}\n' "$id" "$root" "$head" "$hits" ;;
+        *)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+      esac
+    done
+    ;;
+esac
+exit 0
+"#;
+
+/// Writes the fake Travsr into `<env>/fake-travsr` and turns Travsr on in the env's config with it.
+/// Returns the fake's directory, where it writes `log`. Call before [`Env::up`].
+fn fake_travsr(env: &Env) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.dir.path().join("fake-travsr");
+    std::fs::create_dir_all(&dir).expect("mkdir fake-travsr");
+    let path = dir.join("travsr");
+    std::fs::write(
+        &path,
+        FAKE_TRAVSR.replace("@DIR@", &dir.display().to_string()),
+    )
+    .expect("write the fake travsr");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut config = std::fs::read_to_string(&env.config).expect("read config");
+    config.push_str(&format!(
+        "\n[travsr]\ncommand = \"{}\"\nindex_timeout = 120\ncall_timeout = 30\n",
+        path.display()
+    ));
+    std::fs::write(&env.config, config).expect("write config");
+    dir
+}
+
+/// The value of `name=` in the fake's answer text, up to the next field or the end of the text.
+fn answer_field<'a>(answer: &'a str, name: &str) -> &'a str {
+    let head = format!("{name}=");
+    let start = answer
+        .find(&head)
+        .map(|i| i + head.len())
+        .unwrap_or_else(|| panic!("no {name}= in the Travsr answer:\n{answer}"));
+    let rest = &answer[start..];
+    let end = [" root=", " head=", " hits=", "\""]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Scenario 11: a child's Travsr answers come from Kestrel's private copy of the run's starting
+/// commit, never from its clone. The child writes and commits a file that uses the symbol, then
+/// asks Travsr where the symbol is: the answer names the source repo's file and not the child's
+/// (docs/travsr.md, Security model). The fake Travsr answers from the files of the copy it serves.
+#[test]
+fn m2_s11_travsr_answers_from_the_run_s_own_copy() {
+    let env = Env::with_max(8);
+    std::fs::create_dir_all(env.repo.join("src")).expect("mkdir src");
+    std::fs::write(
+        env.repo.join("src").join("seeded.rs"),
+        format!("pub fn {SYMBOL}() {{}}\n"),
+    )
+    .expect("write seeded.rs");
+    let main_sha = seed(&env);
+    let fake = fake_travsr(&env);
+    let _up = env.up();
+    let (root, child) = probe_tree(&env, &format!("c.travsr={SYMBOL}"));
+
+    // The child's edit is real: committed in its own clone before it asked.
+    assert_eq!(env.read_out(&child, "edit.out").trim(), "commit_rc=0");
+    let clone = env.workspace(&child);
+    assert!(clone.join("child-edit.rs").is_file());
+    assert!(git(&clone, &["log", "--format=%s", "-3"]).contains("child edit"));
+
+    let report = env.read_out(&child, "travsr.out");
+    assert!(report.starts_with("url=ok\n"), "{report}");
+    let listed = section(&report, "tools/list");
+    assert!(listed.contains(r#""name":"search_symbol""#), "{report}");
+    assert!(
+        !listed.contains("repo"),
+        "the agent's schema has no repo: {report}"
+    );
+    let answer = section(&report, "search_symbol");
+    assert!(!answer.contains(r#""isError":true"#), "{report}");
+
+    // Served from the child's own copy, at the commit its workspace was cloned at.
+    let base = std::fs::canonicalize(env.dir.path()).expect("canonical env dir");
+    let copy = PathBuf::from(answer_field(answer, "root"));
+    let copies = copy
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("no <data dir>/travsr above {}", copy.display()))
+        .to_path_buf();
+    assert!(copy.starts_with(&base), "{}", copy.display());
+    assert!(
+        copy.ends_with(Path::new("travsr").join(&child).join("repo")),
+        "{}",
+        copy.display()
+    );
+    let clone = std::fs::canonicalize(&clone).expect("canonical clone");
+    assert!(!copy.starts_with(&clone) && !clone.starts_with(&copy));
+    assert_eq!(answer_field(answer, "head"), main_sha, "{report}");
+    let hits: Vec<&str> = answer_field(answer, "hits").split_whitespace().collect();
+    assert_eq!(
+        hits,
+        ["src/seeded.rs"],
+        "the answer has the starting commit's file and not the child's edit: {report}"
+    );
+
+    // What reached Travsr: each run indexed in its own copy, the child's server run in its copy,
+    // and never the `repo` the child sent.
+    let log = std::fs::read_to_string(fake.join("log")).expect("the fake travsr's log");
+    let inits: BTreeSet<String> = log
+        .lines()
+        .filter_map(|l| l.strip_prefix("init "))
+        .map(str::to_string)
+        .collect();
+    let copy_of = |run: &str| copies.join(run).join("repo").display().to_string();
+    assert_eq!(
+        inits,
+        set(&[
+            format!("{} {main_sha}", copy_of(&root)),
+            format!("{} {main_sha}", copy_of(&child)),
+        ]),
+        "{log}"
+    );
+    let served = format!(
+        "mcp {} {}",
+        copy.display(),
+        copy.join(".travsr").join("graph.db").display()
+    );
+    assert!(log.lines().any(|l| l == served), "{log}");
+    assert!(
+        log.lines()
+            .filter(|l| l.starts_with("mcp "))
+            .all(|l| Path::new(l.split(' ').nth(1).unwrap_or("")).starts_with(&copies)),
+        "Travsr served only from Kestrel's copies: {log}"
+    );
+    let calls: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("req ") && l.contains(r#""method":"tools/call""#))
+        .collect();
+    assert_eq!(calls.len(), 1, "{log}");
+    assert!(calls[0].contains(SYMBOL), "{log}");
+    assert!(
+        !calls[0].contains("repo") && !calls[0].contains("/workspace"),
+        "the child's repo argument was dropped: {log}"
+    );
+
+    // Both runs have ended, so their copies are forgotten.
+    wait_until(Duration::from_secs(120), "both copies are deleted", || {
+        !copies.join(&root).exists() && !copies.join(&child).exists()
+    });
 }
 
 /// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart every run

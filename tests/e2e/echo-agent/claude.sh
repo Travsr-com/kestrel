@@ -53,6 +53,9 @@
 #                other mount but the root and the kernel's file systems, read in full (dump.out).
 #   commit=1     at the end writes kid-<n>.txt (shared.txt with same=1), commits everything but
 #                the test's own files in one commit, and records the result (commit.out).
+#   travsr=SYM   writes child-edit.rs, which uses SYM, and commits it (edit.out), then lists the
+#                tools of the `travsr` server in its `--mcp-config` file and calls search_symbol
+#                for SYM with a `repo` argument (travsr.out).
 set -u
 
 model="unknown"
@@ -257,6 +260,38 @@ if marker tools > /dev/null; then
     mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 30
     echo
   } > /workspace/tools.out 2>&1
+fi
+
+sym=$(marker travsr || true)
+if [ -n "$sym" ]; then
+  # The edit is committed before Travsr is asked, so an index of the clone would find it.
+  (
+    export HOME=/tmp
+    cd /workspace || exit 1
+    git config user.email agent@example.invalid
+    git config user.name "echo agent"
+    printf 'fn child_edit() { %s(); }\n' "$sym" > child-edit.rs
+    git add child-edit.rs
+    git commit -q -m "child edit" > /tmp/commit.err 2>&1
+    echo "commit_rc=$?" > /workspace/edit.out
+  )
+  travsr_url=$(sed -n 's/.*"travsr":{[^}]*"url":"\([^"]*\)".*/\1/p' "$mcp_config" 2> /dev/null)
+  travsr_call() { # $1 = request, $2 = seconds; the answer on stdout
+    curl -sS -f --max-time "$2" -H "content-type: application/json" \
+      -H "accept: application/json, text/event-stream" -d "$1" "$travsr_url"
+  }
+  {
+    case "$travsr_url" in
+      */travsr) echo "url=ok" ;;
+      *) echo "url=missing" ;;
+    esac
+    echo "== tools/list"
+    travsr_call '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 30
+    echo
+    echo "== search_symbol"
+    travsr_call "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"search_symbol\",\"arguments\":{\"name\":\"$sym\",\"repo\":\"/workspace\"}}}" 300
+    echo
+  } > /workspace/travsr.out 2>&1
 fi
 
 if marker dump > /dev/null; then
