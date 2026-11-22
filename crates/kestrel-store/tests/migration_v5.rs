@@ -238,8 +238,9 @@ fn s1_v4_database_migrates_to_v5_and_every_event_keeps_its_cursor() {
     let others_before = other_tables(&path);
 
     let store = Store::open(&path).expect("open migrates");
-    assert_eq!(SCHEMA_VERSION, 5);
-    assert_eq!(user_version(&path), 5);
+    // Later versions (v6, #92) migrate on through v5.
+    assert!(SCHEMA_VERSION >= 5);
+    assert_eq!(user_version(&path), SCHEMA_VERSION);
 
     assert_eq!(
         rows(
