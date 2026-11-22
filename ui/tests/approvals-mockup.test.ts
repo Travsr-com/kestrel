@@ -54,14 +54,23 @@ interface Call {
 }
 
 interface Options {
-  /** Decided approvals; each `?status=` request gets those of its status. */
+  /** Decided approvals; the server lists them with the pending ones. */
   decided?: Approval[];
-  /** A decided status whose request fails. */
-  failDecided?: ApprovalStatus;
+  /** The request for every approval (the decided list) fails. */
+  failDecided?: boolean;
+  /**
+   * Runs that ended: their pending approvals are expired from then on, as the server says, and no
+   * longer in `?status=pending`.
+   */
+  ended?: Set<string>;
   resolve?: () => Response | Promise<Response>;
 }
 
-/** A fake API: approvals by status, the runs list (the sidebar's count) and runs by id. */
+/**
+ * A fake API: approvals (`GET /api/approvals` lists all, `?status=` those of one status), the runs
+ * list (the sidebar's count) and runs by id. A pending approval that is also in `decided` was
+ * decided, so it is listed only as decided.
+ */
 function serve(pending: Approval[], runs: RunSummary[], options: Options = {}) {
   const calls: Call[] = [];
   const fetch: typeof globalThis.fetch = async (input, init) => {
@@ -71,9 +80,13 @@ function serve(pending: Approval[], runs: RunSummary[], options: Options = {}) {
     calls.push({ method, path: url.pathname, search: url.search, body });
     if (url.pathname === '/api/approvals') {
       const status = url.searchParams.get('status');
-      if (status === 'pending') return new Response(JSON.stringify(pending));
-      if (status === options.failDecided) return new Response('{"error":"database is locked"}', { status: 500 });
-      return new Response(JSON.stringify((options.decided ?? []).filter((a) => a.status === status)));
+      const decided = options.decided ?? [];
+      const open = pending
+        .filter((a) => !decided.some((d) => d.id === a.id))
+        .map((a): Approval => (options.ended?.has(a.run_id) ? { ...a, status: 'expired' } : a));
+      if (status === null && options.failDecided) return new Response('{"error":"database is locked"}', { status: 500 });
+      const all = [...open, ...decided];
+      return new Response(JSON.stringify(status === null ? all : all.filter((a) => a.status === status)));
     }
     if (url.pathname.startsWith('/api/approvals/')) return options.resolve?.() ?? new Response(null, { status: 202 });
     if (url.pathname === '/api/runs') return new Response(JSON.stringify(runs));
@@ -334,12 +347,8 @@ describe('Approvals: recently decided (scenario 16)', () => {
     );
     const { calls } = show([], [planner, mailer], { decided: [...decided].reverse() });
     await vi.waitFor(() => expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(10));
-    expect(calls.filter((c) => c.path === '/api/approvals').map((c) => c.search).sort()).toEqual([
-      '?status=approved',
-      '?status=expired',
-      '?status=pending',
-      '?status=rejected',
-    ]);
+    // One request for every approval, of any status (PR #85 review), besides the pending list.
+    expect(calls.filter((c) => c.path === '/api/approvals').map((c) => c.search).sort()).toEqual(['', '?status=pending']);
     const rows = within(decidedList()).getAllByRole('listitem');
     expect(rows.map((r) => r.querySelector('.action')?.textContent)).toEqual(
       Array.from({ length: 10 }, (_, i) => `decided ${i}`),
@@ -357,11 +366,12 @@ describe('Approvals: recently decided (scenario 16)', () => {
     expect(calls.filter((c) => c.path === `/api/runs/${mailer.id}`)).toHaveLength(1);
   });
 
-  it('lists an approval once when two of the lists have it', async () => {
+  it('leaves out the pending approvals that the list of every approval has (PR #85 review)', async () => {
     const r = run({ agent: 'planner' });
-    const a = approval(r, { status: 'approved', action: 'merge it' });
-    show([], [r], { decided: [a, { ...a, status: 'expired' }] });
+    const a = approval(r, { action: 'still waiting' });
+    show([a], [r], { decided: [approval(r, { status: 'approved', action: 'merge it' })] });
     await vi.waitFor(() => expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(1));
+    expect(within(decidedList()).getByRole('listitem')).toHaveTextContent('merge it');
   });
 
   it('says when nothing was decided yet', async () => {
@@ -374,7 +384,7 @@ describe('Approvals: recently decided (scenario 16)', () => {
     const a = approval(r);
     const { calls } = show([a], [r], {
       decided: [approval(r, { status: 'approved', action: 'old one' })],
-      failDecided: 'rejected',
+      failDecided: true,
     });
     expect(await screen.findByText('Could not load decided approvals.')).toBeInTheDocument();
     expect(screen.queryByText('old one')).not.toBeInTheDocument();
@@ -511,9 +521,48 @@ describe('Approvals: a decision on an approval that is not selected (PR #85 revi
     expect(items()[0]).toHaveTextContent('Failed, open it to retry');
     expect(screen.getByRole('status').textContent).toBe('');
   });
+
+  it('does not announce a failure again after its row left and another arrived (PR #85 review)', async () => {
+    const lead = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid' });
+    const a = approval(lead, { action: 'deploy', requested_at: ago(10_000) });
+    const b = approval(kid, { action: 'rm -rf build', requested_at: ago(20_000) });
+    let answer: (res: Response) => void = () => {};
+    const { sockets } = show([a, b], [lead, kid], { resolve: () => new Promise<Response>((done) => (answer = done)) });
+    await vi.waitFor(() => expect(within(detail()).getByRole('heading', { level: 2 })).toHaveTextContent('lead asks'));
+    const u = user();
+    await u.click(within(detail()).getByRole('button', { name: 'Approve' }));
+    await u.click(pick(1));
+    answer(new Response('{"error":"database is locked"}', { status: 500 }));
+    const status = screen.getByRole('status');
+    await vi.waitFor(() => expect(status).toHaveTextContent('lead: the decision failed. Open it to retry.'));
+    // Every text the status region takes from now on.
+    const said: string[] = [];
+    const watch = new MutationObserver(() => said.push(status.textContent ?? ''));
+    watch.observe(status, { childList: true, characterData: true, subtree: true });
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(lead.id, { kind: 'approval_resolved', id: a.id, approved: true }));
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    s.event(6, event(lead.id, { kind: 'approval_requested', id: 'new-1', action: 'deploy again' }, NOW + 1_000));
+    await vi.waitFor(() => expect(items()).toHaveLength(2));
+    await vi.advanceTimersByTimeAsync(1_000);
+    watch.disconnect();
+    expect(said.filter((t) => t.includes('failed'))).toEqual([]);
+    expect(items()[0]).not.toHaveTextContent('Failed');
+  });
 });
 
 describe('Approvals: Recently decided stays current (PR #85 review)', () => {
+  /** The actions in Recently decided, in order. */
+  const decidedActions = () =>
+    within(decidedList())
+      .queryAllByRole('listitem')
+      .map((li) => li.querySelector('.action')?.textContent);
+  /** Requests for the decided list: every approval, not the pending list. */
+  const decidedAsks = (calls: Call[]) =>
+    calls.filter((c) => c.path === '/api/approvals' && c.search !== '?status=pending').length;
+
   it('lists an approval decided on the page after its resolved event, with one refetch for several', async () => {
     const r = run({ agent: 'lead' });
     const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
@@ -522,8 +571,10 @@ describe('Approvals: Recently decided stays current (PR #85 review)', () => {
     const { sockets, calls } = show([a, b], [r], { decided });
     await vi.waitFor(() => expect(items()).toHaveLength(2));
     expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
-    const asked = () => calls.filter((c) => c.path === '/api/approvals' && c.search === '?status=approved').length;
+    // One request without a status per refetch.
+    const asked = () => calls.filter((c) => c.path === '/api/approvals' && c.search === '').length;
     expect(asked()).toBe(1);
+    expect(decidedAsks(calls)).toBe(1);
     await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
     decided.push({ ...a, status: 'approved' }, { ...b, status: 'approved' });
     const s = feed(sockets);
@@ -531,33 +582,140 @@ describe('Approvals: Recently decided stays current (PR #85 review)', () => {
     s.event(5, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
     s.event(6, event(r.id, { kind: 'approval_resolved', id: b.id, approved: true }));
     await vi.waitFor(() => expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(2));
-    expect(within(decidedList()).getAllByRole('listitem').map((li) => li.querySelector('.action')?.textContent)).toEqual([
-      'deploy',
-      'publish',
-    ]);
+    expect(decidedActions()).toEqual(['deploy', 'publish']);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(asked()).toBe(2);
+    expect(decidedAsks(calls)).toBe(2);
   });
 
-  it('does not refetch when an ended row is dismissed, and leaves out an approval that is in the pending rows', async () => {
+  it('lists first an approval resolved just now, however long ago it was requested', async () => {
+    const r = run({ agent: 'lead' });
+    const old = approval(r, { action: 'old ask', requested_at: ago(2 * 3_600_000) });
+    const decided = Array.from({ length: 10 }, (_, i) =>
+      approval(r, { action: `recent ${i}`, status: 'approved', requested_at: ago((i + 1) * 60_000) }),
+    );
+    const { sockets } = show([old], [r], { decided });
+    await vi.waitFor(() => expect(decidedActions()).toHaveLength(10));
+    expect(decidedActions()[0]).toBe('recent 0');
+    decided.push({ ...old, status: 'approved' });
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'approval_resolved', id: old.id, approved: true }, NOW + 5_000));
+    await vi.waitFor(() => expect(decidedActions()[0]).toBe('old ask'));
+    // Still ten, the rest by request time.
+    expect(decidedActions()).toEqual(['old ask', ...Array.from({ length: 9 }, (_, i) => `recent ${i}`)]);
+    expect(within(decidedList()).getAllByRole('listitem')[0]).toHaveTextContent('Approved');
+  });
+
+  it('lists first an approval decided on this page whose resolved event never came', async () => {
+    const r = run({ agent: 'lead' });
+    const old = approval(r, { action: 'old ask', requested_at: ago(2 * 3_600_000) });
+    const decided = Array.from({ length: 10 }, (_, i) =>
+      approval(r, { action: `recent ${i}`, status: 'approved', requested_at: ago((i + 1) * 60_000) }),
+    );
+    const { sockets } = show([old], [r], { decided });
+    await vi.waitFor(() => expect(decidedActions()).toHaveLength(10));
+    await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
+    decided.push({ ...old, status: 'approved' });
+    // The socket opens again: the pending list no longer has it, and no event says so.
+    feed(sockets).open();
+    expect(await screen.findByText('Nothing waiting for you')).toBeInTheDocument();
+    await vi.waitFor(() => expect(decidedActions()[0]).toBe('old ask'));
+    expect(decidedActions()).toHaveLength(10);
+  });
+
+  it('shows an approval whose run ended as Expired once its row is dismissed', async () => {
     const r = run({ agent: 'lead' });
     const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
     const old = approval(r, { action: 'old one', status: 'rejected', requested_at: ago(600_000) });
-    const { sockets, calls } = show([a], [r], { decided: [{ ...a, status: 'expired' }, old] });
+    const ended = new Set<string>();
+    const { sockets } = show([a], [r], { decided: [old], ended });
     await vi.waitFor(() => expect(items()).toHaveLength(1));
     await screen.findByText('old one');
     const s = feed(sockets);
     s.open();
+    ended.add(r.id);
     s.event(5, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Completed' }));
     await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
-    expect(within(decidedList()).getAllByRole('listitem').map((li) => li.querySelector('.action')?.textContent)).toEqual([
-      'old one',
-    ]);
-    const asked = () => calls.filter((c) => c.path === '/api/approvals' && c.search === '?status=expired').length;
+    await vi.advanceTimersByTimeAsync(1_000);
+    // Still a pending row, so not listed as decided too.
+    expect(decidedActions()).toEqual(['old one']);
     await user().click(within(detail()).getByRole('button', { name: 'Dismiss' }));
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(asked()).toBe(1);
-    // Dismissed, it is no longer a pending row, so the list shows it with its outcome.
-    expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(2);
+    await vi.waitFor(() => expect(decidedActions()).toEqual(['deploy', 'old one']));
+    expect(within(decidedList()).getAllByRole('listitem')[0]).toHaveTextContent('Expired');
+  });
+
+  it('asks for the decided list again when rows end and when an ended row is dismissed', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const ended = new Set<string>();
+    const { sockets, calls } = show([a], [r], { ended });
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
+    const before = decidedAsks(calls);
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Completed' }));
+    await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(decidedAsks(calls)).toBe(before + 1);
+    // The server says expired only a moment later: the list asked for on the end did not have it.
+    ended.add(r.id);
+    await user().click(within(detail()).getByRole('button', { name: 'Dismiss' }));
+    await vi.waitFor(() => expect(decidedActions()).toEqual(['deploy']));
+    expect(decidedAsks(calls)).toBe(before + 2);
+  });
+
+  it('asks for the decided list again when a decision finds the run no longer waiting', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const ended = new Set<string>();
+    const { calls } = show([a], [r], {
+      ended,
+      resolve: () => {
+        ended.add(r.id);
+        return new Response('{"error":"the run is not waiting on this approval"}', { status: 409 });
+      },
+    });
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
+    const before = decidedAsks(calls);
+    await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(decidedAsks(calls)).toBe(before + 1);
+  });
+
+  it('a steady stream of resolutions still refreshes the list while it lasts', async () => {
+    const r = run({ agent: 'lead' });
+    const list = Array.from({ length: 10 }, (_, i) => approval(r, { action: `ask ${i}`, requested_at: ago((i + 1) * 1_000) }));
+    const { sockets, calls } = show(list, [r]);
+    await vi.waitFor(() => expect(items()).toHaveLength(10));
+    expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
+    const before = decidedAsks(calls);
+    const s = feed(sockets);
+    s.open();
+    // One resolution every 200 ms for 2 seconds.
+    for (const [i, a] of list.entries()) {
+      s.event(10 + i, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(decidedAsks(calls) - before).toBeGreaterThanOrEqual(3);
+  });
+
+  it('counts in the Pending heading only the approvals that can still be decided, as the sidebar does', async () => {
+    const r = run({ agent: 'lead' });
+    const other = run({ agent: 'mailer' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const b = approval(other, { action: 'send', requested_at: ago(20_000) });
+    const { sockets } = show([a, b], [r, other]);
+    await vi.waitFor(() => expect(items()).toHaveLength(2));
+    expect(screen.getByText('Pending (2)')).toBeInTheDocument();
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Completed' }));
+    await vi.waitFor(() => expect(screen.getByText('Pending (1)')).toBeInTheDocument());
+    // The ended row is still listed, to be dismissed.
+    expect(items()).toHaveLength(2);
   });
 });

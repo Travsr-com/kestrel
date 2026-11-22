@@ -130,6 +130,19 @@ describe('Fleet tiles (scenario 4)', () => {
     expect(tile('Sub-agents')).toHaveTextContent('live child runs');
   });
 
+  it('Needs you says it is loading, not 0, until the approvals list has loaded (PR #85 review)', async () => {
+    const runs = fleet();
+    const state = new ApprovalsState();
+    show(runs, state);
+    await screen.findByRole('link', { name: 'lead' });
+    const big = tile('Needs you').querySelector('.big') as HTMLElement;
+    expect(big).not.toHaveTextContent('0');
+    expect(within(big).getByText('...')).toHaveAttribute('aria-hidden', 'true');
+    expect(within(big).getByText('loading')).toHaveClass('visually-hidden');
+    state.load([approval(runs[2]?.id ?? '', 'ap-1', 'git push')], state.beginSync());
+    await vi.waitFor(() => expect(big).toHaveTextContent(/^1$/));
+  });
+
   it('without the approvals list, counts the runs waiting on an approval', async () => {
     show(fleet());
     await screen.findByRole('link', { name: 'lead' });
@@ -296,8 +309,8 @@ describe('Fleet card (scenario 7)', () => {
     expect(pill).toHaveClass('pill', 'tone-running');
     expect(within(c).getByText('$0.42 of $2.00')).toBeInTheDocument();
     expect(within(c).getByText('21%')).toBeInTheDocument();
-    // Named by agent, so a list of cards does not read as many meters of the same name.
-    const meter = within(c).getByRole('meter', { name: 'Budget used by alpha' });
+    // Named by agent and run, so a list of cards does not read as many meters of the same name.
+    const meter = within(c).getByRole('meter', { name: 'Budget used by alpha, run a1b2c3d4' });
     expect(meter).toHaveAttribute('aria-valuenow', '21');
     expect(meter).toHaveClass('track');
     expect(c).toHaveTextContent('no sub-agents');
@@ -320,6 +333,15 @@ describe('Fleet card (scenario 7)', () => {
     expect(card('lead')).toHaveTextContent('3 sub-agents, 2 running');
     expect(card('solo')).toHaveTextContent('1 sub-agent');
     expect(card('solo')).not.toHaveTextContent('running');
+  });
+
+  it('cards of the same agent have meters of different names (PR #85 review)', async () => {
+    const a = run({ id: '00000000-0000-4000-8000-00000000aaaa', agent: 'twin' });
+    const b = run({ id: '00000000-0000-4000-8000-00000000bbbb', agent: 'twin' });
+    show([a, b]);
+    await screen.findAllByRole('link', { name: 'twin' });
+    const names = screen.getAllByRole('meter').map((m) => m.getAttribute('aria-label')).sort();
+    expect(names).toEqual(['Budget used by twin, run 0000aaaa', 'Budget used by twin, run 0000bbbb']);
   });
 
   it('a run with no limit says so and shows no meter', async () => {
@@ -361,6 +383,20 @@ describe('Fleet card status line (scenario 8)', () => {
     show([a], pending(approval(a.id, 'ap-1', `${'x'.repeat(30_000)}\n${'y'.repeat(20_000)}`)));
     await screen.findByRole('link', { name: 'asking' });
     expect(card('asking').querySelector('.note')?.textContent).toBe(`${'x'.repeat(120)}...`);
+  });
+
+  it('says what the approval the run waits on asks, picked by its id, when the run has two (PR #85 review)', async () => {
+    const a = run({ agent: 'asking', status: { Suspended: { Approval: 'ap-1' } } });
+    show([a], pending(approval(a.id, 'ap-1', 'npm install'), approval(a.id, 'ap-2', 'git push')));
+    await screen.findByRole('link', { name: 'asking' });
+    expect(card('asking').querySelector('.note')?.textContent).toBe('npm install');
+  });
+
+  it('says it waits when the approval it waits on is not in the list, even with another of the run there (PR #85 review)', async () => {
+    const a = run({ agent: 'asking', status: { Suspended: { Approval: 'ap-9' } } });
+    show([a], pending(approval(a.id, 'ap-1', 'npm install')));
+    await screen.findByRole('link', { name: 'asking' });
+    expect(card('asking').querySelector('.note')?.textContent).toBe('Waiting for an approval.');
   });
 
   it('a run waiting on an approval not in the list says it waits', async () => {

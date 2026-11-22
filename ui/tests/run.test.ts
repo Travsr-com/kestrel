@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
 import Run from '../src/views/Run.svelte';
 import { createApi } from '../src/lib/api';
-import { allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
+import { addTokens, allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
 import type { Event, RunStatus, RunSummary } from '../src/lib/types';
 import { fakeSockets, type FakeSocket } from './fake-socket';
 import { ids, seriousViolations } from './axe';
@@ -140,7 +140,7 @@ describe('Run view', () => {
     first.event(1, event(r.id, 1, log('one')));
     first.event(2, event(r.id, 2, log('two')));
     first.drop();
-    expect(await screen.findByText(/Reconnecting/)).toBeInTheDocument();
+    expect(await screen.findByText('Reconnecting', { selector: '.link' })).toBeInTheDocument();
     await vi.advanceTimersByTimeAsync(600);
     const second = stream(sockets, r.id);
     expect(second).not.toBe(first);
@@ -439,6 +439,18 @@ describe('Run view', () => {
     expect(liveBelow(nodes, 'r')).toBe(2);
     expect(liveBelow(nodes, 'c')).toBe(0);
     expect(carved(nodes, 'r')).toBe(3);
+  });
+
+  it('adds the tokens of only the new events to running totals, without changing them (PR #85 review)', () => {
+    const call = (tokens: number): Event['kind'] => ({
+      kind: 'model_call', run_id: 'r', provider: 'p', model: 'm', tokens_in: tokens, tokens_out: tokens * 2,
+      tokens_cache_read: tokens * 3, tokens_cache_write: tokens * 4, cost: null, latency_ms: 1, status: 200,
+    });
+    const before = { input: 10, output: 20, cacheRead: 30, cacheWrite: 40 };
+    const after = addTokens(before, [event('r', 1, call(1)), event('r', 2, log('not a call')), event('r', 3, call(5))]);
+    expect(after).toEqual({ input: 16, output: 32, cacheRead: 48, cacheWrite: 64 });
+    expect(before).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40 });
+    expect(addTokens(after, [])).toEqual(after);
   });
 
   it('parses dollars to micro-dollars without float math', () => {

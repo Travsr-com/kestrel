@@ -51,9 +51,10 @@ interface Call {
   body: unknown;
 }
 
-/** Answers the approvals list: `pending` for `?status=pending`, nothing decided for the others. */
+/** Answers the approvals list: nothing is decided, so `pending` for all and for `?status=pending`. */
 function approvalsList(url: URL, pending: Approval[]): Response {
-  return new Response(JSON.stringify(url.searchParams.get('status') === 'pending' ? pending : []));
+  const status = url.searchParams.get('status');
+  return new Response(JSON.stringify(status === null || status === 'pending' ? pending : []));
 }
 
 /** A fake API: pending approvals, runs by id, and resolve answering `resolve`. */
@@ -373,9 +374,9 @@ describe('Approvals inbox', () => {
     const s = feed(sockets);
     s.event(4, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
     s.open();
-    // The list fetched on open still has `a` (it was taken before the resolve was seen). Five
-    // lists: pending at start, the three decided ones, and pending again on open.
-    await vi.waitFor(() => expect(calls.filter((c) => c.path === '/api/approvals').length).toBeGreaterThanOrEqual(5));
+    // The list fetched on open still has `a` (it was taken before the resolve was seen). Three
+    // lists: pending at start, every approval for the decided list, and pending again on open.
+    await vi.waitFor(() => expect(calls.filter((c) => c.path === '/api/approvals').length).toBeGreaterThanOrEqual(3));
     await vi.advanceTimersByTimeAsync(0);
     expect(rows().map((x) => x.dataset.id)).toEqual([b.id]);
   });
@@ -684,5 +685,44 @@ describe('ApprovalsState', () => {
     state.apply(event('r1', { kind: 'agent_log', line: 'x' }));
     state.dismiss('a1');
     expect(Object.keys(state.rows)).toEqual(['a2']);
+  });
+
+  it('remembers when each approval was seen resolved: the event time, or now for a decision accepted here (PR #85 review)', () => {
+    const state = new ApprovalsState();
+    state.load([a1, a2], state.beginSync());
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a1', approved: true }, NOW + 5_000));
+    // One never listed here too.
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'gone', approved: false }, NOW + 6_000));
+    expect(state.decidedAt).toEqual({ a1: new Date(NOW + 5_000).toISOString(), gone: new Date(NOW + 6_000).toISOString() });
+    const t0 = Date.now();
+    state.accepted('a2');
+    const at = Date.parse(state.decidedAt.a2 ?? '');
+    expect(at).toBeGreaterThanOrEqual(t0);
+    expect(at).toBeLessThanOrEqual(Date.now());
+    // The event, when it comes, says when it really was.
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a2', approved: true }, NOW + 9_000));
+    expect(state.decidedAt.a2).toBe(new Date(NOW + 9_000).toISOString());
+  });
+
+  it('counts each change that can change the decided list, and nothing else (PR #85 review)', () => {
+    const state = new ApprovalsState();
+    state.load([a1, a2, { ...a2, id: 'a3', run_id: 'r3' }], state.beginSync());
+    const changes = () => state.decidedChanges;
+    expect(changes()).toBe(0);
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a1', approved: true }));
+    expect(changes()).toBe(1);
+    // A run with no pending row ending changes nothing here.
+    state.apply(event('r9', { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    expect(changes()).toBe(1);
+    state.apply(event('r1', { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    expect(changes()).toBe(2);
+    state.endRow('a3');
+    expect(changes()).toBe(3);
+    state.dismiss('a2');
+    expect(changes()).toBe(4);
+    // A row no longer there.
+    state.endRow('a2');
+    state.dismiss('a2');
+    expect(changes()).toBe(4);
   });
 });

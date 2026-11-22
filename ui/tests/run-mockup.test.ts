@@ -229,19 +229,63 @@ describe('Run view panels (scenario 11)', () => {
     expect(panel).toHaveClass('panel');
     expect(within(panel).getByRole('region', { name: 'Event stream' })).toBeInTheDocument();
     expect(within(panel).getByRole('list', { name: 'Events' })).toBeInTheDocument();
-    expect(within(panel).getByRole('status')).toHaveTextContent('Connecting');
+    const word = () => panel.querySelector('.link') as HTMLElement;
+    expect(word()).toHaveTextContent('Connecting');
     const s = socket(sockets, `/ws/runs/${r.id}`);
     s.open();
     await settle();
     // The tree socket has not opened yet.
-    expect(within(panel).getByRole('status')).toHaveTextContent('Connecting');
+    expect(word()).toHaveTextContent('Connecting');
     socket(sockets, `/ws/tree/${r.id}`).open();
-    await vi.waitFor(() => expect(within(panel).getByRole('status')).toHaveTextContent('Connected'));
+    await vi.waitFor(() => expect(word()).toHaveTextContent('Connected'));
     s.drop();
-    await vi.waitFor(() => expect(within(panel).getByRole('status')).toHaveTextContent('Reconnecting'));
+    await vi.waitFor(() => expect(word()).toHaveTextContent('Reconnecting'));
     await vi.advanceTimersByTimeAsync(600);
     socket(sockets, `/ws/runs/${r.id}`).open();
-    await vi.waitFor(() => expect(within(panel).getByRole('status')).toHaveTextContent('Connected'));
+    await vi.waitFor(() => expect(word()).toHaveTextContent('Connected'));
+  });
+
+  it('the visible word is not a live region, so opening or switching runs announces nothing (PR #85 review)', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const { sockets, rerender } = show(root.id, [root, kid]);
+    const panel = (await screen.findByRole('heading', { level: 2, name: 'Live events' })).closest('section') as HTMLElement;
+    const word = panel.querySelector('.link') as HTMLElement;
+    expect(word).toHaveTextContent('Connecting');
+    // Neither the word nor anything around it is a live region.
+    expect(word.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    const live = within(panel).getByRole('status');
+    expect(live).toHaveClass('visually-hidden');
+    expect(live.textContent).toBe('');
+    socket(sockets, `/ws/runs/${root.id}`).open();
+    socket(sockets, `/ws/tree/${root.id}`).open();
+    await vi.waitFor(() => expect(word).toHaveTextContent('Connected'));
+    expect(live.textContent).toBe('');
+    await rerender({ id: kid.id });
+    await screen.findByRole('heading', { level: 1, name: 'kid' });
+    expect(panel.querySelector('.link')).toHaveTextContent('Connecting');
+    expect(within(panel).getByRole('status').textContent).toBe('');
+    socket(sockets, `/ws/runs/${kid.id}`).open();
+    await vi.waitFor(() => expect(panel.querySelector('.link')).toHaveTextContent('Connected'));
+    expect(within(panel).getByRole('status').textContent).toBe('');
+  });
+
+  it('announces when a socket drops and when live updates come back, once each (PR #85 review)', async () => {
+    const r = run({ agent: 'lead' });
+    const { sockets } = show(r.id, [r]);
+    const panel = (await screen.findByRole('heading', { level: 2, name: 'Live events' })).closest('section') as HTMLElement;
+    const live = () => within(panel).getByRole('status');
+    const s = socket(sockets, `/ws/runs/${r.id}`);
+    s.open();
+    socket(sockets, `/ws/tree/${r.id}`).open();
+    await vi.waitFor(() => expect(panel.querySelector('.link')).toHaveTextContent('Connected'));
+    expect(live().textContent).toBe('');
+    s.drop();
+    await vi.waitFor(() => expect(live()).toHaveTextContent('Reconnecting to live updates.'));
+    await vi.advanceTimersByTimeAsync(600);
+    socket(sockets, `/ws/runs/${r.id}`).open();
+    await vi.waitFor(() => expect(live()).toHaveTextContent('Live updates are back.'));
+    expect(panel.querySelector('.link')).toHaveTextContent('Connected');
   });
 
   it('shows each event with its time, a short coloured kind label and its text', async () => {
@@ -317,6 +361,27 @@ describe('Run view budget panel (scenario 12)', () => {
     expect(definition('Output tokens')).toBe('58,204');
     expect(definition('Cache reads')).toBe('1,204,115');
     expect(definition('Cache writes')).toBe('96,330');
+  });
+
+  it('starts the token totals again from zero when another run is shown (PR #85 review)', async () => {
+    const root = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
+    const { sockets, rerender } = show(root.id, [root, kid]);
+    await screen.findByRole('heading', { level: 2, name: 'Budget' });
+    const s = socket(sockets, `/ws/runs/${root.id}`);
+    s.open();
+    s.event(1, event(root.id, 1, modelCall(root.id, { tokens_in: 500, tokens_out: 50, tokens_cache_read: 5, tokens_cache_write: 1 })));
+    await settle();
+    expect(definition('Input tokens')).toBe('500');
+    await rerender({ id: kid.id });
+    await screen.findByRole('heading', { level: 1, name: 'kid' });
+    for (const term of ['Input tokens', 'Output tokens', 'Cache reads', 'Cache writes']) expect(definition(term)).toBe('0');
+    const k = socket(sockets, `/ws/runs/${kid.id}`);
+    k.open();
+    k.event(1, event(kid.id, 1, modelCall(kid.id, { tokens_in: 7, tokens_out: 3 })));
+    await settle();
+    expect(definition('Input tokens')).toBe('7');
+    expect(definition('Output tokens')).toBe('3');
   });
 
   it('says no limit, with no meter, for a run without a limit', async () => {
