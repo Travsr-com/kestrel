@@ -234,19 +234,20 @@ async fn s9_a_client_that_does_not_read_is_dropped() {
     // Not reading for a while lets the server's buffers and the queue fill up.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut events = 0;
-    let mut closed = false;
-    loop {
+    // Only a close frame passes: a connection that is merely dropped, or a server that keeps the
+    // client, fails.
+    let close = loop {
         match timeout(Duration::from_secs(10), socket.next()).await {
             Ok(Some(Ok(Message::Text(_)))) => events += 1,
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
-                closed = true;
-                break;
-            }
+            Ok(Some(Ok(Message::Close(frame)))) => break frame,
             Ok(Some(Ok(_))) => {}
-            Err(_) => break,
+            Ok(other) => panic!("dropped without a close frame after {events} events: {other:?}"),
+            Err(_) => panic!("the server kept the slow client ({events} events)"),
         }
-    }
-    assert!(closed, "the server kept the slow client");
+    };
+    let close = close.expect("the close frame says why");
+    assert_eq!(u16::from(close.code), 1008, "policy violation: {close:?}");
+    assert_eq!(close.reason.as_str(), "the client is not reading");
     assert!(events < 300, "got all {events} events");
 }
 
