@@ -25,6 +25,8 @@ fn states() -> Vec<(&'static str, RunStatus)> {
 
 // Rows = from, columns = to, same order as `states()`.
 // Suspended -> Suspended is treated as NOT allowed (the issue lists only Suspended -> Running).
+// Provisioning -> Suspended(Error) is how recovery suspends a run that a restart cut off before its
+// sandbox started (#92). No other suspension happens before a run is running.
 #[rustfmt::skip]
 const T: bool = true;
 const F: bool = false;
@@ -32,7 +34,7 @@ const F: bool = false;
 const TABLE: [[bool; 10]; 10] = [
     //            Q  P  R  SA SB SE SM Co Fa Ca
     /* Queued  */ [F, T, F, F, F, F, F, F, T, T],
-    /* Provis. */ [F, F, T, F, F, F, F, F, T, T],
+    /* Provis. */ [F, F, T, F, F, T, F, F, T, T],
     /* Running */ [F, F, F, T, T, T, T, T, T, T],
     /* SuspApp */ [F, F, T, F, F, F, F, F, T, T],
     /* SuspBud */ [F, F, T, F, F, F, F, F, T, T],
