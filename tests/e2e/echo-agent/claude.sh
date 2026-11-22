@@ -27,9 +27,10 @@
 #
 # A parent:
 #   fanout=N     spawn N children with kestrel.spawn (no wait), then kestrel.join all of them.
-#                Child ids go to kids.out (one per line, so a restarted parent spawns only the
-#                ones it has not), the spawn answers to fanout.out, `joining` to joining.out
-#                just before the join, and the join answer to join.out.
+#                It keeps no record of its children: started again (after a restart) it spawns
+#                all N again, as a real agent would, and Kestrel answers with the children it
+#                already has. The spawn answers go to fanout.out (appended), `joining` to
+#                joining.out just before the join, and the join answer to join.out.
 #   kids=NAME    the agent to spawn (default `worker`); each=USD the budget_usd of each child;
 #                first=S sleep S seconds before the first spawn (once per workspace); gap=S sleep
 #                S seconds between spawns.
@@ -377,9 +378,7 @@ if [ -n "$n" ]; then
   if [ -n "$each" ]; then
     budget=",\"budget_usd\":\"$each\""
   fi
-  touch /workspace/kids.out
-  # A parent started again (after a restart) spawns only the children it has not spawned yet.
-  i=$(($(wc -l < /workspace/kids.out) + 1))
+  i=1
   while [ "$i" -le "$n" ]; do
     if [ "$i" -gt 1 ] && [ -n "$gap" ]; then
       sleep "$gap"
@@ -392,7 +391,6 @@ if [ -n "$n" ]; then
       echo "echo-agent: spawn $i failed: $answer" >&2
       break
     fi
-    echo "$child" >> /workspace/kids.out
     i=$((i + 1))
   done
   echo joining > /workspace/joining.out
