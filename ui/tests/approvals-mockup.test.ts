@@ -64,6 +64,8 @@ interface Options {
    */
   ended?: Set<string>;
   resolve?: () => Response | Promise<Response>;
+  /** The decided list (every approval) answers this many ms after it was asked, as it was then. */
+  decidedDelay?: number;
 }
 
 /**
@@ -86,7 +88,9 @@ function serve(pending: Approval[], runs: RunSummary[], options: Options = {}) {
         .map((a): Approval => (options.ended?.has(a.run_id) ? { ...a, status: 'expired' } : a));
       if (status === null && options.failDecided) return new Response('{"error":"database is locked"}', { status: 500 });
       const all = [...open, ...decided];
-      return new Response(JSON.stringify(status === null ? all : all.filter((a) => a.status === status)));
+      const body = JSON.stringify(status === null ? all : all.filter((a) => a.status === status));
+      if (status === null && options.decidedDelay) await new Promise((done) => setTimeout(done, options.decidedDelay));
+      return new Response(body);
     }
     if (url.pathname.startsWith('/api/approvals/')) return options.resolve?.() ?? new Response(null, { status: 202 });
     if (url.pathname === '/api/runs') return new Response(JSON.stringify(runs));
@@ -686,21 +690,73 @@ describe('Approvals: Recently decided stays current (PR #85 review)', () => {
     expect(decidedAsks(calls)).toBe(before + 1);
   });
 
-  it('a steady stream of resolutions still refreshes the list while it lasts', async () => {
+  it('a steady stream of resolutions still refreshes the list while it lasts, with a slow server (PR #85 review)', async () => {
     const r = run({ agent: 'lead' });
     const list = Array.from({ length: 10 }, (_, i) => approval(r, { action: `ask ${i}`, requested_at: ago((i + 1) * 1_000) }));
-    const { sockets, calls } = show(list, [r]);
+    const decided: Approval[] = [];
+    // Each answer takes longer than the time between two asks.
+    const { sockets, calls } = show(list, [r], { decided, decidedDelay: 500 });
     await vi.waitFor(() => expect(items()).toHaveLength(10));
     expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
     const before = decidedAsks(calls);
     const s = feed(sockets);
     s.open();
-    // One resolution every 200 ms for 2 seconds.
+    // One resolution every 200 ms for 2 seconds; how many decided ones show, before each.
+    const shown: number[] = [];
     for (const [i, a] of list.entries()) {
+      shown.push(screen.queryByRole('list', { name: 'Recently decided' }) ? decidedActions().length : 0);
+      decided.push({ ...a, status: 'approved' });
       s.event(10 + i, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
       await vi.advanceTimersByTimeAsync(200);
     }
     expect(decidedAsks(calls) - before).toBeGreaterThanOrEqual(3);
+    // The visible list changed at least twice while the resolutions kept arriving.
+    expect(new Set(shown.filter((count) => count > 0)).size).toBeGreaterThanOrEqual(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(decidedActions()).toHaveLength(10);
+  });
+
+  it('lists an approval whose run ended just now first once dismissed, however long ago it was requested (PR #85 review)', async () => {
+    const r = run({ agent: 'lead' });
+    const old = approval(r, { action: 'old ask', requested_at: ago(2 * 3_600_000) });
+    const decided = Array.from({ length: 10 }, (_, i) =>
+      approval(r, { action: `recent ${i}`, status: 'approved', requested_at: ago((i + 1) * 60_000) }),
+    );
+    const ended = new Set<string>();
+    const { sockets } = show([old], [r], { decided, ended });
+    await vi.waitFor(() => expect(decidedActions()).toHaveLength(10));
+    const s = feed(sockets);
+    s.open();
+    ended.add(r.id);
+    s.event(5, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: old.id } }, to: 'Completed' }, NOW + 5_000));
+    await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
+    await user().click(within(detail()).getByRole('button', { name: 'Dismiss' }));
+    await vi.waitFor(() => expect(decidedActions()[0]).toBe('old ask'));
+    expect(within(decidedList()).getAllByRole('listitem')[0]).toHaveTextContent('Expired');
+    expect(decidedActions()).toEqual(['old ask', ...Array.from({ length: 9 }, (_, i) => `recent ${i}`)]);
+  });
+
+  it('lists first an approval a decision found no longer waiting, once dismissed (PR #85 review)', async () => {
+    const r = run({ agent: 'lead' });
+    const old = approval(r, { action: 'old ask', requested_at: ago(2 * 3_600_000) });
+    const decided = Array.from({ length: 10 }, (_, i) =>
+      approval(r, { action: `recent ${i}`, status: 'approved', requested_at: ago((i + 1) * 60_000) }),
+    );
+    const ended = new Set<string>();
+    show([old], [r], {
+      decided,
+      ended,
+      resolve: () => {
+        ended.add(r.id);
+        return new Response('{"error":"the run is not waiting on this approval"}', { status: 409 });
+      },
+    });
+    await vi.waitFor(() => expect(decidedActions()).toHaveLength(10));
+    await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
+    await user().click(within(detail()).getByRole('button', { name: 'Dismiss' }));
+    await vi.waitFor(() => expect(decidedActions()[0]).toBe('old ask'));
+    expect(within(decidedList()).getAllByRole('listitem')[0]).toHaveTextContent('Expired');
   });
 
   it('counts in the Pending heading only the approvals that can still be decided, as the sidebar does', async () => {

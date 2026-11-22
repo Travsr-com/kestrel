@@ -94,6 +94,19 @@ describe('FleetState', () => {
     expect(asked).toEqual(['c', 'p']);
   });
 
+  it('asks for a run first seen through `lookUp`, and for a known run whose limit moved through `refresh` (PR #85 review)', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p', { root: 'p' })]);
+    const refreshed: string[] = [];
+    const lookedUp: string[] = [];
+    const refresh = (id: string) => refreshed.push(id);
+    const lookUp = (id: string) => lookedUp.push(id);
+    fleet.apply(ev('p', { kind: 'child_spawned', child: 'c', agent: 'kid', budget: 300 }), 0, refresh, 'p', lookUp);
+    fleet.apply(ev('d', { kind: 'run_created', agent: 'kid', parent: 'p' }), 0, refresh, 'p', lookUp);
+    expect(lookedUp).toEqual(['c', 'd']);
+    expect(refreshed).toEqual(['p']);
+  });
+
   it('takes the status from a fetch when told the answer is newer', () => {
     const fleet = new FleetState();
     fleet.load([summary('p')]);

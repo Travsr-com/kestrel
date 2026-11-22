@@ -3,6 +3,7 @@
 // one it does not know and follows its tree like any other.
 
 import { render, screen, within } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
 import type { Event, RunSummary } from '../src/lib/types';
@@ -30,36 +31,69 @@ function run(over: Partial<RunSummary> = {}): RunSummary {
   };
 }
 
+/** Calls `read` once the body of `res` has been read as JSON. */
+function watched(res: Response, read: () => void): Response {
+  const json = res.json.bind(res);
+  res.json = async () => {
+    const body: unknown = await json();
+    read();
+    return body;
+  };
+  return res;
+}
+
+interface Options {
+  /** Run look-ups (paths) that fail once with a 503. */
+  failOnce?: string[];
+  /** Run look-ups (paths) whose answer waits until `release` is called. */
+  hold?: string[];
+}
+
 /** A server whose run list is `listed` (what existed when Fleet loaded) and that knows `all` by id. */
-function serve(listed: RunSummary[], all: RunSummary[], failOnce: string[] = []) {
+function serve(listed: RunSummary[], all: RunSummary[], { failOnce = [], hold = [] }: Options = {}) {
   const gets: string[] = [];
+  /** Live-run lists read by the app (one per live status per sync), and failed look-ups read. */
+  let lists = 0;
+  let failures = 0;
+  let release: () => void = () => {};
+  const held = new Promise<void>((done) => (release = done));
   const fetch: typeof globalThis.fetch = async (input) => {
     const url = new URL(String(input), 'http://kestrel.test');
     if (url.pathname === '/api/approvals') return new Response('[]');
     if (url.pathname === '/api/runs') {
       const status = url.searchParams.get('status');
       const live = (r: RunSummary) => typeof r.status === 'string' && r.status.toLowerCase() === status;
-      return new Response(JSON.stringify(status === null ? listed : listed.filter(live)));
+      if (status === null) return new Response(JSON.stringify(listed));
+      return watched(new Response(JSON.stringify(listed.filter(live))), () => (lists += 1));
     }
     gets.push(url.pathname);
+    if (hold.includes(url.pathname)) await held;
     const one = all.find((r) => url.pathname === `/api/runs/${r.id}`);
     const fail = failOnce.indexOf(url.pathname);
     if (fail >= 0) {
       failOnce.splice(fail, 1);
-      return new Response('{"error":"busy"}', { status: 503 });
+      return watched(new Response('{"error":"busy"}', { status: 503 }), () => (failures += 1));
     }
     return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no run"}', { status: 404 });
   };
-  return { fetch, gets };
+  return { fetch, gets, lists: () => lists, failures: () => failures, release: () => release() };
 }
 
-function show(listed: RunSummary[], all: RunSummary[], failOnce: string[] = []) {
-  const served = serve(listed, all, failOnce);
+function show(listed: RunSummary[], all: RunSummary[], options: Options = {}) {
+  const served = serve(listed, all, options);
   const sockets = fakeSockets();
   window.location.hash = '#/fleet';
-  render(App, { fetch: served.fetch, sockets: sockets.factory });
-  return { sockets, gets: served.gets };
+  const result = render(App, { fetch: served.fetch, sockets: sockets.factory });
+  return { ...served, sockets, unmount: result.unmount };
 }
+
+/** Lets every promise already settled run its callbacks (each step yields to the event loop). */
+async function flush() {
+  for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(0);
+}
+
+/** The live statuses the app lists, one request each per sync. */
+const LIVE_STATUSES = 4;
 
 function feed(sockets: ReturnType<typeof fakeSockets>): FakeSocket {
   const found = sockets.made.filter((s) => s.url.includes('/ws/events')).at(-1);
@@ -124,26 +158,92 @@ describe('Fleet and runs started after it loaded', () => {
     expect(agents()).toEqual(['old']);
   });
 
-  it('does not look up a run its tree socket already brought, and asks again after a failed look-up', async () => {
+  it('does not look up a run its tree socket already brought', async () => {
     const old = run({ agent: 'old' });
     const kid = run({ agent: 'kid', parent: old.id, root: old.id, depth: 1 });
-    const fresh = run({ agent: 'fresh' });
-    const { sockets, gets } = show([old], [old, kid, fresh], [`/api/runs/${fresh.id}`]);
+    const { sockets, gets } = show([old], [old, kid]);
     await vi.waitFor(() => expect(agents()).toEqual(['old']));
-    const tree = sockets.made.find((x) => x.url.includes(`/ws/tree/${old.id}`));
-    if (!tree) throw new Error('no tree socket for old');
+    const tree = treeOf(sockets, old.id);
     tree.open();
     tree.event(1, ev(kid.id, { kind: 'run_created', agent: 'kid', parent: old.id }, 1));
 
     const s = feed(sockets);
     s.open();
     s.event(1, ev(kid.id, { kind: 'run_created', agent: 'kid', parent: old.id }));
-    s.event(2, ev(fresh.id, { kind: 'run_created', agent: 'fresh' }));
-    // The first look-up of `fresh` fails; the next change to the live runs (`another`) asks again.
-    s.event(3, ev('another', { kind: 'run_created', agent: 'other' }));
-    await vi.waitFor(() => expect(agents()).toContain('fresh'));
-    expect(gets.filter((p) => p === `/api/runs/${fresh.id}`)).toHaveLength(2);
+    await flush();
+    await vi.advanceTimersByTimeAsync(6_000);
     // `kid` came on its tree socket: fetched once for its limit, as before, and not looked up again.
     expect(gets.filter((p) => p === `/api/runs/${kid.id}`)).toHaveLength(1);
   });
+
+  it('asks again by itself after a failed look-up, with no further socket events (PR #85 review)', async () => {
+    const old = run({ agent: 'old' });
+    const fresh = run({ agent: 'fresh' });
+    const server = show([old], [old, fresh], { failOnce: [`/api/runs/${fresh.id}`] });
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const s = feed(server.sockets);
+    s.open();
+    // The sync the opening starts changes the live runs too: it settles first, so it cannot be what
+    // asks again.
+    await vi.waitFor(() => expect(server.lists()).toBe(2 * LIVE_STATUSES));
+    await flush();
+
+    s.event(1, ev(fresh.id, { kind: 'run_created', agent: 'fresh' }));
+    await vi.waitFor(() => expect(server.failures()).toBe(1));
+    await flush();
+    const lookUps = () => server.gets.filter((p) => p === `/api/runs/${fresh.id}`);
+    expect(lookUps()).toHaveLength(1);
+    expect(agents()).toEqual(['old']);
+
+    // No socket event from here on: only time passes.
+    await vi.advanceTimersByTimeAsync(6_000);
+    await vi.waitFor(() => expect(agents()).toEqual(['fresh', 'old']));
+    expect(lookUps()).toHaveLength(2);
+  });
+
+  it('asks nothing more after Fleet is gone, even after a failed look-up (PR #85 review)', async () => {
+    const old = run({ agent: 'old' });
+    const fresh = run({ agent: 'fresh' });
+    const server = show([old], [old, fresh], { failOnce: [`/api/runs/${fresh.id}`] });
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const s = feed(server.sockets);
+    s.open();
+    s.event(1, ev(fresh.id, { kind: 'run_created', agent: 'fresh' }));
+    await vi.waitFor(() => expect(server.failures()).toBe(1));
+    await flush();
+    server.unmount();
+    await vi.advanceTimersByTimeAsync(130_000);
+    expect(server.gets.filter((p) => p === `/api/runs/${fresh.id}`)).toHaveLength(1);
+  });
+
+  it('fetches a new child once when the events socket brings it before its tree socket (PR #85 review)', async () => {
+    const old = run({ agent: 'old' });
+    const kid = run({ agent: 'kid', parent: old.id, root: old.id, depth: 1, limit: 700_000 });
+    const server = show([old], [old, kid], { hold: [`/api/runs/${kid.id}`] });
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const tree = treeOf(server.sockets, old.id);
+    tree.open();
+    const s = feed(server.sockets);
+    s.open();
+    s.event(1, ev(kid.id, { kind: 'run_created', agent: 'kid', parent: old.id }));
+    const fetches = () => server.gets.filter((p) => p === `/api/runs/${kid.id}`);
+    // The look-up is on its way when the tree socket brings the child too.
+    await vi.waitFor(() => expect(fetches()).toHaveLength(1));
+    tree.event(1, ev(kid.id, { kind: 'run_created', agent: 'kid', parent: old.id }, 1));
+    await flush();
+    server.release();
+    await flush();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(fetches()).toHaveLength(1);
+    // The one answer filled the child in.
+    await userEvent.setup({ advanceTimers: vi.advanceTimersByTime }).click(screen.getByRole('checkbox', { name: 'Roots only' }));
+    const card = screen.queryAllByRole('article').find((a) => a.textContent?.includes('kid'));
+    expect(card).toHaveTextContent('$0.70');
+  });
 });
+
+function treeOf(sockets: ReturnType<typeof fakeSockets>, root: string): FakeSocket {
+  const found = sockets.made.find((x) => x.url.includes(`/ws/tree/${root}`));
+  if (!found) throw new Error(`no tree socket for ${root}`);
+  return found;
+}

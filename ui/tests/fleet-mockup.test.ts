@@ -3,6 +3,7 @@
 import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import App from '../src/App.svelte';
 import Fleet from '../src/views/Fleet.svelte';
 import { createApi } from '../src/lib/api';
 import { ApprovalsState } from '../src/lib/approvals.svelte';
@@ -141,6 +142,24 @@ describe('Fleet tiles (scenario 4)', () => {
     expect(within(big).getByText('loading')).toHaveClass('visually-hidden');
     state.load([approval(runs[2]?.id ?? '', 'ap-1', 'git push')], state.beginSync());
     await vi.waitFor(() => expect(big).toHaveTextContent(/^1$/));
+  });
+
+  it('Needs you says the approvals could not be loaded when their request fails, not loading (PR #85 review)', async () => {
+    const runs = fleet();
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = new URL(String(input), 'http://kestrel.test');
+      if (url.pathname === '/api/approvals') return new Response('{"error":"database is locked"}', { status: 500 });
+      if (url.pathname === '/api/runs') return new Response(JSON.stringify(url.searchParams.has('status') ? [] : runs));
+      const one = runs.find((r) => url.pathname === `/api/runs/${r.id}`);
+      return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no run"}', { status: 404 });
+    };
+    window.location.hash = '#/fleet';
+    render(App, { fetch, sockets: fakeSockets().factory });
+    await screen.findByRole('link', { name: 'lead' });
+    const big = tile('Needs you').querySelector('.big') as HTMLElement;
+    await vi.waitFor(() => expect(within(big).getByText('?')).toHaveAttribute('aria-hidden', 'true'));
+    expect(within(big).getByText('approvals could not be loaded')).toHaveClass('visually-hidden');
+    expect(big).not.toHaveTextContent('loading');
   });
 
   it('without the approvals list, counts the runs waiting on an approval', async () => {
