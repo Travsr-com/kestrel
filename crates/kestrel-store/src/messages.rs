@@ -2,7 +2,9 @@
 //!
 //! A message is a `MessageSent` event of its run. The agent takes the ones not yet delivered with
 //! `kestrel.messages`, which records a `MessageDelivered` event naming their `seq`s in the same
-//! transaction, so each message is handed over once however many calls race.
+//! transaction, so no two calls get the same message however many race. An agent that passes the
+//! `seq` of the last message it got (`after`) gets every later one again, so its retry is safe.
+//! A message whose run ends before its agent takes it stays undelivered.
 
 use std::collections::HashSet;
 
@@ -94,10 +96,16 @@ impl Store {
         Ok(event)
     }
 
-    /// The messages of `run` its agent has not taken yet, oldest first, now recorded as delivered
-    /// by one `MessageDelivered` event in the same transaction. Each message is returned by exactly
-    /// one call. Empty, and nothing written, when there is none.
-    pub fn take_messages(&self, run: RunId) -> Result<Vec<InboxMessage>> {
+    /// The messages of `run` for its agent, oldest first. Those not taken before are recorded as
+    /// delivered by one `MessageDelivered` event in the same transaction; nothing is written when
+    /// there are none.
+    ///
+    /// * `after` is `None`: the messages not taken yet. Each message is returned by one call only
+    ///   (at most once: lost if the answer never reaches the agent).
+    /// * `after` is `Some(seq)`, the `seq` of the last message the agent got: every later message,
+    ///   taken before or not. A retry with the same `after` gets the same messages again (at least
+    ///   once).
+    pub fn take_messages(&self, run: RunId, after: Option<u64>) -> Result<Vec<InboxMessage>> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let bodies = {
@@ -122,9 +130,16 @@ impl Store {
                 _ => {}
             }
         }
-        sent.retain(|m| !delivered.contains(&m.seq));
-        if !sent.is_empty() {
-            let seqs = sent.iter().map(|m| m.seq).collect();
+        match after {
+            Some(after) => sent.retain(|m| m.seq > after),
+            None => sent.retain(|m| !delivered.contains(&m.seq)),
+        }
+        let seqs: Vec<u64> = sent
+            .iter()
+            .map(|m| m.seq)
+            .filter(|seq| !delivered.contains(seq))
+            .collect();
+        if !seqs.is_empty() {
             insert_event(&tx, run, EventKind::MessageDelivered { seqs })?;
             tx.commit()?;
         }
