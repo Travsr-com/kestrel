@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# No job writes with the token: checkout, caches and artifact uploads need only read access.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
