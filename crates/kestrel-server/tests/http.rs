@@ -720,3 +720,97 @@ async fn the_embedded_ui_serves_its_build_or_the_placeholder() {
     let built = EmbeddedUi.get("index.html").is_some();
     assert_eq!(page == PLACEHOLDER, !built, "{page}");
 }
+
+// Issue #97, the bare roots of the API and the sockets: `/api`, `/api/`, `/ws` and `/ws/`.
+const ROOTS: [&str; 4] = ["/api", "/api/", "/ws", "/ws/"];
+
+/// The status and the JSON error of a response that must not be the UI page.
+async fn json_error(app: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
+    let target = format!("{} {}", request.method(), request.uri());
+    let (status, headers, body) = send(app, request).await;
+    let page = String::from_utf8_lossy(&body).to_string();
+    assert_ne!(page, INDEX, "{target} served the UI page");
+    assert_eq!(headers["content-type"], "application/json", "{target}");
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (
+        status,
+        value["error"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+// #97 scenario 1: with the token, each root is the JSON 404 every unknown API path gets, for any
+// method. Without the token it is the JSON 401 every other `/api` and `/ws` path gets.
+#[tokio::test]
+async fn issue97_s1_api_and_ws_roots_are_a_json_404_not_the_ui() {
+    let app = app(store());
+    for uri in ROOTS {
+        for method in ["GET", "POST", "DELETE"] {
+            let (status, error) = json_error(&app, req(method, uri, None)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert_eq!(error, "no such API route", "{method} {uri}");
+        }
+        let (status, error) = json_error(&app, bare(uri)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(error, "token required", "{uri}");
+    }
+    // The same answers as for a deeper unknown path.
+    assert_eq!(
+        json_error(&app, get("/api/nope")).await,
+        json_error(&app, get("/api/")).await
+    );
+    assert_eq!(
+        json_error(&app, get("/ws/nope")).await,
+        json_error(&app, get("/ws")).await
+    );
+}
+
+// #97 scenario 1: the socket roots take the token the way every socket path does, so a browser
+// that sends it as `?token=` gets the 404 too. The API roots do not take it from the query.
+#[tokio::test]
+async fn issue97_s1_socket_roots_take_the_query_token_and_api_roots_do_not() {
+    let app = app(store());
+    for uri in ["/ws", "/ws/"] {
+        let (status, _) = json_error(&app, bare(&format!("{uri}?token={TOKEN}"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    for uri in ["/api", "/api/"] {
+        let (status, _) = json_error(&app, bare(&format!("{uri}?token={TOKEN}"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+// #97 scenario 1: the Host and Origin rules still come first on the roots.
+#[tokio::test]
+async fn issue97_s1_roots_refuse_a_foreign_host_or_origin() {
+    let app = app(store());
+    for uri in ROOTS {
+        let mut evil = get(uri);
+        evil.headers_mut()
+            .insert("host", "evil.example:7171".parse().unwrap());
+        assert_eq!(send(&app, evil).await.0, StatusCode::FORBIDDEN, "{uri}");
+        let mut cross = get(uri);
+        cross
+            .headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        assert_eq!(send(&app, cross).await.0, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+// #97 scenario 2: UI routes still get the UI, including ones that only start with `api` or `ws`.
+#[tokio::test]
+async fn issue97_s2_ui_routes_still_get_the_ui() {
+    let app = app(store());
+    for uri in [
+        "/",
+        "/fleet",
+        "/runs/x",
+        "/apis",
+        "/wsx",
+        "/fleet/api",
+        "/runs/ws",
+    ] {
+        let (status, _, body) = send(&app, bare(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body, INDEX.as_bytes(), "{uri}");
+    }
+}
