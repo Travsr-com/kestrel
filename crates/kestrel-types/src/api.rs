@@ -31,6 +31,10 @@ pub struct RunSummary {
     pub sandbox_tier: Option<SandboxTier>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Whether the run's agent takes messages from a person: its spec grants `kestrel.messages`.
+    /// `false` when an older server leaves it out.
+    #[serde(default)]
+    pub takes_messages: bool,
 }
 
 /// One node of `GET /api/runs/{id}/tree`.

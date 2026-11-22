@@ -41,6 +41,7 @@ fn runs_decode_and_encode_unchanged() {
     assert_eq!(root.spent, MicroUsd(420_000));
     assert_eq!(root.limit, Some(MicroUsd(2_000_000)));
     assert_eq!(root.sandbox_tier, Some(SandboxTier::Gvisor));
+    assert!(root.takes_messages);
     let child = &runs[1];
     assert_eq!(child.parent, Some(root.id));
     assert_eq!(child.root, root.id);
@@ -51,6 +52,7 @@ fn runs_decode_and_encode_unchanged() {
     ));
     assert_eq!(runs[2].limit, None);
     assert_eq!(runs[2].sandbox_tier, None);
+    assert!(!runs[2].takes_messages);
 }
 
 #[test]
@@ -100,9 +102,11 @@ fn variant_index(kind: &EventKind) -> usize {
         EventKind::RunFinished { .. } => 11,
         EventKind::ChildSpawned { .. } => 12,
         EventKind::CapabilitiesDropped { .. } => 13,
+        EventKind::MessageSent { .. } => 14,
+        EventKind::MessageDelivered { .. } => 15,
     }
 }
-const VARIANTS: usize = 14;
+const VARIANTS: usize = 16;
 
 #[test]
 fn every_event_kind_decodes_and_encodes_unchanged() {
@@ -160,4 +164,5 @@ fn optional_fields_may_be_missing() {
     assert_eq!(run.parent, None);
     assert_eq!(run.limit, None);
     assert_eq!(run.sandbox_tier, None);
+    assert!(!run.takes_messages);
 }

@@ -94,6 +94,16 @@ pub enum EventKind {
         #[serde(default)]
         agents: Vec<String>,
     },
+    /// A person sent the run a message (`kestrel message`, the API or the UI). It waits for the
+    /// agent to take it with `kestrel.messages`.
+    MessageSent {
+        text: String,
+    },
+    /// The agent took messages with `kestrel.messages`: the `seq`s of their `MessageSent` events.
+    /// Each message is delivered once.
+    MessageDelivered {
+        seqs: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,6 +3,7 @@
 mod api;
 mod event;
 mod ids;
+mod message;
 mod money;
 mod spec;
 mod status;
@@ -13,6 +14,7 @@ pub use api::{
 };
 pub use event::{Event, EventKind, ModelCallRecord};
 pub use ids::{ApprovalId, RunId};
+pub use message::{MAX_MESSAGE_BYTES, MESSAGES_TOOL, message_problem};
 pub use money::MicroUsd;
 pub use spec::{
     AgentSpec, Approvals, Budget, Capabilities, ModelPolicy, Runtime, SandboxSpec, SandboxTier,

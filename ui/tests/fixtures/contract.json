@@ -10,7 +10,8 @@
       "spent": 420000,
       "limit": 2000000,
       "sandbox_tier": "gvisor",
-      "created_at": "2026-11-21T08:00:00Z"
+      "created_at": "2026-11-21T08:00:00Z",
+      "takes_messages": true
     },
     {
       "id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
@@ -22,7 +23,8 @@
       "spent": 125000,
       "limit": 500000,
       "sandbox_tier": "docker-runc",
-      "created_at": "2026-11-21T08:01:30Z"
+      "created_at": "2026-11-21T08:01:30Z",
+      "takes_messages": false
     },
     {
       "id": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
@@ -34,7 +36,8 @@
       "spent": 0,
       "limit": null,
       "sandbox_tier": null,
-      "created_at": "2026-11-20T17:45:12Z"
+      "created_at": "2026-11-20T17:45:12Z",
+      "takes_messages": false
     }
   ],
   "tree": [
@@ -153,7 +156,9 @@
       "hosts": ["evil.example"],
       "secrets": [],
       "agents": ["deployer"]
-    }
+    },
+    { "kind": "message_sent", "text": "Also update the changelog." },
+    { "kind": "message_delivered", "seqs": [4, 7] }
   ],
   "socket": {
     "protocol": "kestrel.v1",

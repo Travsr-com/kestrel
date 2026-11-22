@@ -57,6 +57,10 @@
 #   travsr=SYM   writes child-edit.rs, which uses SYM, and commits it (edit.out), then lists the
 #                tools of the `travsr` server in its `--mcp-config` file and calls search_symbol
 #                for SYM with a `repo` argument (travsr.out).
+#   inbox=N      issue #95: writes inbox-ready.out, then calls kestrel.messages about once a
+#                second (a new id each time) until the test writes `inbox-go` into the workspace,
+#                for at most N calls, writing each answer (its JSON-RPC message) as a line of
+#                inbox.out; then calls it once more into inbox-last.out.
 set -u
 
 model="unknown"
@@ -395,6 +399,21 @@ if [ -n "$n" ]; then
   done
   echo joining > /workspace/joining.out
   mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 3600 > /workspace/join.out 2>&1
+fi
+
+inbox=$(marker inbox || true)
+if [ -n "$inbox" ]; then
+  echo listening > /workspace/inbox-ready.out
+  : > /workspace/inbox.out
+  i=0
+  while [ ! -e /workspace/inbox-go ] && [ "$i" -lt "$inbox" ]; do
+    request="{\"jsonrpc\":\"2.0\",\"id\":\"inbox-$i\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.messages\",\"arguments\":{}}}"
+    mcp_call "$request" 30 2>&1 | sed -n 's/^data: //p' >> /workspace/inbox.out
+    i=$((i + 1))
+    sleep 1
+  done
+  request='{"jsonrpc":"2.0","id":"inbox-last","method":"tools/call","params":{"name":"kestrel.messages","arguments":{}}}'
+  mcp_call "$request" 30 2>&1 | sed -n 's/^data: //p' > /workspace/inbox-last.out
 fi
 
 hold=$(marker hold || true)

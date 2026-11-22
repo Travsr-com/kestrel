@@ -28,6 +28,7 @@ function run(over: Partial<RunSummary> = {}): RunSummary {
     spent: 0,
     limit: 2_000_000,
     sandbox_tier: 'gvisor',
+    takes_messages: true,
     created_at: new Date(NOW - 600_000).toISOString(),
     ...over,
   };

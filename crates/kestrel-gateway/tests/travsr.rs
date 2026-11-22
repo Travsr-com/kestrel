@@ -787,7 +787,12 @@ async fn s11_without_travsr_the_route_is_404_and_mcp_lists_no_travsr_tool() {
         .collect();
     assert_eq!(
         names,
-        ["kestrel.spawn", "kestrel.join", "kestrel.ask_human"]
+        [
+            "kestrel.spawn",
+            "kestrel.join",
+            "kestrel.ask_human",
+            "kestrel.messages"
+        ]
     );
 }
 

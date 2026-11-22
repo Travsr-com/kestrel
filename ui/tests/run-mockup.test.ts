@@ -26,6 +26,7 @@ function run(over: Partial<RunSummary> = {}): RunSummary {
     spent: 0,
     limit: 2_000_000,
     sandbox_tier: 'gvisor',
+    takes_messages: true,
     created_at: new Date(NOW - 60_000 + n).toISOString(),
     ...over,
   };
@@ -312,6 +313,8 @@ describe('Run view panels (scenario 11)', () => {
       [{ kind: 'run_finished', summary: 'All green.' }, 'done', 'done', 'Finished: All green.'],
       [{ kind: 'child_spawned', child: 'kid', agent: 'helper', budget: 2_000_000 }, 'spawn', 'suspended', 'Spawned helper'],
       [{ kind: 'capabilities_dropped', tools: ['shell'], hosts: [], secrets: [], agents: [] }, 'dropped', 'muted', 'shell'],
+      [{ kind: 'message_sent', text: 'hurry' }, 'sent', 'approval', 'Message to the agent: hurry'],
+      [{ kind: 'message_delivered', seqs: [3] }, 'read', 'muted', 'The agent read 1 message'],
     ];
     cases.forEach(([kind], i) => s.event(i + 1, event(r.id, i + 1, kind)));
     await settle();

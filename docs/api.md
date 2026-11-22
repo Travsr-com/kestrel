@@ -44,7 +44,7 @@ micro-dollars (`420000` is $0.42). The shapes are the types in `crates/kestrel-t
 | Route | What it returns |
 | :--- | :--- |
 | `GET /api/runs?status=&agent=&root=` | Runs, newest first. `status` is `queued`, `provisioning`, `running`, `suspended`, `completed`, `failed` or `cancelled`. Filters combine. |
-| `GET /api/runs/{id}` | One run: status, agent, parent, root, depth, spent, limit, sandbox tier, created time. |
+| `GET /api/runs/{id}` | One run: status, agent, parent, root, depth, spent, limit, sandbox tier, created time, and whether its agent takes messages (`takes_messages`). |
 | `GET /api/runs/{id}/tree` | Every run in the tree of `{id}`'s root, each parent before its children. |
 | `GET /api/runs/{id}/events?after=<seq>` | The run's events after `seq` (0 for all). |
 
@@ -73,7 +73,7 @@ sent:
 | `POST /api/runs/{id}/resume` | `kestrel resume` | suspended, but not waiting on an approval (approve or reject it instead) |
 | `POST /api/runs/{id}/cancel` | `kestrel cancel` | queued, provisioning, running or suspended; or ended with a live run below it |
 | `POST /api/runs/{id}/budget` with `{"usd": "5.00"}` | `kestrel budget`. A negative or non-decimal amount is `400`. | queued, provisioning, running or suspended |
-| `POST /api/runs/{id}/message` with `{"text": "..."}` | Not supported by any runtime yet: `409`. | |
+| `POST /api/runs/{id}/message` with `{"text": "..."}` | `kestrel message`. See [Messages](#messages). | running, and its agent takes messages |
 
 A completed, failed or cancelled run has ended: every command answers `409`
 (`the run has ended (completed), so it cannot be paused`). One exception: cancel on an ended run
@@ -91,6 +91,34 @@ curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/cancel"
 curl -X POST -H "Authorization: Bearer $T" -d '{"usd":"5.00"}' "$K/api/runs/$RUN/budget"
 curl -X POST -H "Authorization: Bearer $T" -d '{"text":"also fix the docs"}' "$K/api/runs/$RUN/message"
 ```
+
+## Messages
+
+`POST /api/runs/{id}/message` gives a running agent a message from a person. The agent takes it
+with the `kestrel.messages` tool, which it is told to call between steps.
+
+* **Which runs take one.** A run whose spec grants `kestrel.messages` (in `capabilities.mcp`).
+  `GET /api/runs/{id}` says so in `takes_messages`. Both runtimes (Claude Code and OpenCode) take
+  messages when granted.
+* **Answers.** `202` once the message is stored. `409` with the reason for a run that is not
+  running (`a queued run cannot take a message, only a running one`), has ended, or whose agent
+  cannot take messages. `400` for a body that is not `{"text": "<string>"}`, an empty text, or a
+  control character other than a newline (`\n`) or a tab (a carriage return is refused too). `413`
+  for a text over 16 KiB (16384 bytes). The body is checked before the run.
+* **Events.** `message_sent` (`{"kind": "message_sent", "text": "..."}`) when it is stored, and
+  `message_delivered` (`{"kind": "message_delivered", "seqs": [4, 7]}`, the `seq`s of the
+  `message_sent` events it handed over) when the agent first took it.
+* **What the agent gets.** `{"messages": [{"seq": 4, "text": "..."}]}`, oldest first, and an empty
+  list when there is none. The text is not logged anywhere else. It is in the run's events, so
+  anyone with the API token can read it: do not put secrets in it.
+* **Delivery.** `kestrel.messages()` returns the messages not taken yet: at most once, so a message
+  is lost if serve stops after recording the delivery and before the answer reaches the agent.
+  `kestrel.messages({"after": <seq>})`, with the `seq` of the last message the agent got (`0` for
+  none yet), returns every later message, taken or not: at least once, so a retry is safe. The
+  agent note tells the agent to pass `after`. Answers are never kept by JSON-RPC id, so a client
+  that reconnects and starts its ids again still reads the inbox.
+* **A run that ends first.** A message the agent never took stays `message_sent` with no
+  `message_delivered`. Nothing delivers it later, and an ended run takes no new message.
 
 ## Approvals
 

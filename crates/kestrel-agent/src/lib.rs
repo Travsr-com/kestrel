@@ -97,6 +97,17 @@ const ASK_NOTE: &str = "\
   find out yourself.
 ";
 
+/// The part of the agent note for a run granted `kestrel.messages`.
+const MESSAGES_NOTE: &str = "\
+* kestrel.messages(after) returns the messages a person sent you while you work, oldest first,
+  each with its seq. Call it between steps and once more before you finish, and take what they
+  say into account. Pass as after the seq of the last message you got (0 at first), so a call
+  you repeat loses nothing. If you do not know the last seq you got, leave out after.
+";
+
+/// The heading of the agent note.
+const NOTE_HEADING: &str = "# Kestrel tools\n\n";
+
 /// What an agent is told about the Kestrel tools it was offered: spawning when it may spawn one of
 /// `spawnable` (named, so it knows what to pass), joining when it may also join, asking a person
 /// when it may ask. `None` when it may neither spawn nor ask, since `kestrel.join` alone has no
@@ -106,7 +117,7 @@ pub fn agent_note(spawnable: &[String], join: bool, ask: bool) -> Option<String>
     if !spawn && !ask {
         return None;
     }
-    let mut note = String::from("# Kestrel tools\n\n");
+    let mut note = String::from(NOTE_HEADING);
     if spawn {
         note.push_str(SPAWN_NOTE);
         note.push_str(&format!("* You may spawn: {}.\n", spawnable.join(", ")));
@@ -161,6 +172,8 @@ struct Servers {
     join: bool,
     /// `kestrel.ask_human` is offered.
     ask: bool,
+    /// `kestrel.messages` is offered.
+    messages: bool,
 }
 
 impl Servers {
@@ -168,7 +181,7 @@ impl Servers {
         let caps = &spec.capabilities;
         let mut tools: Vec<String> = Vec::new();
         let (mut kestrel, mut travsr) = (false, false);
-        let (mut spawnable, mut join, mut ask) = (Vec::new(), false, false);
+        let (mut spawnable, mut join, mut ask, mut messages) = (Vec::new(), false, false, false);
         for name in &caps.mcp {
             let tool = if let Some(tool) = name.strip_prefix("kestrel.") {
                 match (tool, &caps.spawn) {
@@ -178,6 +191,7 @@ impl Servers {
                     }
                     ("ask_human", _) => ask = true,
                     ("join", _) => join = true,
+                    ("messages", _) => messages = true,
                     // The gateway has no other Kestrel tool, so it would never list this one.
                     _ => continue,
                 }
@@ -203,6 +217,7 @@ impl Servers {
             spawnable,
             join,
             ask,
+            messages,
         }
     }
 
@@ -210,9 +225,15 @@ impl Servers {
         self.kestrel.is_some() || self.travsr.is_some()
     }
 
-    /// The agent note for the Kestrel tools offered, see [`agent_note`].
+    /// The agent note for the Kestrel tools offered, see [`agent_note`], and then the part on
+    /// messages when `kestrel.messages` is offered.
     fn note(&self) -> Option<String> {
-        agent_note(&self.spawnable, self.join, self.ask)
+        let mut note = agent_note(&self.spawnable, self.join, self.ask);
+        if self.messages {
+            note.get_or_insert_with(|| NOTE_HEADING.to_string())
+                .push_str(MESSAGES_NOTE);
+        }
+        note
     }
 
     /// The servers by name, each to `entry(url)`.

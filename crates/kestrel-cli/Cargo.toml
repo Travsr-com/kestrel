@@ -49,6 +49,7 @@ integration = []
 [dev-dependencies]
 kestrel-types.workspace = true
 kestrel-store.workspace = true
+tower.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true

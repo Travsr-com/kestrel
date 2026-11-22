@@ -30,6 +30,7 @@ const RUN_KEYS = {
   limit: true,
   sandbox_tier: true,
   created_at: true,
+  takes_messages: true,
 } satisfies Record<keyof RunSummary, true>;
 const TREE_KEYS = {
   id: true,
@@ -87,9 +88,11 @@ const EVENT_KIND_KEYS = {
   run_finished: { kind: true, summary: true },
   child_spawned: { kind: true, child: true, agent: true, budget: true },
   capabilities_dropped: { kind: true, tools: true, hosts: true, secrets: true, agents: true },
+  message_sent: { kind: true, text: true },
+  message_delivered: { kind: true, seqs: true },
 } satisfies { [K in EventKind['kind']]: Record<keyof Variant<K>, true> };
 
-type ValueKind = 'string' | 'number' | 'string|null' | 'number|null' | 'status' | 'tier|null';
+type ValueKind = 'string' | 'number' | 'boolean' | 'string|null' | 'number|null' | 'status' | 'tier|null';
 const RUN_VALUE_KINDS = {
   id: 'string',
   agent: 'string',
@@ -101,12 +104,15 @@ const RUN_VALUE_KINDS = {
   limit: 'number|null',
   sandbox_tier: 'tier|null',
   created_at: 'string',
+  takes_messages: 'boolean',
 } satisfies Record<keyof RunSummary, ValueKind>;
 
 function hasKind(v: unknown, kind: ValueKind): boolean {
   switch (kind) {
     case 'string':
       return typeof v === 'string';
+    case 'boolean':
+      return typeof v === 'boolean';
     case 'number':
       return Number.isInteger(v);
     case 'string|null':

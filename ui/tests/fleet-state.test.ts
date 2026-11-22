@@ -15,6 +15,7 @@ function summary(id: string, over: Partial<RunSummary> = {}): RunSummary {
     spent: 100,
     limit: 1_000,
     sandbox_tier: null,
+    takes_messages: true,
     created_at: '2026-11-21T10:00:00Z',
     ...over,
   };
@@ -287,5 +288,17 @@ describe('FleetState', () => {
     fleet.apply(ev('r', call('r', 5)), 0, () => {}, 'r');
     expect(fleet.runs.r?.spent).toBe(45);
     expect(fleet.runs.x).toMatchObject({ spent: 40, counted: 40 });
+  });
+
+  // Issue #95: whether a run takes messages comes from the server, never guessed from an event.
+  it('a run seen first through an event takes no messages until the server says it does', () => {
+    const fleet = new FleetState();
+    fleet.load([summary('p')]);
+    fleet.apply(ev('c', { kind: 'run_created', agent: 'a', parent: 'p' }), 0, () => {}, 'p');
+    expect(fleet.runs.c?.takes_messages).toBe(false);
+    fleet.update(summary('c', { parent: 'p', root: 'p', depth: 1, takes_messages: true }), 0);
+    expect(fleet.runs.c?.takes_messages).toBe(true);
+    fleet.update(summary('c', { parent: 'p', root: 'p', depth: 1, takes_messages: false }), 0);
+    expect(fleet.runs.c?.takes_messages).toBe(false);
   });
 });

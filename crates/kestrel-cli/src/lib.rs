@@ -1,10 +1,11 @@
 //! The `kestrel` command-line tool.
 //!
 //! M1 has no HTTP API. Every command except `serve` talks to the engine only through the SQLite
-//! store (`--db`): `run` writes a `Queued` run, the steering commands push control commands, and
-//! `watch` and `ps` read runs and events. `kestrel serve` runs the engine and the LLM gateway in one
-//! process on the same database. `fetch` reads a finished run from the store and runs git in its
-//! source repo to bring its branch home, as the engine does when a run ends.
+//! store (`--db`): `run` writes a `Queued` run, the steering commands push control commands,
+//! `message` stores a message for the agent to take, and `watch` and `ps` read runs and events.
+//! `kestrel serve` runs the engine and the LLM gateway in one process on the same database.
+//! `fetch` reads a finished run from the store and runs git in its source repo to bring its branch
+//! home, as the engine does when a run ends.
 //!
 //! Exit codes: [`EXIT_OK`], [`EXIT_RUNTIME`], [`EXIT_USAGE`].
 
@@ -107,6 +108,14 @@ pub enum Command {
         /// Run id, as printed by `kestrel run`.
         run_id: RunId,
     },
+    /// Send a message to a running agent. Its spec must grant kestrel.messages; the agent reads
+    /// the message the next time it checks.
+    Message {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
+        /// The message: text of up to 16 KiB.
+        text: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -197,6 +206,12 @@ fn execute(cli: Cli) -> Result<(), Failure> {
             commands::steer(&open(db)?, run_id, ControlCommand::SetBudget(limit), out)
         }
         Command::Fetch { run_id } => fetch::fetch(db, run_id, out),
+        Command::Message { run_id, text } => {
+            if let Some(problem) = kestrel_types::message_problem(&text) {
+                return Err(Failure::usage(problem));
+            }
+            commands::message(&open(db)?, run_id, &text, out)
+        }
     }
 }
 

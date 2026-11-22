@@ -8,7 +8,6 @@ export interface Allowed {
   resume: boolean;
   cancel: boolean;
   budget: boolean;
-  message: boolean;
 }
 
 /**
@@ -17,7 +16,7 @@ export interface Allowed {
  * ended (a run that kept its children): the server cancels that tree.
  */
 export function allowed(status: RunStatus, live = 0): Allowed {
-  if (isTerminal(status)) return { pause: false, resume: false, cancel: live > 0, budget: false, message: false };
+  if (isTerminal(status)) return { pause: false, resume: false, cancel: live > 0, budget: false };
   const suspended = typeof status === 'object' && 'Suspended' in status ? status.Suspended : null;
   const waitsOnApproval = typeof suspended === 'object' && suspended !== null && 'Approval' in suspended;
   return {
@@ -25,8 +24,21 @@ export function allowed(status: RunStatus, live = 0): Allowed {
     resume: suspended !== null && !waitsOnApproval,
     cancel: true,
     budget: true,
-    message: status === 'Running',
   };
+}
+
+/** The most a message to an agent may hold: 16 KiB. The server counts bytes. */
+export const MAX_MESSAGE_BYTES = 16 * 1024;
+
+/**
+ * Why a run cannot take a message from a person now, or `null` when it can: it must be running,
+ * and its agent must take messages (its spec grants `kestrel.messages`).
+ */
+export function messageRefusal(status: RunStatus, takesMessages: boolean): string | null {
+  if (isTerminal(status)) return 'The run has ended, so it takes no more messages.';
+  if (!takesMessages) return 'This agent does not take messages: its spec does not grant kestrel.messages.';
+  if (status !== 'Running') return 'Only a running run takes messages.';
+  return null;
 }
 
 /**
