@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use common::*;
 use kestrel_core::caps::{self, CapToken, Capability, RootKey, SpawnLimits};
-use kestrel_core::{Engine, SpawnError};
+use kestrel_core::{Engine, LoweredDepth, SpawnError};
 use kestrel_store::ControlCommand;
 use kestrel_types::{
     AgentSpec, EventKind, MicroUsd, RunId, RunStatus, SuspendReason, Tier, WorkspaceSpec,
@@ -214,6 +214,144 @@ async fn s6_a_child_cannot_spawn_past_max_depth() {
     let err = spawn(&h, child, Some(DOLLAR / 10)).await.unwrap_err();
     assert!(matches!(err, SpawnError::Depth), "{err:?}");
     assert_eq!(runs(&h), 2);
+}
+
+/// A parent that may spawn `deep` two levels down, so a child may have `max_depth` 1 at most.
+fn deep_lead() -> AgentSpec {
+    agent(
+        "lead",
+        "",
+        "{ mcp: [kestrel.spawn], spawn: { max_children: 4, max_depth: 2, agents: [deep] } }",
+        "2",
+        "empty-dir",
+    )
+}
+
+/// An agent that may spawn copies of itself, asking for spawn `max_depth` `depth`.
+fn deep(depth: u32) -> AgentSpec {
+    let caps = format!(
+        "{{ mcp: [kestrel.spawn], spawn: {{ max_children: 2, max_depth: {depth}, agents: [deep] }} }}"
+    );
+    agent("deep", "", &caps, "1", "empty-dir")
+}
+
+/// The `AgentLog` lines of `run` that report a lowered depth.
+fn lowered_lines(h: &Harness, run: RunId) -> Vec<String> {
+    h.events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::AgentLog { line } if line.contains("max_depth lowered") => Some(line),
+            _ => None,
+        })
+        .collect()
+}
+
+// #94 1. Given a parent that can give depth 1 and a child spec asking for max_depth 5, then the
+//    spawn succeeds with max_depth 1, the answer says it was lowered from 5 to 1, and the child
+//    records it once. The same spec spawned again one level down is lowered to 0, so an agent can
+//    spawn copies of itself.
+#[tokio::test(start_paused = true)]
+async fn a_spawn_asking_for_more_depth_than_the_parent_can_give_is_lowered_and_reported() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let _s = h.driver.live();
+    h.start();
+    let lead = h.submit(deep_lead()).await;
+    until("lead running", || h.is(lead, &RunStatus::Running)).await;
+    let _c = h.driver.live();
+    let spawned = h
+        .engine
+        .spawn_child_with_report(lead, &deep(5), "x", Some(MicroUsd(DOLLAR / 2)))
+        .await
+        .unwrap();
+    let lowered = LoweredDepth {
+        asked: 5,
+        granted: 1,
+    };
+    assert_eq!(spawned.lowered_depth, Some(lowered));
+    assert_eq!(
+        lowered.note(),
+        "max_depth lowered from 5 to 1 (the most this parent can give)"
+    );
+    let child = spawned.id;
+    let grant = caps::grant(&token(&h, child), &key.public()).unwrap();
+    assert_eq!(grant.spawn.map(|s| s.max_depth), Some(1));
+    let stored = h.store.run_spec(child).unwrap().unwrap().capabilities;
+    assert_eq!(stored.spawn.map(|s| s.max_depth), Some(1));
+    let lines = lowered_lines(&h, child);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("max_depth lowered from 5 to 1"),
+        "{lines:?}"
+    );
+    assert!(lowered_lines(&h, lead).is_empty());
+
+    // The copy spawns a copy of itself: lowered again, to 0, and recorded on the grandchild.
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    let grand = h
+        .engine
+        .spawn_child_with_report(child, &deep(5), "y", Some(MicroUsd(DOLLAR / 10)))
+        .await
+        .unwrap();
+    assert_eq!(
+        grand.lowered_depth,
+        Some(LoweredDepth {
+            asked: 5,
+            granted: 0
+        })
+    );
+    let grant = caps::grant(&token(&h, grand.id), &key.public()).unwrap();
+    assert_eq!(grant.spawn.map(|s| s.max_depth), Some(0));
+    assert!(lowered_lines(&h, grand.id)[0].contains("max_depth lowered from 5 to 0"));
+    assert_eq!(runs(&h), 3);
+}
+
+// #94 2. Given a request within the parent's depth (exactly what it can give, or less), then the
+//    child gets what it asked for, the answer reports nothing and nothing is recorded.
+#[tokio::test(start_paused = true)]
+async fn a_spawn_within_the_parents_depth_reports_nothing() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let _s = h.driver.live();
+    h.start();
+    let lead = h.submit(deep_lead()).await;
+    until("lead running", || h.is(lead, &RunStatus::Running)).await;
+    for depth in [1, 0] {
+        let spawned = h
+            .engine
+            .spawn_child_with_report(lead, &deep(depth), "x", Some(MicroUsd(DOLLAR / 10)))
+            .await
+            .unwrap();
+        assert_eq!(spawned.lowered_depth, None);
+        let grant = caps::grant(&token(&h, spawned.id), &key.public()).unwrap();
+        assert_eq!(grant.spawn.map(|s| s.max_depth), Some(depth));
+        assert!(lowered_lines(&h, spawned.id).is_empty());
+    }
+    // A child without spawn rights has no depth to lower.
+    let plain = agent("deep", "", "{ mcp: [] }", "1", "empty-dir");
+    let spawned = h
+        .engine
+        .spawn_child_with_report(lead, &plain, "x", Some(MicroUsd(DOLLAR / 10)))
+        .await
+        .unwrap();
+    assert_eq!(spawned.lowered_depth, None);
+    assert!(lowered_lines(&h, spawned.id).is_empty());
+}
+
+// #94: `spawn_child` lowers and records the same way; only the answer is left out.
+#[tokio::test(start_paused = true)]
+async fn spawn_child_records_a_lowered_depth_too() {
+    let key = RootKey::generate();
+    let mut h = harness(4, &key);
+    let (lead, _s) = running_lead(&mut h, "2").await;
+    // `worker` asks for max_depth 2 under a lead that can give 0.
+    let child = spawn(&h, lead, Some(DOLLAR / 2)).await.unwrap();
+    let lines = lowered_lines(&h, child);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("max_depth lowered from 2 to 0"),
+        "{lines:?}"
+    );
 }
 
 // 7. Given `max_children` 2, when a third spawn is attempted, then `SpawnError::TooManyChildren`.
