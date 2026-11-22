@@ -1,0 +1,181 @@
+// Issue #84, scenarios 1 to 3: the sidebar of the restyled shell, and the active-run count it shows.
+
+import { render, screen, within } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import App from '../src/App.svelte';
+import { ActiveRuns } from '../src/lib/active.svelte';
+import type { Approval, Event, RunSummary } from '../src/lib/types';
+import { fakeSockets, type FakeSocket } from './fake-socket';
+import { ids, seriousViolations } from './axe';
+
+const NOW = Date.parse('2026-11-22T10:00:00Z');
+
+let n = 0;
+const uuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
+
+function run(over: Partial<RunSummary> = {}): RunSummary {
+  const id = over.id ?? uuid();
+  return {
+    id,
+    agent: 'worker',
+    status: 'Running',
+    parent: null,
+    root: id,
+    depth: 0,
+    spent: 0,
+    limit: 2_000_000,
+    sandbox_tier: 'gvisor',
+    created_at: new Date(NOW - 60_000).toISOString(),
+    ...over,
+  };
+}
+
+function approval(r: RunSummary): Approval {
+  return {
+    id: uuid(),
+    run_id: r.id,
+    action: 'git push origin main',
+    status: 'pending',
+    requested_at: new Date(NOW - 60_000).toISOString(),
+    question: false,
+  };
+}
+
+function serve(runs: RunSummary[], pending: Approval[] = []) {
+  const fetch: typeof globalThis.fetch = async (input) => {
+    const url = new URL(String(input), 'http://kestrel.test');
+    if (url.pathname === '/api/approvals') return new Response(JSON.stringify(pending));
+    if (url.pathname === '/api/runs') return new Response(JSON.stringify(runs));
+    const one = runs.find((r) => url.pathname === `/api/runs/${r.id}`);
+    return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no run"}', { status: 404 });
+  };
+  return fetch;
+}
+
+function show(hash: string, runs: RunSummary[], pending: Approval[] = []) {
+  const sockets = fakeSockets();
+  window.location.hash = hash;
+  const result = render(App, { fetch: serve(runs, pending), sockets: sockets.factory });
+  return { ...result, sockets };
+}
+
+function feed(sockets: ReturnType<typeof fakeSockets>): FakeSocket {
+  const found = sockets.made.filter((s) => s.url.includes('/ws/events')).at(-1);
+  if (!found) throw new Error('no events socket');
+  return found;
+}
+
+const nav = () => screen.getByRole('navigation', { name: 'Main' });
+const item = (label: string) => {
+  const found = within(nav())
+    .getAllByRole('listitem')
+    .find((li) => li.textContent?.trim().startsWith(label));
+  if (!found) throw new Error(`no nav item ${label}`);
+  return found;
+};
+const text = (el: Element) => el.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.setSystemTime(NOW);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('sidebar', () => {
+  // 1
+  it('lists Fleet, Run and Approvals, and the later pages as items with their milestone that are not links', async () => {
+    show('#/fleet', []);
+    await screen.findByRole('heading', { level: 1, name: 'Fleet' });
+    expect(within(item('Fleet')).getByRole('link')).toHaveAttribute('href', '#/fleet');
+    expect(within(item('Approvals')).getByRole('link')).toHaveAttribute('href', '#/approvals');
+    for (const [label, tag] of [
+      ['Agents', 'M4'],
+      ['Workflows', 'M4'],
+      ['Triggers', 'M4'],
+      ['Meetings', 'M5'],
+      ['Costs', 'M3'],
+      ['Settings', 'Soon'],
+    ]) {
+      const li = item(label as string);
+      expect(within(li).queryByRole('link')).not.toBeInTheDocument();
+      expect(text(li)).toBe(`${label} coming in ${tag}`);
+    }
+  });
+
+  // 2
+  it('counts active runs on Fleet and pending approvals on Approvals, and marks the current page', async () => {
+    const a = run();
+    const b = run({ status: { Suspended: 'Budget' } });
+    const done = run({ status: 'Completed' });
+    show('#/approvals', [a, b, done], [approval(a), approval(b), approval(b)]);
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 2 active'));
+    await vi.waitFor(() => expect(text(within(item('Approvals')).getByRole('link'))).toBe('Approvals 3 pending'));
+    expect(within(item('Approvals')).getByRole('link')).toHaveAttribute('aria-current', 'page');
+    expect(within(item('Fleet')).getByRole('link')).not.toHaveAttribute('aria-current');
+  });
+
+  it('keeps the active count live from the events socket', async () => {
+    const a = run();
+    const { sockets } = show('#/approvals', [a]);
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 1 active'));
+    const s = feed(sockets);
+    expect(s.url).toContain('run_created');
+    s.open();
+    const ev = (runId: string, kind: Event['kind']): Event => ({ run_id: runId, seq: 1, ts: new Date(NOW).toISOString(), kind });
+    s.event(1, ev('new-run', { kind: 'run_created', agent: 'worker' }));
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 2 active'));
+    s.event(2, ev(a.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 1 active'));
+  });
+
+  // 3
+  it('shows Run as plain text until a run is opened, then links to that run', async () => {
+    const a = run({ agent: 'lead' });
+    show('#/fleet', [a]);
+    await screen.findByRole('heading', { level: 1, name: 'Fleet' });
+    expect(within(item('Run')).queryByRole('link')).not.toBeInTheDocument();
+    expect(text(item('Run'))).toBe('Run, open one from Fleet');
+    window.location.hash = `#/runs/${a.id}`;
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await screen.findByRole('heading', { level: 1, name: 'lead' });
+    const link = within(item('Run')).getByRole('link', { name: 'Run' });
+    expect(link).toHaveAttribute('href', `#/runs/${a.id}`);
+    expect(link).toHaveAttribute('aria-current', 'page');
+    window.location.hash = '#/fleet';
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await screen.findByRole('heading', { level: 1, name: 'Fleet' });
+    expect(within(item('Run')).getByRole('link', { name: 'Run' })).not.toHaveAttribute('aria-current');
+  });
+
+  it('has no serious or critical axe violations', async () => {
+    const { container } = show('#/fleet', [run()]);
+    await screen.findByTestId('ready');
+    expect(ids(await seriousViolations(container))).toEqual([]);
+  });
+});
+
+describe('ActiveRuns', () => {
+  it('counts runs that have not ended, from a list and then from events', () => {
+    const s = new ActiveRuns();
+    expect(s.loaded).toBe(false);
+    s.load([run({ id: 'a' }), run({ id: 'b', status: { Failed: 'x' } }), run({ id: 'c', status: 'Queued' })]);
+    expect(s.loaded).toBe(true);
+    expect(s.count).toBe(2);
+    const ev = (runId: string, kind: Event['kind']): Event => ({ run_id: runId, seq: 1, ts: '', kind });
+    s.apply(ev('d', { kind: 'run_created', agent: 'w' }));
+    expect(s.count).toBe(3);
+    s.apply(ev('a', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }));
+    expect(s.count).toBe(2);
+    // An ended run is not brought back by a late creation event or a list fetched before it ended.
+    s.apply(ev('a', { kind: 'run_created', agent: 'w' }));
+    s.load([run({ id: 'a' }), run({ id: 'c', status: 'Queued' }), run({ id: 'd' })]);
+    expect(s.count).toBe(2);
+    // Other events change nothing; a status change to a live status adds a run not seen yet.
+    s.apply(ev('c', { kind: 'agent_message', text: 'hi' }));
+    s.apply(ev('e', { kind: 'status_changed', from: 'Queued', to: 'Running' }));
+    expect(s.count).toBe(3);
+  });
+});
