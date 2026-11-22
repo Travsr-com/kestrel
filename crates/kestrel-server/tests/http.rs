@@ -250,13 +250,24 @@ async fn s6_events_after_a_seq() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-// 10. `POST cancel` (and pause, resume) reaches the store's control channel; 202.
+// 10. `POST cancel` (and pause, resume) reaches the store's control channel; 202. Each is sent
+//     while the run's status allows it (#90 scenario 5: unchanged).
 #[tokio::test]
 async fn s10_run_commands_go_to_the_control_channel() {
     let store = store();
     let id = store.create_run(&agent("a"), "x").unwrap();
+    run(&store, id);
     let app = app(store.clone());
     for action in ["pause", "resume", "cancel"] {
+        if action == "resume" {
+            store
+                .transition(
+                    id,
+                    &RunStatus::Running,
+                    RunStatus::Suspended(SuspendReason::Manual),
+                )
+                .unwrap();
+        }
         let (status, _, body) =
             send(&app, req("POST", &format!("/api/runs/{id}/{action}"), None)).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{action}");
@@ -279,6 +290,170 @@ async fn s10_run_commands_go_to_the_control_channel() {
             ControlCommand::Cancel
         ]
     );
+}
+
+// Issue #90, scenario 1 over the API: a queued run cannot be paused or resumed (409, with the
+// reason); cancel and budget still reach it.
+#[tokio::test]
+async fn i90_s1_a_queued_run_cannot_be_paused_but_can_be_cancelled() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    let app = app(store.clone());
+    for (action, why) in [
+        ("pause", "a queued run cannot be paused"),
+        ("resume", "a queued run cannot be resumed"),
+    ] {
+        let (status, body) =
+            json(&app, req("POST", &format!("/api/runs/{id}/{action}"), None)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains(why),
+            "{action}: {body}"
+        );
+    }
+    assert!(
+        store.take_control().unwrap().is_empty(),
+        "nothing reaches the engine"
+    );
+    let (status, _, _) = send(
+        &app,
+        req(
+            "POST",
+            &format!("/api/runs/{id}/budget"),
+            Some(r#"{"usd":"3"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _, _) = send(&app, req("POST", &format!("/api/runs/{id}/cancel"), None)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let cmds: Vec<ControlCommand> = store
+        .take_control()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, cmd)| cmd)
+        .collect();
+    assert_eq!(
+        cmds,
+        [
+            ControlCommand::SetBudget(kestrel_types::MicroUsd(3_000_000)),
+            ControlCommand::Cancel
+        ]
+    );
+}
+
+// Issue #90, scenarios 2 and 3: an ended run answers 409 with the reason as JSON on every run
+// command, and nothing is written to the control channel.
+#[tokio::test]
+async fn i90_s3_an_ended_run_answers_409_on_every_command() {
+    let store = store();
+    let completed = store.create_run(&agent("a"), "x").unwrap();
+    run(&store, completed);
+    store
+        .transition(completed, &RunStatus::Running, RunStatus::Completed)
+        .unwrap();
+    let failed = store.create_run(&agent("a"), "x").unwrap();
+    run(&store, failed);
+    store
+        .transition(
+            failed,
+            &RunStatus::Running,
+            RunStatus::Failed("boom".into()),
+        )
+        .unwrap();
+    let cancelled = store.create_run(&agent("a"), "x").unwrap();
+    store
+        .transition(cancelled, &RunStatus::Queued, RunStatus::Cancelled)
+        .unwrap();
+    let app = app(store.clone());
+    for (id, name) in [
+        (completed, "completed"),
+        (failed, "failed"),
+        (cancelled, "cancelled"),
+    ] {
+        for (action, body) in [
+            ("pause", None),
+            ("resume", None),
+            ("cancel", None),
+            ("budget", Some(r#"{"usd":"3"}"#)),
+        ] {
+            let (status, value) =
+                json(&app, req("POST", &format!("/api/runs/{id}/{action}"), body)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action} on {name}: {value}");
+            let error = value["error"].as_str().unwrap();
+            assert!(
+                error.contains(&format!("the run has ended ({name})")),
+                "{action} on {name}: {error}"
+            );
+        }
+    }
+    assert!(
+        store.take_control().unwrap().is_empty(),
+        "nothing reaches the engine"
+    );
+}
+
+// PR #108 review: an ended root that kept a live child still takes a cancel (202, the engine
+// cancels the live tree below it); other commands are 409, and so is cancel once nothing below
+// is live.
+#[tokio::test]
+async fn i90_cancel_on_an_ended_root_with_a_live_kept_child_is_accepted() {
+    let store = store();
+    let root = store.create_run(&agent("lead"), "x").unwrap();
+    run(&store, root);
+    let kid = store.create_child_run(root, &agent("lead"), "kid").unwrap();
+    run(&store, kid);
+    store
+        .transition(root, &RunStatus::Running, RunStatus::Completed)
+        .unwrap();
+    let app = app(store.clone());
+
+    let (status, _, _) = send(&app, req("POST", &format!("/api/runs/{root}/cancel"), None)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let cmds: Vec<(RunId, ControlCommand)> = store
+        .take_control()
+        .unwrap()
+        .into_iter()
+        .map(|(_, run, cmd)| (run, cmd))
+        .collect();
+    assert_eq!(cmds, [(root, ControlCommand::Cancel)]);
+    let (status, body) = json(&app, req("POST", &format!("/api/runs/{root}/pause"), None)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    store
+        .transition(kid, &RunStatus::Running, RunStatus::Cancelled)
+        .unwrap();
+    let (status, body) = json(&app, req("POST", &format!("/api/runs/{root}/cancel"), None)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("the run has ended (completed)"),
+        "{body}"
+    );
+    assert!(store.take_control().unwrap().is_empty());
+}
+
+// Issue #90: a bad budget body is still 400 on an ended run; the body is checked first.
+#[tokio::test]
+async fn i90_a_bad_budget_on_an_ended_run_is_still_400() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    store
+        .transition(id, &RunStatus::Queued, RunStatus::Cancelled)
+        .unwrap();
+    let app = app(store);
+    let (status, _) = json(
+        &app,
+        req(
+            "POST",
+            &format!("/api/runs/{id}/budget"),
+            Some(r#"{"usd":"-1"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

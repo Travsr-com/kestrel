@@ -175,12 +175,25 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 | :--- | :--- |
 | `kestrel ps` | List active runs. Add `--all` for finished ones. Shows spend so far. |
 | `kestrel watch <run-id>` | Follow a run's events. Works on finished runs too. |
-| `kestrel pause <run-id>` / `resume` | Stop and restart a run. |
+| `kestrel pause <run-id>` / `resume` | Stop a running run, and restart a suspended one. |
 | `kestrel cancel <run-id>` | Stop a run for good. |
 | `kestrel budget <run-id> 5` | Set the run's budget to 5 USD. |
 | `kestrel approve <approval-id>` | Approve an action the agent asked about. Add `--reject` to refuse. |
 
 Add `--json` to any command for machine-readable output.
+
+A command the run's status does not allow exits 1 with the reason, and nothing is sent:
+
+```sh
+$ kestrel pause <queued-run-id>
+error: run <queued-run-id>: a queued run cannot be paused, only a running one
+```
+
+* `pause` needs a running run. `resume` needs a suspended one; a run waiting on an approval
+  resumes through `kestrel approve` instead.
+* `cancel` and `budget` work until the run ends.
+* A completed, failed or cancelled run has ended and refuses all four, except `cancel` while a run
+  below it still runs (a run that kept its children): that cancels the live runs below it.
 
 ## What happens at the limit
 

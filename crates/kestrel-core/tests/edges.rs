@@ -8,7 +8,9 @@ mod common;
 
 use common::*;
 use kestrel_store::ControlCommand;
-use kestrel_types::{ApprovalId, EventKind, RunId, RunStatus, SandboxTier, SuspendReason};
+use kestrel_types::{
+    ApprovalId, EventKind, MicroUsd, RunId, RunStatus, SandboxTier, SuspendReason,
+};
 
 use RunStatus::{Cancelled, Completed, Provisioning, Queued, Running, Suspended};
 
@@ -128,6 +130,37 @@ async fn commands_that_do_not_apply_to_an_active_run_are_noted() {
     h.control(id, ControlCommand::Resume);
     until("resume ignored", || logged(&h, id, "ignored Resume")).await;
     assert!(h.is(id, &Running));
+}
+
+// Issue #90, scenario 4: the CLI and the API refuse a command the run's status does not allow, but
+// the status can change between that check and the engine reading the command. The engine then
+// ignores it and logs it, as before, and the rule it applies is the one the check used.
+#[tokio::test(start_paused = true)]
+async fn i90_s4_a_command_that_gets_past_the_check_is_still_ignored() {
+    let mut h = Harness::new(4);
+    let s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &Running)).await;
+    // Allowed when checked...
+    assert_eq!(ControlCommand::Pause.refusal(&Running), None);
+    assert_eq!(
+        ControlCommand::SetBudget(MicroUsd(9_000_000)).refusal(&Running),
+        None
+    );
+    // ...then the run ends before the engine reads them.
+    s.line("ok:done");
+    s.exit(0);
+    until("completed", || h.is(id, &Completed)).await;
+    assert!(ControlCommand::Pause.refusal(&Completed).is_some());
+    let limit = h.store.limit(id).unwrap();
+
+    h.control(id, ControlCommand::Pause);
+    h.control(id, ControlCommand::SetBudget(MicroUsd(9_000_000)));
+    until("pause ignored", || logged(&h, id, "ignored Pause")).await;
+    until("budget ignored", || logged(&h, id, "ignored SetBudget")).await;
+    assert!(h.is(id, &Completed));
+    assert_eq!(h.store.limit(id).unwrap(), limit, "the limit is unchanged");
 }
 
 #[tokio::test(start_paused = true)]

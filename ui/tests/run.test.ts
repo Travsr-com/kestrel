@@ -353,6 +353,39 @@ describe('Run view', () => {
     expect(allowed({ Failed: 'x' })).toEqual({ pause: false, resume: false, cancel: false, budget: false, message: false });
   });
 
+  // PR #108 review: an ended run that still has live runs below it can be cancelled (the engine
+  // cancels that tree); nothing else is allowed on it.
+  it('allows only Cancel on an ended run with live runs below it', () => {
+    for (const s of ['Completed', 'Cancelled', { Failed: 'x' }] as RunStatus[]) {
+      expect(allowed(s, 2)).toEqual({ pause: false, resume: false, cancel: true, budget: false, message: false });
+      expect(allowed(s, 0).cancel).toBe(false);
+    }
+    expect(allowed('Running', 0).cancel).toBe(true);
+    expect(allowed('Queued', 3)).toEqual(allowed('Queued'));
+  });
+
+  it('offers Cancel on an ended root whose kept children still run, naming them', async () => {
+    const root = run({ agent: 'lead', status: 'Completed' });
+    const kid = run({ parent: root.id, root: root.id, depth: 1 });
+    const { calls, sockets } = show(root.id, [root, kid]);
+    const button = (name: string) => screen.getByRole('button', { name });
+    const cancel = await screen.findByRole('button', { name: 'Cancel run' });
+    expect(cancel).toBeEnabled();
+    for (const name of ['Pause', 'Set', 'Send']) expect(button(name)).toBeDisabled();
+    const u = user();
+    await u.click(cancel);
+    expect(screen.getByRole('dialog')).toHaveTextContent('lead has ended. This cancels its 1 child run.');
+    await u.click(screen.getByRole('button', { name: 'Yes, cancel it' }));
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([`/api/runs/${root.id}/cancel`]);
+
+    // Once the last child has ended there is nothing left to cancel.
+    const t = tree(sockets, root.id);
+    t.open();
+    t.event(1, event(kid.id, 1, { kind: 'status_changed', from: 'Running', to: 'Cancelled' }));
+    await settle();
+    expect(button('Cancel run')).toBeDisabled();
+  });
+
   // 10
   it('asks before cancelling, naming the live child runs; Esc keeps the run', async () => {
     const root = run({ agent: 'lead' });

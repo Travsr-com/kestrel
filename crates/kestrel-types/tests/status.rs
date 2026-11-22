@@ -74,6 +74,27 @@ fn s6_terminal_states_have_no_exits() {
     }
 }
 
+// Issue #90: the lower-case name a refusal and `?status=` use. A reason or message is left out.
+#[test]
+fn every_status_has_a_lower_case_name() {
+    let names: Vec<&str> = states().iter().map(|(_, s)| s.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "queued",
+            "provisioning",
+            "running",
+            "suspended",
+            "suspended",
+            "suspended",
+            "suspended",
+            "completed",
+            "failed",
+            "cancelled"
+        ]
+    );
+}
+
 #[test]
 fn s6_failed_payload_does_not_matter() {
     assert!(RunStatus::Running.can_transition_to(&RunStatus::Failed("a".into())));

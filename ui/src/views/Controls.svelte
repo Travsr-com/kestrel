@@ -2,10 +2,11 @@
   // The run's commands, in three parts the Run view places apart: `buttons` (Pause or Resume, and
   // Cancel run after a confirmation that names the live child runs it also cancels), `limit` (the
   // Change limit panel) and `message` (the Message panel). Each is enabled only when the run's
-  // status allows it. A refused command shows the server's reason in its own part, and
+  // status allows it; Cancel run also stays on for an ended run while `live` runs below it go on. A refused command shows the server's reason in its own part, and
   // `onRefused` fetches the run again so the controls match.
   import type { Api } from '../lib/api';
   import type { FleetRun } from '../lib/fleet.svelte';
+  import { isTerminal } from '../lib/format';
   import { failureText, type OnUnauthorized } from '../lib/load';
   import { allowed, parseUsd } from '../lib/run';
 
@@ -27,7 +28,8 @@
     onBudget?: () => void;
   } = $props();
 
-  const can = $derived(allowed(run.status));
+  const can = $derived(allowed(run.status, live));
+  const ended = $derived(isTerminal(run.status));
 
   let refused: string | null = $state(null);
   let confirming = $state(false);
@@ -179,7 +181,11 @@
       >
         <h2 id="cancel-title-{run.id}">Cancel this run?</h2>
         <p id="cancel-text-{run.id}">
-          {live === 0 ? `This cancels ${run.agent}.` : `This cancels ${run.agent} and ${children(live)}.`}
+          {#if ended}
+            {`${run.agent} has ended. This cancels its ${children(live)}.`}
+          {:else}
+            {live === 0 ? `This cancels ${run.agent}.` : `This cancels ${run.agent} and ${children(live)}.`}
+          {/if}
         </p>
         <div class="buttons">
           <button type="button" bind:this={keepButton} onclick={close}>Keep running</button>
