@@ -850,13 +850,13 @@ async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kest
     let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
     cleanup.container(&bridge_name);
     let port = start_gateway();
-    let spec = BridgeSpec {
+    let bridge_spec = BridgeSpec {
         network,
         ..BridgeSpec::default()
     };
     let bridge = within(
         "bridge start",
-        GatewayBridge::start(Arc::new(ProcessRunner), port, spec, &db),
+        GatewayBridge::start(Arc::new(ProcessRunner), port, bridge_spec, &db),
     )
     .await
     .expect("the bridge starts without the default pools");
