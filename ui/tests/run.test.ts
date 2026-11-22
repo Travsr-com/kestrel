@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
 import Run from '../src/views/Run.svelte';
 import { createApi } from '../src/lib/api';
-import { addTokens, allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
+import { addTokens, allowed, carved, formatSize, liveBelow, messageRefusal, parseUsd } from '../src/lib/run';
 import type { Event, RunStatus, RunSummary } from '../src/lib/types';
 import { fakeSockets, type FakeSocket } from './fake-socket';
 import { ids, seriousViolations } from './axe';
@@ -27,6 +27,7 @@ function run(over: Partial<RunSummary> = {}): RunSummary {
     spent: 0,
     limit: 2_000_000,
     sandbox_tier: 'gvisor',
+    takes_messages: true,
     created_at: new Date(NOW - 60_000).toISOString(),
     ...over,
   };
@@ -323,7 +324,9 @@ describe('Run view', () => {
     const c = run({ status: 'Completed' });
     show(c.id, [c]);
     await screen.findByRole('button', { name: 'Pause' });
-    for (const name of ['Pause', 'Cancel run', 'Set', 'Send']) expect(button(name)).toBeDisabled();
+    for (const name of ['Pause', 'Cancel run', 'Set']) expect(button(name)).toBeDisabled();
+    // An ended run takes no message: the box is gone, and the panel says why (issue #95).
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
   });
 
   it('turns Pause into Resume on the same button when the run is paused, keeping focus on it', async () => {
@@ -371,7 +374,8 @@ describe('Run view', () => {
     const button = (name: string) => screen.getByRole('button', { name });
     const cancel = await screen.findByRole('button', { name: 'Cancel run' });
     expect(cancel).toBeEnabled();
-    for (const name of ['Pause', 'Set', 'Send']) expect(button(name)).toBeDisabled();
+    for (const name of ['Pause', 'Set']) expect(button(name)).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
     const u = user();
     await u.click(cancel);
     expect(screen.getByRole('dialog')).toHaveTextContent('lead has ended. This cancels its 1 child run.');
@@ -816,3 +820,83 @@ function serveFetch(runs: RunSummary[]): typeof globalThis.fetch {
     return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no"}', { status: 404 });
   };
 }
+
+// Issue #95: the Message box is shown only for a run that can take a message now, and says why
+// otherwise. A message is recorded as an event, and so is its delivery to the agent.
+describe('Run view: messages to the agent', () => {
+  it('says why a run cannot take a message', () => {
+    expect(messageRefusal('Running', true)).toBeNull();
+    const notGranted = messageRefusal('Running', false) ?? '';
+    expect(notGranted).toContain('does not take messages');
+    expect(notGranted).toContain('kestrel.messages');
+    expect(messageRefusal('Queued', true)).toBe('Only a running run takes messages.');
+    expect(messageRefusal({ Suspended: 'Manual' }, true)).toBe('Only a running run takes messages.');
+    expect(messageRefusal('Completed', true)).toBe('The run has ended, so it takes no more messages.');
+    expect(messageRefusal({ Failed: 'x' }, false)).toBe('The run has ended, so it takes no more messages.');
+    // An agent that never takes them says so, whatever its status.
+    expect(messageRefusal('Queued', false)).toBe(notGranted);
+  });
+
+  it('hides the Message box for an agent that does not take messages, and says why', async () => {
+    const r = run({ takes_messages: false });
+    show(r.id, [r]);
+    await screen.findByRole('heading', { level: 1, name: 'worker' });
+    const panel = await screen.findByRole('region', { name: 'Message to the agent' });
+    expect(within(panel).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(within(panel).queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(panel).toHaveTextContent('does not take messages');
+  });
+
+  it('hides the Message box while the run is not running, and shows it once it runs', async () => {
+    const r = run({ status: 'Queued' });
+    const { sockets } = show(r.id, [r]);
+    const panel = await screen.findByRole('region', { name: 'Message to the agent' });
+    expect(within(panel).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(panel).toHaveTextContent('Only a running run takes messages.');
+    const t = tree(sockets, r.id);
+    t.open();
+    t.event(1, event(r.id, 1, { kind: 'status_changed', from: 'Queued', to: 'Running' }));
+    await settle();
+    expect(await screen.findByRole('textbox', { name: 'Message' })).toBeEnabled();
+    expect(panel).not.toHaveTextContent('Only a running run');
+  });
+
+  it('says a sent message is on its way, and clears the box', async () => {
+    const r = run();
+    const { calls } = show(r.id, [r]);
+    const u = user();
+    const box = await screen.findByRole('textbox', { name: 'Message' });
+    await u.type(box, 'also fix the docs');
+    await u.click(screen.getByRole('button', { name: 'Send' }));
+    await vi.waitFor(() => expect(box).toHaveValue(''));
+    expect(calls.filter((c) => c.method === 'POST')).toEqual([
+      { method: 'POST', path: `/api/runs/${r.id}/message`, body: { text: 'also fix the docs' } },
+    ]);
+    const panel = screen.getByRole('region', { name: 'Message to the agent' });
+    expect(within(panel).getByRole('status')).toHaveTextContent('Sent. The agent reads it the next time it checks for messages.');
+  });
+
+  it('allows at most 16 KiB in the box', async () => {
+    const r = run();
+    show(r.id, [r]);
+    const box = await screen.findByRole('textbox', { name: 'Message' });
+    expect(box).toHaveAttribute('maxlength', String(16 * 1024));
+  });
+
+  it('shows a message and its delivery in the events', async () => {
+    const r = run();
+    const { sockets } = show(r.id, [r]);
+    await screen.findByRole('list', { name: 'Events' });
+    const s = stream(sockets, r.id);
+    s.open();
+    s.event(1, event(r.id, 1, { kind: 'message_sent', text: 'also fix the docs' }));
+    s.event(2, event(r.id, 2, { kind: 'message_delivered', seqs: [1] }));
+    s.event(3, event(r.id, 3, { kind: 'message_delivered', seqs: [4, 5] }));
+    await settle();
+    const text = items();
+    expect(text[0]).toContain('Message to the agent: also fix the docs');
+    expect(text[1]).toContain('The agent read 1 message');
+    expect(text[1]).not.toContain('messages');
+    expect(text[2]).toContain('The agent read 2 messages');
+  });
+});
