@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -222,29 +222,13 @@ impl Env {
 
     /// Starts `kestrel <args> --json` and waits for its first line, which it returns as JSON.
     fn launch(&self, args: &[&str]) -> (Serve, Value) {
-        let mut child = self
-            .cmd(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start kestrel");
-        let stdout = child.stdout.take().expect("kestrel stdout");
-        let (tx, rx) = mpsc::channel();
-        // Keeps draining stdout so serve never blocks on a full pipe.
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
+        let (mut serve, rx) = Serve::start(self.cmd(args));
+        let first = rx.recv_timeout(SERVE_START).unwrap_or_else(|_| {
+            panic!(
+                "kestrel {args:?} printed nothing in {SERVE_START:?}\n{}",
+                serve.output()
+            )
         });
-        let mut serve = Serve {
-            child,
-            cleanup: None,
-        };
-        let first = rx
-            .recv_timeout(SERVE_START)
-            .unwrap_or_else(|_| panic!("kestrel {args:?} printed nothing in {SERVE_START:?}"));
         let v: Value = serde_json::from_str(&first)
             .unwrap_or_else(|e| panic!("first serve line is not JSON ({e}): {first}"));
         assert!(
@@ -607,13 +591,63 @@ pub fn agent_yaml(name: &str, budget_usd: &str, capabilities: &str) -> String {
 /// `kestrel serve` (or `up`), SIGKILLed when dropped. With `cleanup` (what [`Env::up`] sets) it
 /// gets SIGTERM first, so it stops its sandboxes and bridge, and then whatever docker still has
 /// labelled with that instance id is removed, so one test leaves nothing running for the next.
+///
+/// That SIGTERM is a real shutdown, and it is checked: unless the test is already failing, the
+/// drop panics (failing the test that owns serve, with everything serve printed) when serve exits
+/// non-zero, does not stop within [`STOP_GRACE`], or reports that it left sandboxes behind.
+/// [`Serve::kill`] is a crash on purpose and is never checked.
 pub struct Serve {
     pub child: Child,
     /// The `kestrel.instance` id to clean up after, if any.
     pub cleanup: Option<String>,
+    /// Every line serve printed so far, stdout and stderr, in arrival order.
+    output: Arc<Mutex<String>>,
+    /// Disconnected once both pipes reached EOF.
+    drained: mpsc::Receiver<()>,
 }
 
+/// How long a stopped serve's pipes get to reach EOF. A process serve started and that outlived
+/// it can keep them open; the check then goes on with what arrived.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// The line serve prints when its shutdown failed to destroy every sandbox.
+const LEFT_BEHIND: &str = "left sandboxes behind";
+
 impl Serve {
+    /// Starts `cmd` with stdout and stderr piped and drained on their own threads, so serve never
+    /// blocks on a full pipe. Every line of both is kept for a failed shutdown's message, stderr
+    /// lines are also echoed to the test's stderr, and stdout lines go to the returned receiver.
+    pub fn start(mut cmd: Command) -> (Serve, mpsc::Receiver<String>) {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start kestrel");
+        let output = Arc::new(Mutex::new(String::new()));
+        let (done, drained) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let stdout = child.stdout.take().expect("kestrel stdout");
+        let stderr = child.stderr.take().expect("kestrel stderr");
+        drain(stdout, output.clone(), Some(tx), done.clone());
+        drain(stderr, output.clone(), None, done);
+        let serve = Serve {
+            child,
+            cleanup: None,
+            output,
+            drained,
+        };
+        (serve, rx)
+    }
+
+    /// What serve printed so far, under a header.
+    pub fn output(&self) -> String {
+        let text = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!("--- kestrel output ---\n{text}--- end of kestrel output ---")
+    }
+
     /// SIGKILL, like a crash: nothing is cleaned up, so a restart finds what was left.
     pub fn kill(mut self) {
         self.cleanup = None;
@@ -625,34 +659,95 @@ impl Serve {
         let _ = self.child.wait();
     }
 
-    /// SIGTERM, then a wait of up to [`STOP_GRACE`] for serve to stop on its own.
-    fn terminate(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            return;
+    /// SIGTERM, then a wait of up to [`STOP_GRACE`] for serve to stop on its own. Its exit status,
+    /// or `None` when it was still running at the end of the wait.
+    fn terminate(&mut self) -> Option<ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Some(status);
         }
         let _ = Command::new("kill")
             .args(["-TERM", &self.child.id().to_string()])
             .status();
         let start = Instant::now();
         while start.elapsed() < STOP_GRACE {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
             }
             std::thread::sleep(POLL);
         }
+        None
+    }
+
+    /// What went wrong with a shutdown that ended with `status`, or `None` for a clean one.
+    fn shutdown_problem(&self, status: Option<ExitStatus>) -> Option<String> {
+        // Both pipes close when serve exits; wait for the last lines before reading them.
+        let _ = self.drained.recv_timeout(DRAIN_GRACE);
+        let problem = match status {
+            None => format!("did not stop within {STOP_GRACE:?} of SIGTERM"),
+            Some(status) if !status.success() => format!("exited with {status} on shutdown"),
+            Some(_) => {
+                let text = self
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !text.contains(LEFT_BEHIND) {
+                    return None;
+                }
+                format!("printed \"{LEFT_BEHIND}\" on shutdown")
+            }
+        };
+        Some(format!("kestrel {problem}\n{}", self.output()))
     }
 }
 
 impl Drop for Serve {
     fn drop(&mut self) {
-        if let Some(instance) = self.cleanup.take() {
-            self.terminate();
+        let Some(instance) = self.cleanup.take() else {
             self.stop();
-            sweep_docker(&instance);
-        } else {
-            self.stop();
+            return;
+        };
+        let status = self.terminate();
+        self.stop();
+        // Docker is cleaned up either way, so a failed test leaves nothing for the next one.
+        sweep_docker(&instance);
+        if let Some(problem) = self.shutdown_problem(status) {
+            if std::thread::panicking() {
+                // A second panic would abort the test binary; the test is failing already.
+                eprintln!("{problem}");
+            } else {
+                panic!("{problem}");
+            }
         }
     }
+}
+
+/// Reads `pipe` line by line until EOF into `output`, echoing each line to the test's stderr
+/// when there is no `lines` receiver and sending it there otherwise. A receiver that went away
+/// does not stop the draining. `done` is dropped at EOF.
+fn drain(
+    pipe: impl Read + Send + 'static,
+    output: Arc<Mutex<String>>,
+    lines: Option<mpsc::Sender<String>>,
+    done: mpsc::Sender<()>,
+) {
+    std::thread::spawn(move || {
+        let _done = done;
+        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+            {
+                let mut text = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                text.push_str(&line);
+                text.push('\n');
+            }
+            match &lines {
+                Some(tx) => {
+                    let _ = tx.send(line);
+                }
+                None => eprintln!("{line}"),
+            }
+        }
+    });
 }
 
 /// Removes every container and network labelled `kestrel.instance=<instance>`, and the bridge of

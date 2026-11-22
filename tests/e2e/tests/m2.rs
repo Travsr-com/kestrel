@@ -18,7 +18,9 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -26,9 +28,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use common::{
-    Container, Env, ONE_CALL_MICRO_USD, RUN_DEADLINE, Sampler, USAGE_CACHE_READ, USAGE_CACHE_WRITE,
-    USAGE_IN, USAGE_OUT, branch_of, containers, git, network_info, networks, of_kind, run_id,
-    status_event, status_name, ts,
+    Container, Env, ONE_CALL_MICRO_USD, RUN_DEADLINE, Sampler, Serve, USAGE_CACHE_READ,
+    USAGE_CACHE_WRITE, USAGE_IN, USAGE_OUT, branch_of, containers, git, network_info, networks,
+    of_kind, run_id, status_event, status_name, ts,
 };
 
 /// A child that only does what its markers say: no Kestrel tools.
@@ -1509,5 +1511,88 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
         env.mock.keys_seen().len(),
         calls,
         "every call the mock answered is counted once"
+    );
+}
+
+// The harness itself (issue #89) -----------------------------------------------------------------
+
+/// A stand-in for `kestrel up`: prints a ready line, then on SIGTERM runs `on_term` and exits with
+/// `code`. The trap is set before the ready line, so a SIGTERM right after it is handled.
+fn fake_serve(on_term: &str, code: i32) -> Serve {
+    let script = format!(
+        "on_term() {{ {on_term}; exit {code}; }}\n\
+         trap on_term TERM\n\
+         echo '{{\"gateway\": \"127.0.0.1:1\"}}'\n\
+         echo 'fake serve is up' >&2\n\
+         while :; do sleep 0.1; done\n"
+    );
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &script]);
+    let (mut serve, lines) = Serve::start(cmd);
+    let first = lines
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the fake serve printed its ready line");
+    assert!(first.contains("gateway"), "{first}");
+    // Checked like the serve of `Env::up`. No container carries this instance id.
+    serve.cleanup = Some("e2e-harness-89".to_string());
+    serve
+}
+
+/// What a dropped serve panicked with, or `None` when the drop did not panic.
+fn drop_panic(serve: Serve) -> Option<String> {
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(move || drop(serve))).err()?;
+    Some(match caught.downcast::<String>() {
+        Ok(text) => *text,
+        Err(other) => other
+            .downcast::<&str>()
+            .map(|t| (*t).to_string())
+            .unwrap_or_else(|_| "(a panic that is not text)".to_string()),
+    })
+}
+
+/// Issue #89, scenario 3: a serve that exits non-zero on shutdown fails the test that owns it, and
+/// the failure shows what serve printed.
+#[test]
+fn m2_harness_a_serve_that_exits_non_zero_on_shutdown_fails_its_test() {
+    let serve = fake_serve(
+        "echo 'error: shutdown left sandboxes behind: 1 failed' >&2",
+        1,
+    );
+
+    let text = drop_panic(serve).expect("a non-zero exit on shutdown fails the test");
+
+    assert!(text.contains("exit status: 1"), "{text}");
+    assert!(text.contains("fake serve is up"), "serve's output: {text}");
+    assert!(
+        text.contains("shutdown left sandboxes behind: 1 failed"),
+        "serve's output: {text}"
+    );
+}
+
+/// Issue #89, scenario 4: exit 0 is not enough, a "left sandboxes behind" line fails the test too.
+#[test]
+fn m2_harness_a_shutdown_that_reports_leftovers_fails_its_test() {
+    let serve = fake_serve(
+        "echo 'error: shutdown left sandboxes behind: 1 timed out' >&2",
+        0,
+    );
+
+    let text = drop_panic(serve).expect("a leftover line fails the test");
+
+    assert!(text.contains("left sandboxes behind"), "{text}");
+}
+
+/// A clean shutdown (exit 0, nothing left behind) passes, and a killed serve is never checked:
+/// scenario 14 kills serve on purpose.
+#[test]
+fn m2_harness_a_clean_shutdown_or_a_kill_passes() {
+    assert_eq!(
+        drop_panic(fake_serve("echo 'shutdown: 0 destroyed' >&2", 0)),
+        None
+    );
+    let killed = fake_serve("exit 1", 1);
+    assert!(
+        std::panic::catch_unwind(AssertUnwindSafe(move || killed.kill())).is_ok(),
+        "a kill is not a shutdown"
     );
 }
