@@ -498,13 +498,17 @@ async fn messages_are_offered_when_granted_and_handed_over_once() {
         Some(vec!["kestrel.join"])
     );
 
-    assert!(h.engine.take_messages(a).unwrap().is_empty());
+    assert!(h.engine.take_messages(a, None).unwrap().is_empty());
     let sent = h.store.send_message(a, "also fix the docs").unwrap();
-    let taken = h.engine.take_messages(a).unwrap();
+    let taken = h.engine.take_messages(a, None).unwrap();
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].seq, sent.seq);
     assert_eq!(taken[0].text, "also fix the docs");
-    assert!(h.engine.take_messages(a).unwrap().is_empty());
+    assert!(h.engine.take_messages(a, None).unwrap().is_empty());
+    // Asked again from before it (a retry with `after`), it comes again, and is not delivered
+    // twice.
+    let again = h.engine.take_messages(a, Some(sent.seq - 1)).unwrap();
+    assert_eq!(again, taken);
     assert_eq!(
         h.count_events(
             a,
