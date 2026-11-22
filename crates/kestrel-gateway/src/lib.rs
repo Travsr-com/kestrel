@@ -110,10 +110,10 @@ impl Default for GatewayTimeouts {
 /// What the gateway holds open at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayLimits {
-    /// Kestrel tool calls (`/r/{token}/mcp`) whose answer is still open, across all runs. Each
-    /// holds a connection through the bridge, and a `join` or `ask_human` can wait for hours, so
-    /// the bridge is sized for this many plus the runs' own calls. A call past it is refused at
-    /// once with a tool error, and nothing is started.
+    /// Long Kestrel tool calls (`join`, `ask_human`, a `spawn` that waits) whose answer is still
+    /// open, across all runs. Each holds a connection through the bridge, maybe for hours, so the
+    /// bridge is sized for this many plus the runs' own calls. A call past it is refused at once
+    /// with a tool error. 0 counts as 1.
     pub waiting_calls: usize,
 }
 

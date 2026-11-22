@@ -157,24 +157,29 @@ struct Config {
     gateway: GatewayConfig,
 }
 
-/// Connections each concurrent run may hold through the bridge besides Kestrel tool calls: a
-/// model call, a Travsr call, and room for two more (an agent may call in parallel, and an HTTP
-/// client keeps an idle connection open for a moment).
+/// Connections each run holding a slot may use through the bridge besides long Kestrel tool
+/// calls: a model call, a short tool call or a Travsr call, and room for two more (an agent may
+/// call in parallel).
 const CONNECTIONS_PER_RUN: u32 = 4;
-/// `gateway.max_waiting_calls` when it is not set: the gateway's own default.
-const DEFAULT_WAITING_CALLS: u32 = 64;
+/// Connections each long call held open may use: its own, and one idle keep-alive connection
+/// its client may keep open while it waits.
+const CONNECTIONS_PER_WAITING_CALL: u32 = 2;
+/// `gateway.max_waiting_calls` when it is not set: the gateway's own default, which is the
+/// engine's default tree limit (checked in the tests).
+const DEFAULT_WAITING_CALLS: u32 = 256;
 /// Largest `gateway.max_waiting_calls`.
 const MAX_WAITING_CALLS: u32 = 4096;
 
-/// The bridge's connection limit (issue #80): every tool call held open, plus
-/// [`CONNECTIONS_PER_RUN`] for each run that holds a slot. A run waiting in `join` or
-/// `ask_human` gives its slot back but keeps its call open, which `waiting_calls` counts. `None`
+/// The bridge's connection limit (issue #80): [`CONNECTIONS_PER_WAITING_CALL`] for every long
+/// call held open, plus [`CONNECTIONS_PER_RUN`] for each run that holds a slot. A parent waiting
+/// in `join` gives its slot back but keeps its call open, which `waiting_calls` counts. `None`
 /// when that is above [`MAX_BRIDGE_CONNECTIONS`].
 fn bridge_connections(waiting_calls: u32, concurrent_runs: usize) -> Option<u32> {
+    let waiting = waiting_calls.checked_mul(CONNECTIONS_PER_WAITING_CALL)?;
     u32::try_from(concurrent_runs)
         .ok()
         .and_then(|runs| runs.checked_mul(CONNECTIONS_PER_RUN))
-        .and_then(|runs| runs.checked_add(waiting_calls))
+        .and_then(|runs| runs.checked_add(waiting))
         .filter(|n| *n <= MAX_BRIDGE_CONNECTIONS)
 }
 
@@ -189,7 +194,9 @@ fn max_waiting_calls(value: Option<toml::Value>) -> Result<u32, Failure> {
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| (1..=MAX_WAITING_CALLS).contains(n))
         .ok_or_else(|| {
-            Failure::usage("gateway.max_waiting_calls must be a whole number from 1 to 4096")
+            Failure::usage(format!(
+                "gateway.max_waiting_calls must be a whole number from 1 to {MAX_WAITING_CALLS}"
+            ))
         })
 }
 
@@ -276,9 +283,9 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
     let waiting_calls = max_waiting_calls(raw.gateway.max_waiting_calls)?;
     let bridge_connections = bridge_connections(waiting_calls, max).ok_or_else(|| {
         Failure::usage(format!(
-            "gateway.max_waiting_calls plus {CONNECTIONS_PER_RUN} for each of \
-             engine.max_concurrent_runs needs more than {MAX_BRIDGE_CONNECTIONS} bridge \
-             connections; lower one of them"
+            "{CONNECTIONS_PER_WAITING_CALL} for each of gateway.max_waiting_calls plus \
+             {CONNECTIONS_PER_RUN} for each of engine.max_concurrent_runs needs more than \
+             {MAX_BRIDGE_CONNECTIONS} bridge connections; lower one of them"
         ))
     })?;
     Ok(Config {
@@ -1801,11 +1808,13 @@ budget: { usd: 0.000010, wall_clock: 10m }
         (c.waiting_calls, c.bridge_connections)
     }
 
-    /// Issue #80: 64 waiting calls by default, and a bridge sized for them plus 4 connections for
-    /// each of the 4 default concurrent runs.
+    /// Issue #80: by default as many waiting calls as one tree may hold runs (so one tree's
+    /// waiting parents can never fill the cap), and a bridge sized for them (2 each) plus 4
+    /// connections for each of the 4 default concurrent runs.
     #[test]
-    fn waiting_calls_default_to_64_and_the_bridge_to_80() {
-        assert_eq!(sizes(ANTHROPIC), (64, 80));
+    fn waiting_calls_default_to_the_tree_limit_and_the_bridge_to_528() {
+        assert_eq!(sizes(ANTHROPIC), (256, 528));
+        assert_eq!(sizes(ANTHROPIC).0, kestrel_core::DEFAULT_TREE_LIMIT);
         assert_eq!(
             usize::try_from(sizes(ANTHROPIC).0).expect("fits"),
             kestrel_gateway::DEFAULT_WAITING_CALLS
@@ -1817,7 +1826,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
         );
     }
 
-    /// Issue #80 scenario 1: the bridge allows the waiting calls plus 4 connections per
+    /// Issue #80 scenario 1: the bridge allows 2 connections per waiting call plus 4 per
     /// concurrent run.
     #[test]
     fn the_bridge_is_sized_from_the_waiting_calls_and_the_concurrency_cap() {
@@ -1826,12 +1835,13 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 "{ANTHROPIC}[gateway]\nmax_waiting_calls = {w}\n[engine]\nmax_concurrent_runs = {c}\n"
             )
         };
-        assert_eq!(sizes(&cfg(1, 1)), (1, 5));
-        assert_eq!(sizes(&cfg(100, 10)), (100, 140));
-        assert_eq!(sizes(&cfg(4096, 1024)), (4096, 8192));
-        assert_eq!(bridge_connections(64, 4), Some(80));
-        assert_eq!(bridge_connections(4096, 1025), None, "above 8192");
+        assert_eq!(sizes(&cfg(1, 1)), (1, 6));
+        assert_eq!(sizes(&cfg(100, 10)), (100, 240));
+        assert_eq!(sizes(&cfg(4000, 48)), (4000, 8192));
+        assert_eq!(bridge_connections(256, 4), Some(528));
+        assert_eq!(bridge_connections(4000, 49), None, "above 8192");
         assert_eq!(bridge_connections(1, usize::MAX), None, "no overflow");
+        assert_eq!(bridge_connections(u32::MAX, 1), None, "no overflow");
     }
 
     #[test]
@@ -1851,7 +1861,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
     #[test]
     fn settings_that_need_more_than_8192_bridge_connections_are_refused() {
         let e = err(&format!(
-            "{ANTHROPIC}[gateway]\nmax_waiting_calls = 4096\n[engine]\nmax_concurrent_runs = 2000\n"
+            "{ANTHROPIC}[gateway]\nmax_waiting_calls = 4096\n[engine]\nmax_concurrent_runs = 1\n"
         ));
         assert!(e.contains("gateway.max_waiting_calls"), "{e}");
         assert!(e.contains("engine.max_concurrent_runs"), "{e}");

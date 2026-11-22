@@ -20,9 +20,9 @@ pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
 /// Connections the bridge holds at once when [`BridgeSpec::connections`] is not set: the size
-/// `kestrel serve` works out for its default settings (64 waiting calls plus 4 connections for
-/// each of 4 concurrent runs).
-pub const DEFAULT_BRIDGE_CONNECTIONS: u32 = 80;
+/// `kestrel serve` works out for its default settings (2 for each of 256 waiting calls plus 4
+/// for each of 4 concurrent runs).
+pub const DEFAULT_BRIDGE_CONNECTIONS: u32 = 528;
 /// Most connections a bridge may hold at once.
 pub const MAX_BRIDGE_CONNECTIONS: u32 = 8192;
 /// Processes allowed on top of one per connection: `socat` itself (PID 1) and spare, so the

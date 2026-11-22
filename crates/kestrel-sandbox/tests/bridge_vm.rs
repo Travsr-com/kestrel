@@ -125,15 +125,15 @@ async fn vm_run_argv_is_pinned_in_full() {
             "--security-opt",
             "no-new-privileges",
             "--pids-limit",
-            "88",
+            "536",
             "--memory",
-            "112m",
+            "560m",
             "--user",
             "65534:65534",
             kestrel_sandbox::DEFAULT_BRIDGE_IMAGE,
             "-T",
             "300",
-            "TCP-LISTEN:7070,fork,reuseaddr,max-children=80",
+            "TCP-LISTEN:7070,fork,reuseaddr,max-children=528",
             "TCP:host.docker.internal:7070",
         ])
     );

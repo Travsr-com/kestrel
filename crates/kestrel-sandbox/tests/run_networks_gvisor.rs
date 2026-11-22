@@ -626,18 +626,18 @@ async fn ten_sandboxes_started_in_parallel_all_reach_the_gateway() {
 
 // #80 ---------------------------------------------------------------------------------------------
 
-/// #80 scenario 2 on a real bridge: sized for 40 waiting calls and one running run (40 + 1 * 4 =
-/// 44 connections, the formula `kestrel serve` uses), a sandbox holds 40 connections open through
+/// #80 scenario 2 on a real bridge: sized for 40 waiting calls and one running run (2 * 40 + 4 =
+/// 84 connections, the formula `kestrel serve` uses), a sandbox holds 40 connections open through
 /// it, more than the old fixed limit of 32, and one more request still goes through. With the old
-/// limit the 33rd connection would wait for a free slot, so the count never reaches 40 and the
-/// last request times out.
+/// limit the 33rd connection would wait for a free slot, so the count never reaches 40: the poll
+/// gives up within about two minutes and the `held=40` assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_held_connections_than_the_old_limit_of_32_still_leave_room_for_a_call() {
     let _serial = SERIAL.lock().await;
     let held = Arc::new(AtomicUsize::new(0));
     let port = start_holding_gateway(held.clone());
     let spec = BridgeSpec {
-        connections: 44,
+        connections: 84,
         ..BridgeSpec::default()
     };
     let w = World::with("10.231.11.0/24", port, spec).await;
@@ -645,7 +645,7 @@ async fn more_held_connections_than_the_old_limit_of_32_still_leave_room_for_a_c
     let url = w.gateway_url(&net);
     let script = format!(
         "i=0; while [ $i -lt 40 ]; do wget -q -T 200 -O /dev/null {url}hold & i=$((i+1)); done; \
-         n=0; t=0; while [ $t -lt 90 ]; do n=$(wget -q -T 5 -O- {url}count); \
+         n=0; t=0; while [ $t -lt 40 ]; do n=$(wget -q -T 2 -O- {url}count); \
          [ \"$n\" = 40 ] && break; sleep 1; t=$((t+1)); done; echo held=$n; {}",
         probe("after", &url)
     );

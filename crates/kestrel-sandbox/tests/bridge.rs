@@ -74,15 +74,15 @@ fn run(port: u16) -> Vec<String> {
         "--security-opt",
         "no-new-privileges",
         "--pids-limit",
-        "88",
+        "536",
         "--memory",
-        "112m",
+        "560m",
         "--user",
         "65534:65534",
         IMAGE,
         "-T",
         "300",
-        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=80"),
+        &format!("TCP-LISTEN:{port},fork,reuseaddr,max-children=528"),
         &format!("TCP:host.docker.internal:{port}"),
     ])
 }
@@ -491,8 +491,8 @@ async fn the_connection_limit_sets_socat_children_pids_and_memory() {
 }
 
 #[tokio::test]
-async fn the_default_connection_limit_is_80_and_the_most_is_8192() {
-    assert_eq!(DEFAULT_BRIDGE_CONNECTIONS, 80);
+async fn the_default_connection_limit_is_528_and_the_most_is_8192() {
+    assert_eq!(DEFAULT_BRIDGE_CONNECTIONS, 528);
     assert_eq!(
         BridgeSpec::default().connections,
         DEFAULT_BRIDGE_CONNECTIONS

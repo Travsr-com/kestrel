@@ -815,9 +815,10 @@ async fn join_held_open(app: &Router, token: &str, id: u64) -> axum::response::R
     held
 }
 
-/// Issue #80 scenario 3: across all runs, at most `waiting_calls` tool calls are held open (each
-/// holds a bridge connection). The next call is refused at once, with a tool error the agent
-/// reads and an event on its run, and nothing is started. A closed connection makes room again.
+/// Issue #80 scenario 3: across all runs, at most `waiting_calls` long calls are held open (each
+/// holds a bridge connection). The next one, here a spawn that waits, is refused at once, with
+/// a tool error the agent reads and an event on its run, and nothing is started. A closed
+/// connection makes room again.
 #[tokio::test(start_paused = true)]
 async fn calls_held_open_across_runs_are_capped_and_the_next_is_refused_clearly() {
     let (app, host, runs) = many(2, GatewayLimits { waiting_calls: 3 });
@@ -827,7 +828,7 @@ async fn calls_held_open_across_runs_are_capped_and_the_next_is_refused_clearly(
         join_held_open(&app, &a.0, 2).await,
         join_held_open(&app, &b.0, 1).await,
     ];
-    let args = json!({ "agent": "worker", "input": "x" });
+    let args = json!({ "agent": "worker", "input": "x", "wait": true });
     let fourth = send(
         &app,
         &b.0,
@@ -870,35 +871,152 @@ async fn calls_held_open_across_runs_are_capped_and_the_next_is_refused_clearly(
     drop(held);
 }
 
-/// A call that answers at once holds its connection only while it answers, so short calls never
-/// use up the room.
+/// A long call gives its room back as soon as it has answered (a JSON answer is complete before
+/// the response is), and a spawn without `wait`, which answers at once, needs no room at all.
 #[tokio::test(start_paused = true)]
-async fn short_calls_give_their_room_back_when_they_answer() {
+async fn long_calls_give_their_room_back_when_they_answer_and_short_ones_need_none() {
     let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 1 });
+    let token = &runs[0].0;
     for id in 0..5 {
-        let msg = message(
-            send(
-                &app,
-                &runs[0].0,
-                call(id, "kestrel.ask_human", json!({ "question": "q" }))
-                    .to_string()
-                    .into_bytes(),
-                true,
-            )
-            .await,
+        let response = send(
+            &app,
+            token,
+            call(id, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
         )
         .await;
-        assert_eq!(msg["result"]["isError"], json!(false), "call {id}: {msg}");
+        // The room is back before the body is read.
+        let next = send(
+            &app,
+            token,
+            call(100 + id, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(message(next).await["result"]["isError"], json!(false));
+        assert_eq!(message(response).await["result"]["isError"], json!(false));
     }
-    assert_eq!(host.asks.lock().unwrap().len(), 5);
+    assert_eq!(host.asks.lock().unwrap().len(), 10);
+    // With the one room taken by a join, a spawn that does not wait still goes through.
+    let held = join_held_open(&app, token, 200).await;
+    let msg = message(
+        send(
+            &app,
+            token,
+            call(
+                201,
+                "kestrel.spawn",
+                json!({ "agent": "worker", "input": "x" }),
+            )
+            .to_string()
+            .into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
     assert!(host.refused.lock().unwrap().is_empty());
+    drop(held);
+}
+
+/// A cap of 0 would refuse every long call; it counts as 1.
+#[tokio::test(start_paused = true)]
+async fn a_cap_of_0_counts_as_1() {
+    let (app, _host, runs) = many(1, GatewayLimits { waiting_calls: 0 });
+    let held = join_held_open(&app, &runs[0].0, 1).await;
+    let msg = message(
+        send(
+            &app,
+            &runs[0].0,
+            call(2, "kestrel.join", json!({})).to_string().into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(true), "{msg}");
+    drop(held);
+}
+
+/// A call refused because its run already has 8 calls waiting gives back the room it took.
+#[tokio::test(start_paused = true)]
+async fn a_call_refused_for_its_run_gives_its_room_back() {
+    let (app, host, runs) = many(2, GatewayLimits { waiting_calls: 9 });
+    let mut held = Vec::new();
+    for id in 0..8 {
+        held.push(join_held_open(&app, &runs[0].0, id).await);
+    }
+    let busy = send(
+        &app,
+        &runs[0].0,
+        call(8, "kestrel.join", json!({})).to_string().into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The ninth room is free again for another run.
+    held.push(join_held_open(&app, &runs[1].0, 1).await);
+    assert!(host.refused.lock().unwrap().is_empty());
+    drop(held);
+}
+
+/// A client that calls again with the id of a call still running, while the cap is full, is told
+/// that the call is still running (no second join), never that nothing was started. Once it has
+/// finished, the same id gets the result at once, even with the cap full.
+#[tokio::test(start_paused = true)]
+async fn calling_again_at_the_cap_is_told_the_truth_and_a_finished_call_is_answered() {
+    let (app, host, runs) = many(2, GatewayLimits { waiting_calls: 1 });
+    let (a, b) = (&runs[0].0, &runs[1].0);
+    // A's join starts, then its connection drops: the join keeps running, the room is free.
+    drop(join_held_open(&app, a, 1).await);
+    let b_held = join_held_open(&app, b, 1).await;
+    let again = message(
+        send(
+            &app,
+            a,
+            call(1, "kestrel.join", json!({})).to_string().into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(again["result"]["isError"], json!(true), "{again}");
+    let reason = again["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(reason.contains("still running"), "{reason}");
+    assert!(reason.contains("same id"), "{reason}");
+    assert!(!reason.contains("nothing was started"), "{reason}");
+    // Let the call tasks run, then count the joins the host got.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(host.joins.lock().unwrap().len(), 2, "no second join");
+    assert_eq!(host.refused.lock().unwrap().len(), 1);
+
+    // Both joins finish; B still holds the one room.
+    tokio::time::sleep(Duration::from_secs(601)).await;
+    let done = message(
+        send(
+            &app,
+            a,
+            call(1, "kestrel.join", json!({})).to_string().into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(done["result"]["isError"], json!(false), "{done}");
+    assert_eq!(host.joins.lock().unwrap().len(), 2);
+    drop(b_held);
 }
 
 /// Issue #80 scenario 2, gateway side: by default more calls than the old bridge limit of 32 can
 /// wait at once (5 runs with 8 joins each), and one more run's call still goes through.
 #[tokio::test(start_paused = true)]
 async fn by_default_more_calls_than_the_old_limit_of_32_can_wait() {
-    assert_eq!(DEFAULT_WAITING_CALLS, 64);
+    assert_eq!(DEFAULT_WAITING_CALLS, 256);
     assert_eq!(
         GatewayLimits::default().waiting_calls,
         DEFAULT_WAITING_CALLS

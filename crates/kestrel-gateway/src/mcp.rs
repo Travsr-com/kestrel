@@ -18,10 +18,12 @@
 //!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
 //!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
 //!   most 256 children and a day's timeout per join. An unknown token is 401 and a finished run 410; neither echoes it.
-//! * **Calls held open, across all runs**: each call holds its connection (through the shared
-//!   bridge) until it answers, so at most [`crate::GatewayLimits::waiting_calls`] are open at
-//!   once. A call past that gets a tool error at once, nothing is started, and the host records
-//!   it ([`ToolHost::refused`]).
+//! * **Long calls held open, across all runs**: a `join`, a question or a spawn that waits holds
+//!   its connection (through the shared bridge) until it answers, so at most
+//!   [`crate::GatewayLimits::waiting_calls`] are open at once. A call past that gets a tool error
+//!   at once and the host records it ([`ToolHost::refused`]): a new call starts nothing, and one
+//!   called again with the id of a call still running is told so. A finished call is answered
+//!   again whatever the count.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -59,8 +61,9 @@ const BURST: f64 = 20.0;
 const REFILL_PER_SECOND: f64 = 10.0;
 /// Calls of one run that may wait at once, and results of one run kept.
 const MAX_WAITING: usize = 8;
-/// Tool calls held open at once across all runs when [`GatewayLimits`] is not set.
-pub const DEFAULT_WAITING_CALLS: usize = 64;
+/// Long tool calls held open at once across all runs when [`crate::GatewayLimits`] is not set:
+/// the engine's default tree limit, so the waiting parents of one tree can never fill it.
+pub const DEFAULT_WAITING_CALLS: usize = 256;
 const MAX_KEPT: usize = 256;
 /// Longest string id, and most children in one join.
 const MAX_ID_BYTES: usize = 128;
@@ -246,15 +249,24 @@ impl Drop for Held {
 }
 
 impl McpState {
-    /// No calls yet; at most `max_held` held open at once.
+    /// No calls yet; at most `max_held` long calls held open at once (at least 1).
     pub(crate) fn new(max_held: usize) -> McpState {
         McpState {
             calls: Mutex::default(),
             buckets: Mutex::default(),
             pruned: Mutex::default(),
             held: Arc::default(),
-            max_held,
+            max_held: max_held.max(1),
         }
+    }
+
+    /// The call `run` made with `id`, running or finished, if there is one.
+    fn existing(&self, run: RunId, id: &Value) -> Option<CallResult> {
+        let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        calls
+            .get(&run)
+            .and_then(|mine| mine.by_id.get(&id.to_string()))
+            .map(|(result, _)| result.clone())
     }
 
     /// Room for one more call held open, or `None` when [`McpState::max_held`] are.
@@ -517,6 +529,17 @@ enum Task {
     Ask(String),
 }
 
+impl Task {
+    /// A call that may wait a long time for its answer: a join, a question, a spawn that waits.
+    /// A spawn without `wait` answers at once.
+    fn is_long(&self) -> bool {
+        match self {
+            Task::Spawn(call) => call.wait,
+            Task::Join(_) | Task::Ask(_) => true,
+        }
+    }
+}
+
 async fn call(
     state: &Arc<AppState>,
     run: RunId,
@@ -565,17 +588,30 @@ async fn call(
             );
         }
     };
-    // Every tool call holds its connection (through the shared bridge) until it answers, so
-    // the number open at once is capped across all runs. Past the cap the call is refused before
-    // anything starts.
-    let Some(held) = state.mcp.hold() else {
-        let reason = format!(
-            "too many tool calls are waiting across all runs (the limit is {}, \
-             gateway.max_waiting_calls); nothing was started. Call again later",
-            state.mcp.max_held
-        );
-        state.deps.tools.refused(run, tool.name(), &reason).await;
-        return Json(rpc_result(id, tool_result(Err(reason)))).into_response();
+    // A long call holds its connection (through the shared bridge) until it answers, maybe for
+    // hours, so the number of those open at once is capped across all runs. A call made again
+    // with the id of one that has finished is answered at once and needs no room. Past the cap a
+    // new call is refused before anything starts, and one already running is told so.
+    let found = state.mcp.existing(run, &id);
+    let finished = found.as_ref().is_some_and(|r| r.borrow().is_some());
+    let held = if task.is_long() && !finished {
+        let Some(held) = state.mcp.hold() else {
+            let what = if found.is_some() {
+                "this call is still running; call again later with the same id for its result"
+            } else {
+                "nothing was started; call again later"
+            };
+            let reason = format!(
+                "too many tool calls are waiting across all runs (the limit is {}, \
+                 gateway.max_waiting_calls): {what}",
+                state.mcp.max_held
+            );
+            state.deps.tools.refused(run, tool.name(), &reason).await;
+            return Json(rpc_result(id, tool_result(Err(reason)))).into_response();
+        };
+        Some(held)
+    } else {
+        None
     };
     let Ok(mut result) = start(state, run, &id, task) else {
         return rpc_error(

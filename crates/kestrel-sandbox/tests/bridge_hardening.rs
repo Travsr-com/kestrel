@@ -294,8 +294,8 @@ async fn the_container_is_hardened() {
     let argv = run_argv(&runner);
     assert_eq!(value_of(&argv, "--cap-drop"), "ALL");
     assert_eq!(value_of(&argv, "--security-opt"), "no-new-privileges");
-    assert_eq!(value_of(&argv, "--pids-limit"), "88");
-    assert_eq!(value_of(&argv, "--memory"), "112m");
+    assert_eq!(value_of(&argv, "--pids-limit"), "536");
+    assert_eq!(value_of(&argv, "--memory"), "560m");
     assert_eq!(value_of(&argv, "--user"), "65534:65534");
     assert_eq!(value_of(&argv, "--restart"), "no");
     assert!(argv.iter().any(|a| a == "--read-only"), "{argv:?}");
@@ -341,7 +341,7 @@ async fn socat_gets_an_inactivity_timeout_and_a_child_limit() {
         s(&[
             "-T",
             "300",
-            "TCP-LISTEN:7070,fork,reuseaddr,max-children=80",
+            "TCP-LISTEN:7070,fork,reuseaddr,max-children=528",
             "TCP:host.docker.internal:7070",
         ])
     );

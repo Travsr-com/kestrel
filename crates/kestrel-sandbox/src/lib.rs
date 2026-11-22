@@ -85,7 +85,10 @@ pub enum SandboxError {
     #[error("invalid bridge port 0")]
     InvalidBridgePort,
     /// The bridge's connection limit is out of range.
-    #[error("invalid bridge connection limit {connections}: it must be 1 to 8192")]
+    #[error(
+        "invalid bridge connection limit {connections}: it must be 1 to {}",
+        bridge::MAX_BRIDGE_CONNECTIONS
+    )]
     InvalidBridgeConnections { connections: u32 },
     /// Docker refused a run network's block because another network already uses it ("Pool
     /// overlaps"). The engine excludes the block and tries another one.
