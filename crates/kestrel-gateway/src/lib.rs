@@ -37,7 +37,18 @@ use url::Url;
 #[async_trait]
 pub trait RunResolver: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<RunId>;
+
+    /// True once the run has ended (completed, failed or cancelled): its token then opens no
+    /// gateway route, so a finished run can make no more model or tool calls (410). A call
+    /// already in flight is not affected. A suspended run has not ended: it can be resumed with
+    /// the same token, and a budget-suspended one is refused by the [`BudgetGuard`] anyway.
+    async fn ended(&self, _run: RunId) -> bool {
+        false
+    }
 }
+
+/// What a model call or tool call with an ended run's token is told.
+pub(crate) const RUN_ENDED: &str = "the run has ended, its token no longer works";
 
 /// Decides whether a run may make another model call.
 #[async_trait]
@@ -192,6 +203,8 @@ impl Provider {
             Provider::Anthropic => {
                 let kind = match status {
                     StatusCode::UNAUTHORIZED => "authentication_error",
+                    // Not retryable: the run has ended for good.
+                    StatusCode::GONE => "permission_error",
                     StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
                     StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
                     _ => "api_error",
@@ -200,7 +213,7 @@ impl Provider {
             }
             Provider::OpenAi => {
                 let kind = match status {
-                    StatusCode::UNAUTHORIZED | StatusCode::PAYLOAD_TOO_LARGE => {
+                    StatusCode::UNAUTHORIZED | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::GONE => {
                         "invalid_request_error"
                     }
                     StatusCode::TOO_MANY_REQUESTS => "insufficient_quota",
@@ -367,6 +380,9 @@ async fn proxy(
     let Some(run) = state.deps.resolver.resolve(&token).await else {
         return provider.error(StatusCode::UNAUTHORIZED, "unknown run token");
     };
+    if state.deps.resolver.ended(run).await {
+        return provider.error(StatusCode::GONE, RUN_ENDED);
+    }
     if !state.deps.budget.allow(run).await {
         return provider.error(
             StatusCode::TOO_MANY_REQUESTS,

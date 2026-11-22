@@ -50,7 +50,10 @@ async fn an_ended_run_s_anthropic_call_is_410_reaches_nothing_and_costs_nothing(
     // Not a retryable error: the agent must not try again.
     assert_anthropic_error(&body, "permission_error");
     let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("ended"), "the reason says the run ended: {msg}");
+    assert!(
+        msg.contains("ended"),
+        "the reason says the run ended: {msg}"
+    );
     assert!(!msg.contains(RUN_TOKEN), "the token is never echoed: {msg}");
 
     assert!(upstream.received_requests().await.unwrap().is_empty());
@@ -106,10 +109,10 @@ async fn an_ended_run_s_tool_call_is_410_and_never_reaches_the_tools() {
 async fn a_live_run_is_not_affected() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(anthropic_response(CLAUDE_MODEL, 10, 5, 0, 0).into_bytes(), JSON),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            anthropic_response(CLAUDE_MODEL, 10, 5, 0, 0).into_bytes(),
+            JSON,
+        ))
         .expect(1)
         .mount(&upstream)
         .await;

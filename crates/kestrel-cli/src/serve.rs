@@ -1639,6 +1639,11 @@ impl RunResolver for StoreDeps {
     async fn resolve(&self, token: &str) -> Option<RunId> {
         self.0.run_by_token(token).ok().flatten()
     }
+
+    /// Ended unless the store says the run is live: a run it cannot read lets nothing through.
+    async fn ended(&self, run: RunId) -> bool {
+        !matches!(self.0.get_run(run), Ok(Some(row)) if !row.status.is_terminal())
+    }
 }
 
 #[async_trait]
@@ -1826,7 +1831,10 @@ budget: { usd: 0.000010, wall_clock: 10m }
             walk(id, &steps);
             assert!(deps.ended(id).await, "{end:?}");
         }
-        assert!(deps.ended(RunId::new()).await, "a run the store does not have");
+        assert!(
+            deps.ended(RunId::new()).await,
+            "a run the store does not have"
+        );
     }
 
     // Issue #25: bounded shutdown (tests first, failing until implemented).

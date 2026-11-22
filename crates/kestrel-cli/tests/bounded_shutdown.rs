@@ -261,8 +261,7 @@ fn a_run_that_has_ended_cannot_hold_a_request_open() {
     let mut head = [0u8; 12];
     conn.read_exact(&mut head).expect("an answer at once");
     assert_eq!(
-        &head,
-        b"HTTP/1.1 410",
+        &head, b"HTTP/1.1 410",
         "an ended run's model call is refused"
     );
     assert!(
