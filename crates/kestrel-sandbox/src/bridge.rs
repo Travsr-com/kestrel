@@ -83,11 +83,54 @@ pub enum BridgeNetwork {
     /// Create it when missing, on a subnet docker picks from its default address pools.
     #[default]
     DockerPools,
-    /// It exists already: use it as it is, whatever its subnet, and never create it.
-    Existing,
+    /// It exists already: use it as it is, whatever its subnet, and do not create it. If another
+    /// serve removes it before the bridge joins it, it is created once on `fallback` (the span
+    /// the plan would have given it, not taken from the plan: a run network that later overlaps
+    /// it is refused by docker and the engine moves on to another block).
+    Existing { fallback: Option<Subnet> },
     /// Create it on this span (`--subnet`, `--gateway`). One made by someone else in the
-    /// meantime is used as it is.
+    /// meantime is used as it is, and one removed again before the bridge joins it is made once
+    /// more.
     Subnet(Subnet),
+}
+
+impl BridgeNetwork {
+    /// The span to create `kestrel-gw` on when it is gone at `connect`.
+    fn span(&self) -> Option<&Subnet> {
+        match self {
+            BridgeNetwork::DockerPools => None,
+            BridgeNetwork::Existing { fallback } => fallback.as_ref(),
+            BridgeNetwork::Subnet(span) => Some(span),
+        }
+    }
+}
+
+/// `docker network create --internal --subnet <span> --gateway <first host> kestrel-gw`.
+fn create_on(span: &Subnet) -> Vec<String> {
+    argv(&[
+        "docker",
+        "network",
+        "create",
+        "--internal",
+        "--subnet",
+        &span.cidr().to_string(),
+        "--gateway",
+        &span.gateway().to_string(),
+        NETWORK,
+    ])
+}
+
+/// Creates `kestrel-gw` with `create`; one that exists already is fine.
+async fn create_network(runner: &dyn CommandRunner, create: &[String]) -> Result<(), SandboxError> {
+    match docker(runner, create).await {
+        Err(e) if !e.contains("already exists") => Err(step("create-network")(e)),
+        _ => Ok(()),
+    }
+}
+
+/// True when docker says `kestrel-gw` does not exist.
+fn network_gone(e: &str) -> bool {
+    e.contains(NETWORK) && (e.contains("not found") || e.contains("No such network"))
 }
 
 /// What [`GatewayBridge::plan_network`] decided.
@@ -99,15 +142,12 @@ pub struct NetworkPlan {
     pub warning: Option<String>,
 }
 
-/// Attached containers and the first IPv4 subnet of `kestrel-gw`, from
-/// `{{len .Containers}};{{range .IPAM.Config}}{{.Subnet}} {{end}}`. `None` when unreadable.
-fn parse_gw(answer: &str) -> Option<(u64, Ipv4Cidr)> {
-    let (containers, subnets) = answer.trim().split_once(';')?;
-    let containers = containers.trim().parse().ok()?;
-    let subnet = subnets
+/// The first IPv4 subnet of `kestrel-gw`, from `{{range .IPAM.Config}}{{.Subnet}} {{end}}`.
+/// `None` when there is none.
+fn parse_gw(answer: &str) -> Option<Ipv4Cidr> {
+    answer
         .split_whitespace()
-        .find_map(|s| Ipv4Cidr::parse(s).ok())?;
-    Some((containers, subnet))
+        .find_map(|s| Ipv4Cidr::parse(s).ok())
 }
 
 /// The `connect` failure, explained when `kestrel-gw` has no address left.
@@ -226,27 +266,18 @@ impl GatewayBridge {
                 .map_err(step("remove-stale"))?;
         }
         let create = match &spec.network {
-            BridgeNetwork::DockerPools => {
-                Some(argv(&["docker", "network", "create", "--internal"]))
-            }
-            BridgeNetwork::Existing => None,
-            BridgeNetwork::Subnet(subnet) => Some(argv(&[
+            BridgeNetwork::DockerPools => Some(argv(&[
                 "docker",
                 "network",
                 "create",
                 "--internal",
-                "--subnet",
-                &subnet.cidr().to_string(),
-                "--gateway",
-                &subnet.gateway().to_string(),
+                NETWORK,
             ])),
+            BridgeNetwork::Existing { .. } => None,
+            BridgeNetwork::Subnet(span) => Some(create_on(span)),
         };
-        if let Some(mut create) = create {
-            create.push(NETWORK.to_string());
-            match docker(&*runner, &create).await {
-                Err(e) if !e.contains("already exists") => return Err(step("create-network")(e)),
-                _ => {}
-            }
+        if let Some(create) = create {
+            create_network(&*runner, &create).await?;
         }
 
         let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={connections}");
@@ -313,7 +344,18 @@ impl GatewayBridge {
             return Err(step("run")(e));
         }
         let started = async {
-            docker(&*runner, &connect).await.map_err(connect_error)?;
+            let first = docker(&*runner, &connect).await;
+            // Another serve removed kestrel-gw since the plan: make it once on the span, then join.
+            let remake = match &first {
+                Err(e) if network_gone(e) => spec.network.span(),
+                _ => None,
+            };
+            if let Some(span) = remake {
+                create_network(&*runner, &create_on(span)).await?;
+                docker(&*runner, &connect).await.map_err(connect_error)?;
+            } else {
+                first.map_err(connect_error)?;
+            }
             let answer = docker(&*runner, &inspect).await.map_err(step("inspect"))?;
             bridge_url(&answer, host_port)
         }
@@ -340,9 +382,11 @@ impl GatewayBridge {
     ///   [`SubnetPool::claim_span`]). The span is taken out of the plan for good, so no run network
     ///   ever gets a block of it.
     /// * Existing and at least as large as that span, or unreadable: reused as it is
-    ///   ([`BridgeNetwork::Existing`]), taking nothing from `plan`.
+    ///   ([`BridgeNetwork::Existing`]), taking nothing from `plan`. The span it would get is kept
+    ///   as the fallback for a `kestrel-gw` that vanishes before the bridge joins it.
     /// * Existing and smaller (a `/29` left by an older build): removed and recreated on the span
-    ///   when no container is attached. Otherwise kept, with a warning that says how to recreate it.
+    ///   when no container is on it (`docker ps -a`, so created and stopped ones count too).
+    ///   Otherwise kept, with a warning that says how to recreate it.
     ///
     /// # Errors
     /// [`SandboxError::Bridge`] (step `create-network`) when docker cannot list or read its
@@ -392,9 +436,12 @@ impl GatewayBridge {
         runner: &dyn CommandRunner,
         plan: &SubnetPool,
     ) -> Result<NetworkPlan, SandboxError> {
+        let fallback = plan.claimable(BRIDGE_NETWORK_PREFIX);
         let keep = |warning: Option<String>| {
             Ok(NetworkPlan {
-                network: BridgeNetwork::Existing,
+                network: BridgeNetwork::Existing {
+                    fallback: fallback.clone(),
+                },
                 warning,
             })
         };
@@ -403,21 +450,31 @@ impl GatewayBridge {
             "network",
             "inspect",
             "--format",
-            "{{len .Containers}};{{range .IPAM.Config}}{{.Subnet}} {{end}}",
+            "{{range .IPAM.Config}}{{.Subnet}} {{end}}",
             NETWORK,
         ]);
         let answer = docker(runner, &inspect)
             .await
             .map_err(step("create-network"))?;
-        let Some((attached, current)) = parse_gw(&answer) else {
+        let Some(current) = parse_gw(&answer) else {
             return keep(None);
         };
-        let Some(span) = plan
-            .claimable(BRIDGE_NETWORK_PREFIX)
+        let Some(span) = fallback
+            .as_ref()
             .filter(|span| span.cidr().prefix() < current.prefix())
         else {
             return keep(None);
         };
+        // `.Containers` of the network lists only running endpoints: a created or stopped
+        // container on kestrel-gw (a sandbox between create and start) would be missed.
+        let filter = format!("network={NETWORK}");
+        let list = argv(&["docker", "ps", "-aq", "--filter", &filter]);
+        let attached = docker(runner, &list)
+            .await
+            .map_err(step("create-network"))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
         let room = (1_u64 << (32 - u32::from(current.prefix()))).saturating_sub(3);
         let smaller = format!(
             "{NETWORK} is {current}, room for {room} containers, smaller than the {} Kestrel would give it",

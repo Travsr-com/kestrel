@@ -194,7 +194,8 @@ WASM (`wasmtime`) is kept only for small, user-authored policy and watchdog plug
 
 * `kestrel-gw` is created with `--subnet` and `--gateway` on the lowest free aligned `/24` of the plan (32 blocks, room for 253 containers), and no run network gets a block of it. Every `kestrel serve` on one docker daemon puts its bridge on this one network, so a `/24` leaves room for many instances.
 * When the pool cannot hold a `/24` plus one run block, the span shrinks to the largest aligned one that leaves a run block. When not even a `/29` plus one run block fits, serve stops with an error naming `gateway.subnet_pool`.
-* An existing `kestrel-gw` as large as that span is reused as it is and takes nothing from the plan. A smaller one (a `/29` from an older build) is removed and recreated on the span when no container is attached. Otherwise serve keeps it and prints a warning with its subnet and how to recreate it.
+* An existing `kestrel-gw` as large as that span is reused as it is and takes nothing from the plan. A smaller one (a `/29` from an older build) is removed and recreated on the span when no container is on it, counting created and stopped containers too (`docker ps -a --filter network=kestrel-gw`). Otherwise serve keeps it and prints a warning with its subnet and how to recreate it.
+* If another serve removes `kestrel-gw` between the plan and the bridge joining it, the bridge creates it once on the span the plan would give it and joins again.
 * When `kestrel-gw` has no address left, the bridge start fails with an error that says it is full, that other or leaked `kestrel-gateway-*` bridges are the likely cause, and how to free it.
 * One gateway bridge container serves every run. It joins each run network with `docker network connect`. One bridge per run would double the containers and slow every start.
 * The network's host side gets no address, so the bridge is the only way out of it.
