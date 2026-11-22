@@ -528,9 +528,10 @@ fn m2_s05_child_gets_no_secret_its_parent_lacks() {
     assert!(matches!(check(&root, "github_token"), Decision::Deny(_)));
 }
 
-/// Scenario 6: a child cannot spawn with more budget than it has, a grandchild at max_depth 0
-/// cannot spawn at all, and no sandbox holds any token but its own: not in its environment, under
-/// `/kestrel` or its mounts, nor in any file of its workspace.
+/// Scenario 6: a child cannot spawn with more budget than it has, a spawn asking for more depth
+/// than its parent can give gets what the parent can give and is told so (#94), a grandchild at
+/// max_depth 0 cannot spawn at all, and no sandbox holds any token but its own: not in its
+/// environment, under `/kestrel` or its mounts, nor in any file of its workspace.
 #[test]
 fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
     let env = Env::with_max(8);
@@ -561,10 +562,28 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
     let grandchild = grandkids[0].id.to_string();
     env.wait_status(&grandchild, "Completed");
 
-    // Depth: asked for 5, recorded as what is left below the parent.
+    // Depth: asked for 5, lowered to what is left below the parent, so `esc` can spawn a copy of
+    // itself. The spawn answer and the lowered run's events say so (#94).
     let depth = |id: &str| granted(&env, id).spawn.map(|s| s.max_depth);
     assert_eq!(depth(&child), Some(1));
     assert_eq!(depth(&grandchild), Some(0));
+    let fanout = env.read_out(&root, "fanout.out");
+    assert!(fanout.contains(r#""depth":1"#), "{fanout}");
+    assert!(
+        fanout.contains("max_depth lowered from 5 to 1 (the most this parent can give)"),
+        "{fanout}"
+    );
+    let lowered = |id: &str, text: &str| {
+        let events = env.events(id);
+        assert!(
+            of_kind(&events, "agent_log")
+                .iter()
+                .any(|e| e["kind"]["line"].as_str().is_some_and(|l| l.contains(text))),
+            "the lowered depth is recorded on {id}: {events:?}"
+        );
+    };
+    lowered(&child, "max_depth lowered from 5 to 1");
+    lowered(&grandchild, "max_depth lowered from 5 to 0");
 
     let report = env.read_out(&child, "escalate.out");
     let over = section(&report, "spawn over budget");
@@ -572,6 +591,11 @@ fn m2_s06_child_cannot_escalate_budget_depth_or_token() {
     assert!(over.contains("asked for"), "{report}");
     let spawned = section(&report, "spawn grandchild");
     assert!(spawned.contains(&grandchild), "{report}");
+    assert!(spawned.contains(r#""depth":0"#), "{report}");
+    assert!(
+        spawned.contains("max_depth lowered from 5 to 0"),
+        "{report}"
+    );
 
     let report = env.read_out(&grandchild, "escalate.out");
     let listed = section(&report, "tools/list");

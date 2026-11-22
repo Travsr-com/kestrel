@@ -528,6 +528,72 @@ mod tests {
         ender.await.unwrap();
         assert_eq!(waited["result"]["outcome"], "cancelled");
         assert_ne!(waited["child"], spawned["child"]);
+        // Issue #94: nothing was lowered, so neither answer says anything about depth.
+        for answer in [&spawned, &waited] {
+            assert!(answer.get("depth").is_none(), "{answer}");
+            assert!(answer.get("note").is_none(), "{answer}");
+        }
+    }
+
+    // Issue #94: a child spec asking for more spawn depth than the parent can give is spawned with
+    // the depth the parent can give, and the answer says so, with and without wait.
+    #[tokio::test]
+    async fn a_spawn_whose_depth_was_lowered_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = "name: deep\nruntime: claude-code\nrole: r\n\
+             capabilities: { mcp: [kestrel.spawn], spawn: { max_children: 2, max_depth: 5, agents: [deep] } }\n\
+             sandbox: { tier: auto, cpu: 1, memory: 512Mi, workspace: empty-dir }\n\
+             budget: { usd: \"1\", wall_clock: 1h }\n";
+        std::fs::write(dir.path().join("deep.yaml"), deep).unwrap();
+        let (store, tools) = engine_tools(dir.path());
+        let lead = tools
+            .engine
+            .submit(
+                with_caps(
+                    "lead",
+                    "{ mcp: [kestrel.spawn], spawn: { max_children: 4, max_depth: 2, agents: [deep] } }",
+                ),
+                "x".into(),
+            )
+            .await
+            .unwrap();
+        run(&store, lead);
+        let call = |wait| SpawnCall {
+            agent: "deep".into(),
+            input: "help".into(),
+            budget: Some(kestrel_types::MicroUsd(100_000)),
+            wait,
+        };
+        let note = "max_depth lowered from 5 to 1 (the most this parent can give)";
+        let spawned = tools.spawn(lead, call(false)).await.unwrap();
+        assert_eq!(spawned["depth"], 1, "{spawned}");
+        assert_eq!(spawned["note"], note, "{spawned}");
+        let child: RunId = spawned["child"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.get_run(child).unwrap().unwrap().parent, Some(lead));
+        let ender = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                loop {
+                    let children = store.children(lead).unwrap();
+                    if let Some(next) = children.iter().find(|c| c.id != child) {
+                        store
+                            .transition(
+                                next.id,
+                                &kestrel_types::RunStatus::Queued,
+                                kestrel_types::RunStatus::Cancelled,
+                            )
+                            .unwrap();
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let waited = tools.spawn(lead, call(true)).await.unwrap();
+        ender.await.unwrap();
+        assert_eq!(waited["result"]["outcome"], "cancelled");
+        assert_eq!(waited["depth"], 1, "{waited}");
+        assert_eq!(waited["note"], note, "{waited}");
     }
 
     fn spec_of(name: &str) -> AgentSpec {
