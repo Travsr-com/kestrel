@@ -2498,10 +2498,11 @@ exit 0
                 .request(run, "tools/call", find("alpha_kestrel_marker"))
                 .await
                 .unwrap();
-            assert!(
-                found.to_string().contains("alpha_kestrel_marker"),
-                "{found}"
-            );
+            // A real answer: not a tool error echoing the name, and it names the file.
+            assert_ne!(found["isError"], json!(true), "{found}");
+            let text = found.to_string();
+            assert!(text.contains("alpha_kestrel_marker"), "{found}");
+            assert!(text.contains("lib.rs"), "{found}");
             let found = p
                 .request(run, "tools/call", find("beta_kestrel_marker"))
                 .await
