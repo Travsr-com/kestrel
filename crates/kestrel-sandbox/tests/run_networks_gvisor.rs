@@ -30,9 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use kestrel_sandbox::{
-    BridgeSpec, GatewayBridge, GvisorDriver, INSTANCE_LABEL, LaunchSpec, NetworkPolicy,
-    PreparedNetwork, ProcessRunner, RUN_LABEL, SandboxDriver, SandboxHandle, SubnetPool,
-    docker_subnets, host_routes,
+    BridgeNetwork, BridgeSpec, GatewayBridge, GvisorDriver, INSTANCE_LABEL, LaunchSpec,
+    NetworkPolicy, PreparedNetwork, ProcessRunner, RUN_LABEL, SandboxDriver, SandboxHandle,
+    SubnetPool, docker_subnets, host_routes,
 };
 use kestrel_types::RunId;
 use url::Url;
@@ -784,4 +784,104 @@ async fn s8_runs_start_when_the_daemon_default_pools_are_exhausted() {
     assert!(has(&lines, BODY), "{lines:?}");
     w.release(&net).await;
     w.finish().await;
+}
+
+// #99 ---------------------------------------------------------------------------------------------
+
+/// #99 scenario 1: on a host with no `kestrel-gw` network whose default address pools are used
+/// up, the bridge still starts, because `kestrel-gw` gets a block of Kestrel's own plan, as serve
+/// plans it. A run on the same plan never gets that block, and reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kestrel_gw() {
+    let _serial = SERIAL.lock().await;
+    let instance = unique();
+    let cleanup = Arc::new(Cleanup::new(&instance));
+    // Every bridge of an earlier test has stopped, so nothing is attached to `kestrel-gw`.
+    if network_exists("kestrel-gw") {
+        docker_ok(&["network", "rm", "kestrel-gw"]);
+    }
+    assert!(!network_exists("kestrel-gw"));
+    // Registered first, so it is removed last: after the bridge and the filler networks.
+    cleanup.network("kestrel-gw");
+
+    let mut exhausted = false;
+    for i in 0..64 {
+        let name = format!("kestrel-test-fill-{instance}-{i}");
+        cleanup.network(&name);
+        let out = docker(&[
+            "network",
+            "create",
+            "--label",
+            &format!("kestrel.test={instance}"),
+            &name,
+        ]);
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("all predefined address pools have been fully subnetted"),
+                "unexpected failure filling the pools: {stderr}"
+            );
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted, "64 networks did not use up the default pools");
+
+    // The plan, as serve builds it.
+    let pool = SubnetPool::parse("10.231.9.0/24").expect("pool");
+    pool.exclude(
+        &docker_subnets(&ProcessRunner)
+            .await
+            .expect("docker subnets"),
+    );
+    pool.exclude(&host_routes(&ProcessRunner).await);
+    let network = within(
+        "plan the bridge network",
+        GatewayBridge::plan_network(&ProcessRunner, &pool),
+    )
+    .await
+    .expect("planned");
+    let BridgeNetwork::Subnet(block) = network.clone() else {
+        panic!("no kestrel-gw, so it needs a block: {network:?}");
+    };
+
+    let dir = tempfile::tempdir().expect("dir");
+    let db: PathBuf = dir.path().join("kestrel.db");
+    let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
+    cleanup.container(&bridge_name);
+    let port = start_gateway();
+    let spec = BridgeSpec {
+        network,
+        ..BridgeSpec::default()
+    };
+    let bridge = within(
+        "bridge start",
+        GatewayBridge::start(Arc::new(ProcessRunner), port, spec, &db),
+    )
+    .await
+    .expect("the bridge starts without the default pools");
+    assert_eq!(subnet_of("kestrel-gw"), block.cidr().to_string());
+
+    let driver = GvisorDriver::new(Arc::new(ProcessRunner))
+        .with_instance(instance.clone())
+        .with_bridge(bridge_name.clone());
+    let (run, net) = prepare(&driver, &pool, &cleanup).await;
+    assert_ne!(
+        net.subnet.cidr(),
+        block.cidr(),
+        "a run never gets the bridge's block"
+    );
+    let script = format!("wget -q -T 20 -O- http://{}:{port}/", net.gateway_host);
+    let (lines, code) = run_to_end(
+        &driver,
+        &cleanup,
+        &spec(&instance, port, run, &net, &script),
+    )
+    .await;
+    assert_eq!(code, 0, "{lines:?}");
+    assert!(has(&lines, BODY), "{lines:?}");
+    within("release", driver.release_network(&net))
+        .await
+        .expect("release");
+    bridge.stop().await;
 }
