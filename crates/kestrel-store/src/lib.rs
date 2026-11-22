@@ -1435,8 +1435,11 @@ mod tests {
                 [],
             )
             .expect("insert run");
-            conn.execute("INSERT INTO events VALUES (?1, 1, '{')", [run.to_string()])
-                .expect("insert event");
+            conn.execute(
+                "INSERT INTO events (run_id, seq, body) VALUES (?1, 1, '{')",
+                [run.to_string()],
+            )
+            .expect("insert event");
             conn.execute(
                 "INSERT INTO control (run_id, cmd) VALUES (?1, '\"Nope\"')",
                 [run.to_string()],
