@@ -1130,30 +1130,32 @@ async fn long_calls_give_their_room_back_when_they_answer_and_short_ones_need_no
     drop(held);
 }
 
-/// Waiting on a running call takes room whatever the new request names: a short spawn sent with
-/// the id of a running join attaches to the join and is counted, never started.
+/// Waiting on a running call takes room whatever its arguments: a join sent again with the id of
+/// a running join attaches to it and is counted, never started again. Since the review of #95 a
+/// call is kept by tool and id, so a short spawn with that id is a call of its own: it starts, and
+/// needs no room.
 #[tokio::test(start_paused = true)]
-async fn the_id_of_a_running_call_takes_room_whatever_tool_the_request_names() {
+async fn the_id_of_a_running_call_takes_room_when_the_request_names_its_tool() {
     let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 2 });
     let token = &runs[0].0;
     let join = join_held_open(&app, token, 7).await;
-    let short = json!({ "agent": "worker", "input": "x" });
+    let again = json!({ "timeout_s": 1 });
     let attached = send(
         &app,
         token,
-        call(7, "kestrel.spawn", short.clone())
+        call(7, "kestrel.join", again.clone())
             .to_string()
             .into_bytes(),
         true,
     )
     .await;
     assert_eq!(attached.status(), StatusCode::OK);
-    // Both rooms are taken now: the next request with that id is refused, truthfully.
+    // Both rooms are taken now: the next request for that join is refused, truthfully.
     let refused = message(
         send(
             &app,
             token,
-            call(7, "kestrel.spawn", short).to_string().into_bytes(),
+            call(7, "kestrel.join", again).to_string().into_bytes(),
             true,
         )
         .await,
@@ -1163,11 +1165,26 @@ async fn the_id_of_a_running_call_takes_room_whatever_tool_the_request_names() {
     let reason = refused["result"]["content"][0]["text"].as_str().unwrap();
     assert!(reason.contains("still running"), "{reason}");
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        host.spawns.lock().unwrap().is_empty(),
-        "no spawn was started"
-    );
     assert_eq!(host.joins.lock().unwrap().len(), 1);
+    // A short spawn with the same id is another call, and starts with the rooms full.
+    let spawned = message(
+        send(
+            &app,
+            token,
+            call(
+                7,
+                "kestrel.spawn",
+                json!({ "agent": "worker", "input": "x" }),
+            )
+            .to_string()
+            .into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(spawned["result"]["isError"], json!(false), "{spawned}");
+    assert_eq!(host.spawns.lock().unwrap().len(), 1);
     drop((join, attached));
 }
 
