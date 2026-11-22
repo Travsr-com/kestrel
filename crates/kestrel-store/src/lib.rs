@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use kestrel_types::{
     AgentSpec, ApprovalId, Event, EventKind, MicroUsd, ModelCallRecord, RunId, RunStatus,
+    SuspendReason,
 };
 use rusqlite::types::Type;
 use rusqlite::{
@@ -180,6 +181,62 @@ impl ControlCommand {
             self,
             ControlCommand::Approve(_) | ControlCommand::ApproveWith { .. }
         )
+    }
+
+    /// Why a run in `status` would not apply this command, or `None` when it would. This is the
+    /// rule the engine applies; the CLI and the API check it before writing a command so a person
+    /// hears the reason instead of a silent no-op. The status can still change before the engine
+    /// reads the command, and the engine then ignores it and logs it.
+    ///
+    /// * Pause: a running run.
+    /// * Resume: a suspended run that does not wait on an approval (it resumes through its
+    ///   decision).
+    /// * Cancel and SetBudget: any run that has not ended.
+    /// * Approve and reject: a run waiting on that approval.
+    /// * Ask: a running run.
+    pub fn refusal(&self, status: &RunStatus) -> Option<String> {
+        use ControlCommand as C;
+        let what = match self {
+            C::Pause => "paused",
+            C::Resume => "resumed",
+            C::Cancel => "cancelled",
+            C::SetBudget(_) => "given a new budget",
+            C::Approve(_) | C::Reject(_) | C::ApproveWith { .. } | C::RejectWith { .. } => {
+                "approved or rejected"
+            }
+            C::Ask { .. } => "asked a question",
+        };
+        let name = status.name();
+        if status.is_terminal() {
+            return Some(format!(
+                "the run has ended ({name}), so it cannot be {what}"
+            ));
+        }
+        let waits_on = match status {
+            RunStatus::Suspended(SuspendReason::Approval(id)) => Some(*id),
+            _ => None,
+        };
+        match self {
+            C::Cancel | C::SetBudget(_) => None,
+            C::Pause | C::Ask { .. } if *status == RunStatus::Running => None,
+            C::Pause => Some(format!("a {name} run cannot be paused, only a running one")),
+            C::Ask { .. } => Some(format!("a {name} run cannot be {what}")),
+            C::Resume => match (status, waits_on) {
+                (_, Some(id)) => Some(format!(
+                    "the run waits on approval {id}: approve or reject it instead of resuming"
+                )),
+                (RunStatus::Suspended(_), None) => None,
+                _ => Some(format!(
+                    "a {name} run cannot be resumed, only a suspended one"
+                )),
+            },
+            C::Approve(id)
+            | C::Reject(id)
+            | C::ApproveWith { id, .. }
+            | C::RejectWith { id, .. } => {
+                (waits_on != Some(*id)).then(|| format!("the run does not wait on approval {id}"))
+            }
+        }
     }
 }
 

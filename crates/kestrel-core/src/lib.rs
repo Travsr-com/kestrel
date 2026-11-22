@@ -2204,7 +2204,9 @@ fn run_gateway(gateway: &Url, token: &str) -> Url {
     url
 }
 
-/// An `AgentLog` noting that `cmd` does not apply to a run in `status`.
+/// An `AgentLog` noting that `cmd` does not apply to a run in `status`. The CLI and the API refuse
+/// such a command up front ([`ControlCommand::refusal`], the same rule); this covers one that got
+/// past that check because the status changed in between.
 fn ignored(cmd: &ControlCommand, status: &RunStatus) -> EventKind {
     EventKind::AgentLog {
         line: format!("kestrel: ignored {cmd:?} while the run is {status:?}"),

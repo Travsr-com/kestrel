@@ -269,15 +269,19 @@ fn age(d: time::Duration) -> String {
     }
 }
 
-/// `kestrel pause`, `resume`, `cancel` and `budget`: one control command for a known run.
+/// `kestrel pause`, `resume`, `cancel` and `budget`: one control command for a known run whose
+/// status allows it. A command it does not allow is refused with the reason and never written.
 pub(crate) fn steer(
     store: &Store,
     id: RunId,
     cmd: ControlCommand,
     out: Output,
 ) -> Result<(), Failure> {
-    if store.get_run(id)?.is_none() {
+    let Some(run) = store.get_run(id)? else {
         return Err(Failure::runtime(format!("no such run: {id}")));
+    };
+    if let Some(why) = cmd.refusal(&run.status) {
+        return Err(Failure::runtime(format!("run {id}: {why}")));
     }
     send(store, id, cmd, out)
 }
