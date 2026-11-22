@@ -127,7 +127,7 @@ Pause, resume, replay and the live UI all read from this log. Cancelling a run c
 Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd?, wait?)`.
 
 * The server checks the caller's token: is the child agent allowed, are depth and child-count within limits?
-* The child's budget is **carved out of** the parent's remaining budget, so a tree can never exceed the root budget.
+* The child's budget is **carved out of** the parent's remaining budget, so a tree never exceeds the root budget by more than the calls in flight.
 * The child token is the parent token plus attenuation (fewer tools, hosts, secrets). Never more.
 * `wait=true` blocks and returns the child's result; `wait=false` returns a handle for fan-in via `kestrel.join`.
 * Concurrency is capped per host (a semaphore sized to CPU/RAM), so a runaway fan-out queues instead of thrashing.
@@ -171,7 +171,7 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * A long call (`join`, `ask_human`) answers with an event stream and a keepalive comment every 15 s, so the bridge (`socat -T 300`) never sees it idle. Each call is keyed by run and JSON-RPC id: a client that reconnects and calls again with the same id gets the same result, without a second spawn or wait. Results are kept for at least an hour.
 * Limits, so a sandbox cannot make the gateway hold much: bodies up to 1 MiB (413); ids a string of at most 128 bytes or an integer; per run a burst of 20 tool calls refilled at 10 per second, at most 8 calls waiting and 256 results kept (429 beyond); at most 256 children and a timeout of at most a day per join.
 * A question is answered within the run: its wall clock keeps going while the question waits, because the sandbox keeps working. A question still waiting when the engine restarts is declined (unless it was answered just before) and its run fails ("engine restarted while its question waited"), and its live children are cancelled unless its spec keeps them: nobody waits for the answer any more.
-* Known limit: the shared bridge allows 32 connections at once (`socat max-children=32`). Every waiting `join` or `ask_human` holds one, and parents that wait give their slot back, so a large fan-out of waiting parents can use them up. Sizing the bridge to the tree limit is tracked with the M2 acceptance work (#45).
+* Known limit: the shared bridge allows 32 connections at once (`socat max-children=32`). Every waiting `join` or `ask_human` holds one, and parents that wait give their slot back, so a large fan-out of waiting parents can use them up. Sizing the bridge to the tree limit is tracked in #80.
 * `serve` keeps the key that signs capability tokens in `root.key` next to the database. Keep it: a new key refuses the tokens of runs spawned before.
 
 ### 3.4 Sandbox drivers
@@ -508,8 +508,10 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 * `kestrel-server`: HTTP and WebSocket API for the UI (loopback and token by default), serving the embedded UI.
 * UI: Fleet, Run (spawn tree, live stream), Approvals. The 95% coverage rule also applies to `ui/src` (vitest).
 * Accept: one run fans out to 5+ parallel children in separate per-run clones with no conflicts; a child cannot use a
-  tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget; the UI
-  shows the whole tree live.
+  tool, host or secret its parent lacks (negative tests); children's total spend never exceeds the root budget by more
+  than the calls in flight; the UI shows the whole tree live.
+* Status: done. The acceptance suite in [m2.md](milestones/m2.md) (#45, 14 scenarios) passes in the `e2e-m2` CI
+  job.
 
 **M3. Cheaper**
 * Model profiles, role tiers, cache-aware prompt shaping, context bundles, reserved hard budgets,

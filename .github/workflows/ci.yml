@@ -36,6 +36,10 @@ jobs:
           fi
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The end-to-end targets build only with the `e2e` feature, so the line above skips them.
+      # Linting them needs no Docker or gVisor.
+      - name: Clippy on the end-to-end suites
+        run: cargo clippy -p kestrel-e2e --features e2e --all-targets -- -D warnings
       - name: Tests with coverage gate (95% lines)
         run: cargo llvm-cov --workspace --fail-under-lines 95
       - run: cargo deny check
@@ -182,8 +186,9 @@ jobs:
           kill "$(cat "$RUNNER_TEMP/smoke-http.pid")" || true
           docker rm --force kestrel-gateway || true
           docker network rm kestrel-gw || true
+      # Only the M1 target: the M2 suites run in the `e2e-m2` job.
       - name: End-to-end scenarios
-        run: KESTREL_BIN="$PWD/target/debug/kestrel" cargo test -p kestrel-e2e --features e2e -- --test-threads=1 --nocapture
+        run: KESTREL_BIN="$PWD/target/debug/kestrel" cargo test -p kestrel-e2e --features e2e --test e2e -- --test-threads=1 --nocapture
       - name: Docker diagnostics
         if: failure()
         run: |
@@ -195,6 +200,88 @@ jobs:
           docker network inspect kestrel-gw || true
           docker logs kestrel-gateway || true
           for name in $(docker ps -a --filter name=kestrel --format '{{.Names}}'); do
+            echo "=== docker logs $name ==="
+            docker logs "$name" 2>&1 || true
+          done
+          true
+
+  # M2 acceptance (issue #45, docs/milestones/m2.md): spawn trees on real Docker and gVisor, and
+  # the UI in headless Chromium against a real `kestrel up` with the embedded UI build.
+  e2e-m2:
+    name: end-to-end (gVisor, M2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            tests/e2e/ui/package-lock.json
+      - name: Install gVisor runsc (https://gvisor.dev/docs/user_guide/install/)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+      - name: Register runsc with docker
+        run: |
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc
+      - run: docker pull alpine:3.20
+      - run: docker pull alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e
+      - run: docker build -t kestrel-echo-agent:test tests/e2e/echo-agent
+      # `kestrel up` serves ui/dist, so the UI is built before the binary.
+      - name: Build the UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+      - id: cli
+        run: cargo build -p kestrel-cli
+      - name: Install the Playwright suite
+        working-directory: tests/e2e/ui
+        run: npm ci
+      - name: Type check the Playwright suite
+        working-directory: tests/e2e/ui
+        run: npm run check
+      - name: Cache the Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/ui/package-lock.json') }}
+      # Downloads Chromium only on a cache miss; its system libraries come from apt every time.
+      - name: Install Chromium for Playwright
+        working-directory: tests/e2e/ui
+        run: npx playwright install --with-deps chromium
+      - name: M2 scenarios
+        run: KESTREL_BIN="$PWD/target/debug/kestrel" cargo test -p kestrel-e2e --features e2e --test m2 -- --test-threads=1 --nocapture
+      # Runs even when an M2 scenario failed, so one CI run reports both suites.
+      - name: M2 UI scenarios (Playwright)
+        if: ${{ !cancelled() && steps.cli.outcome == 'success' }}
+        run: KESTREL_BIN="$PWD/target/debug/kestrel" cargo test -p kestrel-e2e --features e2e --test ui -- --test-threads=1 --nocapture
+      - name: Upload the Playwright traces and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: tests/e2e/ui/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Docker diagnostics
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker network ls || true
+          for name in $(docker ps -a --filter label=kestrel.run --format '{{.Names}}') $(docker ps -a --filter name=kestrel-gateway --format '{{.Names}}'); do
             echo "=== docker logs $name ==="
             docker logs "$name" 2>&1 || true
           done

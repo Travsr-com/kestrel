@@ -16,15 +16,29 @@ workspace = true
 # Opt-in: needs Docker, gVisor `runsc`, the echo agent image and KESTREL_BIN.
 e2e = []
 
+# M1: one agent, end to end.
 [[test]]
 name = "e2e"
 path = "tests/e2e.rs"
+required-features = ["e2e"]
+
+# M2: spawn trees, attenuation, budget carving, concurrency, cancel, networks, restart.
+[[test]]
+name = "m2"
+path = "tests/m2.rs"
+required-features = ["e2e"]
+
+# M2: the UI in a real browser (Playwright, in tests/e2e/ui). Also needs Node and Chromium.
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
 required-features = ["e2e"]
 
 [dev-dependencies]
 axum.workspace = true
 kestrel-core.workspace = true
 kestrel-sandbox.workspace = true
+kestrel-store.workspace = true
 kestrel-types.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

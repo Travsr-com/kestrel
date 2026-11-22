@@ -21,6 +21,41 @@
 #
 # If the input contains `sleep=N`, it sleeps N seconds after the model call, once per
 # workspace (a marker file remembers it), so a test can act while the run is in flight.
+#
+# M2 markers (issue #45). Each is a whole word `name=value` of the input, so `c.nap=4` is not
+# `nap=4`. The MCP calls go to the Kestrel server URL in the `--mcp-config` file, as `spawn=1`.
+#
+# A parent:
+#   fanout=N     spawn N children with kestrel.spawn (no wait), then kestrel.join all of them.
+#                Child ids go to kids.out (one per line, so a restarted parent spawns only the
+#                ones it has not), the spawn answers to fanout.out, `joining` to joining.out
+#                just before the join, and the join answer to join.out.
+#   kids=NAME    the agent to spawn (default `worker`); each=USD the budget_usd of each child;
+#                first=S sleep S seconds before the first spawn (once per workspace); gap=S sleep
+#                S seconds between spawns.
+#   c.WORD       passed on to every child as WORD, after `kid=<n>` (so `c.c.nap=9` reaches a
+#                grandchild as `nap=9`).
+# A child:
+#   nap=N        sleep N seconds after the model call, once per workspace.
+#   hold=N       after the model call, write holding.out and wait until the test writes `go` into
+#                the workspace, for at most N seconds; then write `go` or `timeout` to held.out.
+#   spend=N      make model calls until N were made or the gateway refuses one; after a refusal it
+#                waits, so the engine suspends it while it runs. spend.out holds `calls=<made>` after
+#                every call, `calls=<made> refused=yes` once a call is refused, and
+#                `calls=<made> refused=no` when all N were made.
+#   hosts=1      also try api.github.com and evil.example (egress.txt).
+#   tools=1      the `--allowedTools`, a tools/list, a call of kestrel.ask_human and a call of
+#                kestrel.join with no children (tools.out).
+#   ask=1        asks a person with kestrel.ask_human (ask.out) and writes the answer (answer.out).
+#   escalate=1   spawns with a budget above its own, then a grandchild with escalate=2 and wait
+#                (escalate.out); escalate=2 lists its tools and tries to spawn (escalate.out).
+#   dump=1       everything under /kestrel, listed and read at every depth, /proc/mounts, and every
+#                other mount but the root and the kernel's file systems, read in full (dump.out).
+#   commit=1     at the end writes kid-<n>.txt (shared.txt with same=1), commits everything but
+#                the test's own files in one commit, and records the result (commit.out).
+#   travsr=SYM   writes child-edit.rs, which uses SYM, and commits it (edit.out), then lists the
+#                tools of the `travsr` server in its `--mcp-config` file and calls search_symbol
+#                for SYM with a `repo` argument (travsr.out).
 set -u
 
 model="unknown"
@@ -44,25 +79,71 @@ result_line() { # $1 = is_error (true/false), $2 = result text without quotes
     "$session" "$1" "$2"
 }
 
+# The value of the first word `$1=value` of the input; nothing (and status 1) when there is none.
+marker() (
+  set -f
+  for word in $input; do
+    case "$word" in
+      "$1="*) printf '%s' "${word#*=}"; exit 0 ;;
+    esac
+  done
+  exit 1
+)
+
+# The input of child number $1: `kid=$1`, then every `c.WORD` of this input as `WORD`.
+child_input() (
+  set -f
+  out="kid=$1"
+  for word in $input; do
+    case "$word" in
+      c.*) out="$out ${word#c.}" ;;
+    esac
+  done
+  printf '%s' "$out"
+)
+
+try_host() { # $1 = url; one line in egress.txt
+  curl -s -o /dev/null --max-time 5 "$1"
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    echo "reachable $1" >> /workspace/egress.txt
+  else
+    echo "blocked $code $1" >> /workspace/egress.txt
+  fi
+}
+
+model_call() { # one Messages API call through the gateway; status 1 when it failed
+  body=$(printf '{"model":"%s","max_tokens":64,"messages":[{"role":"user","content":"echo"}]}' "$model")
+  curl -sS -f --max-time 30 -o /tmp/response.json \
+    -H "x-api-key: ${ANTHROPIC_API_KEY:-}" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$body" "${ANTHROPIC_BASE_URL:-}/v1/messages" 2> /tmp/curl.err
+}
+
+# The Kestrel server URL from the MCP config Kestrel mounted at /kestrel.
+kestrel_url() {
+  sed -n 's/.*"kestrel":{[^}]*"url":"\([^"]*\)".*/\1/p' "$mcp_config" 2> /dev/null
+}
+
+mcp_call() { # $1 = request, $2 = seconds; the answer on stdout
+  curl -sS -f --max-time "$2" -H "content-type: application/json" \
+    -H "accept: application/json, text/event-stream" -d "$1" "$(kestrel_url)"
+}
+
 env > /workspace/env.txt
 
 : > /workspace/egress.txt
 for url in https://example.com https://1.1.1.1; do
-  curl -s -o /dev/null --max-time 5 "$url"
-  code=$?
-  if [ "$code" -eq 0 ]; then
-    echo "reachable $url" >> /workspace/egress.txt
-  else
-    echo "blocked $code $url" >> /workspace/egress.txt
-  fi
+  try_host "$url"
 done
+if marker hosts > /dev/null; then
+  for url in https://api.github.com https://evil.example; do
+    try_host "$url"
+  done
+fi
 
-body=$(printf '{"model":"%s","max_tokens":64,"messages":[{"role":"user","content":"echo"}]}' "$model")
-if ! curl -sS -f --max-time 30 -o /tmp/response.json \
-  -H "x-api-key: ${ANTHROPIC_API_KEY:-}" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "content-type: application/json" \
-  -d "$body" "${ANTHROPIC_BASE_URL:-}/v1/messages" 2> /tmp/curl.err; then
+if ! model_call; then
   echo "echo-agent: gateway call failed: $(cat /tmp/curl.err)" >&2
   result_line true "gateway call failed"
   exit 1
@@ -137,7 +218,232 @@ case "$input" in
     ;;
 esac
 
+# M2 (issue #45) ------------------------------------------------------------------------------
+
+kid=$(marker kid || echo 0)
+
+spend=$(marker spend || true)
+if [ -n "$spend" ]; then
+  # The call above was the first one. spend.out is written after every call, because the engine
+  # can stop the sandbox at any point once the run is out of budget.
+  calls=1
+  refused=no
+  echo "calls=$calls" > /workspace/spend.out
+  while [ "$calls" -lt "$spend" ]; do
+    if ! model_call; then
+      refused=yes
+      echo "calls=$calls refused=yes" > /workspace/spend.out
+      break
+    fi
+    calls=$((calls + 1))
+    echo "calls=$calls" > /workspace/spend.out
+  done
+  if [ "$refused" = no ]; then
+    echo "calls=$calls refused=no" > /workspace/spend.out
+  fi
+  if [ "$refused" = yes ]; then
+    # Out of budget: wait for the engine to suspend the run, as a real agent would be cut off.
+    sleep 600
+  fi
+fi
+
+if marker tools > /dev/null; then
+  {
+    echo "allowed=$allowed"
+    echo "== tools/list"
+    mcp_call '{"jsonrpc":"2.0","id":"list","method":"tools/list"}' 30
+    echo
+    echo "== kestrel.ask_human"
+    mcp_call '{"jsonrpc":"2.0","id":"ask","method":"tools/call","params":{"name":"kestrel.ask_human","arguments":{"question":"may I?"}}}' 30
+    echo
+    echo "== kestrel.join"
+    mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 30
+    echo
+  } > /workspace/tools.out 2>&1
+fi
+
+sym=$(marker travsr || true)
+if [ -n "$sym" ]; then
+  # The edit is committed before Travsr is asked, so an index of the clone would find it.
+  (
+    export HOME=/tmp
+    cd /workspace || exit 1
+    git config user.email agent@example.invalid
+    git config user.name "echo agent"
+    printf 'fn child_edit() { %s(); }\n' "$sym" > child-edit.rs
+    git add child-edit.rs
+    git commit -q -m "child edit" > /tmp/commit.err 2>&1
+    echo "commit_rc=$?" > /workspace/edit.out
+  )
+  travsr_url=$(sed -n 's/.*"travsr":{[^}]*"url":"\([^"]*\)".*/\1/p' "$mcp_config" 2> /dev/null)
+  travsr_call() { # $1 = request, $2 = seconds; the answer on stdout
+    curl -sS -f --max-time "$2" -H "content-type: application/json" \
+      -H "accept: application/json, text/event-stream" -d "$1" "$travsr_url"
+  }
+  {
+    case "$travsr_url" in
+      */travsr) echo "url=ok" ;;
+      *) echo "url=missing" ;;
+    esac
+    echo "== tools/list"
+    travsr_call '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 30
+    echo
+    echo "== search_symbol"
+    travsr_call "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"search_symbol\",\"arguments\":{\"name\":\"$sym\",\"repo\":\"/workspace\"}}}" 300
+    echo
+  } > /workspace/travsr.out 2>&1
+fi
+
+if marker dump > /dev/null; then
+  {
+    echo "== ls -laR /kestrel"
+    ls -laR /kestrel 2>&1
+    # Every file at any depth, not only the top level.
+    find /kestrel -type f 2>&1 | while IFS= read -r f; do
+      echo "== $f"
+      cat "$f" 2>&1
+      echo
+    done
+    echo "== /proc/mounts"
+    cat /proc/mounts 2>&1
+    # Every other mount, read in full: all but the root, /dev (the runtime's emulated devices, no
+    # host files), the kernel's own file systems, /kestrel (read above) and /workspace (this file is
+    # written there; the test reads it on the host).
+    while read -r device point fstype rest; do
+      case "$fstype" in
+        proc | sysfs | tmpfs | devtmpfs | devpts | mqueue | cgroup | cgroup2 | securityfs | debugfs | tracefs | bpf) continue ;;
+      esac
+      case "$point" in
+        / | /dev | /kestrel | /workspace) continue ;;
+      esac
+      echo "== mount $point"
+      if [ -d "$point" ]; then
+        find "$point" -type f 2>&1 | while IFS= read -r f; do
+          echo "-- $f"
+          cat "$f" 2>&1
+          echo
+        done
+      else
+        cat "$point" 2>&1
+        echo
+      fi
+    done < /proc/mounts
+  } > /workspace/dump.out 2>&1
+fi
+
+case "$(marker escalate || true)" in
+  1)
+    agent=$(marker kids || echo worker)
+    {
+      echo "== spawn over budget"
+      mcp_call "{\"jsonrpc\":\"2.0\",\"id\":\"over\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.spawn\",\"arguments\":{\"agent\":\"$agent\",\"input\":\"kid=$kid.0 escalate=2 kids=$agent\",\"budget_usd\":\"5.00\"}}}" 60
+      echo
+      echo "== spawn grandchild"
+      mcp_call "{\"jsonrpc\":\"2.0\",\"id\":\"grandchild\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.spawn\",\"arguments\":{\"agent\":\"$agent\",\"input\":\"kid=$kid.1 escalate=2 kids=$agent dump=1\",\"budget_usd\":\"0.02\",\"wait\":true}}}" 300
+      echo
+    } > /workspace/escalate.out 2>&1
+    ;;
+  2)
+    agent=$(marker kids || echo worker)
+    {
+      echo "== tools/list"
+      mcp_call '{"jsonrpc":"2.0","id":"list","method":"tools/list"}' 30
+      echo
+      echo "== spawn below max_depth 0"
+      mcp_call "{\"jsonrpc\":\"2.0\",\"id\":\"deeper\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.spawn\",\"arguments\":{\"agent\":\"$agent\",\"input\":\"kid=$kid.1\",\"budget_usd\":\"0.01\"}}}" 60
+      echo
+    } > /workspace/escalate.out 2>&1
+    ;;
+esac
+
+if marker ask > /dev/null; then
+  question="Which colour should kid $kid use?"
+  answer=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":\"ask\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.ask_human\",\"arguments\":{\"question\":\"$question\"}}}" 900 2>&1)
+  printf '%s\n' "$answer" > /workspace/ask.out
+  printf '%s\n' "$answer" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p' | head -n 1 > /workspace/answer.out
+fi
+
+n=$(marker fanout || true)
+if [ -n "$n" ]; then
+  agent=$(marker kids || echo worker)
+  each=$(marker each || true)
+  first=$(marker first || true)
+  gap=$(marker gap || true)
+  if [ -n "$first" ] && [ ! -e /workspace/.echo-agent-first ]; then
+    touch /workspace/.echo-agent-first
+    sleep "$first"
+  fi
+  budget=""
+  if [ -n "$each" ]; then
+    budget=",\"budget_usd\":\"$each\""
+  fi
+  touch /workspace/kids.out
+  # A parent started again (after a restart) spawns only the children it has not spawned yet.
+  i=$(($(wc -l < /workspace/kids.out) + 1))
+  while [ "$i" -le "$n" ]; do
+    if [ "$i" -gt 1 ] && [ -n "$gap" ]; then
+      sleep "$gap"
+    fi
+    task=$(child_input "$i")
+    answer=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":\"spawn-$i\",\"method\":\"tools/call\",\"params\":{\"name\":\"kestrel.spawn\",\"arguments\":{\"agent\":\"$agent\",\"input\":\"$task\"$budget}}}" 60 2>&1)
+    printf '%s\n' "$answer" >> /workspace/fanout.out
+    child=$(printf '%s\n' "$answer" | sed -n 's/.*"child":"\([0-9a-f-]*\)".*/\1/p' | head -n 1)
+    if [ -z "$child" ]; then
+      echo "echo-agent: spawn $i failed: $answer" >&2
+      break
+    fi
+    echo "$child" >> /workspace/kids.out
+    i=$((i + 1))
+  done
+  echo joining > /workspace/joining.out
+  mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 3600 > /workspace/join.out 2>&1
+fi
+
+hold=$(marker hold || true)
+if [ -n "$hold" ]; then
+  # Wait for the test to write /workspace/go, so the test decides when this sandbox may end.
+  echo holding > /workspace/holding.out
+  waited=0
+  while [ ! -e /workspace/go ] && [ "$waited" -lt "$hold" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [ -e /workspace/go ]; then echo go > /workspace/held.out; else echo timeout > /workspace/held.out; fi
+fi
+
+nap=$(marker nap || true)
+if [ -n "$nap" ] && [ ! -e /workspace/.echo-agent-napped ]; then
+  touch /workspace/.echo-agent-napped
+  sleep "$nap"
+fi
+
 echo "echo-agent: $input" >> /workspace/README.txt
+
+if marker commit > /dev/null; then
+  # One commit of the child's work in its own clone. The files this script writes for the tests
+  # are left out, so `git status` is clean afterwards.
+  (
+    export HOME=/tmp
+    cd /workspace || exit 1
+    git config user.email agent@example.invalid
+    git config user.name "echo agent"
+    mkdir -p .git/info
+    printf '%s\n' env.txt egress.txt '.echo-agent-*' '*.out' >> .git/info/exclude
+    if marker same > /dev/null; then file=shared.txt; else file="kid-$kid.txt"; fi
+    echo "work of kid $kid" > "$file"
+    git add -A
+    add_rc=$?
+    git commit -q -m "kid $kid" > /tmp/commit.err 2>&1
+    commit_rc=$?
+    {
+      echo "file=$file"
+      echo "add_rc=$add_rc"
+      echo "commit_rc=$commit_rc"
+      echo "branch=$(git rev-parse --abbrev-ref HEAD 2>&1)"
+      echo "status=$(git status --porcelain 2>&1 | tr '\n' ' ')"
+    } > /workspace/commit.out
+  )
+fi
 
 printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"id":"msg_e2e","type":"message","role":"assistant","model":"%s","content":[{"type":"text","text":"echo-agent edited README.txt"}],"stop_reason":"end_turn"}}\n' \
   "$session" "$model"
