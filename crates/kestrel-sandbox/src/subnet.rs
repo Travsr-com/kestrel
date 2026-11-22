@@ -110,7 +110,8 @@ impl std::fmt::Display for Ipv4Cidr {
     }
 }
 
-/// One reserved `/29` block for one run's network.
+/// One reserved `/29` block for one run's network, or the larger span claimed for the bridge's
+/// `kestrel-gw` ([`SubnetPool::claim_span`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subnet {
     block: Ipv4Cidr,
@@ -338,14 +339,72 @@ impl SubnetPool {
         Some(self.subnet(block))
     }
 
-    /// Takes the lowest free block out of the pool for good, for a network that outlives every
-    /// run (the bridge's `kestrel-gw`). The block is excluded: it is never handed out, never
-    /// counts as in use, and releasing it changes nothing. `None` when no block is free.
-    pub fn claim(&self) -> Option<Subnet> {
+    /// Takes an aligned span out of the pool for good, for a network that outlives every run (the
+    /// bridge's `kestrel-gw`): the lowest free `/largest` span, or when none fits with at least one
+    /// free block left for runs, the largest smaller one that does (down to one `/29` block). The
+    /// span's blocks are excluded: never handed out, never in use, and releasing the span changes
+    /// nothing. `None` when not even one block can be taken with one left over.
+    pub fn claim_span(&self, largest: u8) -> Option<Subnet> {
         let mut state = self.state();
-        let block = self.lowest_free(&state)?;
-        state.exclude(block, block + 1);
-        Some(self.subnet(block))
+        let (start, prefix) = self.free_span(&state, largest)?;
+        state.exclude(start, start + (1 << (SUBNET_BLOCK_PREFIX - prefix)));
+        Some(self.span_at(start, prefix))
+    }
+
+    /// The span [`SubnetPool::claim_span`] would take now, without taking it.
+    pub fn claimable(&self, largest: u8) -> Option<Subnet> {
+        let state = self.state();
+        self.free_span(&state, largest)
+            .map(|(start, prefix)| self.span_at(start, prefix))
+    }
+
+    /// The first block and prefix of the span `claim_span` takes: the largest prefix from
+    /// `largest` (never larger than the pool) to a `/29`, at the lowest aligned start whose blocks
+    /// are all free, that leaves at least one free block.
+    fn free_span(&self, state: &PoolState, largest: u8) -> Option<(u32, u8)> {
+        let free = u64::try_from(self.available_in(state)).unwrap_or(u64::MAX);
+        let first = largest.clamp(self.pool.prefix, SUBNET_BLOCK_PREFIX);
+        (first..=SUBNET_BLOCK_PREFIX).find_map(|prefix| {
+            let size = 1_u32 << (SUBNET_BLOCK_PREFIX - prefix);
+            if free <= u64::from(size) {
+                return None;
+            }
+            self.lowest_free_span(state, size)
+                .map(|start| (start, prefix))
+        })
+    }
+
+    /// The lowest start, aligned to `size` blocks, of `size` blocks that are all free.
+    fn lowest_free_span(&self, state: &PoolState, size: u32) -> Option<u32> {
+        let mut start = 0;
+        while start < self.blocks {
+            match Self::first_taken(state, start, start + size) {
+                // Past the taken block, at the next aligned start.
+                Some(next) => start = next.div_ceil(size).saturating_mul(size),
+                None => return Some(start),
+            }
+        }
+        None
+    }
+
+    /// The block after the first taken one in `[from, to)`: the end of its excluded range, or the
+    /// next block when it is in use. `None` when all are free.
+    fn first_taken(state: &PoolState, from: u32, to: u32) -> Option<u32> {
+        (from..to).find_map(|block| match state.excluded_range(block) {
+            Some((_, end)) => Some(end),
+            None => state.used.contains(&block).then_some(block + 1),
+        })
+    }
+
+    /// The span of `/prefix` starting at block `start`.
+    fn span_at(&self, start: u32, prefix: u8) -> Subnet {
+        let block = self.subnet(start).block;
+        Subnet {
+            block: Ipv4Cidr {
+                addr: block.addr,
+                prefix,
+            },
+        }
     }
 
     /// The index of the lowest block neither excluded nor in use.

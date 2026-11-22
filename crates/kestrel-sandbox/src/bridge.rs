@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use url::Url;
 
-use crate::{CommandRunner, SandboxError, Subnet, SubnetPool, check_image};
+use crate::{CommandRunner, Ipv4Cidr, SandboxError, Subnet, SubnetPool, check_image};
 
 /// Pinned `socat` image used when [`BridgeSpec::image`] is not set.
 pub const DEFAULT_BRIDGE_IMAGE: &str =
@@ -19,6 +19,12 @@ pub const DEFAULT_BRIDGE_IMAGE: &str =
 pub const BRIDGE_NAME: &str = "kestrel-gateway";
 /// The `--internal` network the sandboxes join.
 const NETWORK: &str = "kestrel-gw";
+/// Prefix of the span [`GatewayBridge::plan_network`] claims for `kestrel-gw`: a `/24`, 32 blocks
+/// of the subnet pool and room for 253 containers, so the bridges of many `kestrel serve`
+/// instances fit on one docker daemon (and, with `gateway.advertise_url`, many sandboxes).
+pub const BRIDGE_NETWORK_PREFIX: u8 = 24;
+/// What docker says when a network has no address left for one more container.
+const NETWORK_FULL: &str = "no available IPv4 addresses";
 /// Connections the bridge holds at once when [`BridgeSpec::connections`] is not set: the size
 /// `kestrel serve` works out for its default settings (2 for each of 256 waiting calls plus 4
 /// for each of 4 concurrent runs).
@@ -79,9 +85,39 @@ pub enum BridgeNetwork {
     DockerPools,
     /// It exists already: use it as it is, whatever its subnet, and never create it.
     Existing,
-    /// Create it on this block (`--subnet`, `--gateway`). One made by someone else in the
+    /// Create it on this span (`--subnet`, `--gateway`). One made by someone else in the
     /// meantime is used as it is.
     Subnet(Subnet),
+}
+
+/// What [`GatewayBridge::plan_network`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPlan {
+    pub network: BridgeNetwork,
+    /// Set when an existing `kestrel-gw` is smaller than the span Kestrel would give it and could
+    /// not be recreated. Says how to recreate it by hand.
+    pub warning: Option<String>,
+}
+
+/// Attached containers and the first IPv4 subnet of `kestrel-gw`, from
+/// `{{len .Containers}};{{range .IPAM.Config}}{{.Subnet}} {{end}}`. `None` when unreadable.
+fn parse_gw(answer: &str) -> Option<(u64, Ipv4Cidr)> {
+    let (containers, subnets) = answer.trim().split_once(';')?;
+    let containers = containers.trim().parse().ok()?;
+    let subnet = subnets
+        .split_whitespace()
+        .find_map(|s| Ipv4Cidr::parse(s).ok())?;
+    Some((containers, subnet))
+}
+
+/// The `connect` failure, explained when `kestrel-gw` has no address left.
+fn connect_error(e: String) -> SandboxError {
+    if !e.contains(NETWORK_FULL) {
+        return step("connect")(e);
+    }
+    step("connect")(format!(
+        "{NETWORK} is full: every address of its subnet is taken, most likely by the bridges of other kestrel serve instances on this docker daemon or by leaked kestrel-gateway-* containers. List them with `docker ps -a --filter label=kestrel.managed=bridge` and remove the ones whose serve is no longer running (`docker rm --force <name>`). To make {NETWORK} larger, stop every kestrel serve on this daemon and run `docker network rm {NETWORK}`: the next serve creates it on a /{BRIDGE_NETWORK_PREFIX} of gateway.subnet_pool. Docker said: {e}"
+    ))
 }
 
 /// A running bridge container. Not published on any host port.
@@ -277,7 +313,7 @@ impl GatewayBridge {
             return Err(step("run")(e));
         }
         let started = async {
-            docker(&*runner, &connect).await.map_err(step("connect"))?;
+            docker(&*runner, &connect).await.map_err(connect_error)?;
             let answer = docker(&*runner, &inspect).await.map_err(step("inspect"))?;
             bridge_url(&answer, host_port)
         }
@@ -297,19 +333,25 @@ impl GatewayBridge {
         }
     }
 
-    /// Decides where `kestrel-gw` comes from, before [`GatewayBridge::start`]: an existing one is
-    /// reused as it is ([`BridgeNetwork::Existing`]) and takes nothing from `plan`. Otherwise it
-    /// gets the lowest free block of `plan` ([`BridgeNetwork::Subnet`]), taken out of the plan for
-    /// good, so no run network ever gets it.
+    /// Decides where `kestrel-gw` comes from, before [`GatewayBridge::start`].
+    ///
+    /// * Missing: it gets an aligned span of `plan` ([`BridgeNetwork::Subnet`]), a
+    ///   `/`[`BRIDGE_NETWORK_PREFIX`] unless the pool cannot hold that plus one run block (see
+    ///   [`SubnetPool::claim_span`]). The span is taken out of the plan for good, so no run network
+    ///   ever gets a block of it.
+    /// * Existing and at least as large as that span, or unreadable: reused as it is
+    ///   ([`BridgeNetwork::Existing`]), taking nothing from `plan`.
+    /// * Existing and smaller (a `/29` left by an older build): removed and recreated on the span
+    ///   when no container is attached. Otherwise kept, with a warning that says how to recreate it.
     ///
     /// # Errors
-    /// [`SandboxError::Bridge`] (step `create-network`) when docker cannot list its networks, or
-    /// when `kestrel-gw` is missing and `plan` has fewer than two free blocks: one for
-    /// `kestrel-gw` and at least one for runs. Nothing is taken from `plan` then.
+    /// [`SandboxError::Bridge`] (step `create-network`) when docker cannot list or read its
+    /// networks, or when `kestrel-gw` is missing and `plan` cannot hold one `/29` for it plus one
+    /// for runs. Nothing is taken from `plan` then.
     pub async fn plan_network(
         runner: &dyn CommandRunner,
         plan: &SubnetPool,
-    ) -> Result<BridgeNetwork, SandboxError> {
+    ) -> Result<NetworkPlan, SandboxError> {
         let name = format!("name=^{NETWORK}$");
         let lookup = argv(&[
             "docker",
@@ -325,16 +367,76 @@ impl GatewayBridge {
             .map_err(step("create-network"))?;
         // The filter is a pattern: only the exact name counts.
         if listed.lines().any(|l| l.trim() == NETWORK) {
-            return Ok(BridgeNetwork::Existing);
+            return Self::existing_network(runner, plan).await;
         }
+        Self::claim_network(plan)
+    }
+
+    /// `kestrel-gw` on a span claimed from `plan`, or the error naming `gateway.subnet_pool`.
+    fn claim_network(plan: &SubnetPool) -> Result<NetworkPlan, SandboxError> {
         let free = plan.available();
-        let claimed = if free >= 2 { plan.claim() } else { None };
-        claimed.map(BridgeNetwork::Subnet).ok_or_else(|| {
+        let span = plan.claim_span(BRIDGE_NETWORK_PREFIX).ok_or_else(|| {
             step("create-network")(format!(
                 "subnet pool {} has {free} free /29 block(s), but the {NETWORK} network needs one and runs need at least one more. Set gateway.subnet_pool to a larger or free range",
                 plan.pool()
             ))
+        })?;
+        Ok(NetworkPlan {
+            network: BridgeNetwork::Subnet(span),
+            warning: None,
         })
+    }
+
+    /// The plan for an existing `kestrel-gw`: kept, or recreated on a larger span of `plan`.
+    async fn existing_network(
+        runner: &dyn CommandRunner,
+        plan: &SubnetPool,
+    ) -> Result<NetworkPlan, SandboxError> {
+        let keep = |warning: Option<String>| {
+            Ok(NetworkPlan {
+                network: BridgeNetwork::Existing,
+                warning,
+            })
+        };
+        let inspect = argv(&[
+            "docker",
+            "network",
+            "inspect",
+            "--format",
+            "{{len .Containers}};{{range .IPAM.Config}}{{.Subnet}} {{end}}",
+            NETWORK,
+        ]);
+        let answer = docker(runner, &inspect)
+            .await
+            .map_err(step("create-network"))?;
+        let Some((attached, current)) = parse_gw(&answer) else {
+            return keep(None);
+        };
+        let Some(span) = plan
+            .claimable(BRIDGE_NETWORK_PREFIX)
+            .filter(|span| span.cidr().prefix() < current.prefix())
+        else {
+            return keep(None);
+        };
+        let room = (1_u64 << (32 - u32::from(current.prefix()))).saturating_sub(3);
+        let smaller = format!(
+            "{NETWORK} is {current}, room for {room} containers, smaller than the {} Kestrel would give it",
+            span.cidr()
+        );
+        let how = format!(
+            "To make it larger, stop every kestrel serve on this docker daemon, run `docker network rm {NETWORK}`, then start serve again"
+        );
+        if attached > 0 {
+            return keep(Some(format!(
+                "{smaller}, and {attached} container(s) are attached, so Kestrel keeps it. {how}"
+            )));
+        }
+        if let Err(e) = docker(runner, &argv(&["docker", "network", "rm", NETWORK])).await {
+            return keep(Some(format!(
+                "{smaller}, and removing it failed, so Kestrel keeps it: {e}. {how}"
+            )));
+        }
+        Self::claim_network(plan)
     }
 
     /// The 8 hex chars naming the bridge of the database at `db`: the first 8 of the 16-digit
