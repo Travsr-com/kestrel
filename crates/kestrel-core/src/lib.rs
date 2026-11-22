@@ -915,14 +915,14 @@ impl Engine {
         Ok(())
     }
 
-    /// The messages a person sent `run` that its agent has not taken yet, oldest first, now
-    /// recorded as delivered (`kestrel.messages`, #95). Each is handed over once. The text goes to
-    /// the agent and stays in its event: it is never logged.
+    /// The messages a person sent `run` for its agent (`kestrel.messages`, #95), see
+    /// [`Store::take_messages`]: those not taken yet, or with `after` every one after that `seq`.
+    /// The text goes to the agent and stays in its event: it is never logged.
     ///
     /// # Errors
     /// The store's.
-    pub fn take_messages(&self, run: RunId) -> Result<Vec<InboxMessage>> {
-        Ok(self.inner.store.take_messages(run)?)
+    pub fn take_messages(&self, run: RunId, after: Option<u64>) -> Result<Vec<InboxMessage>> {
+        Ok(self.inner.store.take_messages(run, after)?)
     }
 
     /// Asks a person `question` for `run` (`kestrel.ask_human`) and waits for the answer. The run
