@@ -13,10 +13,12 @@
 //! * **What it may call**: [`ToolHost::tools`] lists the tools the run's capability allows.
 //!   `tools/list` shows only those; calling another is a tool error "not permitted", and the host
 //!   records the denial.
-//! * **Calls survive a dropped connection**: each call runs in its own task, keyed by the run and
-//!   the JSON-RPC id. Calling again with the same id waits for the same result, so a client that
-//!   reconnects gets it without a second spawn or a second wait. Results are kept for at least an
-//!   hour, and dropped by the first call that comes after that.
+//! * **Calls survive a dropped connection**: each call runs in its own task, keyed by the run, the
+//!   tool and the JSON-RPC id. Calling the same tool again with the same id waits for the same
+//!   result, so a client that reconnects gets it without a second spawn or a second wait. Results
+//!   are kept for at least an hour, and dropped by the first call that comes after that.
+//!   `kestrel.messages` is not kept: it answers at once, and a reconnected client that starts its
+//!   ids again would get old messages. Its retry is safe with `after` instead.
 //! * **Limits**, so a sandbox cannot make the gateway hold much: bodies up to 1 MiB (413), ids a
 //!   string of at most 128 bytes or an integer, per run a burst of 20 tool calls refilled at 10 per
 //!   second, at most 8 calls waiting and 256 results kept (the oldest finished go first), and at
@@ -155,10 +157,21 @@ impl KestrelTool {
                 }),
             ),
             KestrelTool::Messages => (
-                "Get the messages a person sent you since you last checked, oldest first. Each \
-                 message comes once. Check between steps and before you finish, and take what \
-                 they say into account.",
-                json!({ "type": "object", "properties": {} }),
+                "Get the messages a person sent you, oldest first, each with its seq. Check \
+                 between steps and before you finish, and take what they say into account. Pass \
+                 after, the seq of the last message you got (0 at first), to get every later \
+                 one: a call you repeat with the same after loses nothing. Without after, you \
+                 get each message once.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "after": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "The seq of the last message you got; 0 for none yet."
+                        }
+                    }
+                }),
             ),
         };
         json!({ "name": self.name(), "description": description, "inputSchema": schema })
@@ -208,9 +221,9 @@ pub trait ToolHost: Send + Sync {
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String>;
     /// Asks a person; the answer text once they decide.
     async fn ask_human(&self, run: RunId, question: String) -> Result<String, String>;
-    /// The messages a person sent `run` that it has not taken yet, now delivered. The default has
-    /// none to give.
-    async fn messages(&self, _run: RunId) -> Result<Value, String> {
+    /// The messages a person sent `run`, now delivered: those it has not taken yet, or with
+    /// `after` every one after that `seq`, taken or not. The default has none to give.
+    async fn messages(&self, _run: RunId, _after: Option<u64>) -> Result<Value, String> {
         Err("this host keeps no messages for agents".into())
     }
     /// Records that `run`'s call of `tool` was refused for lack of room, with the reason the
@@ -557,7 +570,8 @@ enum Task {
     Spawn(SpawnCall),
     Join(JoinCall),
     Ask(String),
-    Messages,
+    /// With `after`, the seq of the last message the agent got.
+    Messages(Option<u64>),
 }
 
 impl Task {
@@ -567,7 +581,7 @@ impl Task {
         match self {
             Task::Spawn(call) => call.wait,
             Task::Join(_) | Task::Ask(_) => true,
-            Task::Messages => false,
+            Task::Messages(_) => false,
         }
     }
 }
@@ -620,7 +634,13 @@ async fn call(
             );
         }
     };
-    let (mut result, held) = match start(state, run, &id, task) {
+    if matches!(task, Task::Messages(_)) {
+        // Answers at once and is never kept by id: a client that reconnects starts its ids again
+        // and would get an old answer. A retry passes `after` instead.
+        let value = perform(state.deps.tools.clone(), run, task).await;
+        return answer(id, value, events);
+    }
+    let (mut result, held) = match start(state, run, tool, &id, task) {
         Ok(started) => started,
         Err(NoRoom::Busy) => {
             return rpc_error(
@@ -675,6 +695,38 @@ async fn call(
         .into_response()
 }
 
+/// The answer to a call that is done: one event when the client accepts an event stream, else
+/// plain JSON.
+fn answer(id: Value, value: Value, events: bool) -> Response {
+    let message = rpc_result(id, value);
+    if !events {
+        return Json(message).into_response();
+    }
+    let event = Event::default().event("message").data(message.to_string());
+    Sse::new(futures::stream::once(
+        async move { Ok::<_, Infallible>(event) },
+    ))
+    .into_response()
+}
+
+/// Runs `task` for `run` on `host` in a task of its own: a client that goes away does not cancel
+/// it, and a host call that panics still ends with a result, so it never counts as waiting
+/// forever.
+async fn perform(host: Arc<dyn ToolHost>, run: RunId, task: Task) -> Value {
+    let work = tokio::spawn(async move {
+        match task {
+            Task::Spawn(call) => host.spawn(run, call).await,
+            Task::Join(call) => host.join(run, call).await,
+            Task::Ask(question) => host.ask_human(run, question).await.map(Value::String),
+            Task::Messages(after) => host.messages(run, after).await,
+        }
+    });
+    let outcome = work
+        .await
+        .unwrap_or_else(|_| Err("the call failed inside Kestrel; try again".into()));
+    tool_result(outcome)
+}
+
 /// A JSON answer for a client that does not accept an event stream, to a call still waiting: a
 /// space at once and every [`KEEPALIVE`] after, then the JSON-RPC result. Leading whitespace is
 /// valid JSON, so the body still parses as the result.
@@ -711,10 +763,12 @@ where
 fn start(
     state: &Arc<AppState>,
     run: RunId,
+    tool: KestrelTool,
     id: &Value,
     task: Task,
 ) -> Result<(CallResult, Option<Held>), NoRoom> {
-    let key = id.to_string();
+    // By tool and id: a reused id that names another tool is another call.
+    let key = format!("{} {id}", tool.name());
     let mut calls = state
         .mcp
         .calls
@@ -779,20 +833,8 @@ fn start(
     drop(calls);
     let host = state.deps.tools.clone();
     tokio::spawn(async move {
-        // In a task of its own, so a host call that panics still ends with a result: it never
-        // counts as waiting forever.
-        let work = tokio::spawn(async move {
-            match task {
-                Task::Spawn(call) => host.spawn(run, call).await,
-                Task::Join(call) => host.join(run, call).await,
-                Task::Ask(question) => host.ask_human(run, question).await.map(Value::String),
-                Task::Messages => host.messages(run).await,
-            }
-        });
-        let outcome = work
-            .await
-            .unwrap_or_else(|_| Err("the call failed inside Kestrel; try again".into()));
-        let _ = tx.send(Some((tool_result(outcome), Instant::now())));
+        let value = perform(host, run, task).await;
+        let _ = tx.send(Some((value, Instant::now())));
     });
     Ok((rx, held))
 }
@@ -862,8 +904,16 @@ fn check(tool: KestrelTool, args: &Value) -> Result<Task, String> {
                 .ok_or("question is required")?;
             Ok(Task::Ask(question))
         }
-        // Takes no arguments; any given are ignored.
-        KestrelTool::Messages => Ok(Task::Messages),
+        KestrelTool::Messages => match args.get("after") {
+            None | Some(Value::Null) => Ok(Task::Messages(None)),
+            Some(after) => after
+                .as_u64()
+                .map(|seq| Task::Messages(Some(seq)))
+                .ok_or_else(|| {
+                    "after must be the seq of the last message you got, a whole number from 0"
+                        .to_string()
+                }),
+        },
     }
 }
 
