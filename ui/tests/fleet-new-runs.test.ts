@@ -88,7 +88,7 @@ afterEach(() => {
 describe('Fleet and runs started after it loaded', () => {
   it('shows a run started after the page loaded, and follows it live', async () => {
     const old = run({ agent: 'old' });
-    const fresh = run({ agent: 'fresh', status: 'Provisioning' });
+    const fresh = run({ agent: 'fresh', status: 'Provisioning', created_at: new Date(NOW).toISOString() });
     const { sockets } = show([old], [old, fresh]);
     await vi.waitFor(() => expect(agents()).toEqual(['old']));
 
@@ -139,11 +139,11 @@ describe('Fleet and runs started after it loaded', () => {
     s.open();
     s.event(1, ev(kid.id, { kind: 'run_created', agent: 'kid', parent: old.id }));
     s.event(2, ev(fresh.id, { kind: 'run_created', agent: 'fresh' }));
-    // The first look-up of `fresh` fails; the next change to the live runs asks again.
-    await vi.waitFor(() => expect(gets.filter((p) => p === `/api/runs/${fresh.id}`)).toHaveLength(1));
+    // The first look-up of `fresh` fails; the next change to the live runs (`another`) asks again.
     s.event(3, ev('another', { kind: 'run_created', agent: 'other' }));
     await vi.waitFor(() => expect(agents()).toContain('fresh'));
-    // `kid` came on its tree socket, so Fleet never fetched it for being new.
-    expect(gets.filter((p) => p === `/api/runs/${kid.id}`)).toHaveLength(0);
+    expect(gets.filter((p) => p === `/api/runs/${fresh.id}`)).toHaveLength(2);
+    // `kid` came on its tree socket: fetched once for its limit, as before, and not looked up again.
+    expect(gets.filter((p) => p === `/api/runs/${kid.id}`)).toHaveLength(1);
   });
 });
