@@ -241,6 +241,8 @@ async fn recovery_resumes_only_what_the_restart_stopped() {
     let key = RootKey::generate().to_bytes();
     let aid = ApprovalId::new();
     let other_error = Suspended(SuspendReason::Error("model refused".into()));
+    // `earlier` was suspended for a restart by an engine that did not resume it (before this
+    // upgrade, or with the setting off): it is left for a person.
     let (running, earlier, manual, budget, approval, errored) = {
         let first = harness_on(&db, 4, &key, true);
         let st = &first.store;
@@ -278,19 +280,135 @@ async fn recovery_resumes_only_what_the_restart_stopped() {
     assert_eq!(report.interrupted, vec![running]);
     again.engine.recover().await.unwrap();
     again.start();
-    until("both resumed", || {
-        again.is(running, &Running) && again.is(earlier, &Running)
-    })
-    .await;
+    until("resumed", || again.is(running, &Running)).await;
     settle().await;
+    assert!(
+        again.is(earlier, &restarted()),
+        "a run an earlier start did not resume stays suspended"
+    );
     assert!(again.is(manual, &Suspended(SuspendReason::Manual)));
     assert!(again.is(budget, &Suspended(SuspendReason::Budget)));
     assert!(again.is(approval, &Suspended(SuspendReason::Approval(aid))));
     assert!(again.is(errored, &other_error));
-    assert_eq!(again.driver.starts(), 2);
-    for run in [running, earlier] {
-        assert_eq!(ignored_commands(&again, run), 0, "resumed once: {run}");
+    assert_eq!(again.driver.starts(), 1);
+    assert_eq!(ignored_commands(&again, running), 0, "resumed once");
+}
+
+/// A first engine with one running run, stopped. Returns the run.
+async fn one_running(db: &Path, key: &[u8]) -> RunId {
+    use RunStatus::{Provisioning, Queued, Running};
+    let first = harness_on(db, 4, key, true);
+    let id = first.submit(spec()).await;
+    first.store.transition(id, &Queued, Provisioning).unwrap();
+    first.store.transition(id, &Provisioning, Running).unwrap();
+    id
+}
+
+// A start with resume off suspends a run and does not mark it; a later start with resume on
+// leaves it suspended, for a person.
+#[tokio::test(start_paused = true)]
+async fn a_run_stopped_while_resume_was_off_stays_suspended_when_it_is_turned_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let key = RootKey::generate().to_bytes();
+    let run = one_running(&db, &key).await;
+
+    let off = harness_on(&db, 4, &key, false);
+    assert_eq!(off.engine.recover().await.unwrap().interrupted, vec![run]);
+    drop(off);
+
+    let mut on = harness_on(&db, 4, &key, true);
+    let report = on.engine.recover().await.unwrap();
+    assert_eq!(report.suspended, vec![run]);
+    let _session = on.driver.live();
+    on.start();
+    settle().await;
+    assert!(on.is(run, &restarted()), "left for a person");
+    assert_eq!(on.driver.starts(), 0);
+}
+
+// A resuming start queued a resume, which was claimed and lost when serve stopped again before a
+// slot freed. The next start queues it again: the run was stopped by a resuming start.
+#[tokio::test(start_paused = true)]
+async fn a_resume_lost_to_a_second_stop_is_queued_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let key = RootKey::generate().to_bytes();
+    let run = one_running(&db, &key).await;
+
+    let first = harness_on(&db, 4, &key, true);
+    first.engine.recover().await.unwrap();
+    // A scheduler claimed the resume and died before delivering it.
+    let claimed = first.store.take_control().unwrap();
+    assert_eq!(claimed.len(), 1, "{claimed:?}");
+    drop(first);
+
+    let mut again = harness_on(&db, 4, &key, true);
+    assert_eq!(again.engine.recover().await.unwrap().suspended, vec![run]);
+    let _session = again.driver.live();
+    again.start();
+    until("resumed", || again.is(run, &RunStatus::Running)).await;
+    assert_eq!(again.driver.starts(), 1);
+}
+
+/// A first engine with one running run that `restarts_before` earlier restarts already stopped
+/// and resumed. Returns the run.
+async fn restarted_before(db: &Path, key: &[u8], restarts_before: usize) -> RunId {
+    let run = one_running(db, key).await;
+    let st = kestrel_store::Store::open(db).unwrap();
+    for _ in 0..restarts_before {
+        st.transition(run, &RunStatus::Running, restarted())
+            .unwrap();
+        st.transition(run, &restarted(), RunStatus::Running)
+            .unwrap();
     }
+    run
+}
+
+fn left_for_a_person(h: &Harness, run: RunId) -> bool {
+    h.has_event(
+        run,
+        |k| matches!(k, EventKind::AgentLog { line } if line.contains("not resumed automatically")),
+    )
+}
+
+// A run that takes serve down is not resumed on every start: after three restarts stopped it,
+// the fourth leaves it suspended and says why.
+#[tokio::test(start_paused = true)]
+async fn a_run_stopped_by_a_fourth_restart_is_left_for_a_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let key = RootKey::generate().to_bytes();
+    let run = restarted_before(&db, &key, 3).await;
+
+    let mut h = harness_on(&db, 4, &key, true);
+    assert_eq!(h.engine.recover().await.unwrap().interrupted, vec![run]);
+    assert!(left_for_a_person(&h, run));
+    let _session = h.driver.live();
+    h.start();
+    settle().await;
+    assert!(h.is(run, &restarted()), "not resumed");
+    assert_eq!(h.driver.starts(), 0);
+
+    // A person can still resume it.
+    h.control(run, ControlCommand::Resume);
+    until("resumed by hand", || h.is(run, &RunStatus::Running)).await;
+}
+
+// Three restarts are still resumed: the third stop is resumed like the first.
+#[tokio::test(start_paused = true)]
+async fn a_run_stopped_by_a_third_restart_is_still_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kestrel.db");
+    let key = RootKey::generate().to_bytes();
+    let run = restarted_before(&db, &key, 2).await;
+
+    let mut h = harness_on(&db, 4, &key, true);
+    assert_eq!(h.engine.recover().await.unwrap().interrupted, vec![run]);
+    assert!(!left_for_a_person(&h, run));
+    let _session = h.driver.live();
+    h.start();
+    until("resumed", || h.is(run, &RunStatus::Running)).await;
 }
 
 // Scenario 3: a child still `Provisioning` at the restart (its sandbox never started) is suspended
