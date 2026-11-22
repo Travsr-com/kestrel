@@ -1732,6 +1732,90 @@ budget: { usd: 0.000010, wall_clock: 10m }
         assert_eq!(grace(ANTHROPIC), std::time::Duration::from_secs(10));
     }
 
+    fn sizes(config: &str) -> (u32, u32) {
+        let (_dir, path) = write(config);
+        let c = load_config(&path).expect("config loads");
+        (c.waiting_calls, c.bridge_connections)
+    }
+
+    /// Issue #80: 64 waiting calls by default, and a bridge sized for them plus 4 connections for
+    /// each of the 4 default concurrent runs.
+    #[test]
+    fn waiting_calls_default_to_64_and_the_bridge_to_80() {
+        assert_eq!(sizes(ANTHROPIC), (64, 80));
+        assert_eq!(
+            usize::try_from(sizes(ANTHROPIC).0).expect("fits"),
+            kestrel_gateway::DEFAULT_WAITING_CALLS
+        );
+        assert_eq!(
+            sizes(ANTHROPIC).1,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+            "the bridge's own default is the size for the default settings"
+        );
+    }
+
+    /// Issue #80 scenario 1: the bridge allows the waiting calls plus 4 connections per
+    /// concurrent run.
+    #[test]
+    fn the_bridge_is_sized_from_the_waiting_calls_and_the_concurrency_cap() {
+        let cfg = |w: u32, c: u32| {
+            format!(
+                "{ANTHROPIC}[gateway]\nmax_waiting_calls = {w}\n[engine]\nmax_concurrent_runs = {c}\n"
+            )
+        };
+        assert_eq!(sizes(&cfg(1, 1)), (1, 5));
+        assert_eq!(sizes(&cfg(100, 10)), (100, 140));
+        assert_eq!(sizes(&cfg(4096, 1024)), (4096, 8192));
+        assert_eq!(bridge_connections(64, 4), Some(80));
+        assert_eq!(bridge_connections(4096, 1025), None, "above 8192");
+        assert_eq!(bridge_connections(1, usize::MAX), None, "no overflow");
+    }
+
+    #[test]
+    fn a_bad_max_waiting_calls_names_the_key_and_never_echoes_the_value() {
+        for bad in ["0", "4097", "-1", "1.5", "\"sekrit-waiting\"", "987654321"] {
+            let e = err(&format!("{ANTHROPIC}[gateway]\nmax_waiting_calls = {bad}\n"));
+            assert!(
+                e.contains("gateway.max_waiting_calls must be a whole number from 1 to 4096"),
+                "{bad}: {e}"
+            );
+            assert!(!e.contains("sekrit") && !e.contains("987654321"), "{e}");
+        }
+    }
+
+    #[test]
+    fn settings_that_need_more_than_8192_bridge_connections_are_refused() {
+        let e = err(&format!(
+            "{ANTHROPIC}[gateway]\nmax_waiting_calls = 4096\n[engine]\nmax_concurrent_runs = 2000\n"
+        ));
+        assert!(e.contains("gateway.max_waiting_calls"), "{e}");
+        assert!(e.contains("engine.max_concurrent_runs"), "{e}");
+        assert!(e.contains("8192"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_gets_its_connection_limit() {
+        let r = recorder(0);
+        start_bridge(
+            r.clone(),
+            DockerHost::Native,
+            true,
+            None,
+            7070,
+            140,
+            Path::new("/tmp/k.db"),
+        )
+        .await
+        .expect("started")
+        .expect("bridge");
+        let argv = run_call(&r);
+        assert!(
+            argv.iter()
+                .any(|a| a == "TCP-LISTEN:7070,fork,reuseaddr,max-children=140"),
+            "{argv:?}"
+        );
+    }
+
     #[test]
     fn the_shutdown_grace_is_read_in_whole_seconds_from_1_to_3600() {
         for secs in [1u64, 2, 10, 3600] {
@@ -2319,6 +2403,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 docker,
                 advertise,
                 7070,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
                 Path::new("/tmp/k.db"),
             )
             .await;
@@ -2332,6 +2417,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             true,
             None,
             7070,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -2351,6 +2437,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             true,
             None,
             7070,
+            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -3071,7 +3158,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
     async fn the_bridge_run_has_add_host_for_native_and_none_for_vm() {
         for (host, has) in [(DockerHost::Native, true), (DockerHost::Vm, false)] {
             let r = recorder(0);
-            start_bridge(r.clone(), host, true, None, 7070, Path::new("/tmp/k.db"))
+            start_bridge(r.clone(), host, true, None, 7070, kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS, Path::new("/tmp/k.db"))
                 .await
                 .expect("started")
                 .expect("bridge");
@@ -3372,7 +3459,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
     #[tokio::test]
     async fn the_bridge_names_the_container_drivers_join_to_run_networks() {
         let db = Path::new("/tmp/k.db");
-        let bridge = start_bridge(recorder(0), DockerHost::Native, true, None, 7070, db)
+        let bridge = start_bridge(recorder(0), DockerHost::Native, true, None, 7070, kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS, db)
             .await
             .expect("started")
             .expect("bridge");

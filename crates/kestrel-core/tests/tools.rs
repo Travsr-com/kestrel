@@ -207,6 +207,24 @@ async fn a_tool_call_that_was_not_permitted_is_recorded() {
     )));
 }
 
+/// Issue #80: a call the gateway refused for lack of room is recorded on the run with the reason.
+#[tokio::test(start_paused = true)]
+async fn a_tool_call_refused_for_lack_of_room_is_recorded_with_its_reason() {
+    let mut h = Harness::new(4);
+    let _s = h.driver.live();
+    h.start();
+    let id = h.submit(agent("{ mcp: [kestrel.join] }")).await;
+    h.engine
+        .tool_refused(id, "kestrel.join", "64 tool calls are already waiting")
+        .unwrap();
+    assert!(h.has_event(id, |k| matches!(
+        k,
+        EventKind::AgentLog { line } if line.contains("kestrel.join")
+            && line.contains("was refused")
+            && line.contains("64 tool calls are already waiting")
+    )));
+}
+
 // Review 1 of PR 76.
 
 #[tokio::test(start_paused = true)]

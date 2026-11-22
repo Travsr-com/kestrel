@@ -16,8 +16,8 @@ use axum::http::{Request, StatusCode, header};
 use common::{FakeBudget, FakeSink, config};
 use futures::StreamExt;
 use kestrel_gateway::{
-    GatewayDeps, JoinCall, JoinWait, KestrelTool, RunResolver, SpawnCall, ToolHost, ToolsError,
-    router,
+    DEFAULT_WAITING_CALLS, GatewayDeps, GatewayLimits, GatewayTimeouts, JoinCall, JoinWait,
+    KestrelTool, RunResolver, SpawnCall, ToolHost, ToolsError, router, router_with_limits,
 };
 use kestrel_types::{MicroUsd, RunId};
 use serde_json::{Value, json};
@@ -47,6 +47,7 @@ struct FakeHost {
     joins: Mutex<Vec<(RunId, JoinCall)>>,
     asks: Mutex<Vec<(RunId, String)>>,
     denied: Mutex<Vec<(RunId, String)>>,
+    refused: Mutex<Vec<(RunId, String, String)>>,
     tools_asked: Mutex<usize>,
     spawn_refusal: Mutex<Option<String>>,
     join_takes: Mutex<Duration>,
@@ -93,6 +94,12 @@ impl ToolHost for FakeHost {
     }
     async fn denied(&self, run: RunId, tool: &str) {
         self.denied.lock().unwrap().push((run, tool.to_string()));
+    }
+    async fn refused(&self, run: RunId, tool: &str, reason: &str) {
+        self.refused
+            .lock()
+            .unwrap()
+            .push((run, tool.to_string(), reason.to_string()));
     }
 }
 
@@ -764,6 +771,205 @@ async fn a_run_has_at_most_8_calls_waiting() {
     )
     .await;
     assert_eq!(later.status(), StatusCode::OK);
+}
+
+/// `runs` runs that may call every tool, each with its own token `rt_live_many_<i>`, behind a
+/// router with `limits`. Joins take 600 s, so a join call stays open.
+fn many(runs: usize, limits: GatewayLimits) -> (Router, Arc<FakeHost>, Vec<(String, RunId)>) {
+    let ids: Vec<(String, RunId)> = (0..runs)
+        .map(|i| (format!("rt_live_many_{i}"), RunId::new()))
+        .collect();
+    let host = Arc::new(FakeHost::default());
+    *host.join_takes.lock().unwrap() = Duration::from_secs(600);
+    for (_, run) in &ids {
+        host.allowed
+            .lock()
+            .unwrap()
+            .insert(*run, KestrelTool::ALL.to_vec());
+    }
+    let deps = GatewayDeps {
+        resolver: Arc::new(Tokens(ids.iter().cloned().collect())),
+        budget: Arc::new(FakeBudget::new(true)),
+        meter: Arc::new(FakeSink::default()),
+        tools: host.clone(),
+        travsr: None,
+    };
+    let app = router_with_limits(
+        config("http://127.0.0.1:9", "http://127.0.0.1:9"),
+        deps,
+        GatewayTimeouts::default(),
+        limits,
+    );
+    (app, host, ids)
+}
+
+async fn join_held_open(app: &Router, token: &str, id: u64) -> axum::response::Response {
+    let held = send(
+        app,
+        token,
+        call(id, "kestrel.join", json!({})).to_string().into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(held.status(), StatusCode::OK);
+    held
+}
+
+/// Issue #80 scenario 3: across all runs, at most `waiting_calls` tool calls are held open (each
+/// holds a bridge connection). The next call is refused at once, with a tool error the agent
+/// reads and an event on its run, and nothing is started. A closed connection makes room again.
+#[tokio::test(start_paused = true)]
+async fn calls_held_open_across_runs_are_capped_and_the_next_is_refused_clearly() {
+    let (app, host, runs) = many(2, GatewayLimits { waiting_calls: 3 });
+    let (a, b) = (&runs[0], &runs[1]);
+    let mut held = vec![
+        join_held_open(&app, &a.0, 1).await,
+        join_held_open(&app, &a.0, 2).await,
+        join_held_open(&app, &b.0, 1).await,
+    ];
+    let args = json!({ "agent": "worker", "input": "x" });
+    let fourth = send(
+        &app,
+        &b.0,
+        call(2, "kestrel.spawn", args.clone())
+            .to_string()
+            .into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(fourth.status(), StatusCode::OK, "a tool error, not a hang");
+    let msg = message(fourth).await;
+    assert_eq!(msg["id"], json!(2));
+    assert_eq!(msg["result"]["isError"], json!(true));
+    let reason = msg["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(reason.contains("gateway.max_waiting_calls"), "{reason}");
+    assert!(reason.contains('3'), "{reason}");
+    assert!(reason.contains("nothing was started"), "{reason}");
+    assert!(host.spawns.lock().unwrap().is_empty(), "nothing was started");
+    assert_eq!(
+        host.refused.lock().unwrap().clone(),
+        vec![(b.1, "kestrel.spawn".to_string(), reason.to_string())],
+        "the refusal is recorded on the calling run"
+    );
+
+    // One held call's connection closes: there is room again.
+    drop(held.pop());
+    let fifth = send(
+        &app,
+        &b.0,
+        call(3, "kestrel.spawn", args).to_string().into_bytes(),
+        true,
+    )
+    .await;
+    let msg = message(fifth).await;
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    assert_eq!(host.spawns.lock().unwrap().len(), 1);
+    drop(held);
+}
+
+/// A call that answers at once holds its connection only while it answers, so short calls never
+/// use up the room.
+#[tokio::test(start_paused = true)]
+async fn short_calls_give_their_room_back_when_they_answer() {
+    let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 1 });
+    for id in 0..5 {
+        let msg = message(
+            send(
+                &app,
+                &runs[0].0,
+                call(id, "kestrel.ask_human", json!({ "question": "q" }))
+                    .to_string()
+                    .into_bytes(),
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["result"]["isError"], json!(false), "call {id}: {msg}");
+    }
+    assert_eq!(host.asks.lock().unwrap().len(), 5);
+    assert!(host.refused.lock().unwrap().is_empty());
+}
+
+/// Issue #80 scenario 2, gateway side: by default more calls than the old bridge limit of 32 can
+/// wait at once (5 runs with 8 joins each), and one more run's call still goes through.
+#[tokio::test(start_paused = true)]
+async fn by_default_more_calls_than_the_old_limit_of_32_can_wait() {
+    assert_eq!(DEFAULT_WAITING_CALLS, 64);
+    assert_eq!(GatewayLimits::default().waiting_calls, DEFAULT_WAITING_CALLS);
+    let (app, host, runs) = many(6, GatewayLimits::default());
+    let mut held = Vec::new();
+    for (token, _) in &runs[..5] {
+        for id in 0..8 {
+            held.push(join_held_open(&app, token, id).await);
+        }
+    }
+    assert_eq!(held.len(), 40);
+    let msg = message(
+        send(
+            &app,
+            &runs[5].0,
+            call(1, "kestrel.ask_human", json!({ "question": "q" }))
+                .to_string()
+                .into_bytes(),
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    assert!(host.refused.lock().unwrap().is_empty());
+    drop(held);
+}
+
+/// `router` keeps the default cap, and a host that does not record refusals still refuses.
+#[tokio::test(start_paused = true)]
+async fn the_default_host_hook_for_a_refusal_does_nothing() {
+    struct Quiet;
+    #[async_trait]
+    impl ToolHost for Quiet {
+        async fn tools(&self, _: RunId) -> Result<Vec<KestrelTool>, ToolsError> {
+            Ok(KestrelTool::ALL.to_vec())
+        }
+        async fn spawn(&self, _: RunId, _: SpawnCall) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn join(&self, _: RunId, _: JoinCall) -> Result<Value, String> {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok(json!({}))
+        }
+        async fn ask_human(&self, _: RunId, _: String) -> Result<String, String> {
+            Ok(String::new())
+        }
+        async fn denied(&self, _: RunId, _: &str) {}
+    }
+    let run = RunId::new();
+    let deps = GatewayDeps {
+        resolver: Arc::new(Tokens(HashMap::from([("rt_live_quiet".to_string(), run)]))),
+        budget: Arc::new(FakeBudget::new(true)),
+        meter: Arc::new(FakeSink::default()),
+        tools: Arc::new(Quiet),
+        travsr: None,
+    };
+    let app = router_with_limits(
+        config("http://127.0.0.1:9", "http://127.0.0.1:9"),
+        deps,
+        GatewayTimeouts::default(),
+        GatewayLimits { waiting_calls: 1 },
+    );
+    let held = join_held_open(&app, "rt_live_quiet", 1).await;
+    let msg = message(
+        send(
+            &app,
+            "rt_live_quiet",
+            call(2, "kestrel.join", json!({})).to_string().into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], json!(true), "{msg}");
+    drop(held);
 }
 
 #[tokio::test(start_paused = true)]
