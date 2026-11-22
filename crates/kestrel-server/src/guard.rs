@@ -83,7 +83,8 @@ fn allowed_host(host: &str, bind: SocketAddr) -> bool {
 /// since browsers cannot set headers on a WebSocket.
 pub(crate) async fn auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let token = state.config.token.as_str();
-    let socket = req.uri().path().starts_with("/ws/");
+    let path = req.uri().path();
+    let socket = path == "/ws" || path.starts_with("/ws/");
     let ok = bearer(req.headers()).is_some_and(|t| same(t, token))
         || (socket && subprotocol(req.headers()).is_some_and(|t| same(t, token)))
         || (socket && query(req.uri().query()).is_some_and(|t| same(t, token)));

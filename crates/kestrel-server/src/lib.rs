@@ -91,11 +91,16 @@ pub fn router(
         .route("/api/runs/{id}/{action}", post(api::command))
         .route("/api/approvals", get(api::approvals))
         .route("/api/approvals/{id}/{action}", post(api::resolve))
+        // A catch-all never matches an empty tail, so the bare roots (with and without the
+        // slash) get their own routes. Otherwise they would fall through to the UI.
         .route("/api", any(api::not_found))
+        .route("/api/", any(api::not_found))
         .route("/api/{*rest}", any(api::not_found))
         .route("/ws/runs/{id}", get(ws::run_socket))
         .route("/ws/tree/{id}", get(ws::tree_socket))
         .route("/ws/events", get(ws::events_socket))
+        .route("/ws", any(api::not_found))
+        .route("/ws/", any(api::not_found))
         .route("/ws/{*rest}", any(api::not_found))
         .route_layer(middleware::from_fn_with_state(state.clone(), guard::auth));
     Router::new()
