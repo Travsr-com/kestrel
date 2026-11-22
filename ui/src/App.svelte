@@ -46,7 +46,8 @@
   });
 
   /** The run opened last in this tab: the Run item in the sidebar goes back to it. */
-  let lastRun: string | null = $state(route.name === 'run' ? route.id : null);
+  const opened = parseRoute(window.location.hash);
+  let lastRun: string | null = $state(opened.name === 'run' ? opened.id : null);
 
   $effect(() => {
     const onHash = () => {
