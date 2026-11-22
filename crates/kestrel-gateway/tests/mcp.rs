@@ -710,6 +710,49 @@ async fn a_json_only_long_join_is_kept_alive_with_whitespace_then_its_result() {
     assert_eq!(s.host.joins.lock().unwrap().len(), 1);
 }
 
+/// Issue #91: a JSON-only client that goes away after its padded body started gives its room back
+/// (the next long call fits under a cap of 1), and calling again with the same id gets the one
+/// join's result, never a second join.
+#[tokio::test(start_paused = true)]
+async fn a_json_only_client_that_leaves_mid_padding_gives_its_room_back_and_its_call_is_kept() {
+    let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 1 });
+    let token = &runs[0].0;
+    let join = call(300, "kestrel.join", json!({}))
+        .to_string()
+        .into_bytes();
+    let response = send(&app, token, join.clone(), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.expect("the padding started").unwrap();
+    assert!(first.iter().all(|b| *b == b' '), "{first:?}");
+    // The client goes away mid-padding.
+    drop(body);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let ask = send(
+        &app,
+        token,
+        call(301, "kestrel.ask_human", json!({ "question": "q" }))
+            .to_string()
+            .into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(
+        message(ask).await["result"]["isError"],
+        json!(false),
+        "the room came back when the client left"
+    );
+    assert!(host.refused.lock().unwrap().is_empty());
+
+    let again = message(send(&app, token, join, true).await).await;
+    assert_eq!(
+        content(&again)["children"][0]["outcome"],
+        json!("completed")
+    );
+    assert_eq!(host.joins.lock().unwrap().len(), 1, "one join, never two");
+}
+
 /// Issue #91 scenario 2: an SSE client's long join still gets a keepalive comment every 15 s,
 /// never bare whitespace, then its result as an event.
 #[tokio::test(start_paused = true)]
@@ -775,6 +818,10 @@ async fn a_json_call_answered_within_15_s_has_no_leading_whitespace() {
                 .to_str()
                 .unwrap()
                 .starts_with("application/json")
+        );
+        assert!(
+            response.headers().contains_key(header::CONTENT_LENGTH),
+            "a quick answer keeps its Content-Length"
         );
         let body = text(response).await;
         assert!(body.starts_with('{'), "{body:?}");
