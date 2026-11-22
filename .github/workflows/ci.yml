@@ -126,6 +126,38 @@ jobs:
       - run: docker pull alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e
       - run: cargo test -p kestrel-sandbox --features integration
 
+  # Issue #96: the real-Travsr tests, against a pinned Travsr release. With
+  # KESTREL_TRAVSR_VERSION set, a travsr that is missing, does not run, or reports another
+  # version fails the test instead of skipping it. To move the pin, change both values: the
+  # checksum is in the release's SHA256SUMS.
+  integration-travsr:
+    name: travsr integration (pinned release)
+    runs-on: ubuntu-latest
+    env:
+      KESTREL_TRAVSR_VERSION: 1.4.0
+      KESTREL_TRAVSR_SHA256: eb9f8eef339559a7ff2ad3918265222d382b14d6e799c7a6fa880a65441aa843
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the pinned Travsr release
+        run: |
+          name="travsr-v${KESTREL_TRAVSR_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name" \
+            "https://github.com/Travsr-com/travsr/releases/download/v${KESTREL_TRAVSR_VERSION}/$name"
+          echo "${KESTREL_TRAVSR_SHA256}  $RUNNER_TEMP/$name" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/travsr"
+          tar -xzf "$RUNNER_TEMP/$name" -C "$RUNNER_TEMP/travsr"
+          "$RUNNER_TEMP/travsr/travsr" --version
+          echo "TRAVSR_BIN=$RUNNER_TEMP/travsr/travsr" >> "$GITHUB_ENV"
+      # The real-Travsr tests build only with `integration`, so the checks job does not lint them.
+      - name: Clippy with the integration tests
+        run: cargo clippy -p kestrel-cli --features integration --all-targets -- -D warnings
+      - name: Real-Travsr tests
+        run: cargo test -p kestrel-cli --features integration --lib travsr::tests -- --nocapture
+
   e2e:
     name: end-to-end (gVisor, M1)
     runs-on: ubuntu-latest

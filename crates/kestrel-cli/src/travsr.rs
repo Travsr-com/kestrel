@@ -1114,6 +1114,77 @@ mod tests {
         }
     }
 
+    // Issue #96, scenario 2: the real-Travsr test picks its binary with `real_travsr`. With no
+    // pinned version (a developer's machine) a missing or broken travsr skips it; with one (CI)
+    // that is a failure, and so is any other version than the pinned one.
+
+    /// A `--version` that reports `out`.
+    fn reports(out: &'static str) -> impl Fn(&Path) -> io::Result<String> {
+        move |_| Ok(out.to_string())
+    }
+
+    /// A `--version` whose binary cannot be started.
+    fn does_not_run(_: &Path) -> io::Result<String> {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    #[test]
+    fn real_travsr_missing_from_path_skips_unpinned_and_fails_pinned() {
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path()]).unwrap();
+        let picked = real_travsr(None, Some(&path), None, reports("travsr 1.4.0"));
+        assert!(matches!(picked, Ok(RealTravsr::Skip(_))), "{picked:?}");
+        let err = real_travsr(None, Some(&path), Some("1.4.0"), reports("travsr 1.4.0"))
+            .unwrap_err();
+        assert!(err.contains("KESTREL_TRAVSR_VERSION"), "{err}");
+        // No PATH at all is the same as an empty one.
+        let picked = real_travsr(None, None, None, reports("travsr 1.4.0"));
+        assert!(matches!(picked, Ok(RealTravsr::Skip(_))), "{picked:?}");
+    }
+
+    #[test]
+    fn real_travsr_that_does_not_run_skips_unpinned_and_fails_pinned() {
+        let bin = std::env::temp_dir().join("kestrel-no-such-travsr");
+        let picked = real_travsr(Some(bin.clone().into()), None, None, does_not_run);
+        assert!(matches!(picked, Ok(RealTravsr::Skip(_))), "{picked:?}");
+        let err =
+            real_travsr(Some(bin.into()), None, Some("1.4.0"), does_not_run).unwrap_err();
+        assert!(err.contains("does not run"), "{err}");
+    }
+
+    #[test]
+    fn real_travsr_runs_only_the_pinned_version_when_one_is_pinned() {
+        let bin = std::env::temp_dir().join("travsr");
+        let run = |out| real_travsr(Some(bin.clone().into()), None, Some("1.4.0"), reports(out));
+        for ok in ["travsr 1.4.0", "travsr v1.4.0\n", "1.4.0"] {
+            assert!(
+                matches!(run(ok), Ok(RealTravsr::Run(ref b)) if *b == bin),
+                "{ok:?}"
+            );
+        }
+        for other in ["travsr 1.3.0", "travsr 11.4.0", "travsr 1.4.0-rc1", ""] {
+            let err = run(other).unwrap_err();
+            assert!(err.contains("1.4.0"), "{other:?}: {err}");
+        }
+        // Unpinned, any version runs.
+        let picked = real_travsr(Some(bin.clone().into()), None, None, reports("travsr 0.1.0"));
+        assert!(matches!(picked, Ok(RealTravsr::Run(ref b)) if *b == bin), "{picked:?}");
+    }
+
+    #[test]
+    fn real_travsr_refuses_a_relative_travsr_bin_pinned_or_not() {
+        for pinned in [None, Some("1.4.0")] {
+            let err = real_travsr(
+                Some("./travsr".into()),
+                None,
+                pinned,
+                reports("travsr 1.4.0"),
+            )
+            .unwrap_err();
+            assert!(err.contains("TRAVSR_BIN"), "{err}");
+        }
+    }
+
     /// `target` as a path relative to the current directory (`..` up to the deepest common
     /// ancestor, then down), `None` when they share no root (another drive, on Windows).
     fn relative_to_current_dir(target: &Path) -> Option<PathBuf> {
@@ -2302,29 +2373,34 @@ exit 0
         }
 
         /// Scenario 12, reworked: the index answers from the run's private copy, and an edit the
-        /// agent makes in its workspace never reaches the host's index. Against a real Travsr:
-        /// `TRAVSR_BIN` (an absolute path or a bare name), else `travsr`, resolved as `serve`
-        /// resolves `travsr.command`; skipped, saying so, when it is not found or does not run.
-        /// A relative `TRAVSR_BIN` fails the test. `cargo test -p kestrel-cli --features
-        /// integration`.
+        /// agent makes in its workspace never reaches the host's index. Against a real Travsr,
+        /// picked by `real_travsr` from `TRAVSR_BIN` and `KESTREL_TRAVSR_VERSION`: skipped,
+        /// saying so, when none is found or it does not run, unless a version is pinned, as CI
+        /// does. `cargo test -p kestrel-cli --features integration`.
         #[cfg(feature = "integration")]
         #[tokio::test]
         async fn s12_the_index_answers_from_the_private_copy_and_never_sees_the_workspace() {
-            let wanted = std::env::var_os("TRAVSR_BIN")
-                .map_or_else(|| PathBuf::from("travsr"), PathBuf::from);
-            assert!(
-                acceptable_command(&wanted),
-                "TRAVSR_BIN must be an absolute path or a bare command name, not {}",
-                wanted.display()
-            );
-            let Ok(bin) = resolve_command(&wanted, std::env::var_os("PATH").as_deref()) else {
-                eprintln!("SKIPPED: no travsr binary in an absolute PATH entry (set TRAVSR_BIN)");
-                return;
+            let pinned = std::env::var("KESTREL_TRAVSR_VERSION").ok();
+            let version = |bin: &Path| {
+                let out = Std::new(bin).arg("--version").output()?;
+                if !out.status.success() {
+                    return Err(io::Error::other(format!("exit {}", out.status)));
+                }
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
-            if Std::new(&bin).arg("--version").output().is_err() {
-                eprintln!("SKIPPED: {} does not run (set TRAVSR_BIN)", bin.display());
-                return;
-            }
+            let bin = match real_travsr(
+                std::env::var_os("TRAVSR_BIN"),
+                std::env::var_os("PATH").as_deref(),
+                pinned.as_deref(),
+                version,
+            ) {
+                Ok(RealTravsr::Run(bin)) => bin,
+                Ok(RealTravsr::Skip(why)) => {
+                    eprintln!("SKIPPED: {why}");
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            };
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
