@@ -27,7 +27,10 @@ fn the_tool_and_the_limit_are_named_once() {
 fn a_message_is_text_of_1_to_16_kib() {
     assert_eq!(message_problem("also fix the docs"), None);
     // Lines, tabs and any language are text.
-    assert_eq!(message_problem("first\nsecond\r\n\tthird, \u{00e9}t\u{00e9}"), None);
+    assert_eq!(
+        message_problem("first\nsecond\r\n\tthird, \u{00e9}t\u{00e9}"),
+        None
+    );
     assert_eq!(message_problem(&"x".repeat(MAX_MESSAGE_BYTES)), None);
 
     for empty in ["", "   ", "\n\t"] {
