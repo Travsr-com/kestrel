@@ -108,8 +108,7 @@
     if (state === 'reconnecting') {
       down[name] = true;
       dropped = true;
-    }
-    else if (state !== 'connecting') delete down[name];
+    } else if (state !== 'connecting') delete down[name];
     if (state === 'connecting') opening[name] = true;
     else delete opening[name];
     if (state === 'unauthorized') onUnauthorized(getToken());
