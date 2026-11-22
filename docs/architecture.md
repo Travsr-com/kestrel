@@ -190,8 +190,10 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 
 WASM (`wasmtime`) is kept only for small, user-authored policy and watchdog plugins, not for agents.
 
-**Run networks (docker drivers).** Each run gets its own `--internal` network, so a sandbox can reach the gateway and nothing else, not even another sandbox. Kestrel picks the subnet itself: a `/29` block from `gateway.subnet_pool` (default `10.200.0.0/16`, 8192 blocks), skipping blocks that docker networks or host routes already use. Run networks never use docker's default address pools, so a large fan-out does not run out of them. The one shared `kestrel-gw` network (the bridge's own) still comes from those pools, so serve needs one default-pool network free.
+**Run networks (docker drivers).** Each run gets its own `--internal` network, so a sandbox can reach the gateway and nothing else, not even another sandbox. Kestrel picks the subnet itself: a `/29` block from `gateway.subnet_pool` (default `10.200.0.0/16`, 8192 blocks), skipping blocks that docker networks or host routes already use. Run networks never use docker's default address pools, so a large fan-out does not run out of them. The bridge's own shared `kestrel-gw` network gets a block from the same plan, so serve starts even when the default pools are used up.
 
+* `kestrel-gw` is created with `--subnet` and `--gateway` on the lowest free block of the plan, and that block never goes to a run network. A `/29` holds 5 bridges, one per `kestrel serve` sharing the docker daemon. An existing `kestrel-gw` is reused as it is, whatever its subnet, and takes no block.
+* The pool must hold the `kestrel-gw` block plus at least one run block when `kestrel-gw` does not exist yet. A smaller pool stops serve with an error naming `gateway.subnet_pool`.
 * One gateway bridge container serves every run. It joins each run network with `docker network connect`. One bridge per run would double the containers and slow every start.
 * The network's host side gets no address, so the bridge is the only way out of it.
 * When every block is in use, new runs wait `Queued` (one event says why) and start when a run ends. When no block can come back (all are taken by networks outside Kestrel, or held by networks that could not be removed), a queued run fails at once and says to change `gateway.subnet_pool` or restart.

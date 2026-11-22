@@ -16,8 +16,8 @@ use kestrel_gateway::{
     ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
-    BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
-    MAX_BRIDGE_CONNECTIONS, ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots,
+    BridgeNetwork, BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo,
+    Ipv4Cidr, MAX_BRIDGE_CONNECTIONS, ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots,
     docker_subnets_except_instance, host_routes,
 };
 use kestrel_store::Store;
@@ -454,16 +454,18 @@ fn subnet_pool(value: Option<toml::Value>) -> Result<Ipv4Cidr, Failure> {
 /// The subnet plan for run networks: every `/29` block of `pool` that no docker network uses
 /// and, when docker runs on this host, no host route covers (a VM's routes are not this host's,
 /// so they are not read). The leftover run networks of `instance` do not count: `recover` removes
-/// them before any block is reserved. Writes one line naming the pool and the free block count
-/// to `err`. No free block is a runtime error that says to set `gateway.subnet_pool` to a free
-/// range.
+/// them before any block is reserved. Also decides where the bridge's `kestrel-gw` network comes
+/// from: an existing one is reused, a missing one takes the lowest free block for good (issue
+/// #99). Writes one line naming the pool and the free block count to `err`. No free block, or
+/// no block left for runs after `kestrel-gw` took its own, is a runtime error that names
+/// `gateway.subnet_pool`.
 async fn subnet_plan(
     pool: Ipv4Cidr,
     runner: &dyn CommandRunner,
     host: DockerHost,
     instance: Option<&str>,
     err: &mut dyn std::io::Write,
-) -> Result<Arc<SubnetPool>, Failure> {
+) -> Result<(Arc<SubnetPool>, BridgeNetwork), Failure> {
     let plan =
         SubnetPool::new(pool).map_err(|e| Failure::usage(format!("gateway.subnet_pool: {e}")))?;
     let networks = docker_subnets_except_instance(runner, instance)
@@ -481,12 +483,20 @@ async fn subnet_plan(
             "subnet pool {pool} has no free /29 block: docker networks or host routes use all of it. Set gateway.subnet_pool to a free range"
         )));
     }
+    let network = GatewayBridge::plan_network(runner, &plan)
+        .await
+        .map_err(|e| Failure::runtime(e.to_string()))?;
+    let free = plan.available();
+    let bridge = match &network {
+        BridgeNetwork::Subnet(block) => format!("; kestrel-gw takes {}", block.cidr()),
+        _ => String::new(),
+    };
     // A closed stderr must not stop serve.
     let _ = writeln!(
         err,
-        "networks: one per run, from subnet pool {pool} ({free} free /29 blocks)"
+        "networks: one per run, from subnet pool {pool} ({free} free /29 blocks{bridge})"
     );
-    Ok(Arc::new(plan))
+    Ok((Arc::new(plan), network))
 }
 
 /// The warning for sandboxes on the one shared network, which is what they get with docker
@@ -887,24 +897,28 @@ fn acquire_serve_lock(db: &Path) -> Result<ServeLock, Failure> {
     Ok(ServeLock { _file: file })
 }
 
+/// The bridge for docker on `host`, holding `connections` at once, on `network`.
+fn bridge_spec(host: DockerHost, connections: u32, network: BridgeNetwork) -> BridgeSpec {
+    BridgeSpec {
+        add_host_gateway: host == DockerHost::Native,
+        connections,
+        network,
+        ..BridgeSpec::default()
+    }
+}
+
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
 async fn start_bridge(
     runner: Arc<dyn CommandRunner>,
-    host: DockerHost,
+    spec: BridgeSpec,
     docker: bool,
     advertise: Option<&Url>,
     port: u16,
-    connections: u32,
     db: &Path,
 ) -> Result<Option<GatewayBridge>, Failure> {
     if !docker || advertise.is_some() {
         return Ok(None);
     }
-    let spec = BridgeSpec {
-        add_host_gateway: host == DockerHost::Native,
-        connections,
-        ..BridgeSpec::default()
-    };
     GatewayBridge::start(runner, port, spec, db)
         .await
         .map(Some)
@@ -1176,8 +1190,9 @@ async fn run(
             "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
         );
     }
-    // Before the bridge: a pool with no free block stops serve with nothing to clean up.
-    let subnets = if needs_bridge {
+    // Before the bridge: a pool with no free block stops serve with nothing to clean up. The plan
+    // also decides where the bridge's `kestrel-gw` network comes from.
+    let (subnets, network) = if needs_bridge {
         let mut err = std::io::stderr();
         // This instance's leftover run networks do not count: `recover` removes them before
         // any block is reserved.
@@ -1189,17 +1204,17 @@ async fn run(
             Some(&instance),
             &mut err,
         );
-        Some(plan.await?)
+        let (plan, network) = plan.await?;
+        (Some(plan), network)
     } else {
-        None
+        (None, BridgeNetwork::DockerPools)
     };
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
-        host,
+        bridge_spec(host, config.bridge_connections, network),
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
-        config.bridge_connections,
         &db,
     )
     .await?;

@@ -39,6 +39,9 @@ Kestrel warns you if other users can read it.
 # Long tool calls (a waiting `kestrel.join`, a question) held open at once across all runs,
 # from 1 to 4096. Default 256. Past the limit a call is refused with a clear error.
 # max_waiting_calls = 256
+# Where the run networks and the bridge's `kestrel-gw` network get their /29 blocks. Default
+# 10.200.0.0/16. Change it if that range is already used on your network.
+# subnet_pool = "10.200.0.0/16"
 
 [engine]
 max_concurrent_runs = 4
@@ -201,7 +204,8 @@ A resumed run starts the agent command again in the same workspace.
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
 * With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
-  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`).
+  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`), and so does the
+  bridge's `kestrel-gw` network the first time serve creates it.
 
 ## If something goes wrong
 
@@ -216,3 +220,5 @@ A resumed run starts the agent command again in the same workspace.
   `gateway.subnet_pool` to a free range, or restart `kestrel serve`.
 * `subnet pool ... has no free /29 block`: docker networks or host routes already cover the pool. Set
   `gateway.subnet_pool` to a free range, for example `subnet_pool = "10.201.0.0/16"`.
+* `... the kestrel-gw network needs one and runs need at least one more`: the pool has only one free block.
+  Set `gateway.subnet_pool` to a larger or free range.
