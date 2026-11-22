@@ -576,6 +576,7 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
             "protocol.ext.allow=never",
             "fetch",
             "--no-tags",
+            "--no-write-fetch-head",
             "--",
             path.to_str().unwrap(),
             "kestrel/run-123456789abc:kestrel/run-123456789abc",
