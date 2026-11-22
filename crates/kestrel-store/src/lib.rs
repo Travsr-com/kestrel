@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -268,7 +268,8 @@ CREATE TABLE run_tokens (
 /// The `runs_default_root` trigger gives every row one anyway: an older binary still writing to a
 /// migrated file inserts only the v3 columns, and its run must read back as a root.
 /// `run_caps` holds one capability token per run; nothing writes it yet. `events_run` is keyed
-/// `(run_id, rowid)`, so reading a tree's events after a cursor seeks instead of scanning.
+/// `(run_id, rowid)` (`(run_id, cursor)` from v5 on), so reading a tree's events after a cursor
+/// seeks instead of scanning.
 const SCHEMA_V4: &str = "
 ALTER TABLE runs ADD COLUMN parent_run_id TEXT;
 ALTER TABLE runs ADD COLUMN root_run_id TEXT;
@@ -284,6 +285,28 @@ CREATE TABLE run_caps (
 );
 CREATE INDEX runs_parent ON runs (parent_run_id);
 CREATE INDEX runs_root ON runs (root_run_id);
+CREATE INDEX events_run ON events (run_id);
+";
+
+/// v5: the global event cursor becomes an explicit column. Up to v4 it was the implicit `rowid` of
+/// `events`, which `VACUUM` may renumber; an `INTEGER PRIMARY KEY` is kept as is, and
+/// `AUTOINCREMENT` never hands out a value again, even if its row is gone. SQLite cannot add a
+/// primary key to a table, so the table is rebuilt: every row is copied with its rowid as its
+/// cursor (which also starts the `AUTOINCREMENT` counter at the newest one). The old table is
+/// renamed first so the new one, its unique index and `events_run` keep their names.
+const SCHEMA_V5: &str = "
+ALTER TABLE events RENAME TO events_v4;
+DROP INDEX events_run;
+CREATE TABLE events (
+    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    seq    INTEGER NOT NULL,
+    body   TEXT NOT NULL,
+    UNIQUE (run_id, seq)
+);
+INSERT INTO events (cursor, run_id, seq, body)
+    SELECT rowid, run_id, seq, body FROM events_v4 ORDER BY rowid;
+DROP TABLE events_v4;
 CREATE INDEX events_run ON events (run_id);
 ";
 
@@ -812,9 +835,10 @@ impl Store {
     }
 
     /// Events of every run whose root is `root` (the root's own included) with a cursor greater
-    /// than `after_cursor`, in commit order. The cursor is the `events` rowid; 0 reads from the
-    /// start. It relies on `events` being append-only: rows are never deleted, so the implicit
-    /// rowid only grows. `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
+    /// than `after_cursor`, in commit order. The cursor is the `events.cursor` column; 0 reads from
+    /// the start. It is an `AUTOINCREMENT` primary key, so it only grows, is never handed out
+    /// twice and survives `VACUUM`: a cursor a client holds keeps pointing at the same event.
+    /// `root` must be a root run (see [`RunRow::root`]): an unknown id, or the
     /// id of a run that is not a root, reads nothing.
     pub fn events_since_global(&self, root: RunId, after_cursor: u64) -> Result<Vec<(u64, Event)>> {
         self.events_since_global_page(root, after_cursor, usize::MAX)
@@ -831,9 +855,9 @@ impl Store {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT rowid, body FROM events
-             WHERE rowid > ?2 AND run_id IN (SELECT id FROM runs WHERE root_run_id = ?1)
-             ORDER BY rowid LIMIT ?3",
+            "SELECT cursor, body FROM events
+             WHERE cursor > ?2 AND run_id IN (SELECT id FROM runs WHERE root_run_id = ?1)
+             ORDER BY cursor LIMIT ?3",
         )?;
         let rows = stmt
             .query_map(params![root.to_string(), after, limit], |r| {
@@ -841,8 +865,8 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.iter()
-            // Rowids start at 1, so the u64 view is exact.
-            .map(|(rowid, body)| Ok((rowid.unsigned_abs(), serde_json::from_str(body)?)))
+            // Cursors start at 1, so the u64 view is exact.
+            .map(|(cursor, body)| Ok((cursor.unsigned_abs(), serde_json::from_str(body)?)))
             .collect()
     }
 
@@ -864,17 +888,17 @@ impl Store {
         // The kinds go in as a JSON array bound like any other value, never into the SQL text.
         let wanted = serde_json::to_string(kinds)?;
         let conn = self.conn();
-        // Read under one lock: the newest event first, then the page up to it. Rowids are given
+        // Read under one lock: the newest event first, then the page up to it. Cursors are given
         // out in commit order under the write lock, so nothing below `top` can appear later.
-        let top: i64 = conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+        let top: i64 = conn.query_row("SELECT COALESCE(MAX(cursor), 0) FROM events", [], |r| {
             r.get(0)
         })?;
         let mut stmt = conn.prepare(
-            "SELECT rowid, body FROM events
-             WHERE rowid > ?1 AND rowid <= ?4
+            "SELECT cursor, body FROM events
+             WHERE cursor > ?1 AND cursor <= ?4
                AND (json_array_length(?2) = 0
                     OR json_extract(body, '$.kind.kind') IN (SELECT value FROM json_each(?2)))
-             ORDER BY rowid LIMIT ?3",
+             ORDER BY cursor LIMIT ?3",
         )?;
         let rows = stmt
             .query_map(params![after, wanted, wanted_limit, top], |r| {
@@ -883,8 +907,8 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let events = rows
             .iter()
-            // Rowids start at 1, so the u64 view is exact.
-            .map(|(rowid, body)| Ok((rowid.unsigned_abs(), serde_json::from_str(body)?)))
+            // Cursors start at 1, so the u64 view is exact.
+            .map(|(cursor, body)| Ok((cursor.unsigned_abs(), serde_json::from_str(body)?)))
             .collect::<Result<Vec<_>>>()?;
         let last = events.last().map_or(after_cursor, |(cursor, _)| *cursor);
         let next = if events.len() == limit {
@@ -899,7 +923,7 @@ impl Store {
     /// committed from now on.
     pub fn latest_cursor(&self) -> Result<u64> {
         let conn = self.conn();
-        let max: i64 = conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+        let max: i64 = conn.query_row("SELECT COALESCE(MAX(cursor), 0) FROM events", [], |r| {
             r.get(0)
         })?;
         Ok(max.unsigned_abs())
@@ -914,7 +938,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT body FROM events
              WHERE json_extract(body, '$.kind.kind') IN ('approval_requested', 'approval_resolved')
-             ORDER BY rowid",
+             ORDER BY cursor",
         )?;
         let bodies = stmt
             .query_map([], |r| r.get::<_, String>(0))?
@@ -1200,6 +1224,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if found < 4 {
         tx.execute_batch(SCHEMA_V4)?;
+    }
+    if found < 5 {
+        tx.execute_batch(SCHEMA_V5)?;
     }
     if found < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;

@@ -430,8 +430,9 @@ CREATE TABLE runs        (id TEXT PRIMARY KEY, agent TEXT, agent_version INTEGER
                           status TEXT NOT NULL, budget_usd REAL, spent_usd REAL DEFAULT 0,
                           sandbox_driver TEXT, created_at TEXT, finished_at TEXT);
 CREATE TABLE run_caps    (run_id TEXT PRIMARY KEY, token BLOB NOT NULL);
-CREATE TABLE events      (run_id TEXT, seq INTEGER, kind TEXT NOT NULL, payload_json TEXT,
-                          ts TEXT NOT NULL, PRIMARY KEY (run_id, seq));
+CREATE TABLE events      (cursor INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+                          seq INTEGER NOT NULL, kind TEXT NOT NULL, payload_json TEXT,
+                          ts TEXT NOT NULL, UNIQUE (run_id, seq));
 CREATE TABLE model_calls (id TEXT PRIMARY KEY, run_id TEXT, provider TEXT, model TEXT, tier TEXT,
                           model_profile TEXT, route_reason TEXT, cache_profile TEXT,
                           context_bundle_hash TEXT, cache_miss_reason TEXT,
@@ -447,6 +448,11 @@ CREATE INDEX runs_root ON runs(root_run_id);
 CREATE INDEX events_run ON events(run_id);
 CREATE INDEX runs_status ON runs(status);
 ```
+
+`events.cursor` is the global event cursor that `/ws/tree/{id}?after=` and `/ws/events?after=` hand to
+clients. It is an explicit `AUTOINCREMENT` primary key, not SQLite's implicit rowid, so `VACUUM`
+cannot renumber it and a value is never handed out twice. Schema v5 added it; the migration copies
+every existing event with its old rowid as its cursor.
 
 Traces for future training are a view over `events` + `model_calls` + `approvals`, not a separate pipeline.
 
