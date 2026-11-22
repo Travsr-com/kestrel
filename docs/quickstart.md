@@ -161,7 +161,9 @@ When serve starts again, the runs it cut off carry on by themselves: each starts
 from its input in a fresh sandbox. A parent that spawns the same children again gets the ones it
 already had. Paused runs, runs over budget and runs waiting for an approval stay as they were.
 `engine.resume_after_restart = false` leaves the cut-off runs suspended until you `kestrel resume`
-them.
+them. A run that three restarts already stopped is left suspended the fourth time, in case it is
+what brings serve down; its log says so. Runs suspended by a restart before you upgraded also stay
+suspended.
 
 For the web UI, start `kestrel up` instead. It runs the same, plus the API server on
 `127.0.0.1:7171`, and opens the UI in your browser (`--no-open` only prints the address). The UI
