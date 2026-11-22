@@ -150,7 +150,10 @@ fn a_key_is_its_agent_its_input_and_its_parent() {
     let child = new_child(once(&store, parent, &worker, "help", 0));
     assert_ne!(new_child(once(&store, parent, &worker, "other", 0)), child);
     assert_ne!(new_child(once(&store, parent, &helper, "help", 0)), child);
-    assert_ne!(new_child(once(&store, other_parent, &worker, "help", 0)), child);
+    assert_ne!(
+        new_child(once(&store, other_parent, &worker, "help", 0)),
+        child
+    );
     assert_eq!(existing(once(&store, parent, &worker, "help", 0)), child);
 }
 

@@ -69,6 +69,8 @@ toml         = "0.8"
 # crypto-bigint 0.5.5), and 7.0.0 is still a pre-release, so no other version may slip in.
 # No default features: Kestrel uses no Datalog macros, PEM keys or Unicode regex classes.
 biscuit-auth = { version = "=7.0.0-alpha.4", default-features = false }
+# Spawn keys (#92): a digest of a spawn's agent and input. Already in the tree.
+sha2         = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
