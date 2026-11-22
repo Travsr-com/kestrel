@@ -76,9 +76,10 @@ test('the spawn tree grows and completes live', async ({ page, request }) => {
         const run = await api<RunSummary>(request, `/api/runs/${root}`);
         const runs = await api<RunSummary[]>(request, `/api/runs?root=${root}`);
         const carved = runs.filter((r) => r.parent === root).reduce((sum, r) => sum + (r.limit ?? 0), 0);
+        // Each amount up to the next label, so $0.01 does not also match $0.015.
         const want = [
           `${formatUsd(run.spent)} of ${formatUsd(run.limit)} limit`,
-          `Carved to children ${formatUsd(carved)}`,
+          `Carved to children ${formatUsd(carved)} Left to spend`,
         ];
         const shown = (await page.locator('.budget').innerText()).replace(/\s+/g, ' ');
         return want.every((w) => shown.includes(w)) ? 'matches' : `shown "${shown}", the API says "${want.join('; ')}"`;
