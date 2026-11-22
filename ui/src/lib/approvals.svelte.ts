@@ -45,7 +45,8 @@ export class ApprovalsState {
   decidedChanges = $state(0);
   /**
    * When each approval was seen resolved: the time of its `approval_resolved` event, or of a
-   * decision accepted here until that event comes. The API has no decision time.
+   * decision accepted here until that event comes. One that ended with its run: the time of the
+   * run's end, or when a decision found the run no longer waiting. The API has no decision time.
    */
   decidedAt: Record<ApprovalId, string> = $state({});
   private gen = 0;
@@ -119,6 +120,7 @@ export class ApprovalsState {
           if (row.approval.run_id !== event.run_id) continue;
           if (row.ended === null) changed = true;
           row.ended = ended;
+          this.decidedAt[row.approval.id] ??= event.ts;
         }
         if (changed) this.decidedChanges += 1;
         return;
@@ -148,6 +150,8 @@ export class ApprovalsState {
     const row = this.rows[id];
     if (!row || row.ended !== null) return;
     row.ended = 'ended';
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    this.decidedAt[id] ??= new Date().toISOString();
     this.decidedChanges += 1;
   }
 
