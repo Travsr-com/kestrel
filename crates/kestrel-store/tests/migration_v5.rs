@@ -369,6 +369,25 @@ fn s1_a_cursor_is_never_handed_out_twice() {
     );
 }
 
+// 1. ... and the same holds for the cursors a v4 database handed out before it was migrated: the
+//    migration starts the counter at the newest existing cursor, not at zero.
+#[test]
+fn s1_a_migrated_cursor_is_never_handed_out_twice() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = migrated_v4(&dir);
+    exec(&path, "DELETE FROM events WHERE rowid = 11");
+
+    let store = Store::open(&path).expect("reopen");
+    let event = store.append(id(BETA), msg("after delete")).expect("append");
+    assert_eq!(
+        store
+            .events_since_global(id(BETA), 9)
+            .expect("events_since_global"),
+        vec![(12, event)],
+        "cursor 11 was handed out by v4 and must not be reused"
+    );
+}
+
 // 2. Given `VACUUM` on a database with gaps in the cursor, then the cursors are unchanged.
 #[test]
 fn s2_vacuum_keeps_every_cursor() {
