@@ -2,8 +2,8 @@
 //!
 //! M1 has no HTTP API. Every command except `serve` talks to the engine only through the SQLite
 //! store (`--db`): `run` writes a `Queued` run, the steering commands push control commands,
-//! `message` stores a message for the agent to take, and `watch` and `ps` read runs and events. `kestrel serve` runs the engine and the LLM gateway in one
-//! process on the same database.
+//! `message` stores a message for the agent to take, and `watch` and `ps` read runs and events.
+//! `kestrel serve` runs the engine and the LLM gateway in one process on the same database.
 //!
 //! Exit codes: [`EXIT_OK`], [`EXIT_RUNTIME`], [`EXIT_USAGE`].
 

@@ -208,11 +208,14 @@ impl ToolHost for EngineTools {
             .map_err(|e| e.to_string())
     }
 
-    async fn messages(&self, run: RunId) -> Result<Value, String> {
-        let taken = self.engine.take_messages(run).map_err(|e| e.to_string())?;
+    async fn messages(&self, run: RunId, after: Option<u64>) -> Result<Value, String> {
+        let taken = self
+            .engine
+            .take_messages(run, after)
+            .map_err(|e| e.to_string())?;
         let messages: Vec<Value> = taken
             .into_iter()
-            .map(|m| json!({ "text": m.text }))
+            .map(|m| json!({ "seq": m.seq, "text": m.text }))
             .collect();
         Ok(json!({ "messages": messages }))
     }
