@@ -9,9 +9,9 @@
 //!   finished run), waits at most `grace` in total, and reports what it did not finish. When it
 //!   returns, `run_forever` has returned. Calling it again, or with nothing running, is fine.
 //! * It does not change any run's status. A `Running` run stays `Running` and a `Provisioning`
-//!   run stays `Provisioning` in the store, so `recover` (unchanged) turns them into
-//!   `Suspended(Error("engine restarted"))` and `Failed("engine restarted while provisioning")`
-//!   on the next start. `Queued` runs stay queued and are never started by a shutdown.
+//!   run stays `Provisioning` in the store, so `recover` turns both into
+//!   `Suspended(Error("engine restarted"))` on the next start (#92: a provisioning run used to
+//!   fail). `Queued` runs stay queued and are never started by a shutdown.
 //! * `recover` also asks every driver for `leftovers` and destroys what it lists, so a container
 //!   a crash left behind (no `SandboxProvisioned` event) is removed too.
 //!
@@ -195,11 +195,13 @@ async fn s1_a_create_still_in_flight_is_destroyed_once_it_returns() {
         "the agent is not started during shutdown"
     );
     assert_run_forever_returned(&mut h).await;
-    // The run is still `Provisioning`; the next start fails it.
+    // The run is still `Provisioning`; the next start suspends it for the restart (#92).
     assert!(h.is(id, &Provisioning));
     h.engine.recover().await.expect("recover");
-    let msg = h.is_failed(id).unwrap_or_default();
-    assert!(msg.contains("engine restarted"), "{msg}");
+    assert!(h.is(
+        id,
+        &Suspended(SuspendReason::Error("engine restarted".into()))
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -593,9 +595,12 @@ async fn s1_recover_destroys_a_container_a_crash_left_behind_without_an_event() 
     let mut swept = p.destroyed();
     swept.sort();
     assert_eq!(swept, vec!["lost-1".to_string(), "lost-2".to_string()]);
-    assert!(report.interrupted.is_empty() && report.suspended.is_empty());
-    let msg = h.is_failed(id).unwrap_or_default();
-    assert!(msg.contains("engine restarted"), "{msg}");
+    assert_eq!(report.interrupted, vec![id]);
+    assert!(report.suspended.is_empty());
+    assert!(h.is(
+        id,
+        &Suspended(SuspendReason::Error("engine restarted".into()))
+    ));
 }
 
 #[tokio::test(start_paused = true)]

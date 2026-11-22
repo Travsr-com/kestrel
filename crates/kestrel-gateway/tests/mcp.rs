@@ -262,6 +262,21 @@ async fn tools_list_shows_only_what_the_run_may_call() {
         assert_eq!(tool["inputSchema"]["type"], json!("object"));
         assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
     }
+    // Issue #92: an agent started again learns that a repeated spawn returns the child it had,
+    // which may have ended, and how to get a new one.
+    let spawn = tools[0]["description"].as_str().unwrap();
+    for needed in [
+        "starts again",
+        "paused",
+        "budget",
+        "approval",
+        "existing",
+        "may already have ended",
+        "kestrel.join",
+        "new child",
+    ] {
+        assert!(spawn.contains(needed), "{needed}: {spawn}");
+    }
 }
 
 // 3, 14

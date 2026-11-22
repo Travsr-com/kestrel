@@ -1414,13 +1414,12 @@ fn m2_s11_travsr_answers_from_the_run_s_own_copy() {
     });
 }
 
-/// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart every run
-/// is suspended (as in M1). The parent is resumed alone and waits in its join again while its
-/// children stay suspended; then the children are resumed, they finish, the join counts each once,
-/// and every model call is counted once.
-///
-/// That the parent spawns no child again is the echo agent's doing (it keeps its children in
-/// `kids.out`), not a Kestrel guarantee: spawn de-dup by JSON-RPC id is in memory only.
+/// Scenario 14: `kill -9` of serve while the parent waits in its join. After the restart, serve
+/// resumes every run the restart stopped by itself (#92); the suite resumes nothing. The parent's
+/// agent starts again from its input and spawns its six children again, and each spawn answers
+/// with the child it already has (`existing`), so no child is spawned twice and none counts
+/// against `max_children` again. The children finish, the join counts each once, and every model
+/// call is counted once. The echo agent keeps no record of its children.
 #[test]
 fn m2_s14_restart_mid_join_resumes_and_counts_once() {
     let env = Env::with_max(8);
@@ -1453,65 +1452,49 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
     );
     std::thread::sleep(Duration::from_secs(2));
     up.kill();
+    let before = env.read_out(&root, "fanout.out");
+    assert!(
+        !before.contains(r#""existing":true"#),
+        "first spawns are new children: {before}"
+    );
 
+    // No `kestrel resume`: the tree carries on by itself.
     let _up = env.up();
     let mut tree = vec![root.clone()];
     tree.extend(kids.iter().cloned());
     for id in &tree {
-        assert_eq!(
-            status_name(&env.row(id)["status"]),
-            "Suspended(Error(engine restarted))",
-            "run {id} after the restart"
-        );
-        assert_eq!(env.spent(id), ONE_CALL_MICRO_USD, "spend of {id} survives");
-    }
-    // The parent alone first. A resumed child would finish at once (its nap is done), so the
-    // children stay suspended until the parent is back in its join: a join that took a suspended
-    // child for an ended one would answer now.
-    std::fs::remove_file(&joining).expect("remove joining.out");
-    env.ok(&["resume", root.as_str()]);
-    wait_until(RUN_DEADLINE, "the resumed parent joins again", || {
-        joining.exists()
-    });
-    std::thread::sleep(Duration::from_secs(5));
-    assert_eq!(
-        status_name(&env.row(&root)["status"]),
-        "Running",
-        "the parent waits in its join"
-    );
-    for kid in &kids {
-        assert_eq!(
-            status_name(&env.row(kid)["status"]),
-            "Suspended(Error(engine restarted))",
-            "child {kid} while only its parent was resumed"
-        );
-    }
-    let waiting = env.read_out(&root, "join.out");
-    assert!(
-        !waiting.contains("outcome"),
-        "the join answered while every child was suspended: {waiting}"
-    );
-
-    for kid in &kids {
-        env.ok(&["resume", kid.as_str()]);
-    }
-    for id in &tree {
         env.wait_status(id, "Completed");
     }
+    for id in &tree {
+        let events = env.events(id);
+        let stopped = "Suspended(Error(engine restarted))";
+        assert!(
+            status_event(&events, stopped).is_some(),
+            "run {id} was suspended by the restart: {events:?}"
+        );
+        let resumed = events.iter().any(|e| {
+            e["kind"]["kind"] == "status_changed"
+                && status_name(&e["kind"]["from"]) == stopped
+                && status_name(&e["kind"]["to"]) == "Running"
+        });
+        assert!(resumed, "run {id} was resumed by serve: {events:?}");
+    }
 
-    // The echo agent remembers the children it spawned (kids.out in its workspace) and spawns
-    // only the rest when it starts again. Kestrel does not guarantee this: its spawn de-dup by
-    // JSON-RPC id is kept in memory and does not survive a restart.
+    // The parent spawned all six again; each spawn answered with the child it had.
+    assert_eq!(env.children(&root).len(), 6, "no child was spawned twice");
+    let fanout = env.read_out(&root, "fanout.out");
+    let again = fanout.get(before.len()..).unwrap_or_default();
     assert_eq!(
-        env.read_out(&root, "kids.out").lines().count(),
+        again.matches(r#""existing":true"#).count(),
         6,
-        "the echo agent's own list of its children"
+        "the spawns after the restart: {again}"
     );
-    assert_eq!(
-        env.children(&root).len(),
-        6,
-        "the echo agent read its kids.out after the restart and spawned no child again"
-    );
+    for kid in &kids {
+        assert!(
+            again.contains(kid.as_str()),
+            "{kid} answered again: {again}"
+        );
+    }
     let joined = env.read_out(&root, "join.out");
     for kid in &kids {
         assert!(
@@ -1522,7 +1505,7 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
     assert_eq!(
         joined.matches(r#""outcome":"completed""#).count(),
         6,
-        "the join answer: {joined}"
+        "the join answer counts each child once: {joined}"
     );
 
     let mut calls = 0;

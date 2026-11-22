@@ -19,6 +19,7 @@ use rusqlite::{
     Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 mod messages;
@@ -26,7 +27,18 @@ pub use messages::InboxMessage;
 
 /// Schema version this binary knows. Stored in `PRAGMA user_version`. A database with a higher
 /// value is refused with [`StoreError::SchemaTooNew`] instead of being migrated down.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// What a spawn is known by across restarts (#92): a SHA-256, in hex, of the child's agent name
+/// and its input. The name's length goes first, so a name cannot run into the input. Long inputs
+/// are not stored twice.
+pub fn spawn_key(agent: &str, input: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(u64::try_from(agent.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hash.update(agent.as_bytes());
+    hash.update(input.as_bytes());
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -117,6 +129,15 @@ pub struct Spawned {
     pub id: RunId,
     /// The budget carved out of the parent for it.
     pub budget: MicroUsd,
+}
+
+/// What [`Store::spawn_child_once`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnOnce {
+    /// A new child, made as [`Store::spawn_child`] makes one.
+    New(Spawned),
+    /// A child the parent spawned before with the same key, returned again. Nothing was written.
+    Existing(RunId),
 }
 
 /// One row of the `runs` table.
@@ -385,6 +406,20 @@ ALTER TABLE events_new RENAME TO events;
 CREATE INDEX events_run ON events (run_id);
 ";
 
+/// v6: every spawn of a parent with its key ([`spawn_key`]), oldest first by `id`, so a parent
+/// started again (after a restart) that spawns the same thing gets the child it spawned before
+/// (#92). The migration keys the children a v5 database already has, in the order they were made
+/// (see [`key_existing_children`]).
+const SCHEMA_V6: &str = "
+CREATE TABLE spawn_keys (
+    id            INTEGER PRIMARY KEY,
+    parent_run_id TEXT NOT NULL,
+    spawn_key     TEXT NOT NULL,
+    child_run_id  TEXT NOT NULL UNIQUE
+);
+CREATE INDEX spawn_keys_parent ON spawn_keys (parent_run_id, spawn_key, id);
+";
+
 /// RFC 3339 timestamp, stored as JSON text like the rest of the typed columns.
 #[derive(Serialize, Deserialize)]
 struct Ts(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
@@ -563,103 +598,61 @@ impl Store {
     ///
     /// `cap` gets the child's id and carve and returns its capability token, stored in
     /// `run_caps` (`None` stores none). Events: the child's `RunCreated` naming the parent, then
-    /// `plan.child_events`, then `ChildSpawned` on the parent. On any error nothing is written.
+    /// `plan.child_events`, then `ChildSpawned` on the parent. The spawn's key ([`spawn_key`]) is
+    /// kept with the child (see [`Store::spawn_child_once`]). On any error nothing is written.
     pub fn spawn_child<F>(&self, parent: RunId, plan: ChildPlan<'_>, cap: F) -> Result<Spawned>
     where
         F: FnOnce(RunId, MicroUsd) -> Result<Option<Vec<u8>>>,
     {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found = tx
+        let above = running_parent(&tx, parent)?;
+        let spawned = spawn_in(&tx, above, plan, cap)?;
+        tx.commit()?;
+        Ok(spawned)
+    }
+
+    /// [`Store::spawn_child`], once per spawn (#92): when `parent` already has more than `nth`
+    /// children spawned with this plan's key ([`spawn_key`] of its agent and input), returns the
+    /// `nth` of them (from 0, oldest first), live or finished, and writes nothing. That child is
+    /// not spawned again: no carve, no event, and it does not count against `max_children` or
+    /// the tree limit. Otherwise spawns a new child, as [`Store::spawn_child`] does.
+    ///
+    /// The caller counts the spawns with each key since the parent's agent last started, so a
+    /// parent that spawns the same thing twice gets two children, and the same two again after a
+    /// restart. Only a `Running` parent gets a child back, as only a running one may spawn.
+    pub fn spawn_child_once<F>(
+        &self,
+        parent: RunId,
+        plan: ChildPlan<'_>,
+        nth: usize,
+        cap: F,
+    ) -> Result<SpawnOnce>
+    where
+        F: FnOnce(RunId, MicroUsd) -> Result<Option<Vec<u8>>>,
+    {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let above = running_parent(&tx, parent)?;
+        let key = spawn_key(&plan.spec.name, plan.input);
+        let existing = tx
             .query_row(
-                "SELECT status, root_run_id, depth FROM runs WHERE id = ?1",
-                [parent.to_string()],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        run_id_col(r, 1)?,
-                        r.get::<_, u32>(2)?,
-                    ))
-                },
+                "SELECT child_run_id FROM spawn_keys WHERE parent_run_id = ?1 AND spawn_key = ?2
+                 ORDER BY id LIMIT 1 OFFSET ?3",
+                params![
+                    parent.to_string(),
+                    key,
+                    i64::try_from(nth).unwrap_or(i64::MAX)
+                ],
+                |r| run_id_col(r, 0),
             )
             .optional()?;
-        let Some((status, root, depth)) = found else {
-            return Err(StoreError::NotFound(parent));
-        };
-        let status: RunStatus = serde_json::from_str(&status)?;
-        if status != RunStatus::Running {
-            return Err(StoreError::Spawn(SpawnRefusal::ParentNotRunning(
-                parent, status,
-            )));
+        if let Some(child) = existing {
+            return Ok(SpawnOnce::Existing(child));
         }
-        let children = count(
-            &tx,
-            "SELECT COUNT(*) FROM runs WHERE parent_run_id = ?1",
-            parent,
-        )?;
-        if children >= u64::from(plan.max_children) {
-            return Err(StoreError::Spawn(SpawnRefusal::TooManyChildren(
-                plan.max_children,
-            )));
-        }
-        let tree = count(
-            &tx,
-            "SELECT COUNT(*) FROM runs WHERE root_run_id = ?1",
-            root,
-        )?;
-        if tree >= u64::from(plan.max_tree_runs) {
-            return Err(StoreError::Spawn(SpawnRefusal::TooManyRuns(
-                plan.max_tree_runs,
-            )));
-        }
-        let limit = read_limit(&tx, parent)?;
-        let remaining = left(limit, spent_in(&tx, parent)?);
-        let carve = plan
-            .budget
-            .unwrap_or_else(|| plan.spec.budget.limit.min(MicroUsd(remaining.0 / 2)));
-        if carve.0 <= 0 || carve > remaining {
-            return Err(StoreError::Spawn(SpawnRefusal::Budget {
-                asked: carve,
-                remaining,
-            }));
-        }
-        let mut spec = plan.spec.clone();
-        spec.budget.limit = carve;
-        let above = Parent {
-            id: parent,
-            root,
-            depth,
-        };
-        let id = insert_run(&tx, &spec, plan.input, Some(above))?;
-        write_limit(&tx, parent, MicroUsd(limit.0 - carve.0))?;
-        if let Some(token) = cap(id, carve)? {
-            tx.execute(
-                "INSERT INTO run_caps (run_id, token) VALUES (?1, ?2)",
-                params![id.to_string(), token],
-            )?;
-        }
-        insert_event(
-            &tx,
-            id,
-            EventKind::RunCreated {
-                agent: spec.name.clone(),
-                parent: Some(parent),
-            },
-        )?;
-        for kind in plan.child_events {
-            insert_event(&tx, id, kind)?;
-        }
-        insert_event(
-            &tx,
-            parent,
-            EventKind::ChildSpawned {
-                child: id,
-                agent: spec.name,
-                budget: carve,
-            },
-        )?;
+        let spawned = spawn_in(&tx, above, plan, cap)?;
         tx.commit()?;
-        Ok(Spawned { id, budget: carve })
+        Ok(SpawnOnce::New(spawned))
     }
 
     /// The run's budget limit: what it may spend itself. For a spawned run this moves: it shrinks
@@ -1122,6 +1115,32 @@ impl Store {
         Ok(id)
     }
 
+    /// [`Store::push_control`], unless the same command for `run` already waits unclaimed: then
+    /// nothing is pushed. True when it was pushed. Recovery resumes a run this way, so starting
+    /// twice before the engine runs does not resume it twice.
+    pub fn push_control_once(&self, run: RunId, cmd: ControlCommand) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_run(&tx, run)?;
+        let cmd = serde_json::to_string(&cmd)?;
+        let waiting = tx
+            .query_row(
+                "SELECT 1 FROM control WHERE run_id = ?1 AND cmd = ?2 AND claimed = 0",
+                params![run.to_string(), cmd],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !waiting {
+            tx.execute(
+                "INSERT INTO control (run_id, cmd) VALUES (?1, ?2)",
+                params![run.to_string(), cmd],
+            )?;
+        }
+        tx.commit()?;
+        Ok(!waiting)
+    }
+
     /// Claims every unclaimed command. Each command is returned by exactly one call, even with
     /// several consumers racing.
     pub fn take_control(&self) -> Result<Vec<(i64, RunId, ControlCommand)>> {
@@ -1303,6 +1322,137 @@ fn credit(tx: &Transaction<'_>, mut parent: RunId, mut amount: MicroUsd) -> Resu
     }
 }
 
+/// `parent` as a spawn needs it: it exists ([`StoreError::NotFound`]) and is `Running`
+/// ([`SpawnRefusal::ParentNotRunning`]).
+fn running_parent(tx: &Transaction<'_>, parent: RunId) -> Result<Parent> {
+    let found = tx
+        .query_row(
+            "SELECT status, root_run_id, depth FROM runs WHERE id = ?1",
+            [parent.to_string()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    run_id_col(r, 1)?,
+                    r.get::<_, u32>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, root, depth)) = found else {
+        return Err(StoreError::NotFound(parent));
+    };
+    let status: RunStatus = serde_json::from_str(&status)?;
+    if status != RunStatus::Running {
+        return Err(StoreError::Spawn(SpawnRefusal::ParentNotRunning(
+            parent, status,
+        )));
+    }
+    Ok(Parent {
+        id: parent,
+        root,
+        depth,
+    })
+}
+
+/// The spawn of [`Store::spawn_child`] under `above`, inside the caller's transaction. Records the
+/// spawn's key with the child.
+fn spawn_in<F>(tx: &Transaction<'_>, above: Parent, plan: ChildPlan<'_>, cap: F) -> Result<Spawned>
+where
+    F: FnOnce(RunId, MicroUsd) -> Result<Option<Vec<u8>>>,
+{
+    let parent = above.id;
+    let children = count(
+        tx,
+        "SELECT COUNT(*) FROM runs WHERE parent_run_id = ?1",
+        parent,
+    )?;
+    if children >= u64::from(plan.max_children) {
+        return Err(StoreError::Spawn(SpawnRefusal::TooManyChildren(
+            plan.max_children,
+        )));
+    }
+    let tree = count(
+        tx,
+        "SELECT COUNT(*) FROM runs WHERE root_run_id = ?1",
+        above.root,
+    )?;
+    if tree >= u64::from(plan.max_tree_runs) {
+        return Err(StoreError::Spawn(SpawnRefusal::TooManyRuns(
+            plan.max_tree_runs,
+        )));
+    }
+    let limit = read_limit(tx, parent)?;
+    let remaining = left(limit, spent_in(tx, parent)?);
+    let carve = plan
+        .budget
+        .unwrap_or_else(|| plan.spec.budget.limit.min(MicroUsd(remaining.0 / 2)));
+    if carve.0 <= 0 || carve > remaining {
+        return Err(StoreError::Spawn(SpawnRefusal::Budget {
+            asked: carve,
+            remaining,
+        }));
+    }
+    let mut spec = plan.spec.clone();
+    spec.budget.limit = carve;
+    let id = insert_run(tx, &spec, plan.input, Some(above))?;
+    tx.execute(
+        "INSERT INTO spawn_keys (parent_run_id, spawn_key, child_run_id) VALUES (?1, ?2, ?3)",
+        params![
+            parent.to_string(),
+            spawn_key(&plan.spec.name, plan.input),
+            id.to_string()
+        ],
+    )?;
+    write_limit(tx, parent, MicroUsd(limit.0 - carve.0))?;
+    if let Some(token) = cap(id, carve)? {
+        tx.execute(
+            "INSERT INTO run_caps (run_id, token) VALUES (?1, ?2)",
+            params![id.to_string(), token],
+        )?;
+    }
+    insert_event(
+        tx,
+        id,
+        EventKind::RunCreated {
+            agent: spec.name.clone(),
+            parent: Some(parent),
+        },
+    )?;
+    for kind in plan.child_events {
+        insert_event(tx, id, kind)?;
+    }
+    insert_event(
+        tx,
+        parent,
+        EventKind::ChildSpawned {
+            child: id,
+            agent: spec.name,
+            budget: carve,
+        },
+    )?;
+    Ok(Spawned { id, budget: carve })
+}
+
+/// Keys every child a database from before v6 has (see [`SCHEMA_V6`]), in the order the children
+/// were made, so a parent started again after the upgrade gets them back too.
+fn key_existing_children(tx: &Transaction<'_>) -> Result<()> {
+    let children: Vec<(String, String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, parent_run_id, agent, input FROM runs
+             WHERE parent_run_id IS NOT NULL ORDER BY rowid",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (child, parent, agent, input) in children {
+        tx.execute(
+            "INSERT INTO spawn_keys (parent_run_id, spawn_key, child_run_id) VALUES (?1, ?2, ?3)",
+            params![parent, spawn_key(&agent, &input), child],
+        )?;
+    }
+    Ok(())
+}
+
 /// Fails with [`StoreError::NotFound`] unless `run` exists, so no orphan rows are written.
 fn ensure_run(tx: &Transaction<'_>, run: RunId) -> Result<()> {
     let found = tx
@@ -1334,6 +1484,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if found < 5 {
         tx.execute_batch(SCHEMA_V5)?;
+    }
+    if found < 6 {
+        tx.execute_batch(SCHEMA_V6)?;
+        key_existing_children(&tx)?;
     }
     if found < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;

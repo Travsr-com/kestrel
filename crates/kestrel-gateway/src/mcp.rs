@@ -122,7 +122,13 @@ impl KestrelTool {
                 "Start a child run of another agent with its own budget, carved out of yours. \
                  Returns the child's run id; with wait, also its result. When the child agent's \
                  spec asks for more spawn depth than you can give, it gets what you can give, and \
-                 the answer says so in depth and note.",
+                 the answer says so in depth and note. Whenever your agent starts again (after a \
+                 restart, or a resume after you were paused or stopped for budget or an \
+                 approval), spawning the same agent with the same input returns the child you \
+                 already have, with existing: true and its status, instead of a new one. That \
+                 child may already have ended: use kestrel.join for its result. Once every \
+                 earlier child with that agent and input has been returned, the same call gives \
+                 a new child.",
                 json!({
                     "type": "object",
                     "properties": {

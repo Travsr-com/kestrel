@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::Duration;
 
 use common::*;
@@ -396,15 +397,11 @@ async fn s8_approve_unknown_id_is_noop_with_agent_log_warning() {
 
 // 9 ---------------------------------------------------------------------------------------------
 
-#[tokio::test(start_paused = true)]
-async fn s9_restart_recovery_keeps_suspended_and_marks_running_interrupted() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = dir.path().join("kestrel.db");
-
-    // The first engine accepted three runs, then stopped with one budget-suspended, one running
-    // and one still queued.
-    let (budget_run, running_run, queued_run) = {
-        let first = Harness::on(&db, 4);
+/// The first engine accepted three runs, then stopped with one budget-suspended, one running and
+/// one still queued. Returns them in that order.
+async fn s9_stopped_engine(db: &Path) -> (RunId, RunId, RunId) {
+    {
+        let first = Harness::on(db, 4);
         let a = first.submit(spec_with("1", "1h")).await;
         let b = first.submit(spec()).await;
         let c = first.submit(spec()).await;
@@ -425,17 +422,34 @@ async fn s9_restart_recovery_keeps_suspended_and_marks_running_interrupted() {
         .unwrap();
         st.transition(b, &Provisioning, Running).unwrap();
         (a, b, c)
-    };
+    }
+}
 
-    let mut h = Harness::on(&db, 4);
+/// Recovers and checks the report and statuses every s9 variant shares.
+async fn s9_recover(h: &Harness, (budget_run, running_run, queued_run): (RunId, RunId, RunId)) {
     let report = h.engine.recover().await.expect("recover");
     assert_eq!(report.suspended, vec![budget_run]);
     assert_eq!(report.interrupted, vec![running_run]);
-
-    let interrupted = Suspended(SuspendReason::Error("engine restarted".into()));
     assert!(h.is(budget_run, &Suspended(SuspendReason::Budget)));
-    assert!(h.is(running_run, &interrupted));
+    assert!(h.is(running_run, &s9_interrupted()));
     assert!(h.is(queued_run, &Queued));
+}
+
+fn s9_interrupted() -> RunStatus {
+    Suspended(SuspendReason::Error("engine restarted".into()))
+}
+
+// With `resume_after_restart` off, the old behaviour: the interrupted run waits for a human.
+#[tokio::test(start_paused = true)]
+async fn s9_restart_recovery_keeps_suspended_and_marks_running_interrupted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("kestrel.db");
+    let runs = s9_stopped_engine(&db).await;
+    let (budget_run, running_run, queued_run) = runs;
+
+    let mut h = Harness::on(&db, 4);
+    h.rebuild(|e| e.with_resume_after_restart(false));
+    s9_recover(&h, runs).await;
 
     // The new engine schedules the queued run and can resume the budget-suspended one.
     let _queued_session = h.driver.live();
@@ -448,9 +462,41 @@ async fn s9_restart_recovery_keeps_suspended_and_marks_running_interrupted() {
 
     settle().await;
     assert!(
-        h.is(running_run, &interrupted),
+        h.is(running_run, &s9_interrupted()),
         "an interrupted run waits for a human"
     );
+}
+
+// By default (#92) the interrupted run is resumed by itself; a budget suspension still waits for a
+// human, and the queued run is scheduled.
+#[tokio::test(start_paused = true)]
+async fn s9_restart_recovery_resumes_interrupted_run_by_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("kestrel.db");
+    let runs = s9_stopped_engine(&db).await;
+    let (budget_run, running_run, queued_run) = runs;
+
+    let mut h = Harness::on(&db, 4);
+    s9_recover(&h, runs).await;
+
+    let _queued_session = h.driver.live();
+    let _interrupted_session = h.driver.live();
+    let _budget_session = h.driver.live();
+    h.start();
+    until("queued run started", || h.is(queued_run, &Running)).await;
+    until("interrupted run resumed by itself", || {
+        h.is(running_run, &Running)
+    })
+    .await;
+
+    settle().await;
+    assert!(
+        h.is(budget_run, &Suspended(SuspendReason::Budget)),
+        "a budget suspension waits for a human"
+    );
+    h.control(budget_run, ControlCommand::SetBudget(MicroUsd(5_000_000)));
+    h.control(budget_run, ControlCommand::Resume);
+    until("budget run resumed", || h.is(budget_run, &Running)).await;
 }
 
 // 10 --------------------------------------------------------------------------------------------
