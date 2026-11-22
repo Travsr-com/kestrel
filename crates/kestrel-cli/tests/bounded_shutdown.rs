@@ -221,7 +221,7 @@ fn a_run_serve_has_already_claimed_still_holds_a_request_in_flight() {
         &config(Some(port), &format!("shutdown_grace_secs = {GRACE}")),
     );
     let run = new_run(&f);
-    poll("serve to claim the run", || {
+    poll("serve to claim and fail the run", || {
         let row = f
             .store()
             .get_run(run)
