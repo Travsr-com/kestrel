@@ -620,7 +620,7 @@ pub async fn clone_at(
 /// * object alternates (`objects/info/alternates`, `http-alternates`), present at all;
 /// * a `commondir` (refs and objects come from the other repo) or a `.git` inside `.git`;
 /// * a `HEAD` that is not a regular file;
-/// * a link at `objects`, `objects/info` or `packed-refs`, or anywhere under `refs`.
+/// * a link anywhere in `.git` (objects, packs, refs, `packed-refs`, `reftable`, ...).
 async fn check_clone(clone_dir: &Path) -> Result<(), WorkspaceError> {
     let clone = || clone_dir.to_path_buf();
     let unsafe_clone = |reason: String| WorkspaceError::UnsafeClone {
@@ -650,15 +650,8 @@ async fn check_clone(clone_dir: &Path) -> Result<(), WorkspaceError> {
     if !head.is_ok_and(|m| m.is_file()) {
         return Err(unsafe_clone("`.git/HEAD` is not a regular file".into()));
     }
-    for name in ["objects", "objects/info", "packed-refs", "refs"] {
-        let path = name
-            .split('/')
-            .fold(git_dir.clone(), |p, part| p.join(part));
-        if is_link(&path).await {
-            return Err(unsafe_clone(format!("`.git/{name}` is a link")));
-        }
-    }
-    if let Some(link) = link_under(&git_dir.join("refs")).await? {
+    // A clone Kestrel made has no link anywhere in `.git`, so any link is the agent's.
+    if let Some(link) = link_under(&git_dir).await? {
         let shown = link.strip_prefix(clone_dir).unwrap_or(&link).display();
         return Err(unsafe_clone(format!("`{shown}` is a link")));
     }
@@ -668,13 +661,6 @@ async fn check_clone(clone_dir: &Path) -> Result<(), WorkspaceError> {
 /// Whether anything, a dangling link included, is at `path`.
 async fn exists(path: &Path) -> bool {
     tokio::fs::symlink_metadata(path).await.is_ok()
-}
-
-/// Whether `path` is a link (a junction too, on Windows).
-async fn is_link(path: &Path) -> bool {
-    tokio::fs::symlink_metadata(path)
-        .await
-        .is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The first link found anywhere under `dir`, never following one. A missing `dir` has none.
