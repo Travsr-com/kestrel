@@ -405,3 +405,145 @@ describe('Approvals: accessibility (scenario 17)', () => {
     expect(ids(await seriousViolations(container))).toEqual([]);
   });
 });
+
+describe('Approvals: a long action is capped in the lists (PR #85 review)', () => {
+  const huge = `${'x'.repeat(30_000)}\n${'y'.repeat(20_000)}`;
+  const capped = `${'x'.repeat(120)}...`;
+
+  it('shows the first line, capped, in the pending item and its button name, and in Recently decided', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: huge });
+    const d = approval(r, { action: huge, status: 'approved', requested_at: ago(120_000) });
+    show([a], [r], { decided: [d] });
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    await vi.waitFor(() => expect(items()[0]).toHaveTextContent('lead'));
+    const button = pick(0);
+    expect(button.querySelector('.action')?.textContent).toBe(capped);
+    expect(text(button)).toMatch(new RegExp(`^lead ${capped.replace(/\./g, '\\.')} Command, waiting 1m \\d\\ds$`));
+    const name = new RegExp(`^lead ${capped.replace(/\./g, '\\.')} Command, waiting`);
+    expect(within(pendingList()).getByRole('button', { name })).toBe(button);
+    await vi.waitFor(() => expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(1));
+    const row = within(decidedList()).getByRole('listitem');
+    const action = row.querySelector('.action') as HTMLElement;
+    expect(action.textContent).toBe(capped);
+    expect((action.getAttribute('title') ?? '').length).toBeLessThanOrEqual(capped.length);
+    expect(text(row).length).toBeLessThan(200);
+    // The detail panel keeps its 500-character preview with Show all.
+    expect(detail().querySelector('pre.action')?.textContent).toBe(`${huge.slice(0, 500)}...`);
+    expect(within(detail()).getByRole('button', { name: 'Show all' })).toBeInTheDocument();
+  });
+});
+
+describe('Approvals: a decision on an approval that is not selected (PR #85 review)', () => {
+  it('says in its list item while it is on its way and after it failed, announces the failure, and Retry works', async () => {
+    const lead = run({ agent: 'lead' });
+    const kid = run({ agent: 'kid' });
+    const a = approval(lead, { action: 'deploy', requested_at: ago(10_000) });
+    const b = approval(kid, { action: 'rm -rf build', requested_at: ago(20_000) });
+    let answer: (res: Response) => void = () => {};
+    let answers = 0;
+    const { calls } = show([a, b], [lead, kid], {
+      resolve: () => {
+        answers += 1;
+        if (answers > 1) return new Response(null, { status: 202 });
+        return new Promise<Response>((done) => (answer = done));
+      },
+    });
+    await vi.waitFor(() => expect(within(detail()).getByRole('heading', { level: 2 })).toHaveTextContent('lead asks'));
+    const u = user();
+    await u.click(within(detail()).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(items()[0]).toHaveTextContent('Approving'));
+    await u.click(pick(1));
+    expect(detail()).toHaveTextContent('rm -rf build');
+    expect(items()[0]).toHaveTextContent('Approving');
+    answer(new Response('{"error":"database is locked"}', { status: 500 }));
+    await vi.waitFor(() => expect(items()[0]).toHaveTextContent('Failed, open it to retry'));
+    expect(items()[0]).not.toHaveTextContent('Approving');
+    expect(screen.getByRole('status')).toHaveTextContent('lead: the decision failed. Open it to retry.');
+    // B is still selected.
+    expect(pick(1)).toHaveAttribute('aria-pressed', 'true');
+    await u.click(pick(0));
+    expect(within(detail()).getByRole('alert')).toHaveTextContent('database is locked');
+    await u.click(within(detail()).getByRole('button', { name: 'Retry' }));
+    expect(posts(calls).map((c) => c.path)).toEqual([`/api/approvals/${a.id}/approve`, `/api/approvals/${a.id}/approve`]);
+    await vi.waitFor(() => expect(items()[0]).toHaveTextContent('Approving'));
+    expect(within(detail()).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('says Rejecting and Sending answer while those are on their way', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const q = approval(r, { action: 'Which branch?', question: true, requested_at: ago(20_000) });
+    show([a, q], [r], { resolve: () => new Promise<Response>(() => {}) });
+    await vi.waitFor(() => expect(items()).toHaveLength(2));
+    const u = user();
+    await u.click(within(detail()).getByRole('button', { name: 'Reject' }));
+    await u.click(within(detail()).getByRole('button', { name: 'Confirm reject' }));
+    await vi.waitFor(() => expect(items()[0]).toHaveTextContent('Rejecting'));
+    await u.click(pick(1));
+    await u.type(within(detail()).getByLabelText('Answer'), 'main');
+    await u.click(within(detail()).getByRole('button', { name: 'Send answer' }));
+    await vi.waitFor(() => expect(items()[1]).toHaveTextContent('Sending answer'));
+    expect(items()[0]).toHaveTextContent('Rejecting');
+  });
+
+  it('a failure of the selected approval shows in its panel and is not announced again', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy' });
+    show([a], [r], { resolve: () => new Response('{"error":"database is locked"}', { status: 500 }) });
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
+    await vi.waitFor(() => expect(within(detail()).getByRole('alert')).toHaveTextContent('database is locked'));
+    expect(items()[0]).toHaveTextContent('Failed, open it to retry');
+    expect(screen.getByRole('status').textContent).toBe('');
+  });
+});
+
+describe('Approvals: Recently decided stays current (PR #85 review)', () => {
+  it('lists an approval decided on the page after its resolved event, with one refetch for several', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const b = approval(r, { action: 'publish', requested_at: ago(20_000) });
+    const decided: Approval[] = [];
+    const { sockets, calls } = show([a, b], [r], { decided });
+    await vi.waitFor(() => expect(items()).toHaveLength(2));
+    expect(await screen.findByText('Nothing decided yet.')).toBeInTheDocument();
+    const asked = () => calls.filter((c) => c.path === '/api/approvals' && c.search === '?status=approved').length;
+    expect(asked()).toBe(1);
+    await user().click(within(detail()).getByRole('button', { name: 'Approve' }));
+    decided.push({ ...a, status: 'approved' }, { ...b, status: 'approved' });
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
+    s.event(6, event(r.id, { kind: 'approval_resolved', id: b.id, approved: true }));
+    await vi.waitFor(() => expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(2));
+    expect(within(decidedList()).getAllByRole('listitem').map((li) => li.querySelector('.action')?.textContent)).toEqual([
+      'deploy',
+      'publish',
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(asked()).toBe(2);
+  });
+
+  it('does not refetch when an ended row is dismissed, and leaves out an approval that is in the pending rows', async () => {
+    const r = run({ agent: 'lead' });
+    const a = approval(r, { action: 'deploy', requested_at: ago(10_000) });
+    const old = approval(r, { action: 'old one', status: 'rejected', requested_at: ago(600_000) });
+    const { sockets, calls } = show([a], [r], { decided: [{ ...a, status: 'expired' }, old] });
+    await vi.waitFor(() => expect(items()).toHaveLength(1));
+    await screen.findByText('old one');
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Completed' }));
+    await vi.waitFor(() => expect(within(detail()).getByText('Run ended')).toBeInTheDocument());
+    expect(within(decidedList()).getAllByRole('listitem').map((li) => li.querySelector('.action')?.textContent)).toEqual([
+      'old one',
+    ]);
+    const asked = () => calls.filter((c) => c.path === '/api/approvals' && c.search === '?status=expired').length;
+    await user().click(within(detail()).getByRole('button', { name: 'Dismiss' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(asked()).toBe(1);
+    // Dismissed, it is no longer a pending row, so the list shows it with its outcome.
+    expect(within(decidedList()).getAllByRole('listitem')).toHaveLength(2);
+  });
+});

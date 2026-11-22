@@ -296,7 +296,8 @@ describe('Fleet card (scenario 7)', () => {
     expect(pill).toHaveClass('pill', 'tone-running');
     expect(within(c).getByText('$0.42 of $2.00')).toBeInTheDocument();
     expect(within(c).getByText('21%')).toBeInTheDocument();
-    const meter = within(c).getByRole('meter', { name: 'Budget used' });
+    // Named by agent, so a list of cards does not read as many meters of the same name.
+    const meter = within(c).getByRole('meter', { name: 'Budget used by alpha' });
     expect(meter).toHaveAttribute('aria-valuenow', '21');
     expect(meter).toHaveClass('track');
     expect(c).toHaveTextContent('no sub-agents');
@@ -353,6 +354,13 @@ describe('Fleet card status line (scenario 8)', () => {
     expect(card('asking')).toHaveTextContent('npm install');
     expect(card('asking')).toHaveClass('tone-approval');
     expect(within(card('asking')).getByText('Needs approval')).toBeInTheDocument();
+  });
+
+  it('a long ask shows only its first line, capped (PR #85 review)', async () => {
+    const a = run({ agent: 'asking', status: { Suspended: { Approval: 'ap-1' } } });
+    show([a], pending(approval(a.id, 'ap-1', `${'x'.repeat(30_000)}\n${'y'.repeat(20_000)}`)));
+    await screen.findByRole('link', { name: 'asking' });
+    expect(card('asking').querySelector('.note')?.textContent).toBe(`${'x'.repeat(120)}...`);
   });
 
   it('a run waiting on an approval not in the list says it waits', async () => {

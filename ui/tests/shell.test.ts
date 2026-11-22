@@ -41,12 +41,32 @@ function approval(r: RunSummary): Approval {
   };
 }
 
-function serve(runs: RunSummary[], pending: Approval[] = []) {
+interface Served {
+  runs: RunSummary[];
+  pending: Approval[];
+  /** Run statuses whose `?status=` request fails. */
+  fail: string[];
+  /** The search part of every `/api/runs` request. */
+  runSearches: string[];
+}
+
+/** The lower-case status name the `?status=` filter takes. */
+const statusOf = (r: RunSummary) =>
+  typeof r.status === 'string' ? r.status.toLowerCase() : 'Suspended' in r.status ? 'suspended' : 'failed';
+
+function serve(served: Served) {
   const fetch: typeof globalThis.fetch = async (input) => {
     const url = new URL(String(input), 'http://kestrel.test');
-    if (url.pathname === '/api/approvals') return new Response(JSON.stringify(pending));
-    if (url.pathname === '/api/runs') return new Response(JSON.stringify(runs));
-    const one = runs.find((r) => url.pathname === `/api/runs/${r.id}`);
+    if (url.pathname === '/api/approvals') return new Response(JSON.stringify(served.pending));
+    if (url.pathname === '/api/runs') {
+      served.runSearches.push(url.search);
+      const status = url.searchParams.get('status');
+      if (status !== null && served.fail.includes(status)) {
+        return new Response('{"error":"database is locked"}', { status: 500 });
+      }
+      return new Response(JSON.stringify(served.runs.filter((r) => status === null || statusOf(r) === status)));
+    }
+    const one = served.runs.find((r) => url.pathname === `/api/runs/${r.id}`);
     return one ? new Response(JSON.stringify(one)) : new Response('{"error":"no run"}', { status: 404 });
   };
   return fetch;
@@ -54,9 +74,17 @@ function serve(runs: RunSummary[], pending: Approval[] = []) {
 
 function show(hash: string, runs: RunSummary[], pending: Approval[] = []) {
   const sockets = fakeSockets();
+  const served: Served = { runs, pending, fail: [], runSearches: [] };
   window.location.hash = hash;
-  const result = render(App, { fetch: serve(runs, pending), sockets: sockets.factory });
-  return { ...result, sockets };
+  const result = render(App, { fetch: serve(served), sockets: sockets.factory });
+  return { ...result, sockets, served };
+}
+
+/** What a screen reader says for `el`: its text without the parts hidden from it. */
+function spoken(el: Element): string {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll('[aria-hidden="true"]').forEach((hidden) => hidden.remove());
+  return copy.textContent?.replace(/\s+/g, ' ').trim() ?? '';
 }
 
 function feed(sockets: ReturnType<typeof fakeSockets>): FakeSocket {
@@ -91,17 +119,21 @@ describe('sidebar', () => {
     await screen.findByRole('heading', { level: 1, name: 'Fleet' });
     expect(within(item('Fleet')).getByRole('link')).toHaveAttribute('href', '#/fleet');
     expect(within(item('Approvals')).getByRole('link')).toHaveAttribute('href', '#/approvals');
-    for (const [label, tag] of [
-      ['Agents', 'M4'],
-      ['Workflows', 'M4'],
-      ['Triggers', 'M4'],
-      ['Meetings', 'M5'],
-      ['Costs', 'M3'],
-      ['Settings', 'Soon'],
-    ]) {
-      const li = item(label as string);
+    for (const [label, tag, said] of [
+      ['Agents', 'M4', 'Agents, coming in M4'],
+      ['Workflows', 'M4', 'Workflows, coming in M4'],
+      ['Triggers', 'M4', 'Triggers, coming in M4'],
+      ['Meetings', 'M5', 'Meetings, coming in M5'],
+      ['Costs', 'M3', 'Costs, coming in M3'],
+      ['Settings', 'Soon', 'Settings, coming soon'],
+    ] as const) {
+      const li = item(label);
       expect(within(li).queryByRole('link')).not.toBeInTheDocument();
-      expect(text(li)).toBe(`${label} coming in ${tag}`);
+      // The full phrase is read out; the short tag is only seen.
+      expect(spoken(li)).toBe(said);
+      const shown = li.querySelector('.tag');
+      expect(shown).toHaveAttribute('aria-hidden', 'true');
+      expect(shown?.textContent).toBe(tag);
     }
   });
 
@@ -129,6 +161,39 @@ describe('sidebar', () => {
     await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 2 active'));
     s.event(2, ev(a.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }));
     await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 1 active'));
+  });
+
+  it('asks only for live runs, one request per live status, never the whole history (PR #85 review)', async () => {
+    const a = run();
+    const b = run({ status: 'Queued' });
+    const c = run({ status: { Suspended: 'Manual' } });
+    const d = run({ status: 'Provisioning' });
+    const { served } = show('#/approvals', [a, b, c, d, run({ status: 'Completed' }), run({ status: { Failed: 'x' } })]);
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 4 active'));
+    expect([...served.runSearches].sort()).toEqual([
+      '?status=provisioning',
+      '?status=queued',
+      '?status=running',
+      '?status=suspended',
+    ]);
+  });
+
+  it('leaves the active count as it was when one of the live-status requests fails', async () => {
+    const a = run();
+    const { served, sockets } = show('#/approvals', [a]);
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 1 active'));
+    served.runs.push(run({ status: 'Queued' }), run());
+    served.fail.push('running');
+    feed(sockets).open();
+    await vi.waitFor(() => expect(served.runSearches).toHaveLength(8));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 1 active');
+    // The next sync that succeeds brings the count up to date.
+    served.fail.length = 0;
+    feed(sockets).drop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    feed(sockets).open();
+    await vi.waitFor(() => expect(text(within(item('Fleet')).getByRole('link'))).toBe('Fleet 3 active'));
   });
 
   // 3

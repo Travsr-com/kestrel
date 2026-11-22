@@ -121,6 +121,9 @@ describe('Run view header (scenario 10)', () => {
     const crumbs = screen.getByRole('navigation', { name: 'Breadcrumb' });
     expect(within(crumbs).getByRole('link', { name: 'Fleet' })).toHaveAttribute('href', '#/fleet');
     expect(crumbs).toHaveTextContent(/^Fleet\s*\/\s*schema-reader$/);
+    // The last item is the page itself.
+    expect(within(crumbs).getByText('schema-reader')).toHaveAttribute('aria-current', 'page');
+    expect(within(crumbs).getByRole('link', { name: 'Fleet' })).not.toHaveAttribute('aria-current');
     const header = heading.closest('header') as HTMLElement;
     const pill = within(header).getByText('Running', { selector: '.pill' });
     expect(pill).toHaveClass('tone-running');
@@ -219,16 +222,21 @@ describe('Run view panels (scenario 11)', () => {
     expect(icon('waiting')).toBe('clock');
   });
 
-  it('shows a Live events panel that says Connected, or Reconnecting while a socket is down', async () => {
+  it('shows a Live events panel that says Connecting until the sockets open, then Connected, or Reconnecting while one is down', async () => {
     const r = run({ agent: 'lead' });
     const { sockets } = show(r.id, [r]);
     const panel = (await screen.findByRole('heading', { level: 2, name: 'Live events' })).closest('section') as HTMLElement;
     expect(panel).toHaveClass('panel');
     expect(within(panel).getByRole('region', { name: 'Event stream' })).toBeInTheDocument();
     expect(within(panel).getByRole('list', { name: 'Events' })).toBeInTheDocument();
-    expect(within(panel).getByRole('status')).toHaveTextContent('Connected');
+    expect(within(panel).getByRole('status')).toHaveTextContent('Connecting');
     const s = socket(sockets, `/ws/runs/${r.id}`);
     s.open();
+    await settle();
+    // The tree socket has not opened yet.
+    expect(within(panel).getByRole('status')).toHaveTextContent('Connecting');
+    socket(sockets, `/ws/tree/${r.id}`).open();
+    await vi.waitFor(() => expect(within(panel).getByRole('status')).toHaveTextContent('Connected'));
     s.drop();
     await vi.waitFor(() => expect(within(panel).getByRole('status')).toHaveTextContent('Reconnecting'));
     await vi.advanceTimersByTimeAsync(600);
@@ -257,7 +265,7 @@ describe('Run view panels (scenario 11)', () => {
       [{ kind: 'agent_log', line: 'npm test' }, 'log', 'muted', 'npm test'],
       [{ kind: 'run_finished', summary: 'All green.' }, 'done', 'done', 'Finished: All green.'],
       [{ kind: 'child_spawned', child: 'kid', agent: 'helper', budget: 2_000_000 }, 'spawn', 'suspended', 'Spawned helper'],
-      [{ kind: 'capabilities_dropped', tools: ['shell'], hosts: [], secrets: [], agents: [] }, 'limits', 'muted', 'shell'],
+      [{ kind: 'capabilities_dropped', tools: ['shell'], hosts: [], secrets: [], agents: [] }, 'dropped', 'muted', 'shell'],
     ];
     cases.forEach(([kind], i) => s.event(i + 1, event(r.id, i + 1, kind)));
     await settle();
@@ -387,5 +395,32 @@ describe('Run view accessibility (scenario 17)', () => {
     expect(ids(await seriousViolations(container))).toEqual([]);
     await userEvent.click(screen.getByRole('button', { name: 'Cancel run' }));
     expect(ids(await seriousViolations(container))).toEqual([]);
+  });
+});
+
+describe('Run view controls listeners (PR #85 review)', () => {
+  it('listens for keys and focus on the window once, in the part that owns the cancel dialog, until unmounted', async () => {
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const count = (spy: typeof added, type: string) => spy.mock.calls.filter(([t]) => t === type).length;
+    try {
+      const r = run({ agent: 'lead' });
+      const { unmount } = show(r.id, [r]);
+      await screen.findByRole('heading', { level: 1, name: 'lead' });
+      await screen.findByLabelText('Message');
+      expect(count(added, 'keydown')).toBe(1);
+      expect(count(added, 'focusin')).toBe(1);
+      // The dialog still closes on Escape.
+      const u = user();
+      await u.click(screen.getByRole('button', { name: 'Cancel run' }));
+      await u.keyboard('{Escape}');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      unmount();
+      expect(count(removed, 'keydown')).toBe(1);
+      expect(count(removed, 'focusin')).toBe(1);
+    } finally {
+      added.mockRestore();
+      removed.mockRestore();
+    }
   });
 });
