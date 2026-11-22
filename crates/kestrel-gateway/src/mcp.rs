@@ -660,7 +660,9 @@ fn padded<F>(id: Value, wait: Pin<Box<F>>) -> Response
 where
     F: Future<Output = Value> + Send + 'static,
 {
-    let ticks = tokio::time::interval(KEEPALIVE);
+    let mut ticks = tokio::time::interval(KEEPALIVE);
+    // A client that stopped reading for a while gets one space when it reads again, not a burst.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stream = futures::stream::unfold(Some((wait, ticks, id)), |open| async move {
         let (mut wait, mut ticks, id) = open?;
         tokio::select! {
