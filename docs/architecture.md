@@ -122,6 +122,10 @@ QUEUED → PROVISIONING → RUNNING ⇄ SUSPENDED(approval | budget | error | ma
 Every transition, tool call, model call and approval is an append-only event keyed by `(run_id, seq)`.
 Pause, resume, replay and the live UI all read from this log. Cancelling a run cancels its subtree.
 
+A restart cuts off what was `RUNNING` or `PROVISIONING`. The next start suspends those runs as
+`SUSPENDED(error: "engine restarted")` and resumes them by itself (section 3.3, "After a restart").
+That is the one way a run goes from `PROVISIONING` to `SUSPENDED`.
+
 ### 3.3 Agents spawning agents
 
 Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd?, wait?)`.
@@ -154,6 +158,19 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * A parent that waits gives its concurrency slot back. It takes it back in line with queued runs before the join returns, so a fan-out to as many children as there are slots cannot deadlock. Its sandbox keeps running meanwhile (it is inside a tool call), so running sandboxes can briefly outnumber the slots by the parents that wait.
 * Several joins of one parent share this: the first gives the slot back, the last takes it again. A timeout bounds the wait for the slot too: past its deadline a join returns without it, and the parent takes the slot back once one is free. A join whose caller goes away also leaves the slot to come back to the parent.
 * A join reads everything from the store. Calling it again, after a restart too, returns the children that ended at once.
+
+**After a restart** (`Engine::recover`, then `run_forever`). An agent process cannot resume in the middle of a join, so Kestrel makes running it again safe and automatic:
+
+* **Cut-off runs are resumed.** Every run that was `Running` or `Provisioning` becomes `Suspended(Error("engine restarted"))`, and recovery queues a resume for it, parents and children alike. The resumes wait for slots in the usual line, so a tree comes back without anyone running `kestrel resume`. If serve stops again before a queued resume is delivered, the next start queues it again: the start that suspended a run with a resume logs `kestrel: the engine restarted; this run resumes when a slot is free`, and only runs with that line after their last restart are resumed this way. Paused runs, runs over budget, runs waiting for an approval and runs suspended for any other error stay as they are.
+* **Turning it off.** A resumed agent starts again from its input in a fresh sandbox, so whatever it did before it does again. For agents whose work must not happen twice, set `engine.resume_after_restart = false` (default `true`, `Engine::with_resume_after_restart`). The cut-off runs then stay suspended until someone resumes them.
+* **No crash loop.** A run that takes serve down would otherwise be resumed on every start. Recovery counts the run's earlier `StatusChanged` events to `Suspended(Error("engine restarted"))`. The first three restarts that stop a run resume it; from the fourth on, it stays suspended and its log says `kestrel: not resumed automatically: ...; resume it by hand`. `kestrel resume` still works.
+* **Upgrading.** Only runs that a start with automatic resume stopped are resumed. Runs already `Suspended(Error("engine restarted"))` before the upgrade, or stopped while the setting was `false`, stay suspended after the upgrade or after the setting is turned on. Resume them with `kestrel resume` if you want them back.
+* **Spawn returns the child it already made.** The store keeps each spawn with a key: a SHA-256 of the child's agent name and input. Within one start of the parent's agent, its nth spawn with a key returns the nth child it spawned with that key before (oldest first), live or finished. Past those, it spawns a new one. So a parent that spawns the same worker three times gets three children, and gets the same three back after a restart. The count starts over each time the parent's agent starts (a resume after a restart, a pause, a budget stop or an approval).
+* **A child returned again is not spawned again.** No budget is carved, no `ChildSpawned` is written, and it does not count against `max_children` or the tree limit. The answer carries `"existing": true` and the child's `status` now (it may have ended: `kestrel.join` gives its result), and the parent's log names the child. The `budget_usd` and `wait` of the repeated call are not part of the key: the child keeps the budget it got.
+* **Why agent and input, not the JSON-RPC id.** A restarted Claude Code opens a new MCP session. Its ids start over and follow whatever the model calls in that run (`initialize`, `tools/list`, other tools), so after a restart an id can name a different call. What the agent reproduces is what it asks for: the same agent and input. An agent that rewords a child's input gets a new child.
+* **The join answers once.** A join from the re-run parent reads its children from the store: finished ones answer at once, live ones are waited for, and each is in the answer once.
+* **A child cut off while provisioning** never started its agent. It is suspended and resumed like the others, so it starts once, and the parent's join counts it.
+* Children spawned before the keys existed (schema v5) get theirs when the store migrates to v6.
 
 **Cancelling a tree:**
 
