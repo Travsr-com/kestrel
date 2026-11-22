@@ -366,8 +366,8 @@ fn strings(v: &Value) -> Vec<String> {
 /// show them, and a direct call is refused with `not permitted` and recorded. A call of a tool it
 /// holds (`kestrel.join`) on the same route succeeds.
 ///
-/// The gateway serves only the `kestrel.*` tools until the Travsr route lands (#44), so the
-/// direct call is made to `kestrel.ask_human`; `travsr.get_callers` is checked in the grant.
+/// Travsr is off in this test, so the direct call is made to `kestrel.ask_human`, a tool the child
+/// asked for and did not get; `travsr.get_callers` is checked in the grant.
 #[test]
 fn m2_s03_child_cannot_use_a_tool_its_parent_lacks() {
     let env = Env::with_max(8);
@@ -1222,7 +1222,7 @@ case "$1" in
     ;;
   mcp)
     db=$4
-    echo "mcp $(pwd -P) $db" >> "$d/log"
+    echo "mcp $(pwd -P) $(cd "$(dirname "$db")" && pwd -P)/$(basename "$db")" >> "$d/log"
     root=$(cd "$(dirname "$db")/.." && pwd -P)
     while IFS= read -r line; do
       echo "req $line" >> "$d/log"
@@ -1230,7 +1230,7 @@ case "$1" in
       [ -n "$id" ] || continue
       case "$line" in
         *'"method":"tools/list"'*)
-          printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_symbol","description":"Where a symbol is defined and used","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"repo":{"type":"string"}},"required":["name"]}}]}}\n' "$id" ;;
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_symbol","description":"Where a symbol is defined and used","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"repo":{"type":"string"}},"required":["name","repo"]}}]}}\n' "$id" ;;
         *'"method":"tools/call"'*)
           sym=$(printf '%s\n' "$line" | sed -n 's/.*"arguments":{[^}]*"name":"\([A-Za-z0-9_]*\)".*/\1/p')
           hits=$(cd "$root" && grep -rl --exclude-dir=.git --exclude-dir=.travsr -e "${sym:-no symbol given}" . | sed 's|^\./||' | sort | tr '\n' ' ')
