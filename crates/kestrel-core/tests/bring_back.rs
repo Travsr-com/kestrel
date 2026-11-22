@@ -882,6 +882,28 @@ async fn s5_linked_objects_refs_or_packed_refs_are_refused_before_any_git_call()
         symlink(away.join("file"), g.join("packed-refs")).unwrap();
     })
     .await;
+    // Below `objects` a link lets git read another repo's packs or loose objects.
+    refused_before_any_git_call("objects/pack link", |g| {
+        std::fs::create_dir(g.join("objects")).unwrap();
+        symlink(&away, g.join("objects").join("pack")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("loose object directory link", |g| {
+        std::fs::create_dir(g.join("objects")).unwrap();
+        symlink(&away, g.join("objects").join("ab")).unwrap();
+    })
+    .await;
+    refused_before_any_git_call("pack file link", |g| {
+        let pack = g.join("objects").join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        symlink(away.join("file"), pack.join("pack-1.pack")).unwrap();
+    })
+    .await;
+    // A linked reftable directory would hand git another repo's refs.
+    refused_before_any_git_call("reftable link", |g| {
+        symlink(&away, g.join("reftable")).unwrap();
+    })
+    .await;
 }
 
 #[tokio::test]
