@@ -401,7 +401,7 @@ async fn s8_approve_unknown_id_is_noop_with_agent_log_warning() {
 /// one still queued. Returns them in that order.
 async fn s9_stopped_engine(db: &Path) -> (RunId, RunId, RunId) {
     {
-        let first = Harness::on(&db, 4);
+        let first = Harness::on(db, 4);
         let a = first.submit(spec_with("1", "1h")).await;
         let b = first.submit(spec()).await;
         let c = first.submit(spec()).await;
