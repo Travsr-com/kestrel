@@ -1,7 +1,7 @@
 // Scenario 6: a 401 shows "Token required"; the token entered is kept in memory only, and the
 // request is retried with it.
 
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
@@ -55,7 +55,8 @@ describe('late answers', () => {
     window.dispatchEvent(new HashChangeEvent('hashchange'));
     const user = userEvent.setup();
     await user.type(await screen.findByLabelText('API token'), 's3cret{Enter}');
-    expect(await screen.findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
+    const pending = await screen.findByRole('list', { name: 'Pending approvals' });
+    expect(await within(pending).findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
 
     // Fleet's old request now comes back 401.
     release();
