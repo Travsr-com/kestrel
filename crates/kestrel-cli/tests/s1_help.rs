@@ -9,8 +9,8 @@ mod common;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-const COMMANDS: [&str; 9] = [
-    "serve", "run", "watch", "ps", "approve", "pause", "resume", "cancel", "budget",
+const COMMANDS: [&str; 10] = [
+    "serve", "run", "watch", "ps", "approve", "pause", "resume", "cancel", "budget", "fetch",
 ];
 
 fn kestrel() -> Command {
