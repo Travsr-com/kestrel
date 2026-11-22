@@ -120,7 +120,8 @@ fn text(s: &str) -> Value {
 }
 
 /// Every v3 table, read by its v3 columns only, so the same queries work before and after the
-/// migration. `events` includes the rowid, because v4 uses it as the global cursor.
+/// migration. `events` includes the rowid, which is the global cursor (an alias of `events.cursor`
+/// from v5 on).
 const V3_DATA: [&str; 6] = [
     "SELECT id, agent, input, status, created_at FROM runs ORDER BY rowid",
     "SELECT rowid, run_id, seq, body FROM events ORDER BY rowid",
@@ -218,8 +219,8 @@ fn run(store: &Store, id: RunId) -> RunRow {
     store.get_run(id).expect("get_run").expect("run exists")
 }
 
-// 1. Given a v3 database with runs, when it is opened, then it migrates to v4 ... and no data is
-//    lost. This part: the version moves from 3 to 4 and every v3 row is byte for byte the same.
+// 1. Given a v3 database with runs, when it is opened, then it migrates to v4 (and on to the current
+//    version) and no data is lost. This part: every v3 row is byte for byte the same.
 #[test]
 fn s1_v3_database_migrates_to_v4_and_loses_no_data() {
     let dir = TempDir::new().expect("tempdir");
@@ -234,12 +235,11 @@ fn s1_v3_database_migrates_to_v4_and_loses_no_data() {
     );
 
     let store = Store::open(&path).expect("open migrates");
-    assert_eq!(SCHEMA_VERSION, 4);
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), SCHEMA_VERSION);
     assert_eq!(v3_data(&path), before, "migration changed existing rows");
 
     drop(store);
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), SCHEMA_VERSION);
     assert_eq!(
         v3_data(&path),
         before,
@@ -496,7 +496,8 @@ fn s1_migrated_database_accepts_new_roots_and_children_of_old_runs() {
     );
 }
 
-// 2. Given a v4 database, when it is opened again, then the migration is a no-op.
+// 2. Given a database at the current version, when it is opened again, then the migration is a
+//    no-op.
 #[test]
 fn s2_reopening_a_v4_database_is_a_no_op() {
     let dir = TempDir::new().expect("tempdir");
@@ -521,7 +522,7 @@ fn s2_reopening_a_v4_database_is_a_no_op() {
         (root, child, grandchild, runs)
     };
     let first = snapshot(&path);
-    assert_eq!(first.version, 4);
+    assert_eq!(first.version, SCHEMA_VERSION);
 
     for _ in 0..2 {
         {
@@ -539,7 +540,8 @@ fn s2_reopening_a_v4_database_is_a_no_op() {
     }
 }
 
-// 2. Same for a database that reached v4 by migration: the second open changes nothing.
+// 2. Same for a database that reached the current version by migration: the second open changes
+//    nothing.
 #[test]
 fn s2_reopening_a_migrated_v3_database_is_a_no_op() {
     let dir = TempDir::new().expect("tempdir");
@@ -549,7 +551,7 @@ fn s2_reopening_a_migrated_v3_database_is_a_no_op() {
         store.list_runs(RunFilter::default()).expect("list")
     };
     let first = snapshot(&path);
-    assert_eq!(first.version, 4);
+    assert_eq!(first.version, SCHEMA_VERSION);
 
     for _ in 0..2 {
         {
@@ -560,25 +562,26 @@ fn s2_reopening_a_migrated_v3_database_is_a_no_op() {
     }
 }
 
-// 3. Given a binary that knows v4 and a database at v5, when it is opened, then it fails with the
-//    existing "newer schema" error.
+// 3. Given a binary and a database at a newer schema than it knows (v5 for the v4 binary of #32),
+//    when it is opened, then it fails with the existing "newer schema" error.
 #[test]
-fn s3_v5_database_is_refused_with_the_newer_schema_error() {
+fn s3_newer_database_is_refused_with_the_newer_schema_error() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kestrel.db");
     {
         let store = Store::open(&path).expect("open");
         store.create_run(&agent("a"), "x").expect("create_run");
     }
+    let newer = SCHEMA_VERSION + 1;
     rusqlite::Connection::open(&path)
         .expect("raw open")
-        .pragma_update(None, "user_version", 5)
+        .pragma_update(None, "user_version", newer)
         .expect("bump user_version");
     let before = snapshot(&path);
-    assert_eq!(before.version, 5);
+    assert_eq!(before.version, newer);
 
     match Store::open(&path) {
-        Ok(_) => panic!("opening a v5 database must fail"),
+        Ok(_) => panic!("opening a newer database must fail"),
         Err(e) => {
             assert!(
                 e.to_string().contains("upgrade kestrel"),
@@ -587,12 +590,10 @@ fn s3_v5_database_is_refused_with_the_newer_schema_error() {
             assert!(
                 matches!(
                     e,
-                    StoreError::SchemaTooNew {
-                        found: 5,
-                        supported: 4
-                    }
+                    StoreError::SchemaTooNew { found, supported }
+                        if found == newer && supported == SCHEMA_VERSION
                 ),
-                "expected SchemaTooNew {{ found: 5, supported: 4 }}, got {e:?}"
+                "expected SchemaTooNew {{ found: {newer}, supported: {SCHEMA_VERSION} }}, got {e:?}"
             );
         }
     }

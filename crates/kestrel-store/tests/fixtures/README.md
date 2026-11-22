@@ -1,9 +1,12 @@
 # Store test fixtures
 
-`v3.db` is a real schema v3 database, written by the store at commit `49fbcfd` (the last v3 commit).
-`tests/migration_v4.rs` copies it into a temp dir, opens the copy and checks nothing is lost.
+Real databases written by older versions of the store. Migration tests copy one into a temp dir,
+open the copy and check nothing is lost:
 
-Never open `v3.db` in place. Opening migrates the file, and the fixture must stay at v3.
+* `v3.db`: schema v3, used by `tests/migration_v4.rs` (and `tests/migration_v5.rs`).
+* `v4.db`: schema v4 with gaps in the `events` rowids, used by `tests/migration_v5.rs`.
+
+Never open a fixture in place. Opening migrates the file, and a fixture must stay at its version.
 
 ## What `v3.db` contains
 
@@ -71,7 +74,7 @@ Provider `anthropic`, model `test-model`, 10 tokens in, 20 out, latency 5 ms, st
 | 1 | gamma | `Cancel` | yes |
 | 2 | beta | `Pause` | no |
 
-## How it was made
+## How `v3.db` was made
 
 A throwaway integration test ran against the v3 code and was then deleted. It did, in order:
 
@@ -84,3 +87,48 @@ A throwaway integration test ran against the v3 code and was then deleted. It di
 
 Regenerating gives new run ids, tokens and timestamps, so update this file and the constants in
 `tests/migration_v4.rs` if you ever do.
+
+## What `v4.db` contains
+
+`PRAGMA user_version` is 4. The file is in WAL mode, checkpointed, with no `-wal` or `-shm` beside it.
+SHA-256: `0519413f0a498a17658a1d3ffc45af7a7ce2c1d5f0568744fe7fbb852d1d32ee`.
+
+### Runs (3)
+
+All are `Queued`, each with one `run_specs` row (the spec above, named after the agent) and one
+`run_tokens` row. `run_caps`, `model_calls` and `control` are empty.
+
+| Agent | Run id | Input | Parent | Gateway token |
+|---|---|---|---|---|
+| `alpha` | `01a203e6-b979-7376-ae42-2b2c01c2ae75` | `first task` | none (root) | `1234feeb6db618a6fd5b04b36da085ab` |
+| `beta` | `01a203e6-b99f-7440-a2a4-ef8fc3b1efc9` | `second task` | none (root) | `db66ab368ec118a11534e4b077f04a99` |
+| `child` | `01a203e6-b9be-738a-a3a5-c92f7f2bbde6` | `child task` | `alpha` (depth 1) | `19271581d8a5ca8971bb3087b887c1ba` |
+
+### Events (7, with gaps)
+
+The rowid is the global cursor. Rowids 2, 4, 7 and 8 belonged to a fourth run (`scratch`, id
+`01a203e6-b97e-750e-87fa-ec25468ff79f`) whose rows were deleted by hand, so the cursor has gaps.
+
+| Rowid | Run | Seq | Kind |
+|---|---|---|---|
+| 1 | alpha | 1 | `run_created` (agent `alpha`, no parent) |
+| 3 | beta | 1 | `run_created` (agent `beta`, no parent) |
+| 5 | child | 1 | `run_created` (agent `child`, parent `alpha`) |
+| 6 | alpha | 2 | `agent_message` "hello from alpha" |
+| 9 | beta | 2 | `agent_message` "hello from beta" |
+| 10 | child | 2 | `agent_message` "hello from child" |
+| 11 | alpha | 3 | `agent_message` "alpha again" |
+
+## How `v4.db` was made
+
+A throwaway integration test ran against the v4 code at commit `8949305` and was then deleted:
+
+1. `Store::open` on a new file, `create_run` for alpha, scratch and beta, `create_child_run` for
+   child under alpha (before its first event).
+2. `append` calls in the rowid order above, with scratch's events at rowids 2 (`run_created`), 4,
+   7 and 8 (`agent_message`).
+3. Dropped the store, then on a raw connection deleted scratch's `events`, `run_specs`,
+   `run_tokens` and `runs` rows, and closed it (which checkpoints the WAL).
+
+Regenerating gives new run ids, tokens and timestamps, so update this file and the constants in
+`tests/migration_v5.rs` if you ever do.

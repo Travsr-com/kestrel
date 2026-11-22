@@ -145,9 +145,9 @@ fn index_columns(path: &Path, table: &str) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn events_have_an_index_on_run_id_alone_so_a_tail_read_seeks_by_rowid() {
-    // An index on `run_id` alone is keyed `(run_id, rowid)`, so `rowid > cursor` is a range seek
-    // per run instead of a scan of every event the run ever wrote.
+fn events_have_an_index_on_run_id_alone_so_a_tail_read_seeks_by_cursor() {
+    // An index on `run_id` alone is keyed `(run_id, cursor)` (`events.cursor` is the rowid), so
+    // `cursor > ?` is a range seek per run instead of a scan of every event the run ever wrote.
     let run_id_only = vec!["run_id".to_string()];
     for path in [
         fresh(&TempDir::new().expect("tempdir")),
