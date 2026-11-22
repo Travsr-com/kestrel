@@ -445,16 +445,23 @@ fn i95_a_message_reaches_the_running_agent_once() {
         Some(r#"{"text":"from the api"}"#),
     );
     assert_eq!(status, 202, "{body}");
-    wait_until(RUN_DEADLINE, "the API message is delivered", || delivered(1));
+    wait_until(RUN_DEADLINE, "the API message is delivered", || {
+        delivered(1)
+    });
     env.ok(&["message", &id, "from the cli"]);
-    wait_until(RUN_DEADLINE, "the CLI message is delivered", || delivered(2));
+    wait_until(RUN_DEADLINE, "the CLI message is delivered", || {
+        delivered(2)
+    });
     std::fs::write(workspace.join("inbox-go"), "go").expect("tell the agent to finish");
     env.wait_status(&id, "Completed");
 
     // The agent got each message once, in order, and nothing after.
     let got = taken_texts(&env.read_out(&id, "inbox.out"));
     assert_eq!(got, ["from the api", "from the cli"]);
-    assert_eq!(taken_texts(&env.read_out(&id, "inbox-last.out")), Vec::<String>::new());
+    assert_eq!(
+        taken_texts(&env.read_out(&id, "inbox-last.out")),
+        Vec::<String>::new()
+    );
 
     let events = env.events(&id);
     let sent: Vec<(u64, &str)> = events
