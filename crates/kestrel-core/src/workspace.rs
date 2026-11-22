@@ -276,7 +276,9 @@ impl Workspaces {
         depth: Option<u32>,
         dest: &str,
     ) -> Result<(), WorkspaceError> {
-        let mut clone = argv(&["git", "clone", "--local", "--no-hardlinks"]);
+        // No template: one from the host (`init.templateDir`) may hold links, and a link in
+        // `.git` makes `bring_back` refuse the clone.
+        let mut clone = argv(&["git", "clone", "--local", "--no-hardlinks", "--template="]);
         let source = match depth {
             Some(n) => {
                 clone.extend(argv(&["--depth", &n.to_string()]));
