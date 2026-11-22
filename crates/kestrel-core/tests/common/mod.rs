@@ -665,8 +665,13 @@ async fn yield_a_bit() {
 
 /// Lets the engine run, advancing the paused clock in small steps, until `cond` holds. Panics
 /// naming `what` if it never does.
-pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + REAL_DEADLINE;
+pub async fn until(what: &str, cond: impl FnMut() -> bool) {
+    until_within(what, REAL_DEADLINE, cond).await;
+}
+
+/// [`until`] with its own real-time bound, for a wait that runs many real `git` processes.
+pub async fn until_within(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + limit;
     let mut advanced = Duration::ZERO;
     loop {
         if cond() {

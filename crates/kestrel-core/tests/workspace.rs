@@ -113,10 +113,11 @@ fn is_checkout(argv: &[String]) -> bool {
 }
 
 /// `git clone ... <source> <path>`: the path is the last argument. Imitate git: create it with
-/// a `.git` directory and a checked-out file.
+/// a `.git` directory holding `HEAD`, and a checked-out file.
 fn make_clone_dir(argv: &[String]) -> std::io::Result<()> {
     let path = PathBuf::from(argv.last().expect("clone has a target"));
     std::fs::create_dir_all(path.join(".git"))?;
+    std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
     std::fs::write(path.join("README.md"), "hello\n")
 }
 
@@ -278,7 +279,7 @@ fn s1_branch_name_uses_the_run_id_tail() {
 // Scenario 2: git-clone gives each run its own clone and branch (fake git, exact argv).
 // ---------------------------------------------------------------------------------------------
 
-/// `git clone --local --no-hardlinks <extra> -- <repo> <path>` (`extra` goes before the `--`), then the branch checkout inside the fresh clone with host hooks disabled.
+/// `git clone --local --no-hardlinks --template= <extra> -- <repo> <path>` (`extra` goes before the `--`), then the branch checkout inside the fresh clone with host hooks disabled.
 fn expected_calls(
     repo: &str,
     source: &str,
@@ -287,7 +288,7 @@ fn expected_calls(
     branch: &str,
 ) -> Vec<Vec<String>> {
     let p = path.to_str().unwrap();
-    let mut clone = s(&["git", "clone", "--local", "--no-hardlinks"]);
+    let mut clone = s(&["git", "clone", "--local", "--no-hardlinks", "--template="]);
     clone.extend(s(extra));
     clone.extend(s(&["--", source, p]));
     vec![
@@ -557,6 +558,7 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
     let git = FakeGit::new(Mode::Ok);
     let ws = Workspaces::new(root.clone(), git.clone());
     let path = ws.prepare(run_a(), &git_spec(&repo())).await.unwrap();
+    let clone_git = path.join(".git");
     let before = git.calls().len();
 
     ws.fetch_back(run_a(), &repo()).await.unwrap();
@@ -576,9 +578,13 @@ async fn fetch_back_runs_exactly_one_hardened_fetch_from_the_source_repo() {
             "protocol.ext.allow=never",
             "fetch",
             "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--upload-pack=git-upload-pack --strict",
             "--",
-            path.to_str().unwrap(),
-            "kestrel/run-123456789abc:kestrel/run-123456789abc",
+            clone_git.to_str().unwrap(),
+            "refs/heads/kestrel/run-123456789abc:refs/heads/kestrel/run-123456789abc",
         ])]
     );
 }

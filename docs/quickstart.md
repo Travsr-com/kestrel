@@ -183,6 +183,37 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 
 `--watch` follows the run live. Without it, `run` prints the run id and returns.
 
+## 6. Get the work back
+
+A moment after a `git-clone` run ends (completed, failed or cancelled), Kestrel fetches its work
+into your repository as branch `kestrel/run-<id>`, where `<id>` is the last 12 characters of the
+run id. `kestrel watch` can exit before that; the branch still arrives.
+Children of a run come back the same way, each on its own branch, so six children that edit the
+same file give six branches and nothing conflicts. Review and merge them like any other branch:
+
+```sh
+git log main..kestrel/run-5f3c9a1b2d4e
+git merge kestrel/run-5f3c9a1b2d4e
+```
+
+* Only that branch is created or moved. Your checkout, your index, your other branches and your
+  uncommitted changes are never touched.
+* A run that made no commits brings nothing back.
+* The run's log says `kestrel: fetched branch ...`. If the fetch fails (you already have a branch
+  of that name that the run does not build on, a commit fails git's object check, the clone's
+  `.git` points somewhere else, or git takes more than 2 minutes), the log has a
+  `kestrel: warning:` line instead, and the run's outcome is unchanged.
+
+To fetch by hand, for a run whose fetch failed, that ended before this existed, or that ended just
+before `kestrel serve` stopped:
+
+```sh
+kestrel fetch <run-id>
+```
+
+It prints what it did and exits 0 when the branch is there or there was nothing to fetch, 1 when
+the run is unknown, still going, has no clone, or git refuses.
+
 ## Everyday commands
 
 | Command | What it does |
@@ -193,6 +224,7 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 | `kestrel cancel <run-id>` | Stop a run for good. |
 | `kestrel budget <run-id> 5` | Set the run's budget to 5 USD. |
 | `kestrel approve <approval-id>` | Approve an action the agent asked about. Add `--reject` to refuse. |
+| `kestrel fetch <run-id>` | Fetch a finished run's branch `kestrel/run-<id>` into its repository. |
 | `kestrel message <run-id> "also fix the docs"` | Send a message to a running agent. See [Messages](#messages-to-a-running-agent). |
 
 Add `--json` to any command for machine-readable output.

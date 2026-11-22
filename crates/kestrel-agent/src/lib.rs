@@ -76,8 +76,9 @@ can go on at the same time.
   With wait set, it also waits for the child and returns how it ended.
 * A child starts from nothing: give it a complete, self-contained task.
 * Each child works in its own workspace, set by its agent spec: usually a fresh clone of the
-  original repository, never your copy. It sees none of your changes, committed or not, and its
-  changes do not reach yours: put what it needs in its input, and ask for what you need back in
+  original repository, never your copy. It sees none of your changes, committed or not: put what
+  it needs in its input. When it ends, its commits come back as branch kestrel/run-<id> in the
+  original repository, for the person to review, not into yours: ask for what you need back in
   its summary.
 * Few well-scoped children beat many small ones: each one costs a sandbox and its own model calls.
 ";

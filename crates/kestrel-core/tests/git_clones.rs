@@ -436,6 +436,8 @@ async fn s4_a_hostile_clone_config_and_hooks_never_run_during_fetch_back() {
         "pre-receive",
         "post-receive",
     ];
+    // The clone has no template, so no `.git/hooks`; the agent makes it.
+    std::fs::create_dir_all(clone.join(".git/hooks")).unwrap();
     for name in hook_names {
         trap(&hooks_dir.join(name), &marker(&format!("hookspath-{name}")));
         trap(
