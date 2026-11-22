@@ -149,6 +149,12 @@
     const text = message.trim();
     if (text === '') return;
     sent = '';
+    // The server counts UTF-8 bytes; the box's maxlength counts characters, so it lets more by.
+    const bytes = new TextEncoder().encode(text).length;
+    if (bytes > MAX_MESSAGE_BYTES) {
+      refused = `This message is ${bytes} bytes; a message may hold at most ${MAX_MESSAGE_BYTES} bytes (16 KiB). Shorten it and send again.`;
+      return;
+    }
     if (await send(() => api.message(run.id, text))) {
       message = '';
       sent = 'Sent. The agent reads it the next time it checks for messages.';
