@@ -51,19 +51,7 @@ pub(crate) fn find_run(store: &Store, id: &str) -> Result<RunRow, Reject> {
         .ok_or_else(missing)
 }
 
-/// The lower-case name `?status=` filters on.
-fn status_name(status: &RunStatus) -> &'static str {
-    match status {
-        RunStatus::Queued => "queued",
-        RunStatus::Provisioning => "provisioning",
-        RunStatus::Running => "running",
-        RunStatus::Suspended(_) => "suspended",
-        RunStatus::Completed => "completed",
-        RunStatus::Failed(_) => "failed",
-        RunStatus::Cancelled => "cancelled",
-    }
-}
-
+/// The names `?status=` filters on ([`RunStatus::name`]).
 const STATUS_NAMES: [&str; 7] = [
     "queued",
     "provisioning",
@@ -126,7 +114,7 @@ pub(crate) async fn list_runs(State(s): State<AppState>, Query(q): Params) -> Re
     };
     let mut rows: Vec<RunRow> = rows
         .into_iter()
-        .filter(|r| status.is_none_or(|n| status_name(&r.status) == n))
+        .filter(|r| status.is_none_or(|n| r.status.name() == n))
         .filter(|r| q.get("agent").is_none_or(|a| r.agent == *a))
         .filter(|r| root.is_none_or(|root| r.root == root))
         .collect();
@@ -215,7 +203,7 @@ struct BudgetBody {
 }
 
 /// `POST /api/runs/{id}/{pause|resume|cancel|budget|message}`: 202 once the command is in the
-/// store's control channel.
+/// store's control channel, 409 with the reason when the run's status does not allow it.
 pub(crate) async fn command(
     State(s): State<AppState>,
     Path((id, action)): Path<(String, String)>,
@@ -251,6 +239,13 @@ pub(crate) async fn command(
         }
         other => return error(StatusCode::NOT_FOUND, format!("no command `{other}`")),
     };
+    // Refused up front, so the caller hears why instead of a 202 the engine then ignores. A cancel
+    // of an ended run with a live run below it goes through: it cancels that tree.
+    match s.store.command_refusal(&row, &cmd) {
+        Ok(None) => {}
+        Ok(Some(why)) => return error(StatusCode::CONFLICT, format!("run {}: {why}", row.id)),
+        Err(e) => return internal(e),
+    }
     match s.store.push_control(row.id, cmd) {
         Ok(_) => accepted(),
         Err(e) => internal(e),

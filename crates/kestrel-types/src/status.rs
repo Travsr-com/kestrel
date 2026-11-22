@@ -29,9 +29,24 @@ impl RunStatus {
         matches!(self, Self::Completed | Self::Failed(_) | Self::Cancelled)
     }
 
+    /// The lower-case name, without a reason or message: `queued`, `suspended`, `failed`, ...
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Provisioning => "provisioning",
+            Self::Running => "running",
+            Self::Suspended(_) => "suspended",
+            Self::Completed => "completed",
+            Self::Failed(_) => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     /// Lifecycle from `docs/architecture.md` section 3.2:
     /// `Queued -> Provisioning -> Running <-> Suspended`, `Running -> Completed`,
     /// any non-terminal state `-> Failed | Cancelled`. Terminal states have no exits.
+    /// `Provisioning -> Suspended(Error)` is how a restart suspends a run it cut off before its
+    /// agent started (#92).
     pub fn can_transition_to(&self, next: &RunStatus) -> bool {
         use RunStatus::*;
         if self.is_terminal() {
@@ -41,7 +56,7 @@ impl RunStatus {
             (self, next),
             (_, Failed(_) | Cancelled)
                 | (Queued, Provisioning)
-                | (Provisioning, Running)
+                | (Provisioning, Running | Suspended(SuspendReason::Error(_)))
                 | (Running, Suspended(_) | Completed)
                 | (Suspended(_), Running)
         )

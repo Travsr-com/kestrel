@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use kestrel_core::caps::RootKey;
 use kestrel_core::{ChildResult, Engine, JoinMode, JoinOutcome};
 use kestrel_gateway::{JoinCall, JoinWait, KestrelTool, SpawnCall, ToolHost, ToolsError};
-use kestrel_types::{AgentSpec, RunId};
+use kestrel_types::{AgentSpec, RunId, RunStatus};
 use serde_json::{Value, json};
 
 use crate::Failure;
@@ -172,6 +172,12 @@ impl ToolHost for EngineTools {
             .map_err(|e| e.to_string())?;
         let child = spawned.id;
         let mut answer = json!({ "child": child.to_string() });
+        // The parent spawned this before its agent started again: the same child, not a new one,
+        // and it may have moved on or ended since, so the answer says where it is now.
+        if spawned.existing {
+            answer["existing"] = json!(true);
+            answer["status"] = json!(status_name(&spawned.status));
+        }
         // A spec that asked for more spawn depth than this run can give: say what it got.
         if let Some(lowered) = spawned.lowered_depth {
             answer["depth"] = json!(lowered.granted);
@@ -242,6 +248,19 @@ fn results_json(results: &[ChildResult]) -> Vec<Value> {
             out
         })
         .collect()
+}
+
+/// The lower-case name of `status`, as the API's `?status=` filter spells it.
+fn status_name(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Provisioning => "provisioning",
+        RunStatus::Running => "running",
+        RunStatus::Suspended(_) => "suspended",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed(_) => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
 }
 
 #[cfg(test)]
@@ -603,8 +622,90 @@ mod tests {
         assert_eq!(waited["note"], note, "{waited}");
     }
 
+    // Issue #92: a parent started again (here: a new engine on the same store, as after a restart)
+    // that spawns the same agent with the same input gets the child it had, and the answer says so.
+    #[tokio::test]
+    async fn a_spawn_repeated_after_a_restart_answers_with_the_same_child() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("worker.yaml"), spec("worker")).unwrap();
+        let (store, tools) = engine_tools(dir.path());
+        let lead = tools
+            .engine
+            .submit(
+                with_caps(
+                    "lead",
+                    "{ mcp: [kestrel.spawn], spawn: { max_children: 1, max_depth: 1, agents: [worker] } }",
+                ),
+                "x".into(),
+            )
+            .await
+            .unwrap();
+        run(&store, lead);
+        let call = SpawnCall {
+            agent: "worker".into(),
+            input: "help".into(),
+            budget: Some(kestrel_types::MicroUsd(100_000)),
+            wait: false,
+        };
+        let first = tools.spawn(lead, call.clone()).await.unwrap();
+        assert!(first.get("existing").is_none(), "{first}");
+        let child: RunId = first["child"].as_str().unwrap().parse().unwrap();
+        store
+            .transition(child, &RunStatus::Queued, RunStatus::Cancelled)
+            .unwrap();
+        let restarted = EngineTools {
+            engine: Arc::new(
+                Engine::new(
+                    store.clone(),
+                    Vec::new(),
+                    Arc::new(kestrel_agent::adapter_for),
+                    url::Url::parse("http://127.0.0.1:7070").unwrap(),
+                    kestrel_core::Limits::default(),
+                )
+                .with_root_key(RootKey::generate()),
+            ),
+            agents: AgentDir(dir.path().to_path_buf()),
+        };
+        let again = restarted.spawn(lead, call).await.unwrap();
+        assert_eq!(again["child"], first["child"], "{again}");
+        assert_eq!(again["existing"], true, "{again}");
+        // The child may have ended since: the answer says where it is now.
+        assert!(first.get("status").is_none(), "{first}");
+        assert_eq!(again["status"], "cancelled", "{again}");
+        assert_eq!(store.children(lead).unwrap().len(), 1);
+    }
+
     fn spec_of(name: &str) -> AgentSpec {
         AgentSpec::from_yaml(&spec(name)).unwrap()
+    }
+
+    #[test]
+    fn status_names_are_the_api_filter_names() {
+        use kestrel_types::SuspendReason;
+        let names: Vec<&str> = [
+            RunStatus::Queued,
+            RunStatus::Provisioning,
+            RunStatus::Running,
+            RunStatus::Suspended(SuspendReason::Budget),
+            RunStatus::Completed,
+            RunStatus::Failed("x".into()),
+            RunStatus::Cancelled,
+        ]
+        .iter()
+        .map(status_name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "queued",
+                "provisioning",
+                "running",
+                "suspended",
+                "completed",
+                "failed",
+                "cancelled"
+            ]
+        );
     }
 
     #[test]

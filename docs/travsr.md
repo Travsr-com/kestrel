@@ -165,6 +165,42 @@ This is a deliberate limit: **the index shows the code the run started from, not
 edits.** Indexing the agent's edits safely means running Travsr inside the sandbox, which is the
 follow-up.
 
+### What a run sees
+
+| What | In the run's answers |
+|---|---|
+| The source repo at the commit the run's workspace was cloned at | Yes |
+| A file the agent added or changed in its workspace | No, not even after the agent commits it |
+| Another run's edits, or its index | No: each run has its own copy and its own server |
+| A later commit of the source repo | No, until a new run starts from it |
+
+Seeing a run's own edits after a re-index (issue #96, scenario 1) waits on Travsr indexing a repo
+by path from another process ([#1133](https://github.com/Travsr-com/travsr/issues/1133)) and
+serving every read tool over MCP from a long-running server
+([#1134](https://github.com/Travsr-com/travsr/issues/1134)). The test
+`m2_s11_travsr_answers_from_the_run_s_own_copy` holds today's behaviour.
+
+## Testing against a real Travsr
+
+Unit tests use a fake `travsr` (a shell script). One test runs the real one:
+`s12_the_index_answers_from_the_private_copy_and_never_sees_the_workspace`, behind the
+`integration` feature.
+
+```sh
+TRAVSR_BIN=/usr/local/bin/travsr cargo test -p kestrel-cli --features integration --lib travsr::tests
+```
+
+* `TRAVSR_BIN` is an absolute path or a bare name (default `travsr`, looked up on `PATH`). A
+  relative path fails the test.
+* Without `KESTREL_TRAVSR_VERSION`, a travsr that is missing or does not run skips the test, and
+  says so.
+* With `KESTREL_TRAVSR_VERSION=1.4.0`, that fails the test, and so does a travsr whose
+  `--version` reports another version.
+
+CI's `travsr integration (pinned release)` job installs the pinned Travsr release, checks its
+SHA-256, and runs this test with the version set. To move the pin, change
+`KESTREL_TRAVSR_VERSION` and `KESTREL_TRAVSR_SHA256` in `.github/workflows/ci.yml`.
+
 ## Limits
 
 | What | Limit |
@@ -196,7 +232,9 @@ Known limits on Kestrel's side:
 
 The security model above rests on these places in Travsr's source, checked at Travsr commit
 `c1305034`. Paths are relative to the travsr repo; line numbers move, so search for the code
-quoted.
+quoted. The release CI pins, v1.4.0 (`3649dc6e`), is older than that commit. It has
+`init --no-connect`, `mcp --stdio --db`, and the `CI`, `TRAVSR_SKIP_DOWNLOAD` and
+`TRAVSR_DISABLE_REGISTRY` checks, in the same functions.
 
 | What Kestrel relies on | Where |
 |---|---|

@@ -16,9 +16,9 @@ use kestrel_gateway::{
     ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
-    BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
-    MAX_BRIDGE_CONNECTIONS, ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots,
-    docker_subnets_except_instance, host_routes,
+    BridgeNetwork, BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo,
+    Ipv4Cidr, MAX_BRIDGE_CONNECTIONS, NetworkPlan, ProcessRunner, SandboxDriver, SubnetPool,
+    detect_with_roots, docker_subnets_except_instance, host_routes,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -96,6 +96,8 @@ struct RawEngine {
     shutdown_grace_secs: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key and never echoed.
     agents_dir: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    resume_after_restart: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -145,6 +147,9 @@ struct Config {
     /// `engine.agents_dir`: where `kestrel.spawn` finds agent specs by name. `None` means the
     /// default, `agents` next to the database.
     agents_dir: Option<PathBuf>,
+    /// `engine.resume_after_restart`: whether the runs a restart stopped are resumed when serve
+    /// starts again. Default true.
+    resume_after_restart: bool,
     /// `[travsr]`: `None` without the section, so Travsr is off.
     travsr: Option<TravsrSettings>,
     /// `gateway.max_waiting_calls`: Kestrel tool calls held open at once across all runs.
@@ -274,6 +279,10 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .unwrap_or_default();
     let subnet_pool = subnet_pool(raw.gateway.subnet_pool)?;
     let agents_dir = raw.engine.agents_dir.map(agents_dir_setting).transpose()?;
+    let resume_after_restart = raw
+        .engine
+        .resume_after_restart
+        .map_or(Ok(true), resume_after_restart_setting)?;
     let allowed_roots = raw
         .sandbox
         .allowed_roots
@@ -301,6 +310,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         shutdown_grace,
         allowed_roots,
         agents_dir,
+        resume_after_restart,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -394,6 +404,14 @@ fn agents_dir_setting(value: toml::Value) -> Result<PathBuf, Failure> {
         .ok_or_else(|| Failure::usage("engine.agents_dir must be an absolute path string"))
 }
 
+/// `engine.resume_after_restart`: `true` or `false`. Anything else is a usage error that names the
+/// key and never echoes the value.
+fn resume_after_restart_setting(value: toml::Value) -> Result<bool, Failure> {
+    value
+        .as_bool()
+        .ok_or_else(|| Failure::usage("engine.resume_after_restart must be true or false"))
+}
+
 /// `sandbox.allowed_roots`: a non-empty array of absolute path strings. Anything else is a usage
 /// error that names `sandbox.allowed_roots` and never echoes the value.
 fn allowed_roots_setting(value: toml::Value) -> Result<Vec<PathBuf>, Failure> {
@@ -454,16 +472,19 @@ fn subnet_pool(value: Option<toml::Value>) -> Result<Ipv4Cidr, Failure> {
 /// The subnet plan for run networks: every `/29` block of `pool` that no docker network uses
 /// and, when docker runs on this host, no host route covers (a VM's routes are not this host's,
 /// so they are not read). The leftover run networks of `instance` do not count: `recover` removes
-/// them before any block is reserved. Writes one line naming the pool and the free block count
-/// to `err`. No free block is a runtime error that says to set `gateway.subnet_pool` to a free
-/// range.
+/// them before any block is reserved. Also decides where the bridge's `kestrel-gw` network comes
+/// from ([`GatewayBridge::plan_network`], issue #99): an existing one is reused (a smaller one
+/// with nothing attached is grown), a missing one takes a `/24` span of the pool for good.
+/// Writes a warning when a small `kestrel-gw` is kept, then one line naming the pool and the free
+/// block count, to `err`. No free block, or no block left for runs after `kestrel-gw` took its
+/// span, is a runtime error that names `gateway.subnet_pool`.
 async fn subnet_plan(
     pool: Ipv4Cidr,
     runner: &dyn CommandRunner,
     host: DockerHost,
     instance: Option<&str>,
     err: &mut dyn std::io::Write,
-) -> Result<Arc<SubnetPool>, Failure> {
+) -> Result<(Arc<SubnetPool>, BridgeNetwork), Failure> {
     let plan =
         SubnetPool::new(pool).map_err(|e| Failure::usage(format!("gateway.subnet_pool: {e}")))?;
     let networks = docker_subnets_except_instance(runner, instance)
@@ -481,12 +502,23 @@ async fn subnet_plan(
             "subnet pool {pool} has no free /29 block: docker networks or host routes use all of it. Set gateway.subnet_pool to a free range"
         )));
     }
+    let NetworkPlan { network, warning } = GatewayBridge::plan_network(runner, &plan)
+        .await
+        .map_err(|e| Failure::runtime(e.to_string()))?;
+    let free = plan.available();
+    let bridge = match &network {
+        BridgeNetwork::Subnet(span) => format!("; kestrel-gw takes {}", span.cidr()),
+        _ => String::new(),
+    };
     // A closed stderr must not stop serve.
+    if let Some(warning) = warning {
+        let _ = writeln!(err, "warning: {warning}");
+    }
     let _ = writeln!(
         err,
-        "networks: one per run, from subnet pool {pool} ({free} free /29 blocks)"
+        "networks: one per run, from subnet pool {pool} ({free} free /29 blocks{bridge})"
     );
-    Ok(Arc::new(plan))
+    Ok((Arc::new(plan), network))
 }
 
 /// The warning for sandboxes on the one shared network, which is what they get with docker
@@ -633,6 +665,7 @@ const CONFIG_NAMES: &[&str] = &[
     "max_concurrent_runs",
     "shutdown_grace_secs",
     "agents_dir",
+    "resume_after_restart",
     "providers",
     "anthropic",
     "openai",
@@ -887,24 +920,28 @@ fn acquire_serve_lock(db: &Path) -> Result<ServeLock, Failure> {
     Ok(ServeLock { _file: file })
 }
 
+/// The bridge for docker on `host`, holding `connections` at once, on `network`.
+fn bridge_spec(host: DockerHost, connections: u32, network: BridgeNetwork) -> BridgeSpec {
+    BridgeSpec {
+        add_host_gateway: host == DockerHost::Native,
+        connections,
+        network,
+        ..BridgeSpec::default()
+    }
+}
+
 /// Starts the bridge when sandboxes need one: docker drivers and no `advertise_url`.
 async fn start_bridge(
     runner: Arc<dyn CommandRunner>,
-    host: DockerHost,
+    spec: BridgeSpec,
     docker: bool,
     advertise: Option<&Url>,
     port: u16,
-    connections: u32,
     db: &Path,
 ) -> Result<Option<GatewayBridge>, Failure> {
     if !docker || advertise.is_some() {
         return Ok(None);
     }
-    let spec = BridgeSpec {
-        add_host_gateway: host == DockerHost::Native,
-        connections,
-        ..BridgeSpec::default()
-    };
     GatewayBridge::start(runner, port, spec, db)
         .await
         .map(Some)
@@ -1176,8 +1213,9 @@ async fn run(
             "gateway listens on {addr}, which is not loopback: only run tokens protect it, bind to a private interface if you can"
         );
     }
-    // Before the bridge: a pool with no free block stops serve with nothing to clean up.
-    let subnets = if needs_bridge {
+    // Before the bridge: a pool with no free block stops serve with nothing to clean up. The plan
+    // also decides where the bridge's `kestrel-gw` network comes from.
+    let (subnets, network) = if needs_bridge {
         let mut err = std::io::stderr();
         // This instance's leftover run networks do not count: `recover` removes them before
         // any block is reserved.
@@ -1189,17 +1227,17 @@ async fn run(
             Some(&instance),
             &mut err,
         );
-        Some(plan.await?)
+        let (plan, network) = plan.await?;
+        (Some(plan), network)
     } else {
-        None
+        (None, BridgeNetwork::DockerPools)
     };
     let bridge = start_bridge(
         Arc::new(ProcessRunner),
-        host,
+        bridge_spec(host, config.bridge_connections, network),
         docker,
         config.advertise_url.as_ref(),
         addr.port(),
-        config.bridge_connections,
         &db,
     )
     .await?;
@@ -1348,6 +1386,7 @@ async fn start_engine(
     .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
     .with_instance(GatewayBridge::instance_id(db))
     .with_root_key(root_key)
+    .with_resume_after_restart(config.resume_after_restart)
     // Each run's MCP config and the like, mounted read-only at /kestrel in its sandbox.
     .with_run_config(data_dir.join("run-config"));
     // Travsr, when configured: one process client keeps private copies of runs' code under
@@ -1931,11 +1970,10 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let r = recorder(0);
         start_bridge(
             r.clone(),
-            DockerHost::Native,
+            bridge_spec(DockerHost::Native, 140, BridgeNetwork::DockerPools),
             true,
             None,
             7070,
-            140,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -2405,6 +2443,29 @@ budget: { usd: 0.000010, wall_clock: 10m }
         }
     }
 
+    // Issue #92: runs the restart stopped are resumed by default; `false` leaves them suspended.
+    #[test]
+    fn resume_after_restart_defaults_to_on_and_must_be_true_or_false() {
+        let (_dir, path) = write(ANTHROPIC);
+        assert!(load_config(&path).expect("config").resume_after_restart);
+        let (_dir, path) = write(&format!(
+            "[engine]\nresume_after_restart = false\n{ANTHROPIC}"
+        ));
+        assert!(!load_config(&path).expect("config").resume_after_restart);
+        let (_dir, path) = write(&format!(
+            "[engine]\nresume_after_restart = true\n{ANTHROPIC}"
+        ));
+        assert!(load_config(&path).expect("config").resume_after_restart);
+        for bad in ["'secret-x'", "1", "['true']"] {
+            let (_dir, path) = write(&format!(
+                "[engine]\nresume_after_restart = {bad}\n{ANTHROPIC}"
+            ));
+            let err = load_config(&path).expect_err(bad).message;
+            assert!(err.contains("engine.resume_after_restart"), "{bad}: {err}");
+            assert!(!err.contains("secret-x"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn agents_dir_defaults_to_none_and_must_be_an_absolute_path() {
         let (_dir, path) = write(ANTHROPIC);
@@ -2532,11 +2593,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let r = recorder(0);
             let bridge = start_bridge(
                 r.clone(),
-                DockerHost::Native,
+                bridge_spec(
+                    DockerHost::Native,
+                    kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                    BridgeNetwork::DockerPools,
+                ),
                 docker,
                 advertise,
                 7070,
-                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
                 Path::new("/tmp/k.db"),
             )
             .await;
@@ -2546,11 +2610,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let r = recorder(0);
         let bridge = start_bridge(
             r.clone(),
-            DockerHost::Native,
+            bridge_spec(
+                DockerHost::Native,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                BridgeNetwork::DockerPools,
+            ),
             true,
             None,
             7070,
-            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -2566,11 +2633,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
     async fn a_failing_bridge_is_a_runtime_error() {
         let e = start_bridge(
             recorder(1),
-            DockerHost::Native,
+            bridge_spec(
+                DockerHost::Native,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                BridgeNetwork::DockerPools,
+            ),
             true,
             None,
             7070,
-            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             Path::new("/tmp/k.db"),
         )
         .await
@@ -3293,11 +3363,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let r = recorder(0);
             start_bridge(
                 r.clone(),
-                host,
+                bridge_spec(
+                    host,
+                    kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                    BridgeNetwork::DockerPools,
+                ),
                 true,
                 None,
                 7070,
-                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
                 Path::new("/tmp/k.db"),
             )
             .await
@@ -3406,6 +3479,13 @@ budget: { usd: 0.000010, wall_clock: 10m }
         docker_fails: bool,
         /// What `docker network ls -q` prints when filtered to this instance's run networks.
         ours: &'static str,
+        /// What `docker network ls` prints when filtered to the name `kestrel-gw`: by default it
+        /// exists, so the bridge takes no block.
+        gw: &'static str,
+        /// What `docker network inspect` of `kestrel-gw` prints: its subnets. By default a `/24`.
+        gw_inspect: &'static str,
+        /// What `docker ps -aq --filter network=kestrel-gw` prints. By default one bridge.
+        gw_attached: &'static str,
     }
 
     impl Host {
@@ -3416,6 +3496,17 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 routes,
                 docker_fails: false,
                 ours: "",
+                gw: "kestrel-gw\n",
+                gw_inspect: "172.30.0.0/24 ",
+                gw_attached: "c0ffee000001\n",
+            }
+        }
+
+        /// A docker with no `kestrel-gw` network yet.
+        fn without_gw(subnets: &'static str, routes: &'static str) -> Host {
+            Host {
+                gw: "",
+                ..Host::new(subnets, routes)
             }
         }
 
@@ -3444,7 +3535,12 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let stdout = match words.as_slice() {
                 ["ip", ..] => self.routes,
                 ["docker", "network", "ls", "-q", "--filter", ..] => self.ours,
+                ["docker", "network", "ls", "--filter", name, ..] if name.starts_with("name=") => {
+                    self.gw
+                }
                 ["docker", "network", "ls", ..] => "1a2b3c4d5e6f\n",
+                ["docker", "network", "inspect", "--format", _, "kestrel-gw"] => self.gw_inspect,
+                ["docker", "ps", "-aq", "--filter", "network=kestrel-gw"] => self.gw_attached,
                 ["docker", "network", "inspect", ..] => self.subnets,
                 _ => "",
             };
@@ -3476,6 +3572,16 @@ budget: { usd: 0.000010, wall_clock: 10m }
         host: &Host,
         mode: DockerHost,
     ) -> (Result<Arc<SubnetPool>, Failure>, String) {
+        let (got, line) = plan_with_bridge(pool, host, mode).await;
+        (got.map(|(plan, _)| plan), line)
+    }
+
+    /// The plan and the bridge network it decided on, and what it wrote to stderr.
+    async fn plan_with_bridge(
+        pool: &str,
+        host: &Host,
+        mode: DockerHost,
+    ) -> (Result<(Arc<SubnetPool>, BridgeNetwork), Failure>, String) {
         let mut err = Vec::new();
         let got = subnet_plan(cidr(pool), host, mode, None, &mut err).await;
         (got, String::from_utf8_lossy(&err).into_owned())
@@ -3489,7 +3595,187 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let mut err = Vec::new();
         let pool = cidr("10.200.0.0/29");
         let got = subnet_plan(pool, &host, DockerHost::Vm, Some("k1"), &mut err).await;
-        (got, host)
+        (got.map(|(plan, _)| plan), host)
+    }
+
+    // ---- the bridge's own network gets a block of the plan (issue #99) ----
+
+    #[tokio::test]
+    async fn s1_without_kestrel_gw_the_plan_gives_it_an_aligned_24() {
+        let host = Host::without_gw("10.200.0.0/29\n", "");
+        let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span for kestrel-gw, got {network:?}");
+        };
+        // The first /24 holds a taken block, so the span is the next aligned one.
+        assert_eq!(span.cidr(), cidr("10.200.1.0/24"));
+        assert_eq!(plan.available(), 8191 - 32, "the bridge's span is gone");
+        assert_eq!(
+            plan.reserve().map(|s| s.cidr()),
+            Some(cidr("10.200.0.8/29")),
+            "runs still get the blocks around it"
+        );
+        // The next 40 runs pass the span: blocks 2 to 31, then 64 on.
+        for _ in 0..40 {
+            let run = plan.reserve().expect("a run block");
+            assert!(!run.cidr().overlaps(&span.cidr()), "{:?}", run.cidr());
+        }
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains(&(8191 - 32).to_string()), "{line}");
+        assert!(
+            line.contains("kestrel-gw") && line.contains("10.200.1.0/24"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s2_an_existing_kestrel_gw_is_reused_and_takes_no_block() {
+        let host = Host::new("", "");
+        let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        assert!(
+            matches!(network, BridgeNetwork::Existing { .. }),
+            "{network:?}"
+        );
+        assert_eq!(plan.available(), 8192);
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|a| a.get(2).map(String::as_str) == Some("create")),
+            "{:?}",
+            host.calls()
+        );
+        assert!(line.contains("8192"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn s3_a_pool_without_room_for_the_bridge_and_one_run_stops_serve_naming_the_setting() {
+        let host = Host::without_gw("", "");
+        let (got, line) = plan_with_bridge("10.200.0.0/29", &host, DockerHost::Vm).await;
+        let e = got.expect_err("one block cannot hold kestrel-gw and a run");
+        assert_eq!(e.code, crate::EXIT_RUNTIME);
+        assert!(e.message.contains("gateway.subnet_pool"), "{}", e.message);
+        assert!(e.message.contains("10.200.0.0/29"), "{}", e.message);
+        assert!(line.is_empty(), "{line}");
+
+        // Two blocks are enough: one for kestrel-gw, one for runs.
+        let host = Host::without_gw("", "");
+        let (got, _) = plan_with_bridge("10.200.0.0/28", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        assert!(matches!(network, BridgeNetwork::Subnet(_)), "{network:?}");
+        assert_eq!(plan.available(), 1);
+
+        // With kestrel-gw there already, one block is enough.
+        let host = Host::new("", "");
+        let (got, _) = plan_with_bridge("10.200.0.0/29", &host, DockerHost::Vm).await;
+        assert_eq!(got.expect("plan").0.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_small_pool_gives_kestrel_gw_a_smaller_span_that_leaves_a_run_block() {
+        let host = Host::without_gw("", "");
+        let (got, line) = plan_with_bridge("10.200.0.0/24", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span, got {network:?}");
+        };
+        assert_eq!(span.cidr(), cidr("10.200.0.0/25"));
+        assert_eq!(plan.available(), 16);
+        assert!(line.contains("10.200.0.0/25"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_smaller_kestrel_gw_in_use_is_kept_and_serve_warns_how_to_grow_it() {
+        let mut host = Host::new("", "");
+        host.gw_inspect = "172.30.0.0/29 ";
+        host.gw_attached = "c0ffee000001\nc0ffee000002\n";
+        let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        assert!(
+            matches!(network, BridgeNetwork::Existing { .. }),
+            "{network:?}"
+        );
+        assert_eq!(plan.available(), 8192);
+        assert_eq!(line.lines().count(), 2, "{line}");
+        let warning = line.lines().next().unwrap_or_default();
+        assert!(warning.starts_with("warning:"), "{warning}");
+        assert!(warning.contains("172.30.0.0/29"), "{warning}");
+        assert!(
+            warning.contains("docker network rm kestrel-gw"),
+            "{warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_smaller_kestrel_gw_with_nothing_attached_is_recreated_larger() {
+        let mut host = Host::new("", "");
+        host.gw_inspect = "172.30.0.0/29 ";
+        host.gw_attached = "";
+        let (got, _) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (_, network) = got.expect("plan");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span, got {network:?}");
+        };
+        assert_eq!(span.cidr(), cidr("10.200.0.0/24"));
+        let rm: Vec<String> = ["docker", "network", "rm", "kestrel-gw"]
+            .map(String::from)
+            .to_vec();
+        assert!(host.calls().contains(&rm), "{:?}", host.calls());
+    }
+
+    #[tokio::test]
+    async fn the_bridge_creates_kestrel_gw_on_the_planned_span() {
+        let r = recorder(0);
+        let block = SubnetPool::parse("10.200.0.0/16")
+            .expect("pool")
+            .claim_span(24)
+            .expect("a span");
+        start_bridge(
+            r.clone(),
+            bridge_spec(
+                DockerHost::Native,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                BridgeNetwork::Subnet(block),
+            ),
+            true,
+            None,
+            7070,
+            Path::new("/tmp/k.db"),
+        )
+        .await
+        .expect("started")
+        .expect("bridge");
+        let calls = r
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let create: Vec<String> = [
+            "docker",
+            "network",
+            "create",
+            "--internal",
+            "--subnet",
+            "10.200.0.0/24",
+            "--gateway",
+            "10.200.0.1",
+            "kestrel-gw",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(calls.contains(&create), "{calls:?}");
+    }
+
+    #[test]
+    fn the_bridge_spec_carries_the_host_the_connections_and_the_network() {
+        let existing = BridgeNetwork::Existing { fallback: None };
+        let spec = bridge_spec(DockerHost::Vm, 140, existing.clone());
+        assert!(!spec.add_host_gateway);
+        assert_eq!(spec.connections, 140);
+        assert_eq!(spec.network, existing);
+        assert!(bridge_spec(DockerHost::Native, 1, BridgeNetwork::DockerPools).add_host_gateway);
     }
 
     #[tokio::test]
@@ -3514,7 +3800,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
             !host
                 .calls()
                 .iter()
-                .any(|a| a.get(2).map(String::as_str) == Some("inspect")),
+                // kestrel-gw is read by name: the bridge planning, not the subnet listing.
+                .any(|a| a.get(2).map(String::as_str) == Some("inspect")
+                    && a.last().map(String::as_str) != Some("kestrel-gw")),
             "our leftover is not inspected: {:?}",
             host.calls()
         );
@@ -3602,11 +3890,14 @@ budget: { usd: 0.000010, wall_clock: 10m }
         let db = Path::new("/tmp/k.db");
         let bridge = start_bridge(
             recorder(0),
-            DockerHost::Native,
+            bridge_spec(
+                DockerHost::Native,
+                kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
+                BridgeNetwork::DockerPools,
+            ),
             true,
             None,
             7070,
-            kestrel_sandbox::DEFAULT_BRIDGE_CONNECTIONS,
             db,
         )
         .await

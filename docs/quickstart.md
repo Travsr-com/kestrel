@@ -39,11 +39,17 @@ Kestrel warns you if other users can read it.
 # Long tool calls (a waiting `kestrel.join`, a question) held open at once across all runs,
 # from 1 to 4096. Default 256. Past the limit a call is refused with a clear error.
 # max_waiting_calls = 256
+# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24) get their
+# addresses. Default 10.200.0.0/16. Change it if that range is already used on your network.
+# subnet_pool = "10.200.0.0/16"
 
 [engine]
 max_concurrent_runs = 4
 # Seconds a stop may take, from 1 to 3600. Default 10.
 shutdown_grace_secs = 10
+# Resume the runs a stop or crash cut off when serve starts again. Default true. Set false if your
+# agents do things that must not happen twice: a resumed agent starts again from its input.
+# resume_after_restart = true
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
@@ -154,6 +160,14 @@ one `shutdown:` line. It exits 0 when all is clean and 1 when a sandbox could no
 time. Press Ctrl-C a second time to quit at once (exit 130); sandboxes may be left behind, and the
 next `kestrel serve` removes them.
 
+When serve starts again, the runs it cut off carry on by themselves: each starts its agent again
+from its input in a fresh sandbox. A parent that spawns the same children again gets the ones it
+already had. Paused runs, runs over budget and runs waiting for an approval stay as they were.
+`engine.resume_after_restart = false` leaves the cut-off runs suspended until you `kestrel resume`
+them. A run that three restarts already stopped is left suspended the fourth time, in case it is
+what brings serve down; its log says so. Runs suspended by a restart before you upgraded also stay
+suspended.
+
 For the web UI, start `kestrel up` instead. It runs the same, plus the API server on
 `127.0.0.1:7171`, and opens the UI in your browser (`--no-open` only prints the address). The UI
 shows only a "how to build" page until it is built: `cd ui && npm ci && npm run build`, then
@@ -206,13 +220,26 @@ the run is unknown, still going, has no clone, or git refuses.
 | :--- | :--- |
 | `kestrel ps` | List active runs. Add `--all` for finished ones. Shows spend so far. |
 | `kestrel watch <run-id>` | Follow a run's events. Works on finished runs too. |
-| `kestrel pause <run-id>` / `resume` | Stop and restart a run. |
+| `kestrel pause <run-id>` / `resume` | Stop a running run, and restart a suspended one. |
 | `kestrel cancel <run-id>` | Stop a run for good. |
 | `kestrel budget <run-id> 5` | Set the run's budget to 5 USD. |
 | `kestrel approve <approval-id>` | Approve an action the agent asked about. Add `--reject` to refuse. |
 | `kestrel fetch <run-id>` | Fetch a finished run's branch `kestrel/run-<id>` into its repository. |
 
 Add `--json` to any command for machine-readable output.
+
+A command the run's status does not allow exits 1 with the reason, and nothing is sent:
+
+```sh
+$ kestrel pause <queued-run-id>
+error: run <queued-run-id>: a queued run cannot be paused, only a running one
+```
+
+* `pause` needs a running run. `resume` needs a suspended one; a run waiting on an approval
+  resumes through `kestrel approve` instead.
+* `cancel` and `budget` work until the run ends.
+* A completed, failed or cancelled run has ended and refuses all four, except `cancel` while a run
+  below it still runs (a run that kept its children): that cancels the live runs below it.
 
 ## What happens at the limit
 
@@ -249,7 +276,8 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
 * With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
-  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`).
+  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`), and the
+  bridge's `kestrel-gw` network gets a `/24` of it the first time serve creates it.
 
 ## If something goes wrong
 
@@ -264,3 +292,12 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
   `gateway.subnet_pool` to a free range, or restart `kestrel serve`.
 * `subnet pool ... has no free /29 block`: docker networks or host routes already cover the pool. Set
   `gateway.subnet_pool` to a free range, for example `subnet_pool = "10.201.0.0/16"`.
+* `... the kestrel-gw network needs one and runs need at least one more`: the pool has only one free block.
+  Set `gateway.subnet_pool` to a larger or free range.
+* `no available IPv4 addresses ... kestrel-gw` (the error starts with `kestrel-gw is full`): every address of the
+  shared `kestrel-gw` network is taken, usually by bridges of other `kestrel serve` instances or leaked ones. List them
+  with `docker ps -a --filter label=kestrel.managed=bridge` and remove the ones whose serve is not running
+  (`docker rm --force <name>`). To make `kestrel-gw` larger, stop every `kestrel serve` and run
+  `docker network rm kestrel-gw`; the next serve creates it on a `/24`.
+* `warning: kestrel-gw is ... smaller than ...`: an older `kestrel-gw` is in use, so serve keeps it. Recreate it as
+  the warning says when no serve is running.

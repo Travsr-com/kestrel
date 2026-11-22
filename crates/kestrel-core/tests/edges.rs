@@ -8,7 +8,9 @@ mod common;
 
 use common::*;
 use kestrel_store::ControlCommand;
-use kestrel_types::{ApprovalId, EventKind, RunId, RunStatus, SandboxTier, SuspendReason};
+use kestrel_types::{
+    ApprovalId, EventKind, MicroUsd, RunId, RunStatus, SandboxTier, SuspendReason,
+};
 
 use RunStatus::{Cancelled, Completed, Provisioning, Queued, Running, Suspended};
 
@@ -40,7 +42,7 @@ async fn agent_that_finishes_while_an_approval_is_pending_completes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn recovery_fails_provisioning_runs_and_restarts_approved_runs() {
+async fn recovery_suspends_provisioning_runs_and_restarts_approved_runs() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("kestrel.db");
     let aid = ApprovalId::new();
@@ -65,12 +67,17 @@ async fn recovery_fails_provisioning_runs_and_restarts_approved_runs() {
         (p, a)
     };
 
+    // Without automatic resume, so only the approval starts a sandbox here (#92 resumes the
+    // provisioning run by default).
     let mut h = Harness::on(&db, 4);
+    h.rebuild(|e| e.with_resume_after_restart(false));
     let report = h.engine.recover().await.expect("recover");
     assert_eq!(report.suspended, vec![approval]);
-    assert!(report.interrupted.is_empty());
-    let msg = h.is_failed(provisioning).unwrap_or_default();
-    assert!(msg.contains("engine restarted"), "{msg}");
+    assert_eq!(report.interrupted, vec![provisioning]);
+    assert!(h.is(
+        provisioning,
+        &Suspended(SuspendReason::Error("engine restarted".into()))
+    ));
     assert_eq!(h.driver.count(&Call::Destroy("old-1".into())), 1);
 
     // Approving after the restart runs the agent again in a fresh sandbox.
@@ -128,6 +135,37 @@ async fn commands_that_do_not_apply_to_an_active_run_are_noted() {
     h.control(id, ControlCommand::Resume);
     until("resume ignored", || logged(&h, id, "ignored Resume")).await;
     assert!(h.is(id, &Running));
+}
+
+// Issue #90, scenario 4: the CLI and the API refuse a command the run's status does not allow, but
+// the status can change between that check and the engine reading the command. The engine then
+// ignores it and logs it, as before, and the rule it applies is the one the check used.
+#[tokio::test(start_paused = true)]
+async fn i90_s4_a_command_that_gets_past_the_check_is_still_ignored() {
+    let mut h = Harness::new(4);
+    let s = h.driver.live();
+    h.start();
+    let id = h.submit(spec()).await;
+    until("running", || h.is(id, &Running)).await;
+    // Allowed when checked...
+    assert_eq!(ControlCommand::Pause.refusal(&Running), None);
+    assert_eq!(
+        ControlCommand::SetBudget(MicroUsd(9_000_000)).refusal(&Running),
+        None
+    );
+    // ...then the run ends before the engine reads them.
+    s.line("ok:done");
+    s.exit(0);
+    until("completed", || h.is(id, &Completed)).await;
+    assert!(ControlCommand::Pause.refusal(&Completed).is_some());
+    let limit = h.store.limit(id).unwrap();
+
+    h.control(id, ControlCommand::Pause);
+    h.control(id, ControlCommand::SetBudget(MicroUsd(9_000_000)));
+    until("pause ignored", || logged(&h, id, "ignored Pause")).await;
+    until("budget ignored", || logged(&h, id, "ignored SetBudget")).await;
+    assert!(h.is(id, &Completed));
+    assert_eq!(h.store.limit(id).unwrap(), limit, "the limit is unchanged");
 }
 
 #[tokio::test(start_paused = true)]

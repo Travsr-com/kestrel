@@ -90,10 +90,12 @@ fn v2_database_migrates_to_v3_and_old_runs_have_no_token() {
         store.create_run(&agent(), "x").expect("create_run")
     };
     {
-        // Turn the file back into a v2 database: undo v4 (run tree, `run_caps`), then v3.
+        // Turn the file back into a v2 database: undo v6 (spawn keys), v4 (run tree,
+        // `run_caps`), then v3.
         let conn = rusqlite::Connection::open(&path).expect("raw open");
         conn.execute_batch(
-            "DROP TRIGGER runs_default_root;
+            "DROP TABLE spawn_keys;
+             DROP TRIGGER runs_default_root;
              DROP INDEX events_run;
              DROP INDEX runs_parent;
              DROP INDEX runs_root;

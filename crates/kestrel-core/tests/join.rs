@@ -477,6 +477,25 @@ async fn a_parent_that_keeps_its_children_leaves_them_running() {
     assert!(h.is(child, &RunStatus::Running));
 }
 
+// PR #108 review: the CLI and the API let a cancel through to an ended root that kept a live
+// child, because the engine cancels the live tree below it. The root itself stays as it ended.
+#[tokio::test(start_paused = true)]
+async fn cancelling_an_ended_root_that_kept_its_children_cancels_them() {
+    let mut h = harness(4);
+    let (lead, session) = parent(&mut h, true).await;
+    let _c = h.driver.live();
+    let child = spawn(&h, lead).await;
+    until("child running", || h.is(child, &RunStatus::Running)).await;
+    session.exit(0);
+    until("parent completed", || h.is(lead, &RunStatus::Completed)).await;
+    assert_eq!(h.store.live_below(lead).unwrap(), vec![child]);
+
+    h.control(lead, ControlCommand::Cancel);
+    until("child cancelled", || h.is(child, &RunStatus::Cancelled)).await;
+    assert!(h.is(lead, &RunStatus::Completed), "the root keeps its end");
+    until("sandboxes destroyed", || h.driver.leaked().is_empty()).await;
+}
+
 // 12. A cancel that reaches a child still `Queued` means it never starts and leaves no sandbox.
 #[tokio::test(start_paused = true)]
 async fn s12_a_queued_child_that_is_cancelled_never_starts() {
@@ -806,8 +825,8 @@ async fn keep_children_is_narrowed_by_the_parent() {
     assert!(!keep);
 }
 
-// 13, with a child still running at the restart: it comes back suspended, and once it is resumed
-// and ends, a new join returns its result.
+// 13, with a child still running at the restart: it comes back suspended, the engine resumes it by
+// itself (#92), and once it ends, a new join returns its result.
 #[tokio::test(start_paused = true)]
 async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
     let dir = tempfile::tempdir().unwrap();
@@ -825,12 +844,17 @@ async fn s13_a_child_running_at_the_restart_is_joined_after_it_is_resumed() {
     }
     drop(h);
 
-    let mut again = Harness::on(&db, 4);
+    // One slot: the lead, resumed first, holds it until it joins; then the child runs.
+    let mut again = Harness::on(&db, 1);
     again.rebuild(|e| e.with_root_key(RootKey::from_bytes(&key).unwrap()));
     again.engine.recover().await.unwrap();
+    let _lead = again.driver.live();
     again.driver.script(&["ok:after the restart"], 0);
     again.start();
-    again.control(child, ControlCommand::Resume);
+    until("the lead runs again", || {
+        again.is(lead, &RunStatus::Running)
+    })
+    .await;
     let results = again
         .engine
         .join(lead, &[child], JoinMode::All, Some(Duration::from_secs(60)))

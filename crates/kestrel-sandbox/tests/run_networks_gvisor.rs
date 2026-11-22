@@ -30,9 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use kestrel_sandbox::{
-    BridgeSpec, GatewayBridge, GvisorDriver, INSTANCE_LABEL, LaunchSpec, NetworkPolicy,
-    PreparedNetwork, ProcessRunner, RUN_LABEL, SandboxDriver, SandboxHandle, SubnetPool,
-    docker_subnets, host_routes,
+    BridgeNetwork, BridgeSpec, GatewayBridge, GvisorDriver, INSTANCE_LABEL, LaunchSpec,
+    NetworkPolicy, PreparedNetwork, ProcessRunner, RUN_LABEL, SandboxDriver, SandboxHandle,
+    SubnetPool, docker_subnets, host_routes,
 };
 use kestrel_types::RunId;
 use url::Url;
@@ -45,6 +45,26 @@ const STEP: Duration = Duration::from_secs(240);
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Instance ids (`kestrel.db` labels) of the databases this binary's tests start bridges for.
+static TEST_DBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Remembers `db` as a test database, so a bridge it leaks may be removed by a later test.
+fn test_db(db: &std::path::Path) -> String {
+    let id = GatewayBridge::instance_id(db);
+    TEST_DBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(id.clone());
+    id
+}
+
+fn is_test_db(id: &str) -> bool {
+    TEST_DBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|t| t == id)
+}
 
 /// `[A-Za-z0-9]` only, unique per call in this process and across runs.
 fn unique() -> String {
@@ -262,7 +282,7 @@ impl World {
         let db: PathBuf = dir.path().join("kestrel.db");
         let instance = unique();
         let cleanup = Arc::new(Cleanup::new(&instance));
-        let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
+        let bridge_name = GatewayBridge::container_name(&test_db(&db));
         cleanup.container(&bridge_name);
         let bridge = within(
             "bridge start",
@@ -784,4 +804,132 @@ async fn s8_runs_start_when_the_daemon_default_pools_are_exhausted() {
     assert!(has(&lines, BODY), "{lines:?}");
     w.release(&net).await;
     w.finish().await;
+}
+
+// #99 ---------------------------------------------------------------------------------------------
+
+/// #99 scenario 1: on a host with no `kestrel-gw` network whose default address pools are used
+/// up, the bridge still starts, because `kestrel-gw` gets a /24 of Kestrel's own plan, as serve
+/// plans it. A run on the same plan never gets a block of it, and reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kestrel_gw() {
+    let _serial = SERIAL.lock().await;
+    let instance = unique();
+    let cleanup = Arc::new(Cleanup::new(&instance));
+    if network_exists("kestrel-gw") {
+        // Only bridges of this binary's own test databases may be removed (an earlier test leaked
+        // them). Anything else on kestrel-gw, such as a real serve's bridge on a developer's
+        // machine, is not ours: the test is skipped and nothing is touched. `ps -a` also lists
+        // created and stopped containers.
+        let attached = docker_ok(&["ps", "-aq", "--filter", "network=kestrel-gw"]);
+        let attached: Vec<&str> = attached.split_whitespace().collect();
+        for id in &attached {
+            let labels = docker_ok(&[
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"kestrel.managed\"}} {{index .Config.Labels \"kestrel.db\"}}",
+                id,
+            ]);
+            let ours = matches!(
+                labels.split_whitespace().collect::<Vec<_>>().as_slice(),
+                ["bridge", db] if is_test_db(db)
+            );
+            if !ours {
+                eprintln!(
+                    "skipped: container {id} on kestrel-gw is not a bridge of this test binary's databases (labels: {labels:?}), so this test will not remove kestrel-gw. Remove it yourself to run the test"
+                );
+                return;
+            }
+        }
+        for id in attached {
+            docker_ok(&["rm", "--force", id]);
+        }
+        docker_ok(&["network", "rm", "kestrel-gw"]);
+    }
+    assert!(!network_exists("kestrel-gw"));
+    // Registered first, so it is removed last: after the bridge and the filler networks.
+    cleanup.network("kestrel-gw");
+
+    let mut exhausted = false;
+    for i in 0..64 {
+        let name = format!("kestrel-test-fill-{instance}-{i}");
+        cleanup.network(&name);
+        let out = docker(&[
+            "network",
+            "create",
+            "--label",
+            &format!("kestrel.test={instance}"),
+            &name,
+        ]);
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("all predefined address pools have been fully subnetted"),
+                "unexpected failure filling the pools: {stderr}"
+            );
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted, "64 networks did not use up the default pools");
+
+    // The plan, as serve builds it.
+    let pool = SubnetPool::parse("10.231.12.0/22").expect("pool");
+    pool.exclude(
+        &docker_subnets(&ProcessRunner)
+            .await
+            .expect("docker subnets"),
+    );
+    pool.exclude(&host_routes(&ProcessRunner).await);
+    let planned = within(
+        "plan the bridge network",
+        GatewayBridge::plan_network(&ProcessRunner, &pool),
+    )
+    .await
+    .expect("planned");
+    assert!(planned.warning.is_none(), "{:?}", planned.warning);
+    let network = planned.network;
+    let BridgeNetwork::Subnet(block) = network.clone() else {
+        panic!("no kestrel-gw, so it needs a span: {network:?}");
+    };
+    assert_eq!(block.cidr().prefix(), 24, "room for many bridges");
+
+    let dir = tempfile::tempdir().expect("dir");
+    let db: PathBuf = dir.path().join("kestrel.db");
+    let bridge_name = GatewayBridge::container_name(&test_db(&db));
+    cleanup.container(&bridge_name);
+    let port = start_gateway();
+    let bridge_spec = BridgeSpec {
+        network,
+        ..BridgeSpec::default()
+    };
+    let bridge = within(
+        "bridge start",
+        GatewayBridge::start(Arc::new(ProcessRunner), port, bridge_spec, &db),
+    )
+    .await
+    .expect("the bridge starts without the default pools");
+    assert_eq!(subnet_of("kestrel-gw"), block.cidr().to_string());
+
+    let driver = GvisorDriver::new(Arc::new(ProcessRunner))
+        .with_instance(instance.clone())
+        .with_bridge(bridge_name.clone());
+    let (run, net) = prepare(&driver, &pool, &cleanup).await;
+    assert!(
+        !net.subnet.cidr().overlaps(&block.cidr()),
+        "a run never gets a block of the bridge's span"
+    );
+    let script = format!("wget -q -T 20 -O- http://{}:{port}/", net.gateway_host);
+    let (lines, code) = run_to_end(
+        &driver,
+        &cleanup,
+        &spec(&instance, port, run, &net, &script),
+    )
+    .await;
+    assert_eq!(code, 0, "{lines:?}");
+    assert!(has(&lines, BODY), "{lines:?}");
+    within("release", driver.release_network(&net))
+        .await
+        .expect("release");
+    bridge.stop().await;
 }

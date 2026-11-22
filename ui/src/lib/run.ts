@@ -13,10 +13,11 @@ export interface Allowed {
 
 /**
  * The controls a status allows. A run waiting on an approval resumes through its decision, not
- * through Resume.
+ * through Resume. An ended run allows only Cancel, and only while `live` runs below it have not
+ * ended (a run that kept its children): the server cancels that tree.
  */
-export function allowed(status: RunStatus): Allowed {
-  if (isTerminal(status)) return { pause: false, resume: false, cancel: false, budget: false, message: false };
+export function allowed(status: RunStatus, live = 0): Allowed {
+  if (isTerminal(status)) return { pause: false, resume: false, cancel: live > 0, budget: false, message: false };
   const suspended = typeof status === 'object' && 'Suspended' in status ? status.Suspended : null;
   const waitsOnApproval = typeof suspended === 'object' && suspended !== null && 'Approval' in suspended;
   return {
