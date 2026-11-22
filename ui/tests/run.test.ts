@@ -349,18 +349,18 @@ describe('Run view', () => {
   it('names what each status allows', () => {
     const live: RunStatus[] = ['Queued', 'Provisioning', 'Running'];
     for (const s of live) expect(allowed(s).cancel).toBe(true);
-    expect(allowed('Running')).toEqual({ pause: true, resume: false, cancel: true, budget: true, message: true });
+    expect(allowed('Running')).toEqual({ pause: true, resume: false, cancel: true, budget: true });
     expect(allowed({ Suspended: 'Budget' }).resume).toBe(true);
     expect(allowed({ Suspended: { Error: 'x' } }).resume).toBe(true);
     expect(allowed({ Suspended: { Approval: 'a' } }).resume).toBe(false);
-    expect(allowed({ Failed: 'x' })).toEqual({ pause: false, resume: false, cancel: false, budget: false, message: false });
+    expect(allowed({ Failed: 'x' })).toEqual({ pause: false, resume: false, cancel: false, budget: false });
   });
 
   // PR #108 review: an ended run that still has live runs below it can be cancelled (the engine
   // cancels that tree); nothing else is allowed on it.
   it('allows only Cancel on an ended run with live runs below it', () => {
     for (const s of ['Completed', 'Cancelled', { Failed: 'x' }] as RunStatus[]) {
-      expect(allowed(s, 2)).toEqual({ pause: false, resume: false, cancel: true, budget: false, message: false });
+      expect(allowed(s, 2)).toEqual({ pause: false, resume: false, cancel: true, budget: false });
       expect(allowed(s, 0).cancel).toBe(false);
     }
     expect(allowed('Running', 0).cancel).toBe(true);
@@ -876,11 +876,31 @@ describe('Run view: messages to the agent', () => {
     expect(within(panel).getByRole('status')).toHaveTextContent('Sent. The agent reads it the next time it checks for messages.');
   });
 
-  it('allows at most 16 KiB in the box', async () => {
+  // Review of #95: the server counts UTF-8 bytes, and the box's maxlength counts characters, so
+  // the page counts bytes itself before sending.
+  it('refuses a message over 16 KiB in UTF-8 bytes without sending it, and sends one at 16 KiB', async () => {
     const r = run();
-    show(r.id, [r]);
+    const { calls } = show(r.id, [r]);
+    const u = user();
     const box = await screen.findByRole('textbox', { name: 'Message' });
-    expect(box).toHaveAttribute('maxlength', String(16 * 1024));
+    const panel = screen.getByRole('region', { name: 'Message to the agent' });
+    const posts = () => calls.filter((c) => c.method === 'POST');
+    // 8193 two-byte characters: fewer than 16384 characters, but 16386 bytes.
+    const over = 'é'.repeat(8193);
+    await fireEvent.input(box, { target: { value: over } });
+    await u.click(screen.getByRole('button', { name: 'Send' }));
+    const alert = within(panel).getByRole('alert');
+    expect(alert).toHaveTextContent('16386 bytes');
+    expect(alert).toHaveTextContent('16384');
+    expect(posts()).toEqual([]);
+    expect(box).toHaveValue(over);
+    // Exactly 16 KiB goes, and the warning goes with it.
+    const fits = 'é'.repeat(8192);
+    await fireEvent.input(box, { target: { value: fits } });
+    await u.click(screen.getByRole('button', { name: 'Send' }));
+    await vi.waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0].body).toEqual({ text: fits });
+    expect(within(panel).queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('shows a message and its delivery in the events', async () => {
