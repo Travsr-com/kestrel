@@ -60,13 +60,25 @@ curl -H "Authorization: Bearer $T" "$K/api/runs/$RUN/events?after=4"
 Each answers `202` with no body once the command is in the store's control channel. The engine
 applies it like the same CLI command.
 
-| Route | Same as |
-| :--- | :--- |
-| `POST /api/runs/{id}/pause` | `kestrel pause` |
-| `POST /api/runs/{id}/resume` | `kestrel resume` |
-| `POST /api/runs/{id}/cancel` | `kestrel cancel` |
-| `POST /api/runs/{id}/budget` with `{"usd": "5.00"}` | `kestrel budget`. A negative or non-decimal amount is `400`. |
-| `POST /api/runs/{id}/message` with `{"text": "..."}` | Not supported by any runtime yet: `409`. |
+A command the run's status does not allow is refused with `409` and the reason, and nothing is
+sent:
+
+```json
+{"error": "run 0193...: a queued run cannot be paused, only a running one"}
+```
+
+| Route | Same as | Allowed when the run is |
+| :--- | :--- | :--- |
+| `POST /api/runs/{id}/pause` | `kestrel pause` | running |
+| `POST /api/runs/{id}/resume` | `kestrel resume` | suspended, but not waiting on an approval (approve or reject it instead) |
+| `POST /api/runs/{id}/cancel` | `kestrel cancel` | queued, provisioning, running or suspended |
+| `POST /api/runs/{id}/budget` with `{"usd": "5.00"}` | `kestrel budget`. A negative or non-decimal amount is `400`. | queued, provisioning, running or suspended |
+| `POST /api/runs/{id}/message` with `{"text": "..."}` | Not supported by any runtime yet: `409`. | |
+
+A completed, failed or cancelled run has ended: every command answers `409`
+(`the run has ended (completed), so it cannot be paused`). A status can still change between this
+check and the engine reading the command; the engine then ignores the command and notes it in the
+run's log.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/pause"
