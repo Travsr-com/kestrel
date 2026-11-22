@@ -1481,11 +1481,7 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
     }
 
     // The parent spawned all six again; each spawn answered with the child it had.
-    assert_eq!(
-        env.children(&root).len(),
-        6,
-        "no child was spawned twice"
-    );
+    assert_eq!(env.children(&root).len(), 6, "no child was spawned twice");
     let fanout = env.read_out(&root, "fanout.out");
     let again = fanout.get(before.len()..).unwrap_or_default();
     assert_eq!(
@@ -1494,7 +1490,10 @@ fn m2_s14_restart_mid_join_resumes_and_counts_once() {
         "the spawns after the restart: {again}"
     );
     for kid in &kids {
-        assert!(again.contains(kid.as_str()), "{kid} answered again: {again}");
+        assert!(
+            again.contains(kid.as_str()),
+            "{kid} answered again: {again}"
+        );
     }
     let joined = env.read_out(&root, "join.out");
     for kid in &kids {

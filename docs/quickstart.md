@@ -44,6 +44,9 @@ Kestrel warns you if other users can read it.
 max_concurrent_runs = 4
 # Seconds a stop may take, from 1 to 3600. Default 10.
 shutdown_grace_secs = 10
+# Resume the runs a stop or crash cut off when serve starts again. Default true. Set false if your
+# agents do things that must not happen twice: a resumed agent starts again from its input.
+# resume_after_restart = true
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
@@ -153,6 +156,12 @@ A stop takes at most `engine.shutdown_grace_secs` seconds. Serve destroys the sa
 one `shutdown:` line. It exits 0 when all is clean and 1 when a sandbox could not be destroyed in
 time. Press Ctrl-C a second time to quit at once (exit 130); sandboxes may be left behind, and the
 next `kestrel serve` removes them.
+
+When serve starts again, the runs it cut off carry on by themselves: each starts its agent again
+from its input in a fresh sandbox. A parent that spawns the same children again gets the ones it
+already had. Paused runs, runs over budget and runs waiting for an approval stay as they were.
+`engine.resume_after_restart = false` leaves the cut-off runs suspended until you `kestrel resume`
+them.
 
 For the web UI, start `kestrel up` instead. It runs the same, plus the API server on
 `127.0.0.1:7171`, and opens the UI in your browser (`--no-open` only prints the address). The UI
