@@ -222,6 +222,36 @@ fn fetch_twice_reports_already_fetched() {
 }
 
 #[test]
+fn fetch_of_a_branch_the_user_moved_ahead_says_already_in_and_keeps_it() {
+    need_git!();
+    let (d, tip) = completed_with_commit();
+    let id = d.id.to_string();
+    let branch = branch_for(d.id);
+    d.f.kestrel().args(["fetch", &id]).assert().success();
+    // The user adds a commit of their own on top of the run branch.
+    git(&d.repo, &["checkout", "-q", &branch]);
+    let mine = commit_file(&d.repo, "review.txt", "fixup\n");
+    git(&d.repo, &["checkout", "-q", "main"]);
+
+    let out =
+        d.f.kestrel()
+            .args(["fetch", "--json", &id])
+            .assert()
+            .success();
+    let doc = json_doc(&out.get_output().stdout);
+    assert_eq!(doc["result"], "already_fetched");
+    assert_eq!(doc["commit"], tip);
+
+    d.f.kestrel()
+        .args(["fetch", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already"))
+        .stdout(predicate::str::contains("no new commits").not());
+    assert_eq!(branch_tip(&d.repo, &branch), Some(mine));
+}
+
+#[test]
 fn fetch_works_for_failed_and_cancelled_runs() {
     need_git!();
     for end in [RunStatus::Failed("boom".into()), RunStatus::Cancelled] {
