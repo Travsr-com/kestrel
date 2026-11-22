@@ -13,10 +13,16 @@ test('a question is answered from the Approvals page', async ({ page, request })
   const row = list.getByRole('listitem').filter({ hasText: question });
   // The child asks once its sandbox is up and its parent spawned it.
   await expect(row).toBeVisible({ timeout: 180_000 });
-  await expect(row.getByText('Question', { exact: true })).toBeVisible();
+  await expect(row.getByText(/^Question, waiting/)).toBeVisible();
 
-  await row.getByLabel('Answer').fill(answer);
-  await row.getByRole('button', { name: 'Send answer' }).click();
+  // Selecting it in the list shows it in the detail panel, where it is answered.
+  await row.getByRole('button').click();
+  const panel = page.getByRole('region', { name: /asks a question$/ });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText('Question', { exact: true })).toBeVisible();
+  await expect(panel.getByText(question)).toBeVisible();
+  await panel.getByLabel('Answer').fill(answer);
+  await panel.getByRole('button', { name: 'Send answer' }).click();
   await expect(row).toHaveCount(0);
 
   // The child goes on with the answer and completes.

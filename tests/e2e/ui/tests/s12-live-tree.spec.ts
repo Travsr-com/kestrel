@@ -55,7 +55,7 @@ test('the spawn tree grows and completes live', async ({ page, request }) => {
   expect(kids, 'the children in the tree').toHaveLength(children);
   const events = page.getByRole('list', { name: 'Events' });
   for (const kid of kids) {
-    const link = tree.locator(`a[aria-describedby="node-${kid.id}"]`);
+    const link = tree.locator(`a[aria-describedby="node-status-${kid.id} node-cost-${kid.id}"]`);
     await expect(link, `the tree link of child ${kid.id}`).toHaveText('worker');
     await link.click();
     await expect(page).toHaveURL(new RegExp(`#/runs/${kid.id}`));
@@ -76,9 +76,12 @@ test('the spawn tree grows and completes live', async ({ page, request }) => {
         const run = await api<RunSummary>(request, `/api/runs/${root}`);
         const runs = await api<RunSummary[]>(request, `/api/runs?root=${root}`);
         const carved = runs.filter((r) => r.parent === root).reduce((sum, r) => sum + (r.limit ?? 0), 0);
-        const want = `${formatUsd(run.spent)} of ${formatUsd(run.limit)}, ${formatUsd(carved)} carved to children`;
+        const want = [
+          `${formatUsd(run.spent)} of ${formatUsd(run.limit)} limit`,
+          `Carved to children ${formatUsd(carved)}`,
+        ];
         const shown = (await page.locator('.budget').innerText()).replace(/\s+/g, ' ');
-        return shown.includes(want) ? 'matches' : `shown "${shown}", the API says "${want}"`;
+        return want.every((w) => shown.includes(w)) ? 'matches' : `shown "${shown}", the API says "${want.join('; ')}"`;
       },
       { timeout: 30_000 },
     )
