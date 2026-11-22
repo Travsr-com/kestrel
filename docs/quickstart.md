@@ -39,6 +39,9 @@ Kestrel warns you if other users can read it.
 # Long tool calls (a waiting `kestrel.join`, a question) held open at once across all runs,
 # from 1 to 4096. Default 256. Past the limit a call is refused with a clear error.
 # max_waiting_calls = 256
+# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24) get their
+# addresses. Default 10.200.0.0/16. Change it if that range is already used on your network.
+# subnet_pool = "10.200.0.0/16"
 
 [engine]
 max_concurrent_runs = 4
@@ -230,7 +233,8 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
 * With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
-  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`).
+  Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`), and the
+  bridge's `kestrel-gw` network gets a `/24` of it the first time serve creates it.
 
 ## If something goes wrong
 
@@ -245,3 +249,12 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
   `gateway.subnet_pool` to a free range, or restart `kestrel serve`.
 * `subnet pool ... has no free /29 block`: docker networks or host routes already cover the pool. Set
   `gateway.subnet_pool` to a free range, for example `subnet_pool = "10.201.0.0/16"`.
+* `... the kestrel-gw network needs one and runs need at least one more`: the pool has only one free block.
+  Set `gateway.subnet_pool` to a larger or free range.
+* `no available IPv4 addresses ... kestrel-gw` (the error starts with `kestrel-gw is full`): every address of the
+  shared `kestrel-gw` network is taken, usually by bridges of other `kestrel serve` instances or leaked ones. List them
+  with `docker ps -a --filter label=kestrel.managed=bridge` and remove the ones whose serve is not running
+  (`docker rm --force <name>`). To make `kestrel-gw` larger, stop every `kestrel serve` and run
+  `docker network rm kestrel-gw`; the next serve creates it on a `/24`.
+* `warning: kestrel-gw is ... smaller than ...`: an older `kestrel-gw` is in use, so serve keeps it. Recreate it as
+  the warning says when no serve is running.
