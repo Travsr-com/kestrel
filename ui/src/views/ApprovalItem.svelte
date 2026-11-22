@@ -1,8 +1,8 @@
 <script lang="ts">
   // One pending approval in the list: a button that selects it, with who asks, what, and how long
-  // it has waited. Deciding happens in the detail panel.
-  import type { ApprovalRow } from '../lib/approvals.svelte';
-  import { formatElapsed } from '../lib/format';
+  // it has waited, or how its decision is going. Deciding happens in the detail panel.
+  import type { ApprovalRow, DecisionState } from '../lib/approvals.svelte';
+  import { firstLine, formatElapsed } from '../lib/format';
   import type { RunSummary } from '../lib/types';
 
   let {
@@ -10,9 +10,27 @@
     run,
     now,
     selected,
+    decision = null,
     onSelect,
-  }: { row: ApprovalRow; run: RunSummary | undefined; now: number; selected: boolean; onSelect: () => void } = $props();
+  }: {
+    row: ApprovalRow;
+    run: RunSummary | undefined;
+    now: number;
+    selected: boolean;
+    /** How a decision sent from its panel is going: said here too, as the panel may be hidden. */
+    decision?: DecisionState;
+    onSelect: () => void;
+  } = $props();
 
+  const DECISION: Record<NonNullable<DecisionState>, string> = {
+    approve: 'Approving',
+    reject: 'Rejecting',
+    answer: 'Sending answer',
+    failed: 'Failed, open it to retry',
+  };
+
+  /** Once its run ended, that is what the item says, whatever was being sent. */
+  const shown = $derived(row.ended === null ? decision : null);
   const approval = $derived(row.approval);
   const waited = $derived(now - Date.parse(approval.requested_at));
   const kind = $derived(approval.question ? 'Question' : 'Command');
@@ -41,8 +59,9 @@
         </span>
       {/if}
     </span>
-    <span class="action">{approval.action}</span>
-    <span class="meta">{kind}, {state}</span>
+    <!-- Also the button's accessible name, so only the first line, capped. -->
+    <span class="action">{firstLine(approval.action)}</span>
+    <span class="meta" class:failed={shown === 'failed'}>{shown === null ? `${kind}, ${state}` : DECISION[shown]}</span>
   </button>
 </li>
 
@@ -97,5 +116,8 @@
   .meta {
     color: var(--color-muted);
     font-size: 0.9rem;
+  }
+  .meta.failed {
+    color: var(--color-danger);
   }
 </style>

@@ -47,6 +47,8 @@
   let pending: Event[] = [];
   /** Sockets that dropped and are not open again yet. */
   let down: Record<string, true> = $state({});
+  /** Sockets that have not opened yet since they were made. */
+  let opening: Record<string, true> = $state({});
 
   let box: HTMLElement | undefined = $state();
   /** The stream follows new events while the user has not scrolled up. */
@@ -101,6 +103,8 @@
   function track(name: string, state: ConnectionState) {
     if (state === 'reconnecting') down[name] = true;
     else if (state !== 'connecting') delete down[name];
+    if (state === 'connecting') opening[name] = true;
+    else delete opening[name];
     if (state === 'unauthorized') onUnauthorized(getToken());
   }
 
@@ -199,6 +203,8 @@
   const run = $derived(shown === null ? undefined : fleet.runs[shown]);
   const all = $derived(Object.values(fleet.runs));
   const reconnecting = $derived(Object.keys(down).length > 0);
+  /** What the Live events indicator says: a drop wins over a first connection still on its way. */
+  const link = $derived(reconnecting ? 'Reconnecting' : Object.keys(opening).length > 0 ? 'Connecting' : 'Connected');
   const tokens = $derived(tokenTotals(events));
   const failedWith = (status: RunStatus) => (typeof status === 'object' && 'Failed' in status ? status.Failed : null);
 </script>
@@ -211,7 +217,7 @@
         <nav aria-label="Breadcrumb" class="crumbs">
           <a href={href({ name: 'fleet' })}>Fleet</a>
           <span aria-hidden="true">/</span>
-          <span>{run.agent}</span>
+          <span aria-current="page">{run.agent}</span>
         </nav>
         <div class="heading">
           <h1>{run.agent}</h1>
@@ -268,7 +274,7 @@
           <h2 id="events-title" class="eyebrow">Live events</h2>
           <!-- A live region, so screen readers hear when updates stop and start again. -->
           <p class="link" class:down={reconnecting} role="status">
-            <span class="dot" aria-hidden="true"></span>{reconnecting ? 'Reconnecting' : 'Connected'}
+            <span class="dot" aria-hidden="true"></span>{link}
           </p>
         </div>
         <!-- A named region, focusable so keyboard users can scroll it. -->

@@ -27,10 +27,18 @@ export interface ApprovalRow {
   gen: number;
 }
 
+/**
+ * How a decision sent from an approval's panel is going: which one is in progress (until the
+ * resolved event takes the approval away), failed, or `null` when none is.
+ */
+export type DecisionState = 'approve' | 'reject' | 'answer' | 'failed' | null;
+
 export class ApprovalsState {
   rows: Record<ApprovalId, ApprovalRow> = $state({});
   loaded = $state(false);
   error: string | null = $state(null);
+  /** Bumped each time pending approvals go away because they were resolved (not dismissed). */
+  resolutions = $state(0);
   private gen = 0;
   /** The newest sync whose list was taken. */
   private loadedToken = 0;
@@ -58,10 +66,15 @@ export class ApprovalsState {
       if (this.resolved[approval.id] || this.rows[approval.id]) continue;
       this.rows[approval.id] = { approval, ended: this.endedRuns[approval.run_id] ?? null, gen: token };
     }
+    let gone = 0;
     for (const [id, row] of Object.entries(this.rows)) {
       // Known before this list was asked for, and not on it any more: resolved meanwhile.
-      if (!listed[id] && row.gen < token && row.ended === null) delete this.rows[id];
+      if (!listed[id] && row.gen < token && row.ended === null) {
+        delete this.rows[id];
+        gone += 1;
+      }
     }
+    if (gone > 0) this.resolutions += 1;
     this.loaded = true;
     this.error = null;
   }
@@ -104,7 +117,9 @@ export class ApprovalsState {
   /** The approval is resolved (here, elsewhere, or by someone else). */
   remove(id: ApprovalId): void {
     this.resolved[id] = true;
+    if (!this.rows[id]) return;
     delete this.rows[id];
+    this.resolutions += 1;
   }
 
   /** The run stopped waiting on this approval (the server said so before its event came). */
@@ -129,17 +144,21 @@ export interface FollowOptions {
   runs?: ActiveRuns;
 }
 
+/** The run statuses that have not ended, as the API's `?status=` filter names them. */
+const LIVE = ['queued', 'provisioning', 'running', 'suspended'] as const;
+
 /** Keeps `state` (and `runs`) current: a sync now and on every socket open, and live events between. */
 export function followApprovals({ api, state, onUnauthorized, base, sockets, runs }: FollowOptions) {
   let alive = true;
   function sync() {
     if (runs) {
       const asked = runs.begin();
-      // The count is a hint: on a failure it stays as it was. A refused token is found by the
-      // approvals request made at the same time.
-      api.listRuns().then(
-        (list) => {
-          if (alive) runs.load(list, asked);
+      // Only the live runs, not the whole history: one request per live status, as the API takes
+      // one status at a time. The count is a hint: if any request fails it stays as it was. A
+      // refused token is found by the approvals request made at the same time.
+      Promise.all(LIVE.map((status) => api.listRuns({ status }))).then(
+        (lists) => {
+          if (alive) runs.load(lists.flat(), asked);
         },
         () => {},
       );

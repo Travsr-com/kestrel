@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatElapsed, formatUsd, percentUsed, statusPill, statusTone } from '../lib/format';
+  import { firstLine, formatElapsed, formatUsd, percentUsed, statusPill, statusTone } from '../lib/format';
   import type { ChildCount, FleetRun } from '../lib/fleet.svelte';
   import { href } from '../lib/router';
 
@@ -37,7 +37,8 @@
     const reason = status.Suspended;
     if (reason === 'Budget') return 'Budget used up. Raise the limit to continue.';
     if (reason === 'Manual') return 'Paused.';
-    if ('Approval' in reason) return ask ?? 'Waiting for an approval.';
+    // The first line, capped: an action can be 50,000 characters.
+    if ('Approval' in reason) return ask === undefined ? 'Waiting for an approval.' : firstLine(ask);
     return reason.Error;
   });
 
@@ -79,7 +80,7 @@
     <div
       class="track"
       role="meter"
-      aria-label="Budget used"
+      aria-label="Budget used by {run.agent}"
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={percent}
@@ -149,7 +150,7 @@
   }
   .id {
     margin-top: calc(-1 * var(--space-2));
-    /* Muted, not faint: faint text on a card is below 4.5:1 contrast. */
+    /* Muted, like the rest of the card's secondary text. */
     color: var(--color-muted);
     font-size: 0.85rem;
   }

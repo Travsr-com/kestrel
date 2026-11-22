@@ -3,9 +3,9 @@
   // of the one picked, with enough context to decide without opening the run. Under the list, the
   // approvals decided most recently. The pending list and its live updates come from the app
   // (`ApprovalsState`), which also counts them in the nav; this view adds each run's agent and root.
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import type { Api } from '../lib/api';
-  import type { ApprovalsState } from '../lib/approvals.svelte';
+  import type { ApprovalRow as ApprovalRowState, ApprovalsState, DecisionState } from '../lib/approvals.svelte';
   import { newestFirst } from '../lib/format';
   import { failureText, type OnUnauthorized } from '../lib/load';
   import type { Approval, ApprovalId, RunId, RunSummary } from '../lib/types';
@@ -29,17 +29,25 @@
     return () => clearInterval(tick);
   });
 
-  /** The recently decided approvals, newest first; `null` until loaded. */
-  let decided: Approval[] | null = $state(null);
+  /** How long after an approval is resolved the decided lists are asked for again. */
+  const REFETCH_MS = 300;
+
+  /** The decided approvals, newest first; `null` until loaded. */
+  let decided = $state<Approval[] | null>(null);
   let decidedFailed = $state(false);
+  /** Bumped to ask for the decided lists again. */
+  let decidedAsk = $state(0);
   $effect(() => {
+    void decidedAsk;
     let alive = true;
     Promise.all([api.approvals('approved'), api.approvals('rejected'), api.approvals('expired')]).then(
       (lists) => {
         if (!alive) return;
         // By id, so an approval whose status changed between the requests is listed once.
         const byId = new Map(lists.flat().map((a) => [a.id, a]));
-        decided = [...byId.values()].sort((a, b) => newestFirst(a.requested_at, b.requested_at)).slice(0, DECIDED);
+        // By request time, newest first: the API has no decision time.
+        decided = [...byId.values()].sort((a, b) => newestFirst(a.requested_at, b.requested_at));
+        decidedFailed = false;
       },
       (e: unknown) => {
         if (!alive) return;
@@ -53,6 +61,24 @@
     };
   });
 
+  // A pending approval that was resolved (here or elsewhere) is now decided: the lists are asked
+  // for again a moment later, once for several resolved in a row. Dismissing an ended row is not
+  // a resolution and asks for nothing.
+  let resolutionsSeen = untrack(() => approvals.resolutions);
+  $effect(() => {
+    const resolutions = approvals.resolutions;
+    if (resolutions === resolutionsSeen) return;
+    resolutionsSeen = resolutions;
+    const timer = setTimeout(() => (decidedAsk += 1), REFETCH_MS);
+    return () => clearTimeout(timer);
+  });
+
+  /**
+   * The decided approvals shown. One still in the pending rows is left out: an approval of an
+   * ended run comes back from the API as expired, and is shown once, as "Run ended".
+   */
+  const recent = $derived(decided?.filter((a) => !approvals.rows[a.id]).slice(0, DECIDED) ?? null);
+
   /** Each approval's run, for its agent, root and budget. */
   let runs: Record<RunId, RunSummary> = $state({});
   /** Runs asked for already: bookkeeping only, never rendered. */
@@ -63,7 +89,7 @@
   $effect(() => () => timers.forEach(clearTimeout));
   $effect(() => {
     void again;
-    const wanted = [...Object.values(approvals.rows).map((row) => row.approval), ...(decided ?? [])];
+    const wanted = [...Object.values(approvals.rows).map((row) => row.approval), ...(recent ?? [])];
     for (const { run_id: id } of wanted) {
       if (asked[id]) continue;
       asked[id] = true;
@@ -79,7 +105,10 @@
     }
   });
 
-  /** Said after an approval is taken away because someone else decided it first. */
+  /**
+   * Said after an approval is taken away because someone else decided it first, or when a decision
+   * failed out of sight.
+   */
   let notice = $state('');
 
   /** Clears the notice first, so the same words are announced again. */
@@ -87,6 +116,25 @@
     notice = '';
     await tick();
     notice = text;
+  }
+
+  /** How a decision sent from each panel is going, by approval: its list item says so. */
+  let decisions: Record<ApprovalId, DecisionState> = $state({});
+
+  /**
+   * Called from a panel's effect: untracked, so the effect does not depend on what is read here.
+   * A failure of an approval that is not selected is announced, as its panel and error are hidden.
+   */
+  function decisionState(row: ApprovalRowState, state: DecisionState) {
+    untrack(() => {
+      const id = row.approval.id;
+      const before = decisions[id] ?? null;
+      if (state === null) delete decisions[id];
+      else decisions[id] = state;
+      if (state === 'failed' && before !== 'failed' && id !== chosen) {
+        void say(`${runs[row.approval.run_id]?.agent ?? 'An agent'}: the decision failed. Open it to retry.`);
+      }
+    });
   }
 
   function gone(id: string, why: 'resolved' | 'not-waiting') {
@@ -175,6 +223,7 @@
               run={runs[row.approval.run_id]}
               {now}
               selected={row.approval.id === chosen}
+              decision={decisions[row.approval.id] ?? null}
               onSelect={() => (chosen = row.approval.id)}
             />
           {/each}
@@ -194,13 +243,14 @@
             {onUnauthorized}
             onGone={(why) => gone(row.approval.id, why)}
             onDismiss={() => approvals.dismiss(row.approval.id)}
+            onState={(state) => decisionState(row, state)}
           />
         {/each}
       </div>
     {/if}
 
     <div class="decided">
-      <DecidedList {decided} failed={decidedFailed} {runs} />
+      <DecidedList decided={recent} failed={decidedFailed} {runs} />
     </div>
   </div>
 {/if}

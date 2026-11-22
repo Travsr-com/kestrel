@@ -23,7 +23,8 @@
   --color-sunken: #110e0d;
   --color-text: #f3ece6;
   --color-muted: #a99f97;
-  --color-faint: #7f756d;
+  /* At least 4.5:1 on the surface and the sidebar (5.3:1 and 5.6:1), checked by tests/contrast.test.ts. */
+  --color-faint: #968c83;
   --color-border: #2f2824;
   --color-border-strong: #463c35;
 

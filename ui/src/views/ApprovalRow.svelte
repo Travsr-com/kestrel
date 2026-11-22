@@ -4,9 +4,10 @@
   // one is shown), so a half-filled form or a decision in progress survives selecting another.
   // A decision stays "in progress" until the resolved event takes the approval away; a refusal
   // because someone else decided first (409) is handed to `onGone`; any other failure puts the
-  // buttons back with the error and a Retry, which sends what the fields hold then.
+  // buttons back with the error and a Retry, which sends what the fields hold then. How a decision
+  // is going is also handed to `onState`, as the panel is hidden while another one is selected.
   import { ApiFailure, type Api } from '../lib/api';
-  import type { ApprovalRow } from '../lib/approvals.svelte';
+  import type { ApprovalRow, DecisionState } from '../lib/approvals.svelte';
   import { formatElapsed, formatUsd } from '../lib/format';
   import { failureText, type OnUnauthorized } from '../lib/load';
   import { href } from '../lib/router';
@@ -21,6 +22,7 @@
     onUnauthorized,
     onGone,
     onDismiss,
+    onState = () => {},
   }: {
     row: ApprovalRow;
     run: RunSummary | undefined;
@@ -30,6 +32,7 @@
     onUnauthorized: OnUnauthorized;
     onGone: (why: 'resolved' | 'not-waiting') => void;
     onDismiss: () => void;
+    onState?: (state: DecisionState) => void;
   } = $props();
 
   /** Characters of the payload shown before "Show all". */
@@ -52,6 +55,9 @@
   let answer = $state('');
   let answerError: string | null = $state(null);
   let expanded = $state(false);
+
+  const decision: DecisionState = $derived(sending ?? (error !== null ? 'failed' : null));
+  $effect(() => onState(decision));
 
   const long = $derived(approval.action.length > PREVIEW);
   const shown = $derived(long && !expanded ? `${approval.action.slice(0, PREVIEW)}...` : approval.action);

@@ -79,14 +79,17 @@
     main?.focus();
   }
 
-  /** Pages of later milestones: shown so the shape of the product is clear, not linked. */
+  /**
+   * Pages of later milestones: shown so the shape of the product is clear, not linked. The tag is
+   * only seen; a screen reader says the full phrase.
+   */
   const later = [
-    { label: 'Agents', tag: 'M4' },
-    { label: 'Workflows', tag: 'M4' },
-    { label: 'Triggers', tag: 'M4' },
-    { label: 'Meetings', tag: 'M5' },
-    { label: 'Costs', tag: 'M3' },
-    { label: 'Settings', tag: 'Soon' },
+    { label: 'Agents', tag: 'M4', said: 'coming in M4' },
+    { label: 'Workflows', tag: 'M4', said: 'coming in M4' },
+    { label: 'Triggers', tag: 'M4', said: 'coming in M4' },
+    { label: 'Meetings', tag: 'M5', said: 'coming in M5' },
+    { label: 'Costs', tag: 'M3', said: 'coming in M3' },
+    { label: 'Settings', tag: 'Soon', said: 'coming soon' },
   ];
 </script>
 
@@ -131,7 +134,7 @@
         {#each later as page (page.label)}
           <li>
             <span class="item off"
-              >{page.label}<span class="tag"><span class="visually-hidden">&nbsp;coming in&nbsp;</span>{page.tag}</span></span
+              >{page.label}<span class="visually-hidden">, {page.said}</span><span class="tag" aria-hidden="true">{page.tag}</span></span
             >
           </li>
         {/each}

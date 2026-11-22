@@ -1,5 +1,7 @@
 <script lang="ts">
-  // The approvals decided most recently: who asked, what, and the outcome. Read only.
+  // The approvals decided most recently: who asked, what (its first line, capped: an action can be
+  // 50,000 characters), and the outcome. Read only.
+  import { firstLine } from '../lib/format';
   import type { Approval, RunId, RunSummary } from '../lib/types';
 
   let {
@@ -25,7 +27,7 @@
       <li>
         <span class="text">
           <span class="agent">{runs[approval.run_id]?.agent ?? 'agent not known yet'}</span>
-          <span class="action" title={approval.action}>{approval.action}</span>
+          <span class="action">{firstLine(approval.action)}</span>
         </span>
         <span class="outcome {approval.status}">
           <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">

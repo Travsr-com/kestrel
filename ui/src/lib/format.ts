@@ -68,6 +68,32 @@ export function formatUsd(micro: MicroUsd | null): string {
   return `${micro < 0 ? '-' : ''}$${whole}.${fraction}`;
 }
 
+/**
+ * The first line of `text` (blank lines at the start skipped), at most `max` characters, with
+ * `...` when anything was left out. For lists, where an approval's action can be 50,000
+ * characters: only that slice is copied, never the whole text.
+ */
+export function firstLine(text: string, max = 120): string {
+  const start = text.search(/\S/);
+  if (start < 0) return '';
+  const newline = text.indexOf('\n', start);
+  const end = newline < 0 ? text.length : newline;
+  let line = text.slice(start, Math.min(end, start + max)).trimEnd();
+  const cut = start + max < end && nonBlank(text, start + max, end);
+  if (!cut && !(newline >= 0 && nonBlank(text, newline, text.length))) return line;
+  // Not half of a character made of two UTF-16 units.
+  if (/[\uD800-\uDBFF]$/.test(line)) line = line.slice(0, -1);
+  return `${line}...`;
+}
+
+/** True when `text` has a non-blank character between `from` and `to`, without copying it. */
+function nonBlank(text: string, from: number, to: number): boolean {
+  const re = /\S/g;
+  re.lastIndex = from;
+  const found = re.exec(text);
+  return found !== null && found.index < to;
+}
+
 const two = (n: number) => String(n).padStart(2, '0');
 
 /**

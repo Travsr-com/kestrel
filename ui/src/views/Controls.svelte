@@ -112,6 +112,17 @@
     if (confirming && dialog && !dialog.contains(e.target as Node)) keepButton?.focus();
   }
 
+  // Only the part that owns the cancel dialog listens on the window, not all three.
+  $effect(() => {
+    if (part !== 'buttons') return;
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('focusin', onFocusIn);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('focusin', onFocusIn);
+    };
+  });
+
   function setBudget(e: SubmitEvent) {
     e.preventDefault();
     if (parseUsd(budget) === null) {
@@ -135,8 +146,6 @@
 
   const children = (n: number) => (n === 1 ? '1 child run' : `${n} child runs`);
 </script>
-
-<svelte:window onkeydown={onKey} onfocusin={onFocusIn} />
 
 {#if part === 'buttons'}
   <div class="controls" role="group" aria-label="Controls" tabindex="-1" bind:this={group}>

@@ -1,6 +1,6 @@
 // The runs that have not ended, for the count beside Fleet in the sidebar.
 //
-// The list comes from `GET /api/runs`, and live changes from the app's `/ws/events` socket
+// The list comes from `GET /api/runs?status=`, once per live status, and live changes from the app's `/ws/events` socket
 // (`run_created` and `status_changed`). Two rules keep the sources from fighting:
 //
 // * A run seen to end is never counted again, so a list fetched before it ended cannot bring it back.

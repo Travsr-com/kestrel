@@ -23,7 +23,7 @@
     agent_log: 'log',
     run_finished: 'done',
     child_spawned: 'spawn',
-    capabilities_dropped: 'limits',
+    capabilities_dropped: 'dropped',
   };
 
   function colour(kind: EventKind): string {
