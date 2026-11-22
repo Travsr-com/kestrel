@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use kestrel_core::caps::RootKey;
 use kestrel_core::{ChildResult, Engine, JoinMode, JoinOutcome};
 use kestrel_gateway::{JoinCall, JoinWait, KestrelTool, SpawnCall, ToolHost, ToolsError};
-use kestrel_types::{AgentSpec, RunId};
+use kestrel_types::{AgentSpec, RunId, RunStatus};
 use serde_json::{Value, json};
 
 use crate::Failure;
@@ -172,9 +172,11 @@ impl ToolHost for EngineTools {
             .map_err(|e| e.to_string())?;
         let child = spawned.id;
         let mut answer = json!({ "child": child.to_string() });
-        // The parent spawned this before its agent started again: the same child, not a new one.
+        // The parent spawned this before its agent started again: the same child, not a new one,
+        // and it may have moved on or ended since, so the answer says where it is now.
         if spawned.existing {
             answer["existing"] = json!(true);
+            answer["status"] = json!(status_name(&spawned.status));
         }
         // A spec that asked for more spawn depth than this run can give: say what it got.
         if let Some(lowered) = spawned.lowered_depth {
@@ -248,12 +250,25 @@ fn results_json(results: &[ChildResult]) -> Vec<Value> {
         .collect()
 }
 
+/// The lower-case name of `status`, as the API's `?status=` filter spells it.
+fn status_name(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Provisioning => "provisioning",
+        RunStatus::Running => "running",
+        RunStatus::Suspended(_) => "suspended",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed(_) => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use kestrel_types::{MicroUsd, RunStatus};
+    use kestrel_types::MicroUsd;
 
     #[test]
     fn the_root_key_is_made_once_and_read_back() {
@@ -662,6 +677,35 @@ mod tests {
 
     fn spec_of(name: &str) -> AgentSpec {
         AgentSpec::from_yaml(&spec(name)).unwrap()
+    }
+
+    #[test]
+    fn status_names_are_the_api_filter_names() {
+        use kestrel_types::SuspendReason;
+        let names: Vec<&str> = [
+            RunStatus::Queued,
+            RunStatus::Provisioning,
+            RunStatus::Running,
+            RunStatus::Suspended(SuspendReason::Budget),
+            RunStatus::Completed,
+            RunStatus::Failed("x".into()),
+            RunStatus::Cancelled,
+        ]
+        .iter()
+        .map(status_name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "queued",
+                "provisioning",
+                "running",
+                "suspended",
+                "completed",
+                "failed",
+                "cancelled"
+            ]
+        );
     }
 
     #[test]
