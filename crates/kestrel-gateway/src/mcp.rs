@@ -333,7 +333,8 @@ pub(crate) fn initialized(name: &str, params: &Value) -> Value {
 }
 
 /// The run the token names and the request body, read once the caller is known. `Err` is the
-/// answer: 401 for an unknown token, 413 for a body over [`MAX_BYTES`], 400 when it cannot be read.
+/// answer: 401 for an unknown token, 410 for a run that has ended (503 when that cannot be told), 413 for a body over
+/// [`MAX_BYTES`], 400 when it cannot be read.
 pub(crate) async fn caller(
     state: &AppState,
     token: &str,
@@ -348,6 +349,14 @@ pub(crate) async fn caller(
             "unknown run token",
         )));
     };
+    if let Some((status, why)) = crate::refused(state, run).await {
+        let code = if status == StatusCode::GONE {
+            -32003
+        } else {
+            -32603
+        };
+        return Err(Box::new(rpc_error(status, Value::Null, code, why)));
+    }
     let too_large = || {
         rpc_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -378,12 +387,7 @@ pub(crate) async fn caller(
 /// The answer for a run whose tools the host cannot list: 410 once it has finished, else 503.
 pub(crate) fn tools_error(e: ToolsError) -> Response {
     match e {
-        ToolsError::Gone => rpc_error(
-            StatusCode::GONE,
-            Value::Null,
-            -32003,
-            "the run has finished",
-        ),
+        ToolsError::Gone => rpc_error(StatusCode::GONE, Value::Null, -32003, crate::RUN_ENDED),
         ToolsError::Unavailable => rpc_error(
             StatusCode::SERVICE_UNAVAILABLE,
             Value::Null,

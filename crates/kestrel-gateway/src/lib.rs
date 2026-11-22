@@ -37,6 +37,39 @@ use url::Url;
 #[async_trait]
 pub trait RunResolver: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<RunId>;
+
+    /// Whether the run may still use its token. Every gateway route asks before it does anything
+    /// for a call, so an ended run can make no more model or tool calls. No default: a resolver
+    /// that forgot it would let finished runs through.
+    async fn liveness(&self, run: RunId) -> Liveness;
+}
+
+/// What a [`RunResolver`] knows about a run's state, for its token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// Queued, provisioning, running or suspended: the token works. A suspended run can be
+    /// resumed with the same token, and a budget-suspended one is refused by the [`BudgetGuard`].
+    Live,
+    /// Completed, failed or cancelled (or gone): every route answers 410, not to be retried. A
+    /// call already in flight is not cut.
+    Ended,
+    /// The state cannot be read right now (for example a store error): 503, to be retried.
+    /// Nothing is forwarded or metered.
+    Unknown,
+}
+
+/// What a model call or tool call with an ended run's token is told.
+pub(crate) const RUN_ENDED: &str = "the run has ended, its token no longer works";
+/// What a call is told when the run's state cannot be read.
+pub(crate) const RUN_UNKNOWN: &str = "the gateway cannot check the run right now, try again";
+
+/// The status and message for a run that may not make a call now, `None` when it is live.
+pub(crate) async fn refused(state: &AppState, run: RunId) -> Option<(StatusCode, &'static str)> {
+    match state.deps.resolver.liveness(run).await {
+        Liveness::Live => None,
+        Liveness::Ended => Some((StatusCode::GONE, RUN_ENDED)),
+        Liveness::Unknown => Some((StatusCode::SERVICE_UNAVAILABLE, RUN_UNKNOWN)),
+    }
 }
 
 /// Decides whether a run may make another model call.
@@ -192,6 +225,8 @@ impl Provider {
             Provider::Anthropic => {
                 let kind = match status {
                     StatusCode::UNAUTHORIZED => "authentication_error",
+                    // Not retryable: the run has ended for good.
+                    StatusCode::GONE => "permission_error",
                     StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
                     StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
                     _ => "api_error",
@@ -200,7 +235,7 @@ impl Provider {
             }
             Provider::OpenAi => {
                 let kind = match status {
-                    StatusCode::UNAUTHORIZED | StatusCode::PAYLOAD_TOO_LARGE => {
+                    StatusCode::UNAUTHORIZED | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::GONE => {
                         "invalid_request_error"
                     }
                     StatusCode::TOO_MANY_REQUESTS => "insufficient_quota",
@@ -367,6 +402,9 @@ async fn proxy(
     let Some(run) = state.deps.resolver.resolve(&token).await else {
         return provider.error(StatusCode::UNAUTHORIZED, "unknown run token");
     };
+    if let Some((status, why)) = refused(&state, run).await {
+        return provider.error(status, why);
+    }
     if !state.deps.budget.allow(run).await {
         return provider.error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -381,6 +419,10 @@ async fn proxy(
             "request body is larger than 32 MiB or could not be read",
         );
     };
+    // Again once the body is in: a sandbox could hold its body until after its run ended.
+    if let Some((status, why)) = refused(&state, run).await {
+        return provider.error(status, why);
+    }
 
     let model = serde_json::from_slice::<Value>(&body)
         .ok()

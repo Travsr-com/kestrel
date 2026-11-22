@@ -19,8 +19,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{FakeBudget, FakeSink, config};
 use kestrel_gateway::{
-    GatewayDeps, KestrelTool, NoTools, RunResolver, TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS, ToolsError,
-    TravsrHost, router,
+    GatewayDeps, KestrelTool, Liveness, NoTools, RunResolver, TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS,
+    ToolsError, TravsrHost, router,
 };
 use kestrel_types::RunId;
 use serde_json::{Value, json};
@@ -30,13 +30,23 @@ const TOKEN_A: &str = "rt_live_travsr_a";
 const TOKEN_B: &str = "rt_live_travsr_b";
 const FINISHED: &str = "rt_live_travsr_done";
 const BROKEN: &str = "rt_live_travsr_broken";
+/// A run that has ended (#88): its token opens nothing.
+const ENDED: &str = "rt_live_travsr_ended";
 
-struct Tokens(HashMap<String, RunId>);
+/// Resolves tokens; the runs in the second field have ended.
+struct Tokens(HashMap<String, RunId>, Vec<RunId>);
 
 #[async_trait]
 impl RunResolver for Tokens {
     async fn resolve(&self, token: &str) -> Option<RunId> {
         self.0.get(token).copied()
+    }
+    async fn liveness(&self, run: RunId) -> Liveness {
+        if self.1.contains(&run) {
+            Liveness::Ended
+        } else {
+            Liveness::Live
+        }
     }
 }
 
@@ -200,16 +210,26 @@ struct Setup {
 
 fn setup_with(allowed_a: &[&str], timeout: Duration) -> Setup {
     let (a, b, done, broken) = (RunId::new(), RunId::new(), RunId::new(), RunId::new());
-    let tokens = Tokens(HashMap::from([
-        (TOKEN_A.to_string(), a),
-        (TOKEN_B.to_string(), b),
-        (FINISHED.to_string(), done),
-        (BROKEN.to_string(), broken),
-    ]));
+    let ended = RunId::new();
+    let tokens = Tokens(
+        HashMap::from([
+            (TOKEN_A.to_string(), a),
+            (TOKEN_B.to_string(), b),
+            (FINISHED.to_string(), done),
+            (BROKEN.to_string(), broken),
+            (ENDED.to_string(), ended),
+        ]),
+        vec![ended],
+    );
     let host = Arc::new(FakeTravsr::new(timeout));
     let names = |list: &[&str]| list.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
     host.allowed.lock().unwrap().insert(a, names(allowed_a));
     host.allowed.lock().unwrap().insert(b, names(&TRAVSR_TOOLS));
+    // Allowed everything, so only the ended check can refuse it.
+    host.allowed
+        .lock()
+        .unwrap()
+        .insert(ended, names(&TRAVSR_TOOLS));
     host.gone.lock().unwrap().push(done);
     host.unavailable.lock().unwrap().push(broken);
     let deps = GatewayDeps {
@@ -308,6 +328,25 @@ async fn initialize_and_ping_answer_as_travsr() {
     let msg = ask(&s, &rpc(json!(2), "resources/list", json!({}))).await;
     assert_eq!(msg["error"]["code"], -32601);
     assert!(s.host.calls().is_empty());
+}
+
+/// Issue #88: a run that has ended can list and call nothing, even with every tool granted, and
+/// the host is never asked.
+#[tokio::test]
+async fn an_ended_run_s_token_is_410_and_never_reaches_travsr() {
+    let s = setup(&[]);
+    for message in [
+        rpc(json!(1), "tools/list", json!({})),
+        call(2, "get_callers", json!({ "symbol": "main" })),
+    ] {
+        let response = send(&s.app, ENDED, &message).await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        let msg = body(response).await;
+        let text = msg["error"]["message"].as_str().unwrap();
+        assert!(text.contains("ended"), "{text}");
+        assert!(!text.contains(ENDED), "the token is never echoed: {text}");
+    }
+    assert!(s.host.calls().is_empty(), "nothing reached Travsr");
 }
 
 #[tokio::test]
@@ -721,7 +760,10 @@ async fn get_is_405() {
 async fn s11_without_travsr_the_route_is_404_and_mcp_lists_no_travsr_tool() {
     let run = RunId::new();
     let deps = GatewayDeps {
-        resolver: Arc::new(Tokens(HashMap::from([(TOKEN_A.to_string(), run)]))),
+        resolver: Arc::new(Tokens(
+            HashMap::from([(TOKEN_A.to_string(), run)]),
+            Vec::new(),
+        )),
         budget: Arc::new(FakeBudget::new(true)),
         meter: Arc::new(FakeSink::default()),
         tools: Arc::new(AllKestrel),

@@ -12,8 +12,8 @@ use kestrel_core::{
     default_models,
 };
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, GatewayLimits, GatewayTimeouts, MeterSink, ModelPrice,
-    ProviderConfig, RunResolver,
+    BudgetGuard, GatewayConfig, GatewayDeps, GatewayLimits, GatewayTimeouts, Liveness, MeterSink,
+    ModelPrice, ProviderConfig, RunResolver,
 };
 use kestrel_sandbox::{
     BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo, Ipv4Cidr,
@@ -1639,6 +1639,16 @@ impl RunResolver for StoreDeps {
     async fn resolve(&self, token: &str) -> Option<RunId> {
         self.0.run_by_token(token).ok().flatten()
     }
+
+    /// Live until the run ends; a run the store does not have counts as ended. A store error is
+    /// `Unknown`, so the call is refused for now but may be retried.
+    async fn liveness(&self, run: RunId) -> Liveness {
+        match self.0.get_run(run) {
+            Ok(Some(row)) if !row.status.is_terminal() => Liveness::Live,
+            Ok(_) => Liveness::Ended,
+            Err(_) => Liveness::Unknown,
+        }
+    }
 }
 
 #[async_trait]
@@ -1672,7 +1682,8 @@ impl MeterSink for StoreDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kestrel_types::AgentSpec;
+
+    use kestrel_types::{AgentSpec, RunStatus, SuspendReason};
 
     // #37 scenario 2: the API server binds 127.0.0.1 by default; another address starts it and
     // warns.
@@ -1784,6 +1795,57 @@ budget: { usd: 0.000010, wall_clock: 10m }
         store.set_budget(id, MicroUsd(11)).expect("raise");
         assert!(deps.allow(id).await, "a raised budget allows calls again");
         assert!(!deps.allow(RunId::new()).await, "unknown runs are refused");
+    }
+
+    /// Issue #88: a run's token stops working once the run has ended. A live run (queued,
+    /// provisioning, running or suspended, so it can still be resumed) keeps it, and a run the
+    /// store does not have counts as ended.
+    #[tokio::test]
+    async fn store_deps_say_a_run_has_ended_once_it_completed_failed_or_was_cancelled() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let spec = AgentSpec::from_yaml(YAML).expect("spec");
+        let deps = StoreDeps(store.clone());
+        let walk = |id: RunId, steps: &[RunStatus]| {
+            let mut from = RunStatus::Queued;
+            for next in steps {
+                store.transition(id, &from, next.clone()).expect("walk");
+                from = next.clone();
+            }
+        };
+
+        let live = store.create_run(&spec, "x").expect("create");
+        assert_eq!(deps.liveness(live).await, Liveness::Live, "queued");
+        walk(live, &[RunStatus::Provisioning, RunStatus::Running]);
+        assert_eq!(deps.liveness(live).await, Liveness::Live, "running");
+        store
+            .transition(
+                live,
+                &RunStatus::Running,
+                RunStatus::Suspended(SuspendReason::Manual),
+            )
+            .expect("suspend");
+        assert_eq!(
+            deps.liveness(live).await,
+            Liveness::Live,
+            "a suspended run can be resumed"
+        );
+
+        for end in [
+            RunStatus::Completed,
+            RunStatus::Failed("boom".into()),
+            RunStatus::Cancelled,
+        ] {
+            let id = store.create_run(&spec, "x").expect("create");
+            let mut steps = vec![RunStatus::Provisioning, RunStatus::Running];
+            steps.push(end.clone());
+            walk(id, &steps);
+            assert_eq!(deps.liveness(id).await, Liveness::Ended, "{end:?}");
+        }
+        assert_eq!(
+            deps.liveness(RunId::new()).await,
+            Liveness::Ended,
+            "a run the store does not have"
+        );
     }
 
     // Issue #25: bounded shutdown (tests first, failing until implemented).
