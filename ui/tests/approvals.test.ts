@@ -654,6 +654,15 @@ describe('ApprovalsState', () => {
     expect(state.count).toBe(1);
   });
 
+  it('dates a row the list brings for a run already seen to end, with the time the run ended', () => {
+    const state = new ApprovalsState();
+    const token = state.beginSync();
+    state.apply(event('r1', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }, NOW - 5_000));
+    state.load([a1], token);
+    expect(state.rows.a1?.ended).toBe('cancelled');
+    expect(state.decidedAt.a1).toBe(new Date(NOW - 5_000).toISOString());
+  });
+
   it('ignores a list older than one already loaded', () => {
     const state = new ApprovalsState();
     const older = state.beginSync();

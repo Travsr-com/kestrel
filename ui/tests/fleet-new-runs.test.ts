@@ -119,6 +119,55 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe('Fleet look-ups that cannot succeed, and look-ups in flight', () => {
+  it('does not ask again for a run the server says it does not have', async () => {
+    const old = run({ agent: 'old' });
+    const { sockets, gets } = show([old], [old]);
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const s = feed(sockets);
+    s.open();
+    s.event(1, ev('gone-run', { kind: 'run_created', agent: 'ghost' }));
+    await vi.waitFor(() => expect(gets.filter((p) => p === '/api/runs/gone-run')).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(gets.filter((p) => p === '/api/runs/gone-run')).toHaveLength(1);
+  });
+
+  it('stops asking for a run that failed to load once it is no longer live', async () => {
+    const old = run({ agent: 'old' });
+    const brief = run({ agent: 'brief' });
+    const path = `/api/runs/${brief.id}`;
+    const { sockets, gets, failures } = show([old], [old, brief], { failOnce: [path] });
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const s = feed(sockets);
+    s.open();
+    s.event(1, ev(brief.id, { kind: 'run_created', agent: 'brief' }));
+    await vi.waitFor(() => expect(failures()).toBe(1));
+    await flush();
+    s.event(2, ev(brief.id, { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(gets.filter((p) => p === path)).toHaveLength(1);
+  });
+
+  it('asks once for a run whose look-up is still out when another new run arrives', async () => {
+    const old = run({ agent: 'old' });
+    const first = run({ agent: 'first' });
+    const second = run({ agent: 'second' });
+    const path = `/api/runs/${first.id}`;
+    const { sockets, gets, release } = show([old], [old, first, second], { hold: [path] });
+    await vi.waitFor(() => expect(agents()).toEqual(['old']));
+    const s = feed(sockets);
+    s.open();
+    s.event(1, ev(first.id, { kind: 'run_created', agent: 'first' }));
+    await vi.waitFor(() => expect(gets.filter((p) => p === path)).toHaveLength(1));
+    s.event(2, ev(second.id, { kind: 'run_created', agent: 'second' }));
+    await vi.waitFor(() => expect(agents()).toContain('second'));
+    release();
+    await vi.waitFor(() => expect(agents()).toContain('first'));
+    expect(gets.filter((p) => p === path)).toHaveLength(1);
+  });
+});
+
 describe('Fleet and runs started after it loaded', () => {
   it('shows a run started after the page loaded, and follows it live', async () => {
     const old = run({ agent: 'old' });
