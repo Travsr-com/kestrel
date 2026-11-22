@@ -1188,6 +1188,63 @@ async fn the_id_of_a_running_call_takes_room_when_the_request_names_its_tool() {
     drop((join, attached));
 }
 
+/// Review of #95: a long call of another tool that reuses the id of a running join is a new call,
+/// not one that attaches to the join. At the cap it is refused as a new call: nothing was started,
+/// and the host gets neither the question nor the spawn.
+#[tokio::test(start_paused = true)]
+async fn a_long_call_of_another_tool_reusing_a_running_id_is_refused_at_the_cap() {
+    let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 1 });
+    let (token, run) = (&runs[0].0, runs[0].1);
+    let join = join_held_open(&app, token, 7).await;
+    for (tool, args) in [
+        ("kestrel.ask_human", json!({ "question": "which branch?" })),
+        (
+            "kestrel.spawn",
+            json!({ "agent": "worker", "input": "x", "wait": true }),
+        ),
+    ] {
+        let msg = message(
+            send(
+                &app,
+                token,
+                call(7, tool, args).to_string().into_bytes(),
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["result"]["isError"], json!(true), "{tool}: {msg}");
+        let reason = msg["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(reason.contains("nothing was started"), "{tool}: {reason}");
+        assert!(!reason.contains("still running"), "{tool}: {reason}");
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        host.asks.lock().unwrap().is_empty(),
+        "no question was asked"
+    );
+    assert!(
+        host.spawns.lock().unwrap().is_empty(),
+        "no child was spawned"
+    );
+    let refused: Vec<(RunId, String)> = host
+        .refused
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(r, tool, _)| (*r, tool.clone()))
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            (run, "kestrel.ask_human".to_string()),
+            (run, "kestrel.spawn".to_string())
+        ]
+    );
+    assert_eq!(host.joins.lock().unwrap().len(), 1);
+    drop(join);
+}
+
 /// A cap of 0 would refuse every long call; it counts as 1.
 #[tokio::test(start_paused = true)]
 async fn a_cap_of_0_counts_as_1() {
@@ -1775,6 +1832,10 @@ async fn messages_is_listed_for_a_run_granted_it_and_takes_an_optional_after() {
     let description = tools[0]["description"].as_str().unwrap();
     assert!(description.contains("person"), "{description}");
     assert!(description.contains("after"), "{description}");
+    assert!(
+        description.contains("If you do not know the last seq you got, leave out after."),
+        "{description}"
+    );
 }
 
 #[tokio::test]
