@@ -14,6 +14,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::*;
 use kestrel_core::Workspaces;
@@ -148,12 +149,35 @@ fn warning(h: &Harness, id: RunId) -> Option<String> {
         .find(|l| l.starts_with("kestrel: warning:"))
 }
 
+/// Real-time bound for the tests that start many real `git` processes (six clones, or a clone,
+/// two commits and a fetch), which take longer than [`REAL_DEADLINE`] on slow runners.
+const SLOW_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Waits until the run's log says how its branch came home, then asserts it was fetched.
+async fn fetched(h: &Harness, id: RunId) {
+    fetched_within(h, id, REAL_DEADLINE).await;
+}
+
+/// [`fetched`] with its own real-time bound.
+async fn fetched_within(h: &Harness, id: RunId, limit: Duration) {
+    until_within("fetch or warning recorded", limit, || {
+        fetched_line(h, id).is_some() || warning(h, id).is_some()
+    })
+    .await;
+    assert_eq!(warning(h, id), None, "{:?}", log_lines(h, id));
+}
+
 /// Starts a run that stays alive until the test ends it, and waits until it runs. Returns the
 /// run, its clone and the control of its agent.
 async fn running(s: &Setup) -> (RunId, PathBuf, SessionCtl) {
+    running_within(s, REAL_DEADLINE).await
+}
+
+/// [`running`] with its own real-time bound.
+async fn running_within(s: &Setup, limit: Duration) -> (RunId, PathBuf, SessionCtl) {
     let ctl = s.h.driver.live();
     let id = s.h.submit(clone_of(&s.repo)).await;
-    until("run running or ended", || {
+    until_within("run running or ended", limit, || {
         let status = s.h.status(id);
         status == RunStatus::Running || status.is_terminal()
     })
@@ -181,7 +205,7 @@ async fn s1_a_completed_run_with_a_commit_brings_its_branch_home() {
     ctl.line("ok:done");
     ctl.exit(0);
     until("run completed", || s.h.is(id, &RunStatus::Completed)).await;
-    until("fetch recorded", || fetched_line(&s.h, id).is_some()).await;
+    fetched(&s.h, id).await;
 
     assert_eq!(branch_tip(&s.repo, &branch), Some(tip.clone()));
     let line = fetched_line(&s.h, id).unwrap();
@@ -204,7 +228,7 @@ async fn s1_a_failed_run_with_a_commit_brings_its_branch_home_and_stays_failed()
     ctl.line("fail:gave up");
     ctl.exit(1);
     until("run failed", || s.h.is_failed(id).is_some()).await;
-    until("fetch recorded", || fetched_line(&s.h, id).is_some()).await;
+    fetched(&s.h, id).await;
 
     assert_eq!(branch_tip(&s.repo, &Workspaces::branch_for(id)), Some(tip));
     assert_eq!(s.h.is_failed(id).as_deref(), Some("gave up"));
@@ -219,7 +243,7 @@ async fn s1_a_cancelled_run_with_a_commit_brings_its_branch_home() {
 
     s.h.control(id, ControlCommand::Cancel);
     until("run cancelled", || s.h.is(id, &RunStatus::Cancelled)).await;
-    until("fetch recorded", || fetched_line(&s.h, id).is_some()).await;
+    fetched(&s.h, id).await;
 
     assert_eq!(branch_tip(&s.repo, &Workspaces::branch_for(id)), Some(tip));
     assert!(s.h.is(id, &RunStatus::Cancelled));
@@ -234,7 +258,7 @@ async fn s2_six_runs_editing_the_same_file_arrive_as_six_branches() {
     let main = git(&s.repo, &["rev-parse", "main"]);
     let mut runs = Vec::new();
     for _ in 0..6 {
-        runs.push(running(&s).await);
+        runs.push(running_within(&s, SLOW_DEADLINE).await);
     }
     let mut tips = Vec::new();
     for (n, (_, clone, _)) in runs.iter().enumerate() {
@@ -247,7 +271,7 @@ async fn s2_six_runs_editing_the_same_file_arrive_as_six_branches() {
         ctl.exit(0);
         ids.push(id);
     }
-    until("all fetched", || {
+    until_within("all fetched", SLOW_DEADLINE, || {
         ids.iter().all(|id| fetched_line(&s.h, *id).is_some())
     })
     .await;
@@ -302,7 +326,7 @@ async fn s3_a_run_without_new_commits_fetches_nothing_and_logs_nothing() {
 async fn s4_the_users_dirty_tree_and_new_commits_are_left_alone() {
     need_git!();
     let s = setup(4);
-    let (id, clone, ctl) = running(&s).await;
+    let (id, clone, ctl) = running_within(&s, SLOW_DEADLINE).await;
     let tip = commit_file(&clone, "shared.txt", "agent\n");
     let mine = commit_file(&s.repo, "user.txt", "mine\n");
     std::fs::write(s.repo.join("shared.txt"), "user edit\n").unwrap();
@@ -310,7 +334,7 @@ async fn s4_the_users_dirty_tree_and_new_commits_are_left_alone() {
 
     ctl.line("ok:done");
     ctl.exit(0);
-    until("fetch recorded", || fetched_line(&s.h, id).is_some()).await;
+    fetched_within(&s.h, id, SLOW_DEADLINE).await;
 
     assert_eq!(branch_tip(&s.repo, &Workspaces::branch_for(id)), Some(tip));
     assert_eq!(git(&s.repo, &["rev-parse", "main"]), mine);
