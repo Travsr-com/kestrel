@@ -11,6 +11,7 @@
 //! [`caps`] holds the capability grant a run carries and the signed tokens that narrow it per child.
 
 pub mod caps;
+mod fetch_home;
 mod index;
 mod join;
 mod slots;
@@ -36,7 +37,7 @@ pub enum AskError {
 
 /// The Kestrel tools, by the names a capability's `mcp` list uses.
 const KESTREL_TOOLS: [&str; 3] = ["kestrel.spawn", "kestrel.join", "kestrel.ask_human"];
-pub use workspace::{WorkspaceError, Workspaces};
+pub use workspace::{BroughtBack, WorkspaceError, Workspaces};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -2387,6 +2388,13 @@ impl Actor {
         }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
+        // With the sandbox gone, the clone holds what the agent left: its branch comes home
+        // (#93). After the slot, so a slow fetch never holds one; never changes the outcome.
+        if self.status.is_terminal()
+            && let Some(line) = self.inner.bring_branch_home(self.id, &self.spec).await
+        {
+            let _ = self.log(&self.scrub(&line));
+        }
         // Last, so a slow Travsr never holds the slot: a run that ended is forgotten, one that
         // did not (its status could not be stored) only stops being served.
         if self.status.is_terminal() {

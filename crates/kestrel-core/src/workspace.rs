@@ -7,7 +7,8 @@
 //!   `repo`, on its own branch (`kestrel/run-<short id>`, see [`Workspaces::branch_for`]).
 //!   `depth` makes it shallow. The clone is the agent's to rewrite, so the host runs git inside
 //!   it only before its sandbox exists (the checkout, and [`Workspaces::head`]);
-//!   [`Workspaces::fetch_back`] pulls the branch home from the source repo instead.
+//!   [`Workspaces::bring_back`] pulls the branch home from the source repo instead, when the
+//!   run ends (#93).
 //!
 //! `prepare` is idempotent: if the run's directory already exists (for example after an engine
 //! restart), it is reused as is and no git command runs. Workspaces are kept after the run
@@ -112,12 +113,69 @@ pub fn git_env_scrub() -> EnvScrub {
 pub struct Workspaces {
     root: PathBuf,
     runner: Arc<dyn CommandRunner>,
+    /// One [`Workspaces::bring_back`] at a time, so runs that end together never race on a
+    /// source repo.
+    fetching: tokio::sync::Mutex<()>,
+}
+
+/// What [`Workspaces::bring_back`] found, and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroughtBack {
+    /// The run has no clone: it ended before its workspace was made, or it was removed.
+    NoClone,
+    /// The clone has no run branch (the agent deleted or renamed it), so nothing was fetched.
+    NoBranch { branch: String },
+    /// The branch's tip, `commit`, is reachable from a ref the source already has: the run made
+    /// no new commits, so nothing was fetched.
+    NothingNew { branch: String, commit: String },
+    /// The source's `branch` is already at the clone's tip, `commit`.
+    AlreadyFetched { branch: String, commit: String },
+    /// The source's `refs/heads/<branch>` was created or fast-forwarded to `commit`.
+    Fetched { branch: String, commit: String },
+}
+
+impl BroughtBack {
+    /// The run branch, when the run has a clone.
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            BroughtBack::NoClone => None,
+            BroughtBack::NoBranch { branch }
+            | BroughtBack::NothingNew { branch, .. }
+            | BroughtBack::AlreadyFetched { branch, .. }
+            | BroughtBack::Fetched { branch, .. } => Some(branch),
+        }
+    }
+
+    /// The tip of the clone's run branch, when it has one.
+    pub fn commit(&self) -> Option<&str> {
+        match self {
+            BroughtBack::NoClone | BroughtBack::NoBranch { .. } => None,
+            BroughtBack::NothingNew { commit, .. }
+            | BroughtBack::AlreadyFetched { commit, .. }
+            | BroughtBack::Fetched { commit, .. } => Some(commit),
+        }
+    }
+
+    /// A short snake_case name, as `kestrel fetch --json` prints it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BroughtBack::NoClone => "no_clone",
+            BroughtBack::NoBranch { .. } => "no_branch",
+            BroughtBack::NothingNew { .. } => "nothing_new",
+            BroughtBack::AlreadyFetched { .. } => "already_fetched",
+            BroughtBack::Fetched { .. } => "fetched",
+        }
+    }
 }
 
 impl Workspaces {
     /// `root` is usually `<kestrel data dir>/workspaces`. It is validated by `prepare`.
     pub fn new(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { root, runner }
+        Self {
+            root,
+            runner,
+            fetching: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// The workspace directory for `run`: `<root>/<run id>`. Pure, touches nothing on disk.
@@ -244,48 +302,139 @@ impl Workspaces {
 
     /// Brings the run's branch home: runs ONLY from the source `repo` (never inside the clone,
     /// whose config and hooks the agent controls) and creates `kestrel/run-<id tail>` there.
+    /// Always fetches, whether or not the clone has new commits; [`Workspaces::bring_back`] looks
+    /// first.
     pub async fn fetch_back(&self, run: RunId, repo: &Path) -> Result<(), WorkspaceError> {
-        let repo_text = repo.to_str().ok_or_else(|| WorkspaceError::NonUtf8Repo {
-            repo: repo.to_path_buf(),
-        })?;
-        let branch = Self::branch_for(run);
+        let repo_text = utf8_repo(repo)?;
         let clone_dir = self.path_for(run);
-        // The clone is the agent's: refuse anything that could point git at another repo.
         // A clone directory that does not exist at all is left for git to report.
-        if let Ok(meta) = tokio::fs::symlink_metadata(&clone_dir).await {
-            let objects_info = clone_dir.join(".git/objects/info");
-            let git_dir = tokio::fs::symlink_metadata(clone_dir.join(".git")).await;
-            if !meta.is_dir() || !git_dir.is_ok_and(|m| m.is_dir()) {
-                return Err(WorkspaceError::GitDirNotADirectory { clone: clone_dir });
+        if tokio::fs::symlink_metadata(&clone_dir).await.is_ok() {
+            check_clone(&clone_dir).await?;
+        }
+        let clone = clone_dir.to_string_lossy();
+        self.fetch(repo, repo_text, &clone, &Self::branch_for(run))
+            .await
+    }
+
+    /// Brings the run's branch home when the clone has commits the source does not: creates or
+    /// fast-forwards `refs/heads/kestrel/run-<id tail>` in the source `repo`, and nothing else.
+    /// The user's working tree, index, `HEAD`, other branches and `FETCH_HEAD` are never touched.
+    ///
+    /// Git runs ONLY from the source repo, with the hardening of [`Workspaces::fetch_back`]
+    /// (hooks off, `transfer.fsckObjects`, no `ext::` transport, the environment of
+    /// [`git_env_scrub`], `.git` checked to be a real directory with no object alternates):
+    ///
+    /// 1. `ls-remote` reads the tip of the clone's run branch ([`BroughtBack::NoBranch`] without
+    ///    one).
+    /// 2. When the source has that commit and a ref reaches it, nothing is fetched:
+    ///    [`BroughtBack::AlreadyFetched`] when that ref is the run branch itself,
+    ///    [`BroughtBack::NothingNew`] otherwise.
+    /// 3. Otherwise the branch is fetched ([`BroughtBack::Fetched`]). A branch that cannot
+    ///    fast-forward, or one the user has checked out, is an error and is left as it was.
+    ///
+    /// A run without a clone is [`BroughtBack::NoClone`], and runs no git. Calls are serialized,
+    /// so runs that end together fetch one after the other.
+    pub async fn bring_back(&self, run: RunId, repo: &Path) -> Result<BroughtBack, WorkspaceError> {
+        let clone_dir = self.path_for(run);
+        if tokio::fs::symlink_metadata(&clone_dir).await.is_err() {
+            return Ok(BroughtBack::NoClone);
+        }
+        if repo.is_relative() {
+            return Err(WorkspaceError::RelativeRepo {
+                repo: repo.to_path_buf(),
+            });
+        }
+        let repo_text = utf8_repo(repo)?;
+        check_clone(&clone_dir).await?;
+        let clone = clone_dir.to_string_lossy();
+        let branch = Self::branch_for(run);
+        let wanted = format!("refs/heads/{branch}");
+        let _one_at_a_time = self.fetching.lock().await;
+
+        let listed = self
+            .source_git(repo, repo_text, &["ls-remote", "--", &clone, &wanted])
+            .await?;
+        // `ls-remote` matches a pattern by its tail, so other refs may come back too.
+        let tip = listed.lines().find_map(|line| {
+            let (commit, name) = line.split_once('\t')?;
+            (name == wanted).then_some(commit)
+        });
+        let Some(tip) = tip else {
+            return Ok(BroughtBack::NoBranch { branch });
+        };
+        let commit = commit_id(tip)?;
+        if self.source_has(repo, repo_text, &commit).await? {
+            let format = "--format=%(objectname) %(refname)";
+            let reaching = self
+                .source_git(
+                    repo,
+                    repo_text,
+                    &["for-each-ref", "--contains", &commit, format, "refs/"],
+                )
+                .await?;
+            let own = format!("{commit} {wanted}");
+            if reaching.lines().any(|line| line == own) {
+                return Ok(BroughtBack::AlreadyFetched { branch, commit });
             }
-            for name in ["alternates", "http-alternates"] {
-                if tokio::fs::symlink_metadata(objects_info.join(name))
-                    .await
-                    .is_ok()
-                {
-                    return Err(WorkspaceError::AlternatesPresent { clone: clone_dir });
-                }
+            if !reaching.trim().is_empty() {
+                return Ok(BroughtBack::NothingNew { branch, commit });
             }
         }
-        let clone = clone_dir.to_string_lossy().into_owned();
-        // No `+` on the refspec: a branch that cannot fast-forward is an error on purpose.
-        let command = argv(&[
-            "git",
-            "-C",
-            repo_text,
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "transfer.fsckObjects=true",
-            "-c",
-            "protocol.ext.allow=never",
+        self.fetch(repo, repo_text, &clone, &branch).await?;
+        Ok(BroughtBack::Fetched { branch, commit })
+    }
+
+    /// Fetches `branch` of `clone` into the same branch of the source repo. No `+` on the
+    /// refspec: a branch that cannot fast-forward is an error on purpose.
+    async fn fetch(
+        &self,
+        repo: &Path,
+        repo_text: &str,
+        clone: &str,
+        branch: &str,
+    ) -> Result<(), WorkspaceError> {
+        let refspec = format!("{branch}:{branch}");
+        let args = [
             "fetch",
             "--no-tags",
+            "--no-write-fetch-head",
             "--",
-            &clone,
-            &format!("{branch}:{branch}"),
-        ]);
-        self.run_git(command, repo).await
+            clone,
+            &refspec,
+        ];
+        self.source_git(repo, repo_text, &args).await.map(|_| ())
+    }
+
+    /// Whether the source repo holds `commit` (a full commit id).
+    async fn source_has(
+        &self,
+        repo: &Path,
+        repo_text: &str,
+        commit: &str,
+    ) -> Result<bool, WorkspaceError> {
+        let peeled = format!("{commit}^{{commit}}");
+        let command = source_argv(repo_text, &["rev-parse", "--verify", "--quiet", &peeled]);
+        let out = self.git(&command, repo).await?;
+        match out.status {
+            0 => Ok(true),
+            // `--verify --quiet` exits 1, silently, for a commit the repo does not have.
+            1 => Ok(false),
+            status => Err(WorkspaceError::Git {
+                argv: command,
+                status,
+                stderr: out.stderr.trim_end().to_string(),
+            }),
+        }
+    }
+
+    /// Runs `git <hardened options> <args>` in the source repo and returns its stdout.
+    async fn source_git(
+        &self,
+        repo: &Path,
+        repo_text: &str,
+        args: &[&str],
+    ) -> Result<String, WorkspaceError> {
+        run_git(self.runner.as_ref(), source_argv(repo_text, args), repo).await
     }
 
     /// The commit `run`'s workspace is at, a full commit id.
@@ -398,6 +547,53 @@ pub async fn clone_at(
         }
     }
     Ok(())
+}
+
+/// The clone is the agent's: refuses anything in it that could point git at another repo. The
+/// clone directory must be a real directory, its `.git` too (not a gitfile or a link), and it
+/// must have no object alternates.
+async fn check_clone(clone_dir: &Path) -> Result<(), WorkspaceError> {
+    let clone = || clone_dir.to_path_buf();
+    let meta = tokio::fs::symlink_metadata(clone_dir).await;
+    let git_dir = tokio::fs::symlink_metadata(clone_dir.join(".git")).await;
+    if !meta.is_ok_and(|m| m.is_dir()) || !git_dir.is_ok_and(|m| m.is_dir()) {
+        return Err(WorkspaceError::GitDirNotADirectory { clone: clone() });
+    }
+    let objects_info = clone_dir.join(".git/objects/info");
+    for name in ["alternates", "http-alternates"] {
+        if tokio::fs::symlink_metadata(objects_info.join(name))
+            .await
+            .is_ok()
+        {
+            return Err(WorkspaceError::AlternatesPresent { clone: clone() });
+        }
+    }
+    Ok(())
+}
+
+/// `git -C <repo>` with the options every git call in a source repo carries: hooks off, every
+/// object checked on fetch, no `ext::` transport. Then `args`.
+fn source_argv(repo_text: &str, args: &[&str]) -> Vec<String> {
+    let mut command = argv(&[
+        "git",
+        "-C",
+        repo_text,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "transfer.fsckObjects=true",
+        "-c",
+        "protocol.ext.allow=never",
+    ]);
+    command.extend(argv(args));
+    command
+}
+
+/// `repo` as text for git, or [`WorkspaceError::NonUtf8Repo`].
+fn utf8_repo(repo: &Path) -> Result<&str, WorkspaceError> {
+    repo.to_str().ok_or_else(|| WorkspaceError::NonUtf8Repo {
+        repo: repo.to_path_buf(),
+    })
 }
 
 /// `text` when it is a full commit id: 40 (sha-1) or 64 (sha-256) lowercase hex characters.

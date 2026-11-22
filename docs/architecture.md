@@ -146,6 +146,7 @@ Exposed to every runtime as the MCP tool `kestrel.spawn(agent, input, budget_usd
 * **Tokens.** A capability token is valid for 7 days. A root's expired token is made again from its spec at its next spawn. A spawned run's token comes from its parent's and is not remade. A child's stored spec lists only the capabilities it was granted.
 * **Model tier.** A child spec without `model_policy` runs one tier below its parent (lever 1 in section 3.5).
 * **Workspace.** Each child gets its own clone. A `git-clone` child whose `repo` is relative clones its parent's repo.
+* **How a child's work comes back.** Every `git-clone` run works on branch `kestrel/run-<id>` in its own clone. When a run ends (completed, failed or cancelled) and its sandbox is gone, the engine brings that branch into the source repo (`Workspaces::bring_back`, #93), so six children that edit the same file arrive as six branches and none overwrites another. It fetches only when the clone has commits no ref of the source reaches, and only creates or fast-forwards `refs/heads/kestrel/run-<id>`: never the user's working tree, index, `HEAD`, other branches or `FETCH_HEAD`. Git runs only in the source repo, with the hardening of #52 (hooks off, `transfer.fsckObjects`, no `ext::` transport, a scrubbed environment, `.git` checked to be a real directory without object alternates), one fetch at a time. The run's log records `kestrel: fetched branch ...`; a failed fetch (a branch that cannot fast-forward, one the user has checked out, an object that fails fsck) is a `kestrel: warning:` line and never changes the run's outcome. `kestrel fetch <run-id>` does the same on demand for a run that has ended. The parent does not see a child's branch in its own clone: it gets what it needs from the child's summary.
 * Because a parent's limit shrinks when it spawns, `kestrel ps` shows the budget the parent kept, not the one it started with.
 
 **How a parent waits** (`Engine::join`):
@@ -580,7 +581,7 @@ Apache-compatible, plus RUSTSEC advisories, in CI from the first commit.
 | First chat surface | Google Chat via Pub/Sub pull |
 | Meetings | Live meeting bot, Google Meet first, headless-browser approach (Meet Media API is being sunset) |
 | Repo | Separate `Kestrel` repo; Travsr used only over MCP |
-| Workspaces | Per-run git clones (#22), not git worktrees: a worktree's `.git` points outside the sandbox mount, so git fails inside it. The YAML value is `git-clone`; the optional `sandbox.clone_depth` makes the clone shallow |
+| Workspaces | Per-run git clones (#22), not git worktrees: a worktree's `.git` points outside the sandbox mount, so git fails inside it. The YAML value is `git-clone`; the optional `sandbox.clone_depth` makes the clone shallow. A run's branch is fetched into the source repo when the run ends (#93) |
 | Sandbox tool access | `kestrel.*` and Travsr MCP are served under the gateway path (`/r/{token}/mcp`, `/r/{token}/travsr`), because the gateway is a sandbox's only way out |
 | UI coverage | The 95% line rule covers Rust and the Svelte UI (vitest), enforced in CI |
 

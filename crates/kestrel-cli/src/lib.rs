@@ -3,11 +3,12 @@
 //! M1 has no HTTP API. Every command except `serve` talks to the engine only through the SQLite
 //! store (`--db`): `run` writes a `Queued` run, the steering commands push control commands, and
 //! `watch` and `ps` read runs and events. `kestrel serve` runs the engine and the LLM gateway in one
-//! process on the same database.
+//! process on the same database. `fetch` reads a finished run from the store and runs git in its
+//! source repo to bring its branch home, as the engine does when a run ends.
 //!
 //! Exit codes: [`EXIT_OK`], [`EXIT_RUNTIME`], [`EXIT_USAGE`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -17,6 +18,7 @@ use kestrel_types::{ApprovalId, MicroUsd, RunId};
 mod commands;
 #[cfg(debug_assertions)]
 mod fake;
+mod fetch;
 mod paths;
 mod serve;
 mod tools;
@@ -99,6 +101,11 @@ pub enum Command {
         /// New limit in USD, for example 5 or 2.50.
         #[arg(allow_negative_numbers = true)]
         usd: String,
+    },
+    /// Bring a finished run's branch into its source repo.
+    Fetch {
+        /// Run id, as printed by `kestrel run`.
+        run_id: RunId,
     },
 }
 
@@ -189,6 +196,7 @@ fn execute(cli: Cli) -> Result<(), Failure> {
             })?;
             commands::steer(&open(db)?, run_id, ControlCommand::SetBudget(limit), out)
         }
+        Command::Fetch { run_id } => fetch::fetch(db, run_id, out),
     }
 }
 
@@ -231,6 +239,21 @@ pub(crate) struct Output {
 pub(crate) fn open(db: Option<PathBuf>) -> Result<Store, Failure> {
     let path = db_path(db)?;
     Store::open(&path).map_err(|e| Failure::runtime(format!("{}: {e}", path.display())))
+}
+
+/// The directory the database is in, absolute. Workspaces and run configs live next to it, so a
+/// temp `--db` keeps everything in one place.
+pub(crate) fn data_dir_of(db: &Path) -> Result<PathBuf, Failure> {
+    std::path::absolute(db)
+        .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Failure::runtime(format!("{}: no parent dir", db.display())))
+}
+
+/// Where `kestrel serve` keeps the runs' workspaces: `<data dir>/workspaces`.
+pub(crate) fn workspace_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("workspaces")
 }
 
 /// `db`, or `kestrel.db` under the user data dir (created if needed).
