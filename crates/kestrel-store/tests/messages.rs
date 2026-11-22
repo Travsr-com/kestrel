@@ -132,7 +132,10 @@ fn a_run_that_is_not_running_refuses_a_message_with_the_reason() {
             .unwrap()
             .contains("ended")
     );
-    let live = store.get_run(running(&store, &listener())).unwrap().unwrap();
+    let live = store
+        .get_run(running(&store, &listener()))
+        .unwrap()
+        .unwrap();
     assert_eq!(store.message_refusal(&live).unwrap(), None);
 }
 
@@ -163,7 +166,9 @@ fn a_message_that_is_empty_too_long_or_not_text_is_refused() {
         ));
     }
     assert!(message_events(&store, id).is_empty());
-    store.send_message(id, &"x".repeat(MAX_MESSAGE_BYTES)).unwrap();
+    store
+        .send_message(id, &"x".repeat(MAX_MESSAGE_BYTES))
+        .unwrap();
 }
 
 #[test]
@@ -277,10 +282,7 @@ fn takers_racing_on_one_file_deliver_each_message_exactly_once() {
         })
         .collect();
     senders.join().unwrap();
-    let mut got: Vec<InboxMessage> = takers
-        .into_iter()
-        .flat_map(|t| t.join().unwrap())
-        .collect();
+    let mut got: Vec<InboxMessage> = takers.into_iter().flat_map(|t| t.join().unwrap()).collect();
     got.extend(store.take_messages(id).unwrap());
     let mut texts: Vec<String> = got.into_iter().map(|m| m.text).collect();
     texts.sort();
