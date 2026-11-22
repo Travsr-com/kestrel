@@ -192,7 +192,8 @@ error: run <queued-run-id>: a queued run cannot be paused, only a running one
 * `pause` needs a running run. `resume` needs a suspended one; a run waiting on an approval
   resumes through `kestrel approve` instead.
 * `cancel` and `budget` work until the run ends.
-* A completed, failed or cancelled run has ended and refuses all four.
+* A completed, failed or cancelled run has ended and refuses all four, except `cancel` while a run
+  below it still runs (a run that kept its children): that cancels the live runs below it.
 
 ## What happens at the limit
 

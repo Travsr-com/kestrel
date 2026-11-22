@@ -71,14 +71,18 @@ sent:
 | :--- | :--- | :--- |
 | `POST /api/runs/{id}/pause` | `kestrel pause` | running |
 | `POST /api/runs/{id}/resume` | `kestrel resume` | suspended, but not waiting on an approval (approve or reject it instead) |
-| `POST /api/runs/{id}/cancel` | `kestrel cancel` | queued, provisioning, running or suspended |
+| `POST /api/runs/{id}/cancel` | `kestrel cancel` | queued, provisioning, running or suspended; or ended with a live run below it |
 | `POST /api/runs/{id}/budget` with `{"usd": "5.00"}` | `kestrel budget`. A negative or non-decimal amount is `400`. | queued, provisioning, running or suspended |
 | `POST /api/runs/{id}/message` with `{"text": "..."}` | Not supported by any runtime yet: `409`. | |
 
 A completed, failed or cancelled run has ended: every command answers `409`
-(`the run has ended (completed), so it cannot be paused`). A status can still change between this
-check and the engine reading the command; the engine then ignores the command and notes it in the
-run's log.
+(`the run has ended (completed), so it cannot be paused`). One exception: cancel on an ended run
+that still has a live run below it (it kept its children, `spawn.keep_children`) answers `202` and
+cancels that live tree. The ended run itself keeps its status. Once nothing below it is live,
+cancel is `409` too.
+
+A status can still change between this check and the engine reading the command; the engine then
+ignores the command and notes it in the run's log.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $T" "$K/api/runs/$RUN/pause"
