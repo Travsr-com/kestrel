@@ -12,7 +12,8 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// Why `text` cannot be sent as a message, or `None` when it can. A message is text of 1 to
 /// [`MAX_MESSAGE_BYTES`] bytes that is not only whitespace, with no control character other than
-/// a line break or a tab, so it cannot move a terminal's cursor when `kestrel watch` prints it.
+/// a newline or a tab, so it cannot move a terminal's cursor when `kestrel watch` prints it (a
+/// carriage return would write over the line's prefix).
 pub fn message_problem(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return Some("the message is empty".into());
@@ -25,10 +26,10 @@ pub fn message_problem(text: &str) -> Option<String> {
     }
     if text
         .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
     {
         return Some(
-            "a message is plain text: no control characters other than line breaks and tabs".into(),
+            "a message is plain text: no control characters other than newlines and tabs".into(),
         );
     }
     None
