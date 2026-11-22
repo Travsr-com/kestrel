@@ -1587,21 +1587,10 @@ impl Inner {
         Ok(())
     }
 
-    /// The nearest runs below `run` that have not ended: its live children, and below a child
-    /// that ended (it may have kept its children), that child's nearest live runs.
+    /// The nearest runs below `run` that have not ended ([`Store::live_below`], the same walk the
+    /// CLI and the API use to let a cancel of an ended run through).
     fn live_below(&self, run: RunId) -> Result<Vec<RunId>> {
-        let mut live = Vec::new();
-        let mut look = vec![run];
-        while let Some(r) = look.pop() {
-            for child in self.store.children(r)? {
-                if child.status.is_terminal() {
-                    look.push(child.id);
-                } else {
-                    live.push(child.id);
-                }
-            }
-        }
-        Ok(live)
+        Ok(self.store.live_below(run)?)
     }
 
     fn cancelling(&self) -> MutexGuard<'_, HashSet<RunId>> {

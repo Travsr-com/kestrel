@@ -239,9 +239,12 @@ pub(crate) async fn command(
         }
         other => return error(StatusCode::NOT_FOUND, format!("no command `{other}`")),
     };
-    // Refused up front, so the caller hears why instead of a 202 the engine then ignores.
-    if let Some(why) = cmd.refusal(&row.status) {
-        return error(StatusCode::CONFLICT, format!("run {}: {why}", row.id));
+    // Refused up front, so the caller hears why instead of a 202 the engine then ignores. A cancel
+    // of an ended run with a live run below it goes through: it cancels that tree.
+    match s.store.command_refusal(&row, &cmd) {
+        Ok(None) => {}
+        Ok(Some(why)) => return error(StatusCode::CONFLICT, format!("run {}: {why}", row.id)),
+        Err(e) => return internal(e),
     }
     match s.store.push_control(row.id, cmd) {
         Ok(_) => accepted(),

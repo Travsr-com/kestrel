@@ -184,19 +184,25 @@ impl ControlCommand {
     }
 
     /// Why a run in `status` would not apply this command, or `None` when it would. This is the
-    /// rule the engine applies; the CLI and the API check it before writing a command so a person
-    /// hears the reason instead of a silent no-op. The status can still change before the engine
-    /// reads the command, and the engine then ignores it and logs it.
+    /// rule the engine applies, from the status alone; the CLI and the API check it (through
+    /// [`Store::command_refusal`], which adds the one case that looks below the run) before
+    /// writing a command, so a person hears the reason instead of a silent no-op. The status can
+    /// still change before the engine reads the command, and the engine then ignores it and logs
+    /// it.
     ///
     /// * Pause: a running run.
     /// * Resume: a suspended run that does not wait on an approval (it resumes through its
     ///   decision).
     /// * Cancel and SetBudget: any run that has not ended.
     /// * Approve and reject: a run waiting on that approval.
-    /// * Ask: a running run.
+    ///
+    /// Ask is outside the rule (`None` in every status): the gateway sends it for
+    /// `kestrel.ask_human`, never a person, and the engine answers it in any status (a run that is
+    /// not running hears no).
     pub fn refusal(&self, status: &RunStatus) -> Option<String> {
         use ControlCommand as C;
         let what = match self {
+            C::Ask { .. } => return None,
             C::Pause => "paused",
             C::Resume => "resumed",
             C::Cancel => "cancelled",
@@ -204,7 +210,6 @@ impl ControlCommand {
             C::Approve(_) | C::Reject(_) | C::ApproveWith { .. } | C::RejectWith { .. } => {
                 "approved or rejected"
             }
-            C::Ask { .. } => "asked a question",
         };
         let name = status.name();
         if status.is_terminal() {
@@ -217,10 +222,10 @@ impl ControlCommand {
             _ => None,
         };
         match self {
-            C::Cancel | C::SetBudget(_) => None,
-            C::Pause | C::Ask { .. } if *status == RunStatus::Running => None,
+            // Ask returned above.
+            C::Cancel | C::SetBudget(_) | C::Ask { .. } => None,
+            C::Pause if *status == RunStatus::Running => None,
             C::Pause => Some(format!("a {name} run cannot be paused, only a running one")),
-            C::Ask { .. } => Some(format!("a {name} run cannot be {what}")),
             C::Resume => match (status, waits_on) {
                 (_, Some(id)) => Some(format!(
                     "the run waits on approval {id}: approve or reject it instead of resuming"
@@ -743,6 +748,38 @@ impl Store {
             &format!("SELECT {RUN_COLUMNS} FROM runs WHERE parent_run_id = ?1 ORDER BY rowid"),
             [run.to_string()],
         )
+    }
+
+    /// The nearest runs below `run` that have not ended: its live children, and below a child
+    /// that ended (it may have kept its children, `spawn.keep_children`), that child's nearest
+    /// live runs. Empty when nothing below `run` is live, or for an unknown run. A cancel of `run`
+    /// reaches exactly these (and, through them, everything live below them).
+    pub fn live_below(&self, run: RunId) -> Result<Vec<RunId>> {
+        let mut live = Vec::new();
+        let mut look = vec![run];
+        while let Some(r) = look.pop() {
+            for child in self.children(r)? {
+                if child.status.is_terminal() {
+                    look.push(child.id);
+                } else {
+                    live.push(child.id);
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// Why the engine would not apply `cmd` to `run`, or `None` when it would: the status rule
+    /// ([`ControlCommand::refusal`]) with one case it cannot see from the status. A cancel of a
+    /// run that has ended but still has a live run below it is applied: the engine cancels that
+    /// live tree (the ended run itself stays as it ended). The CLI and the API check this before
+    /// writing a command.
+    pub fn command_refusal(&self, run: &RunRow, cmd: &ControlCommand) -> Result<Option<String>> {
+        let why = cmd.refusal(&run.status);
+        if why.is_some() && *cmd == ControlCommand::Cancel && !self.live_below(run.id)?.is_empty() {
+            return Ok(None);
+        }
+        Ok(why)
     }
 
     /// Every descendant of `run` (not `run` itself), each parent before its children: level by
