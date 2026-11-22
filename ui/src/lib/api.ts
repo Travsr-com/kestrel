@@ -86,7 +86,9 @@ export function createApi({ fetch, getToken, baseUrl = '' }: ApiOptions) {
     getRun: (id: string): Promise<RunSummary> => get(`/api/runs/${seg(id)}`),
     tree: (id: string): Promise<TreeNode[]> => get(`/api/runs/${seg(id)}/tree`),
     events: (id: string, after: number): Promise<Event[]> => get(`/api/runs/${seg(id)}/events?after=${after}`),
-    approvals: (status: ApprovalStatus): Promise<Approval[]> => get(`/api/approvals?status=${status}`),
+    /** The approvals of one status, or all of them without one. */
+    approvals: (status?: ApprovalStatus): Promise<Approval[]> =>
+      get(`/api/approvals${status === undefined ? '' : `?status=${status}`}`),
     pause: (id: string) => post(`/api/runs/${seg(id)}/pause`),
     resume: (id: string) => post(`/api/runs/${seg(id)}/resume`),
     cancel: (id: string) => post(`/api/runs/${seg(id)}/cancel`),

@@ -29,24 +29,22 @@
     return () => clearInterval(tick);
   });
 
-  /** How long after an approval is resolved the decided lists are asked for again. */
+  /** How long after a change the decided list is asked for again, at most once in that time. */
   const REFETCH_MS = 300;
 
-  /** The decided approvals, newest first; `null` until loaded. */
+  /** The approvals that are not pending any more, as the server listed them; `null` until loaded. */
   let decided = $state<Approval[] | null>(null);
   let decidedFailed = $state(false);
-  /** Bumped to ask for the decided lists again. */
+  /** Bumped to ask for the decided list again. */
   let decidedAsk = $state(0);
   $effect(() => {
     void decidedAsk;
     let alive = true;
-    Promise.all([api.approvals('approved'), api.approvals('rejected'), api.approvals('expired')]).then(
-      (lists) => {
+    // Every approval in one request (the API filters one status at a time), less the pending ones.
+    api.approvals().then(
+      (list) => {
         if (!alive) return;
-        // By id, so an approval whose status changed between the requests is listed once.
-        const byId = new Map(lists.flat().map((a) => [a.id, a]));
-        // By request time, newest first: the API has no decision time.
-        decided = [...byId.values()].sort((a, b) => newestFirst(a.requested_at, b.requested_at));
+        decided = list.filter((a) => a.status !== 'pending');
         decidedFailed = false;
       },
       (e: unknown) => {
@@ -61,23 +59,47 @@
     };
   });
 
-  // A pending approval that was resolved (here or elsewhere) is now decided: the lists are asked
-  // for again a moment later, once for several resolved in a row. Dismissing an ended row is not
-  // a resolution and asks for nothing.
-  let resolutionsSeen = untrack(() => approvals.resolutions);
+  // When the decided approvals may have changed (approvals resolved here or elsewhere, rows ended
+  // with their run, an ended row dismissed), the list is asked for again a moment later. A change
+  // while one is already due does not push it back, so a steady stream of changes still refreshes
+  // the list every REFETCH_MS, and the last change is always followed by one.
+  let changesSeen = untrack(() => approvals.decidedChanges);
+  let refetch: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
-    const resolutions = approvals.resolutions;
-    if (resolutions === resolutionsSeen) return;
-    resolutionsSeen = resolutions;
-    const timer = setTimeout(() => (decidedAsk += 1), REFETCH_MS);
-    return () => clearTimeout(timer);
+    const changes = approvals.decidedChanges;
+    if (changes === changesSeen) return;
+    changesSeen = changes;
+    if (refetch !== null) return;
+    refetch = setTimeout(() => {
+      refetch = null;
+      decidedAsk += 1;
+    }, REFETCH_MS);
+  });
+  $effect(() => () => {
+    if (refetch !== null) clearTimeout(refetch);
   });
 
   /**
-   * The decided approvals shown. One still in the pending rows is left out: an approval of an
-   * ended run comes back from the API as expired, and is shown once, as "Run ended".
+   * The decided approvals shown, at most DECIDED. Those seen resolved since the page was opened
+   * come first, newest decision first; the rest follow by request time, newest first, as the API
+   * has no decision time. One still in the pending rows is left out: an approval of an ended run
+   * comes back from the API as expired, and is shown once, as "Run ended", until dismissed.
    */
-  const recent = $derived(decided?.filter((a) => !approvals.rows[a.id]).slice(0, DECIDED) ?? null);
+  const recent = $derived.by(() => {
+    if (decided === null) return null;
+    const at = approvals.decidedAt;
+    return decided
+      .filter((a) => !approvals.rows[a.id])
+      .sort((a, b) => {
+        const x = at[a.id];
+        const y = at[b.id];
+        if (x !== undefined && y !== undefined && x !== y) return newestFirst(x, y);
+        if (x !== undefined && y === undefined) return -1;
+        if (x === undefined && y !== undefined) return 1;
+        return newestFirst(a.requested_at, b.requested_at);
+      })
+      .slice(0, DECIDED);
+  });
 
   /** Each approval's run, for its agent, root and budget. */
   let runs: Record<RunId, RunSummary> = $state({});
@@ -136,6 +158,15 @@
       }
     });
   }
+
+  // The state of a decision goes with its row: forgotten when the row leaves (its panel goes, and
+  // says nothing more).
+  $effect(() => {
+    const ids = Object.keys(approvals.rows);
+    untrack(() => {
+      for (const id of Object.keys(decisions)) if (!ids.includes(id)) delete decisions[id];
+    });
+  });
 
   function gone(id: string, why: 'resolved' | 'not-waiting') {
     if (why === 'not-waiting') {
@@ -212,7 +243,8 @@
 {:else}
   <div class="layout" data-testid="ready">
     <div class="pending">
-      <h2 class="eyebrow">Pending ({list.length})</h2>
+      <!-- The approvals that can still be decided, as the sidebar counts them (not the ended rows). -->
+      <h2 class="eyebrow">Pending ({approvals.count})</h2>
       {#if list.length === 0}
         <p class="muted">Nothing waiting for you</p>
       {:else}
@@ -244,6 +276,7 @@
             onGone={(why) => gone(row.approval.id, why)}
             onDismiss={() => approvals.dismiss(row.approval.id)}
             onState={(state) => decisionState(row, state)}
+            onAccepted={() => approvals.accepted(row.approval.id)}
           />
         {/each}
       </div>

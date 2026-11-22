@@ -80,7 +80,7 @@
     <div
       class="track"
       role="meter"
-      aria-label="Budget used by {run.agent}"
+      aria-label="Budget used by {run.agent}, run {run.id.slice(-8)}"
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={percent}

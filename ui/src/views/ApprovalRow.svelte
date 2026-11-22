@@ -5,7 +5,8 @@
   // A decision stays "in progress" until the resolved event takes the approval away; a refusal
   // because someone else decided first (409) is handed to `onGone`; any other failure puts the
   // buttons back with the error and a Retry, which sends what the fields hold then. How a decision
-  // is going is also handed to `onState`, as the panel is hidden while another one is selected.
+  // is going is also handed to `onState`, as the panel is hidden while another one is selected, and
+  // a decision the server accepted to `onAccepted`.
   import { ApiFailure, type Api } from '../lib/api';
   import type { ApprovalRow, DecisionState } from '../lib/approvals.svelte';
   import { formatElapsed, formatUsd } from '../lib/format';
@@ -23,6 +24,7 @@
     onGone,
     onDismiss,
     onState = () => {},
+    onAccepted = () => {},
   }: {
     row: ApprovalRow;
     run: RunSummary | undefined;
@@ -33,6 +35,8 @@
     onGone: (why: 'resolved' | 'not-waiting') => void;
     onDismiss: () => void;
     onState?: (state: DecisionState) => void;
+    /** The server accepted a decision on it. */
+    onAccepted?: () => void;
   } = $props();
 
   /** Characters of the payload shown before "Show all". */
@@ -73,6 +77,7 @@
     retry = again ?? (() => void decide(kind, call));
     try {
       await call();
+      onAccepted();
     } catch (e) {
       sending = null;
       if (e instanceof ApiFailure && e.status === 409) {

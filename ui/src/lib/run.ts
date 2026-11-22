@@ -79,9 +79,12 @@ export interface Tokens {
   cacheWrite: number;
 }
 
-/** The tokens of the model calls among `events`, summed. */
-export function tokenTotals(events: Event[]): Tokens {
-  const sum: Tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+/** No tokens yet. */
+export const NO_TOKENS: Tokens = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+
+/** `totals` plus the tokens of the model calls among `events`, as a new object. */
+export function addTokens(totals: Tokens, events: Event[]): Tokens {
+  const sum: Tokens = { ...totals };
   for (const { kind } of events) {
     if (kind.kind !== 'model_call') continue;
     sum.input += kind.tokens_in;

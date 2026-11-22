@@ -1,7 +1,8 @@
 // The pending approvals across all runs: what the inbox lists and the nav counts.
 //
 // The list comes from `GET /api/approvals?status=pending`, and live changes from the `/ws/events`
-// socket (requests, resolutions, and runs that end). The socket starts at the newest event, so
+// socket (requests, resolutions, and runs that end). It also counts what may change the decided
+// approvals and remembers when each was seen resolved. The socket starts at the newest event, so
 // the list is fetched again each time it opens: that covers whatever happened while it was not
 // connected. Two rules keep the two sources from fighting:
 //
@@ -37,8 +38,16 @@ export class ApprovalsState {
   rows: Record<ApprovalId, ApprovalRow> = $state({});
   loaded = $state(false);
   error: string | null = $state(null);
-  /** Bumped each time pending approvals go away because they were resolved (not dismissed). */
-  resolutions = $state(0);
+  /**
+   * Bumped each time the decided approvals may have changed: pending ones were resolved, rows
+   * ended because their run did (the server now says expired), or an ended row was dismissed.
+   */
+  decidedChanges = $state(0);
+  /**
+   * When each approval was seen resolved: the time of its `approval_resolved` event, or of a
+   * decision accepted here until that event comes. The API has no decision time.
+   */
+  decidedAt: Record<ApprovalId, string> = $state({});
   private gen = 0;
   /** The newest sync whose list was taken. */
   private loadedToken = 0;
@@ -74,7 +83,7 @@ export class ApprovalsState {
         gone += 1;
       }
     }
-    if (gone > 0) this.resolutions += 1;
+    if (gone > 0) this.decidedChanges += 1;
     this.loaded = true;
     this.error = null;
   }
@@ -98,15 +107,20 @@ export class ApprovalsState {
         };
         return;
       case 'approval_resolved':
+        this.decidedAt[kind.id] = event.ts;
         this.remove(kind.id);
         return;
       case 'status_changed': {
         if (!isTerminal(kind.to)) return;
         const ended = kind.to === 'Cancelled' ? 'cancelled' : 'ended';
         this.endedRuns[event.run_id] = ended;
+        let changed = false;
         for (const row of Object.values(this.rows)) {
-          if (row.approval.run_id === event.run_id) row.ended = ended;
+          if (row.approval.run_id !== event.run_id) continue;
+          if (row.ended === null) changed = true;
+          row.ended = ended;
         }
+        if (changed) this.decidedChanges += 1;
         return;
       }
       default:
@@ -119,18 +133,29 @@ export class ApprovalsState {
     this.resolved[id] = true;
     if (!this.rows[id]) return;
     delete this.rows[id];
-    this.resolutions += 1;
+    this.decidedChanges += 1;
+  }
+
+  /** A decision on it was accepted here: decided now, until its resolved event says when. */
+  accepted(id: ApprovalId): void {
+    // A time to compare and sort, never changed in place: no reactive date is needed.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    this.decidedAt[id] ??= new Date().toISOString();
   }
 
   /** The run stopped waiting on this approval (the server said so before its event came). */
   endRow(id: ApprovalId): void {
     const row = this.rows[id];
-    if (row) row.ended = 'ended';
+    if (!row || row.ended !== null) return;
+    row.ended = 'ended';
+    this.decidedChanges += 1;
   }
 
   /** Takes away a row the user has seen (one whose run ended). */
   dismiss(id: ApprovalId): void {
+    if (!this.rows[id]) return;
     delete this.rows[id];
+    this.decidedChanges += 1;
   }
 }
 

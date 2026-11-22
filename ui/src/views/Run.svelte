@@ -15,7 +15,7 @@
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { Refresher } from '../lib/refresher';
   import { href } from '../lib/router';
-  import { carved, liveBelow, tokenTotals } from '../lib/run';
+  import { addTokens, carved, liveBelow, NO_TOKENS, type Tokens } from '../lib/run';
   import { getToken } from '../lib/token';
   import type { Event, RunId, RunStatus } from '../lib/types';
   import { browserSocket, connectEvents, socketBase, type ConnectionState, type SocketFactory } from '../lib/ws';
@@ -45,10 +45,14 @@
   let events: Event[] = $state.raw([]);
   /** Events that arrived since the last render; added in one go. */
   let pending: Event[] = [];
+  /** The tokens of the stream's model calls, kept up to date with each batch of new events. */
+  let tokens: Tokens = $state.raw(NO_TOKENS);
   /** Sockets that dropped and are not open again yet. */
   let down: Record<string, true> = $state({});
   /** Sockets that have not opened yet since they were made. */
   let opening: Record<string, true> = $state({});
+  /** A socket dropped since the run on screen was shown: its recovery is announced. */
+  let dropped = $state(false);
 
   let box: HTMLElement | undefined = $state();
   /** The stream follows new events while the user has not scrolled up. */
@@ -101,7 +105,10 @@
   });
 
   function track(name: string, state: ConnectionState) {
-    if (state === 'reconnecting') down[name] = true;
+    if (state === 'reconnecting') {
+      down[name] = true;
+      dropped = true;
+    }
     else if (state !== 'connecting') delete down[name];
     if (state === 'connecting') opening[name] = true;
     else delete opening[name];
@@ -130,13 +137,19 @@
     if (run === null) return;
     events = [];
     pending = [];
+    tokens = NO_TOKENS;
     stick = true;
+    // A recovery is announced only after a drop seen while this run is on screen, unless a socket
+    // is still down.
+    dropped = untrack(() => Object.keys(down).length > 0);
     let queued = false;
     let open = true;
     const flush = () => {
       queued = false;
       if (!open) return;
       events = events.concat(pending);
+      // Only the new events: the totals so far are kept, not summed again over the whole stream.
+      tokens = addTokens(tokens, pending);
       pending = [];
     };
     const stream = connectEvents({
@@ -205,7 +218,11 @@
   const reconnecting = $derived(Object.keys(down).length > 0);
   /** What the Live events indicator says: a drop wins over a first connection still on its way. */
   const link = $derived(reconnecting ? 'Reconnecting' : Object.keys(opening).length > 0 ? 'Connecting' : 'Connected');
-  const tokens = $derived(tokenTotals(events));
+  /**
+   * What screen readers hear: nothing on a first connection (opening a run or switching runs), only
+   * that updates stopped and that they are back.
+   */
+  const announced = $derived(reconnecting ? 'Reconnecting to live updates.' : dropped ? 'Live updates are back.' : '');
   const failedWith = (status: RunStatus) => (typeof status === 'object' && 'Failed' in status ? status.Failed : null);
 </script>
 
@@ -272,10 +289,12 @@
       <section class="panel stream" aria-labelledby="events-title">
         <div class="stream-head">
           <h2 id="events-title" class="eyebrow">Live events</h2>
-          <!-- A live region, so screen readers hear when updates stop and start again. -->
-          <p class="link" class:down={reconnecting} role="status">
+          <!-- Not a live region: its word changes on every connection. The region after it says
+               only when updates stop and start again. -->
+          <p class="link" class:down={reconnecting}>
             <span class="dot" aria-hidden="true"></span>{link}
           </p>
+          <p class="visually-hidden" role="status">{announced}</p>
         </div>
         <!-- A named region, focusable so keyboard users can scroll it. -->
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->

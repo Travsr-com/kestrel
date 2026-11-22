@@ -166,14 +166,18 @@
   const needsYou = $derived(approvals ? approvals.count : active.filter((run) => statusTone(run.status) === 'approval').length);
   const subAgents = $derived(active.filter((run) => run.parent !== null).length);
 
-  /** What each run's pending approval asks, by run. */
-  const asks = $derived.by(() => {
-    const byRun: Record<RunId, string> = {};
-    for (const row of Object.values(approvals?.rows ?? {})) {
-      if (row.ended === null) byRun[row.approval.run_id] = row.approval.action;
-    }
-    return byRun;
-  });
+  /**
+   * What the approval a run waits on asks, picked by the approval's id in the run's status (a run
+   * can have more than one pending); `undefined` when the pending list does not have it.
+   */
+  function askOf(run: FleetRun): string | undefined {
+    const status = run.status;
+    if (typeof status !== 'object' || !('Suspended' in status)) return undefined;
+    const reason = status.Suspended;
+    if (typeof reason !== 'object' || !('Approval' in reason)) return undefined;
+    const row = approvals?.rows[reason.Approval];
+    return row?.ended === null ? row.approval.action : undefined;
+  }
 
   const needle = $derived(search.trim().toLowerCase());
 
@@ -299,7 +303,12 @@
         </div>
         <div class="panel tile">
           <dt class="eyebrow">Needs you</dt>
-          <dd class="big mono">{needsYou}</dd>
+          <!-- Not 0 before the approvals list has loaded: that would say nothing waits. -->
+          <dd class="big mono">
+            {#if approvals && !approvals.loaded}<span aria-hidden="true">...</span><span class="visually-hidden"
+                >loading</span
+              >{:else}{needsYou}{/if}
+          </dd>
           <dd class="small">approvals waiting</dd>
         </div>
         <div class="panel tile">
@@ -332,7 +341,7 @@
                 {now}
                 children={children[run.id]}
                 parentAgent={run.parent === null ? undefined : fleet.runs[run.parent]?.agent}
-                ask={asks[run.id]}
+                ask={askOf(run)}
               />
             </li>
           {/each}
