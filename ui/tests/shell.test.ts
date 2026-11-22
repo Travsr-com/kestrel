@@ -178,4 +178,15 @@ describe('ActiveRuns', () => {
     s.apply(ev('e', { kind: 'status_changed', from: 'Queued', to: 'Running' }));
     expect(s.count).toBe(3);
   });
+
+  it('keeps a run created while a list was on its way, and drops a list older than one taken', () => {
+    const s = new ActiveRuns();
+    const first = s.begin();
+    const second = s.begin();
+    s.apply({ run_id: 'x', seq: 1, ts: '', kind: { kind: 'run_created', agent: 'w' } });
+    s.load([run({ id: 'a' })], second);
+    expect(s.count).toBe(2);
+    s.load([], first);
+    expect(s.count).toBe(2);
+  });
 });

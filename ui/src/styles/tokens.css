@@ -1,43 +1,55 @@
-/* Design tokens. Components use these custom properties, never raw colours or sizes. */
+/* Design tokens and the few shared classes. Components use these, never raw colours or sizes.
+   One dark, warm theme, as in the UI mockups (issue #84). */
 
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
 
-  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
+  --space-5: 1.5rem;
   --space-6: 2.5rem;
-  --radius: 6px;
+  --radius: 8px;
+  --radius-lg: 14px;
 
-  --color-bg: #f7f7f8;
-  --color-surface: #ffffff;
-  --color-text: #1b1d21;
-  --color-muted: #5b6170;
-  --color-border: #d9dbe1;
-  --color-accent: #1f5fbf;
-  --color-on-accent: #ffffff;
-  --color-danger: #b3261e;
-  --color-status-running: #1d6b34;
-  --color-status-suspended: #8a5300;
-}
+  --color-bg: #141110;
+  --color-sidebar: #181412;
+  --color-surface: #1d1916;
+  --color-raised: #26201c;
+  --color-sunken: #110e0d;
+  --color-text: #f3ece6;
+  --color-muted: #a99f97;
+  --color-faint: #7f756d;
+  --color-border: #2f2824;
+  --color-border-strong: #463c35;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-bg: #141518;
-    --color-surface: #1d1f23;
-    --color-text: #e8e9ec;
-    --color-muted: #a3a8b4;
-    --color-border: #33363d;
-    --color-accent: #6ea4ff;
-    --color-on-accent: #0b1220;
-    --color-danger: #ff8a80;
-    --color-status-running: #7bd88f;
-    --color-status-suspended: #f2b766;
-  }
+  --color-accent: #e5810f;
+  --color-accent-soft: #2b2018;
+  --color-on-accent: #1a0f05;
+  --color-link: #f0a24a;
+
+  --color-running: #82acff;
+  --color-running-soft: #1c2638;
+  --color-approval: #f2c14e;
+  --color-approval-soft: #2e2615;
+  --color-approval-border: #6e5622;
+  --color-suspended: #b9a2ff;
+  --color-suspended-soft: #251f38;
+  --color-done: #62d39b;
+  --color-done-soft: #15291f;
+  --color-danger: #ff8270;
+  --color-danger-soft: #2e1916;
+  --color-danger-border: #7a3a32;
+  --color-queued: #a99f97;
+  --color-queued-soft: #26201c;
+
+  /* Kept for the views that still use the earlier names. */
+  --color-status-running: var(--color-running);
+  --color-status-suspended: var(--color-approval);
 }
 
 body {
@@ -49,14 +61,148 @@ body {
 }
 
 a {
-  color: var(--color-accent);
+  color: var(--color-link);
 }
 
-code {
+code,
+.mono {
   font-family: var(--font-mono);
 }
 
 :focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+input,
+select,
+textarea {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius);
+  background: var(--color-sunken);
+  color: var(--color-text);
+}
+
+/* Buttons: plain is outlined; `.primary` is the orange call to action; `.danger` is red. */
+button {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: var(--color-raised);
+}
+button:disabled,
+button[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: default;
+}
+button.primary {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+button.primary:hover:not(:disabled) {
+  background: #f08f22;
+}
+button.danger {
+  border-color: var(--color-danger-border);
+  background: transparent;
+  color: var(--color-danger);
+}
+button.danger:hover:not(:disabled) {
+  background: var(--color-danger-soft);
+}
+
+/* A raised box: tiles, cards and panels. */
+.panel {
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+/* The small upper-case title of a panel or a list. */
+.eyebrow {
+  margin: 0 0 var(--space-3);
+  color: var(--color-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* A status pill: `.pill.tone-<tone>`, tones from `statusTone`. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.1rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tone-running {
+  --tone: var(--color-running);
+  --tone-soft: var(--color-running-soft);
+}
+.tone-approval {
+  --tone: var(--color-approval);
+  --tone-soft: var(--color-approval-soft);
+}
+.tone-suspended {
+  --tone: var(--color-suspended);
+  --tone-soft: var(--color-suspended-soft);
+}
+.tone-done {
+  --tone: var(--color-done);
+  --tone-soft: var(--color-done-soft);
+}
+.tone-failed {
+  --tone: var(--color-danger);
+  --tone-soft: var(--color-danger-soft);
+}
+.tone-queued {
+  --tone: var(--color-queued);
+  --tone-soft: var(--color-queued-soft);
+}
+.pill[class*='tone-'] {
+  background: var(--tone-soft);
+  color: var(--tone);
+}
+
+/* A thin meter track with a fill in the tone's colour (orange without a tone). */
+.track {
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--color-raised);
+  overflow: hidden;
+}
+.track > .fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--tone, var(--color-accent));
+}
+
+/* Read by screen readers, not shown. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }

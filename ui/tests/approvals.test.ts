@@ -486,6 +486,8 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     const fetch: typeof globalThis.fetch = async (input) => {
       const url = new URL(String(input), 'http://kestrel.test');
       if (url.pathname === '/api/approvals') return new Response(JSON.stringify([approval(r)]));
+      // The sidebar's count of active runs.
+      if (url.pathname === '/api/runs') return new Response('[]');
       if (fails-- > 0) return new Response('{"error":"busy"}', { status: 503 });
       return new Response(JSON.stringify(r));
     };

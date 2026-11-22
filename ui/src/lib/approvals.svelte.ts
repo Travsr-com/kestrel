@@ -11,6 +11,7 @@
 //   while the list was on its way is kept.
 // * A list older than one already taken is dropped (two can be on their way at once).
 
+import type { ActiveRuns } from './active.svelte';
 import type { Api } from './api';
 import { isTerminal } from './format';
 import { failureText, type OnUnauthorized } from './load';
@@ -124,12 +125,25 @@ export interface FollowOptions {
   onUnauthorized: OnUnauthorized;
   base: string;
   sockets?: SocketFactory;
+  /** Also kept current from the same socket: the runs that have not ended. */
+  runs?: ActiveRuns;
 }
 
-/** Keeps `state` current: a sync now and on every socket open, and live events between. */
-export function followApprovals({ api, state, onUnauthorized, base, sockets }: FollowOptions) {
+/** Keeps `state` (and `runs`) current: a sync now and on every socket open, and live events between. */
+export function followApprovals({ api, state, onUnauthorized, base, sockets, runs }: FollowOptions) {
   let alive = true;
   function sync() {
+    if (runs) {
+      const asked = runs.begin();
+      // The count is a hint: on a failure it stays as it was. A refused token is found by the
+      // approvals request made at the same time.
+      api.listRuns().then(
+        (list) => {
+          if (alive) runs.load(list, asked);
+        },
+        () => {},
+      );
+    }
     const token = state.beginSync();
     api.approvals('pending').then(
       (list) => {
@@ -146,11 +160,14 @@ export function followApprovals({ api, state, onUnauthorized, base, sockets }: F
   const stream = connectEvents({
     base,
     path: '/ws/events',
-    query: { kinds: 'approval_requested,approval_resolved,status_changed' },
+    query: { kinds: `approval_requested,approval_resolved,status_changed${runs ? ',run_created' : ''}` },
     after: null,
     getToken,
     socketFactory: sockets,
-    onEvent: (event) => state.apply(event),
+    onEvent: (event) => {
+      state.apply(event);
+      runs?.apply(event);
+    },
     onState: (s) => {
       if (s === 'open') sync();
       if (s === 'unauthorized') onUnauthorized(getToken());

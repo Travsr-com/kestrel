@@ -14,6 +14,35 @@ export function statusLabel(status: RunStatus): string {
   return `Failed: ${status.Failed}`;
 }
 
+/** The colour family of a status: a pill, a meter and a card border use the same one. */
+export type Tone = 'running' | 'approval' | 'suspended' | 'done' | 'failed' | 'queued';
+
+/** The word on a status pill: shorter than `statusLabel`, which says why a run is suspended or failed. */
+export function statusPill(status: RunStatus): string {
+  if (typeof status === 'string') return status;
+  if ('Failed' in status) return 'Failed';
+  const reason = status.Suspended;
+  if (reason === 'Manual') return 'Paused';
+  if (typeof reason === 'object' && 'Approval' in reason) return 'Needs approval';
+  return 'Suspended';
+}
+
+export function statusTone(status: RunStatus): Tone {
+  if (status === 'Running' || status === 'Provisioning') return 'running';
+  if (status === 'Completed') return 'done';
+  if (typeof status === 'string') return 'queued';
+  if ('Failed' in status) return 'failed';
+  const reason = status.Suspended;
+  return typeof reason === 'object' && 'Approval' in reason ? 'approval' : 'suspended';
+}
+
+/** Whole percent of `limit` spent, at most 100; a zero limit is used up. `null` without a limit. */
+export function percentUsed(spent: MicroUsd, limit: MicroUsd | null): number | null {
+  if (limit === null) return null;
+  if (limit === 0) return 100;
+  return Math.min(100, Math.floor((spent * 100) / limit));
+}
+
 /** The lower-case name of a status, as the API's `?status=` filter takes it. */
 export function statusName(status: RunStatus): string {
   if (typeof status === 'string') return status.toLowerCase();
