@@ -172,6 +172,10 @@ impl ToolHost for EngineTools {
             .map_err(|e| e.to_string())?;
         let child = spawned.id;
         let mut answer = json!({ "child": child.to_string() });
+        // The parent spawned this before its agent started again: the same child, not a new one.
+        if spawned.existing {
+            answer["existing"] = json!(true);
+        }
         // A spec that asked for more spawn depth than this run can give: say what it got.
         if let Some(lowered) = spawned.lowered_depth {
             answer["depth"] = json!(lowered.granted);

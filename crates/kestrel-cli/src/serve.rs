@@ -96,6 +96,8 @@ struct RawEngine {
     shutdown_grace_secs: Option<toml::Value>,
     /// Kept as a raw value so a wrong type is reported against the key and never echoed.
     agents_dir: Option<toml::Value>,
+    /// Kept as a raw value so a wrong type is reported against the key and never echoed.
+    resume_after_restart: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -145,6 +147,9 @@ struct Config {
     /// `engine.agents_dir`: where `kestrel.spawn` finds agent specs by name. `None` means the
     /// default, `agents` next to the database.
     agents_dir: Option<PathBuf>,
+    /// `engine.resume_after_restart`: whether the runs a restart stopped are resumed when serve
+    /// starts again. Default true.
+    resume_after_restart: bool,
     /// `[travsr]`: `None` without the section, so Travsr is off.
     travsr: Option<TravsrSettings>,
     /// `gateway.max_waiting_calls`: Kestrel tool calls held open at once across all runs.
@@ -274,6 +279,10 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         .unwrap_or_default();
     let subnet_pool = subnet_pool(raw.gateway.subnet_pool)?;
     let agents_dir = raw.engine.agents_dir.map(agents_dir_setting).transpose()?;
+    let resume_after_restart = raw
+        .engine
+        .resume_after_restart
+        .map_or(Ok(true), resume_after_restart_setting)?;
     let allowed_roots = raw
         .sandbox
         .allowed_roots
@@ -301,6 +310,7 @@ fn load_config(path: &Path) -> Result<Config, Failure> {
         shutdown_grace,
         allowed_roots,
         agents_dir,
+        resume_after_restart,
         limits: Limits {
             max_concurrent_runs: max,
             ..Limits::default()
@@ -392,6 +402,14 @@ fn agents_dir_setting(value: toml::Value) -> Result<PathBuf, Failure> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .ok_or_else(|| Failure::usage("engine.agents_dir must be an absolute path string"))
+}
+
+/// `engine.resume_after_restart`: `true` or `false`. Anything else is a usage error that names the
+/// key and never echoes the value.
+fn resume_after_restart_setting(value: toml::Value) -> Result<bool, Failure> {
+    value
+        .as_bool()
+        .ok_or_else(|| Failure::usage("engine.resume_after_restart must be true or false"))
 }
 
 /// `sandbox.allowed_roots`: a non-empty array of absolute path strings. Anything else is a usage
@@ -633,6 +651,7 @@ const CONFIG_NAMES: &[&str] = &[
     "max_concurrent_runs",
     "shutdown_grace_secs",
     "agents_dir",
+    "resume_after_restart",
     "providers",
     "anthropic",
     "openai",
@@ -1352,6 +1371,7 @@ async fn start_engine(
     .with_workspaces(Workspaces::new(workspace_root, Arc::new(ProcessRunner)))
     .with_instance(GatewayBridge::instance_id(db))
     .with_root_key(root_key)
+    .with_resume_after_restart(config.resume_after_restart)
     // Each run's MCP config and the like, mounted read-only at /kestrel in its sandbox.
     .with_run_config(data_dir.join("run-config"));
     // Travsr, when configured: one process client keeps private copies of runs' code under
