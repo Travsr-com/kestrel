@@ -300,7 +300,7 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
 * If it fails (a full disk, say), nothing is changed: the database stays as it was. Free some
   space and start again.
 
-## Known limits in M1
+## Known limits
 
 * Resuming a paused run restarts the agent from the beginning.
 * The macOS driver (Apple `container`) is not verified against the real tool yet
