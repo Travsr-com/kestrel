@@ -50,7 +50,7 @@ struct FakeHost {
     spawns: Mutex<Vec<(RunId, SpawnCall)>>,
     joins: Mutex<Vec<(RunId, JoinCall)>>,
     asks: Mutex<Vec<(RunId, String)>>,
-    inbox: Mutex<Vec<RunId>>,
+    inbox: Mutex<Vec<(RunId, Option<u64>)>>,
     denied: Mutex<Vec<(RunId, String)>>,
     refused: Mutex<Vec<(RunId, String, String)>>,
     tools_asked: Mutex<usize>,
@@ -97,8 +97,8 @@ impl ToolHost for FakeHost {
         self.asks.lock().unwrap().push((run, question));
         Ok("release/2.4".into())
     }
-    async fn messages(&self, run: RunId) -> Result<Value, String> {
-        self.inbox.lock().unwrap().push(run);
+    async fn messages(&self, run: RunId, after: Option<u64>) -> Result<Value, String> {
+        self.inbox.lock().unwrap().push((run, after));
         Ok(json!({ "messages": [{ "text": "also fix the docs" }] }))
     }
     async fn denied(&self, run: RunId, tool: &str) {
@@ -1733,7 +1733,7 @@ async fn no_task_stays_behind_for_a_finished_call() {
 // Issue #95: `kestrel.messages`, the run's inbox of messages from a person.
 
 #[tokio::test]
-async fn messages_is_listed_for_a_run_granted_it_and_takes_no_arguments() {
+async fn messages_is_listed_for_a_run_granted_it_and_takes_an_optional_after() {
     let s = setup(&[KestrelTool::Messages]);
     let msg = message(
         send(
@@ -1752,8 +1752,12 @@ async fn messages_is_listed_for_a_run_granted_it_and_takes_no_arguments() {
     assert_eq!(tools[0]["name"], json!("kestrel.messages"));
     assert_eq!(tools[0]["inputSchema"]["type"], json!("object"));
     assert!(tools[0]["inputSchema"].get("required").is_none(), "{msg}");
+    let after = &tools[0]["inputSchema"]["properties"]["after"];
+    assert_eq!(after["type"], json!("integer"), "{msg}");
+    assert_eq!(after["minimum"], json!(0), "{msg}");
     let description = tools[0]["description"].as_str().unwrap();
     assert!(description.contains("person"), "{description}");
+    assert!(description.contains("after"), "{description}");
 }
 
 #[tokio::test]
@@ -1778,19 +1782,121 @@ async fn messages_returns_what_the_host_hands_over_for_the_run_of_the_token() {
             json!({ "messages": [{ "text": "also fix the docs" }] })
         );
     }
-    assert_eq!(*s.host.inbox.lock().unwrap(), [s.a, s.a]);
+    assert_eq!(*s.host.inbox.lock().unwrap(), [(s.a, None), (s.a, None)]);
 }
 
-// A client that calls again with the same id gets the same answer: the messages it may have
-// missed, not a second take that would find none.
+// Review of #95: an MCP client that reconnects starts its ids again, so a `kestrel.messages`
+// answer is never kept by id. Each call reads the inbox; a retry that must not lose messages
+// passes `after` instead.
 #[tokio::test]
-async fn messages_called_again_with_the_same_id_is_taken_once() {
+async fn messages_is_never_answered_from_an_earlier_call_with_the_same_id() {
     let s = setup(&[KestrelTool::Messages]);
     let body = call(7, "kestrel.messages", json!({})).to_string();
-    let first = message(send(&s.app, TOKEN_A, body.clone().into_bytes(), true).await).await;
-    let again = message(send(&s.app, TOKEN_A, body.into_bytes(), true).await).await;
-    assert_eq!(first, again);
-    assert_eq!(*s.host.inbox.lock().unwrap(), [s.a]);
+    for _ in 0..2 {
+        let msg = message(send(&s.app, TOKEN_A, body.clone().into_bytes(), true).await).await;
+        assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    }
+    assert_eq!(*s.host.inbox.lock().unwrap(), [(s.a, None), (s.a, None)]);
+}
+
+// `after` is the seq of the last message the agent got: passed to the host as is.
+#[tokio::test]
+async fn messages_passes_after_to_the_host() {
+    let s = setup(&[KestrelTool::Messages]);
+    for (id, args) in [
+        (1, json!({ "after": 12 })),
+        (2, json!({ "after": 0 })),
+        (3, json!({ "after": null })),
+        (4, json!({})),
+    ] {
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(id, "kestrel.messages", args).to_string().into_bytes(),
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    }
+    assert_eq!(
+        *s.host.inbox.lock().unwrap(),
+        [(s.a, Some(12)), (s.a, Some(0)), (s.a, None), (s.a, None)]
+    );
+}
+
+#[tokio::test]
+async fn messages_with_an_after_that_is_not_a_seq_is_invalid_params() {
+    let s = setup(&[KestrelTool::Messages]);
+    for (id, after) in [
+        (1, json!(-1)),
+        (2, json!(1.5)),
+        (3, json!("4")),
+        (4, json!([1])),
+    ] {
+        let msg = message(
+            send(
+                &s.app,
+                TOKEN_A,
+                call(id, "kestrel.messages", json!({ "after": after }))
+                    .to_string()
+                    .into_bytes(),
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(msg["error"]["code"], json!(-32602), "{after}: {msg}");
+        let text = msg["error"]["message"].as_str().unwrap();
+        assert!(text.contains("after"), "{text}");
+    }
+    assert!(s.host.inbox.lock().unwrap().is_empty());
+}
+
+// Review of #95: a result is kept by tool and id, so a reused id that names another tool starts
+// that tool instead of getting the other one's answer.
+#[tokio::test]
+async fn a_reused_id_for_another_tool_starts_that_tool() {
+    let s = setup(&[KestrelTool::AskHuman, KestrelTool::Spawn]);
+    let asked = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(
+                5,
+                "kestrel.ask_human",
+                json!({ "question": "which branch?" }),
+            )
+            .to_string()
+            .into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(asked["result"]["isError"], json!(false), "{asked}");
+    let spawned = message(
+        send(
+            &s.app,
+            TOKEN_A,
+            call(
+                5,
+                "kestrel.spawn",
+                json!({ "agent": "worker", "input": "go" }),
+            )
+            .to_string()
+            .into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(spawned["result"]["isError"], json!(false), "{spawned}");
+    assert_ne!(asked["result"], spawned["result"]);
+    assert_eq!(s.host.asks.lock().unwrap().len(), 1);
+    assert_eq!(s.host.spawns.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1840,7 +1946,7 @@ async fn messages_needs_no_room_for_a_long_call() {
 #[tokio::test]
 async fn a_host_without_an_inbox_says_so() {
     use kestrel_gateway::NoTools;
-    assert!(NoTools.messages(RunId::new()).await.is_err());
+    assert!(NoTools.messages(RunId::new(), None).await.is_err());
     struct Old;
     #[async_trait]
     impl ToolHost for Old {
@@ -1858,6 +1964,6 @@ async fn a_host_without_an_inbox_says_so() {
         }
         async fn denied(&self, _: RunId, _: &str) {}
     }
-    let error = Old.messages(RunId::new()).await.unwrap_err();
+    let error = Old.messages(RunId::new(), Some(3)).await.unwrap_err();
     assert!(error.contains("messages"), "{error}");
 }
