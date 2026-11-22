@@ -17,8 +17,8 @@ use kestrel_gateway::{
 };
 use kestrel_sandbox::{
     BridgeNetwork, BridgeSpec, CommandRunner, DEFAULT_SUBNET_POOL, GatewayBridge, HostInfo,
-    Ipv4Cidr, MAX_BRIDGE_CONNECTIONS, ProcessRunner, SandboxDriver, SubnetPool, detect_with_roots,
-    docker_subnets_except_instance, host_routes,
+    Ipv4Cidr, MAX_BRIDGE_CONNECTIONS, NetworkPlan, ProcessRunner, SandboxDriver, SubnetPool,
+    detect_with_roots, docker_subnets_except_instance, host_routes,
 };
 use kestrel_store::Store;
 use kestrel_types::{EventKind, MicroUsd, ModelCallRecord, RunId, Tier};
@@ -455,10 +455,11 @@ fn subnet_pool(value: Option<toml::Value>) -> Result<Ipv4Cidr, Failure> {
 /// and, when docker runs on this host, no host route covers (a VM's routes are not this host's,
 /// so they are not read). The leftover run networks of `instance` do not count: `recover` removes
 /// them before any block is reserved. Also decides where the bridge's `kestrel-gw` network comes
-/// from: an existing one is reused, a missing one takes the lowest free block for good (issue
-/// #99). Writes one line naming the pool and the free block count to `err`. No free block, or
-/// no block left for runs after `kestrel-gw` took its own, is a runtime error that names
-/// `gateway.subnet_pool`.
+/// from ([`GatewayBridge::plan_network`], issue #99): an existing one is reused (a smaller one
+/// with nothing attached is grown), a missing one takes a `/24` span of the pool for good.
+/// Writes a warning when a small `kestrel-gw` is kept, then one line naming the pool and the free
+/// block count, to `err`. No free block, or no block left for runs after `kestrel-gw` took its
+/// span, is a runtime error that names `gateway.subnet_pool`.
 async fn subnet_plan(
     pool: Ipv4Cidr,
     runner: &dyn CommandRunner,
@@ -483,15 +484,18 @@ async fn subnet_plan(
             "subnet pool {pool} has no free /29 block: docker networks or host routes use all of it. Set gateway.subnet_pool to a free range"
         )));
     }
-    let network = GatewayBridge::plan_network(runner, &plan)
+    let NetworkPlan { network, warning } = GatewayBridge::plan_network(runner, &plan)
         .await
         .map_err(|e| Failure::runtime(e.to_string()))?;
     let free = plan.available();
     let bridge = match &network {
-        BridgeNetwork::Subnet(block) => format!("; kestrel-gw takes {}", block.cidr()),
+        BridgeNetwork::Subnet(span) => format!("; kestrel-gw takes {}", span.cidr()),
         _ => String::new(),
     };
     // A closed stderr must not stop serve.
+    if let Some(warning) = warning {
+        let _ = writeln!(err, "warning: {warning}");
+    }
     let _ = writeln!(
         err,
         "networks: one per run, from subnet pool {pool} ({free} free /29 blocks{bridge})"
