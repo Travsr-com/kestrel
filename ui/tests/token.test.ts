@@ -90,6 +90,15 @@ describe('late answers', () => {
 });
 
 describe('Token required screen', () => {
+  it('is a panel in the restyled look: the shared input and the primary Continue button (#84)', async () => {
+    window.location.hash = '#/fleet';
+    render(App, { fetch: createMockServer('s3cret').fetch });
+    const input = await screen.findByLabelText('API token');
+    const form = input.closest('form');
+    expect(form?.closest('.panel')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toHaveClass('primary');
+  });
+
   it('appears on 401, then retries with the entered token', async () => {
     const setItem = vi.spyOn(Storage.prototype, 'setItem');
     const server = createMockServer('s3cret');
