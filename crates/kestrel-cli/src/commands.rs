@@ -431,6 +431,20 @@ mod tests {
                 },
                 "not granted by the parent: tools a, b; agents x",
             ),
+            (
+                EventKind::MessageSent {
+                    text: "also fix the docs".into(),
+                },
+                "message to the agent: also fix the docs",
+            ),
+            (
+                EventKind::MessageDelivered { seqs: vec![4] },
+                "the agent read 1 message",
+            ),
+            (
+                EventKind::MessageDelivered { seqs: vec![4, 5] },
+                "the agent read 2 messages",
+            ),
         ];
         for (kind, want) in cases {
             let got = describe(&kind);

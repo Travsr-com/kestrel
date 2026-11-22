@@ -646,4 +646,33 @@ mod tests {
         assert_eq!(json[2]["outcome"], "cancelled");
         assert_eq!(json[3]["outcome"], "timed_out");
     }
+
+    /// Issue #95: `kestrel.messages` hands a running run its messages once, oldest first, as
+    /// `{"messages": [{"text": ...}]}`.
+    #[tokio::test]
+    async fn the_engine_tools_hand_over_messages_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, tools) = engine_tools(dir.path());
+        let lead = tools
+            .engine
+            .submit(with_caps("lead", "{ mcp: [kestrel.messages] }"), "x".into())
+            .await
+            .unwrap();
+        run(&store, lead);
+        assert_eq!(tools.tools(lead).await, Ok(vec![KestrelTool::Messages]));
+        assert_eq!(
+            tools.messages(lead).await.unwrap(),
+            json!({ "messages": [] })
+        );
+        store.send_message(lead, "first").unwrap();
+        store.send_message(lead, "second\nline").unwrap();
+        assert_eq!(
+            tools.messages(lead).await.unwrap(),
+            json!({ "messages": [{ "text": "first" }, { "text": "second\nline" }] })
+        );
+        assert_eq!(
+            tools.messages(lead).await.unwrap(),
+            json!({ "messages": [] })
+        );
+    }
 }
