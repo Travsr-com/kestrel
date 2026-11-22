@@ -2,8 +2,8 @@
 //
 // One request per run at a time: whatever asks while one is out gets a single request after it, so
 // a replay of many spawns costs two requests, and answers never arrive out of order. A failure the
-// caller wants retried is tried again after 5 s, doubling up to 60 s; asks while a retry waits wait
-// with it. `lookUp` is for a run just seen: any answer will do, so it asks for nothing more while
+// caller wants retried is tried again after 5 s, doubling up to 60 s, if the caller still wants it
+// then (its rule is asked again with the same error); asks while a retry waits wait with it. `lookUp` is for a run just seen: any answer will do, so it asks for nothing more while
 // one is out. `stop` ends it all: no answer is handed on and no retry runs after it.
 
 import type { RunId, RunSummary } from './types';
@@ -24,6 +24,8 @@ export class Refresher {
   private readonly again = new Set<RunId>();
   private readonly timers = new Map<RunId, ReturnType<typeof setTimeout>>();
   private readonly delay = new Map<RunId, number>();
+  /** The failure each waiting retry is for, to ask the rule again when it is due. */
+  private readonly failure = new Map<RunId, unknown>();
   private stopped = false;
 
   constructor(private readonly opts: RefresherOptions) {}
@@ -45,7 +47,7 @@ export class Refresher {
         (error: unknown) => {
           if (this.stopped) return;
           this.opts.failed(error);
-          if (this.opts.retry(id, error)) this.schedule(id);
+          if (this.opts.retry(id, error)) this.schedule(id, error);
           else this.delay.delete(id);
         },
       )
@@ -66,14 +68,18 @@ export class Refresher {
     this.timers.clear();
   }
 
-  private schedule(id: RunId): void {
+  private schedule(id: RunId, error: unknown): void {
+    this.failure.set(id, error);
     const wait = this.delay.get(id) ?? RETRY_MS;
     this.delay.set(id, Math.min(wait * 2, MAX_RETRY_MS));
     this.timers.set(
       id,
       setTimeout(() => {
         this.timers.delete(id);
-        this.refresh(id);
+        const error = this.failure.get(id);
+        this.failure.delete(id);
+        if (this.opts.retry(id, error)) this.refresh(id);
+        else this.delay.delete(id);
       }, wait),
     );
   }

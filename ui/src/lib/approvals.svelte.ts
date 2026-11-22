@@ -53,7 +53,8 @@ export class ApprovalsState {
   /** The newest sync whose list was taken. */
   private loadedToken = 0;
   private readonly resolved: Record<ApprovalId, true> = {};
-  private readonly endedRuns: Record<RunId, 'cancelled' | 'ended'> = {};
+  /** Runs seen to end: how, and when (the time of their end event). */
+  private readonly endedRuns: Record<RunId, { how: 'cancelled' | 'ended'; at: string }> = {};
 
   /** Approvals that can still be decided. */
   get count(): number {
@@ -74,7 +75,10 @@ export class ApprovalsState {
     for (const approval of list) {
       listed[approval.id] = true;
       if (this.resolved[approval.id] || this.rows[approval.id]) continue;
-      this.rows[approval.id] = { approval, ended: this.endedRuns[approval.run_id] ?? null, gen: token };
+      const end = this.endedRuns[approval.run_id];
+      this.rows[approval.id] = { approval, ended: end?.how ?? null, gen: token };
+      // A run that ended before this list came: its approval was decided then.
+      if (end) this.decidedAt[approval.id] ??= end.at;
     }
     let gone = 0;
     for (const [id, row] of Object.entries(this.rows)) {
@@ -114,7 +118,7 @@ export class ApprovalsState {
       case 'status_changed': {
         if (!isTerminal(kind.to)) return;
         const ended = kind.to === 'Cancelled' ? 'cancelled' : 'ended';
-        this.endedRuns[event.run_id] = ended;
+        this.endedRuns[event.run_id] = { how: ended, at: event.ts };
         let changed = false;
         for (const row of Object.values(this.rows)) {
           if (row.approval.run_id !== event.run_id) continue;

@@ -3,7 +3,7 @@
   import type { ActiveRuns } from '../lib/active.svelte';
   import type { ApprovalsState } from '../lib/approvals.svelte';
   import { formatUsd, newestFirst, statusTone } from '../lib/format';
-  import { Unauthorized, type Api } from '../lib/api';
+  import { ApiFailure, Unauthorized, type Api } from '../lib/api';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { getToken } from '../lib/token';
   import type { RunId } from '../lib/types';
@@ -113,12 +113,20 @@
   // Every fetch of one run goes through here: those the tree sockets ask for (a new run's limit, a
   // parent's after a spawn) and the look-ups of runs the events socket brings. So a new run is
   // fetched once, whichever socket brings it first. A run the server has not answered for yet (not
-  // known, or known only from its events) still needs its limit: its failed fetch is retried.
+  // known, or known only from its events) still needs its limit: its failed fetch is retried. A run
+  // not known here is retried only while it is live, and never after a 4xx: the server does not
+  // have it, or will not show it.
   const refresher = new Refresher({
     fetch: (id) => api.getRun(id),
     answered: (summary) => (fleet.runs[summary.id] ? fleet.update(summary, Date.now()) : fleet.add(summary)),
     failed: (e) => failureText(e, onUnauthorized),
-    retry: (id, e) => !(e instanceof Unauthorized) && !fleet.runs[id]?.fetched,
+    retry: (id, e) => {
+      if (e instanceof Unauthorized) return false;
+      const known = fleet.runs[id];
+      if (known) return !known.fetched;
+      const refused = e instanceof ApiFailure && e.status >= 400 && e.status < 500;
+      return !refused && (liveRuns?.ids.includes(id) ?? false);
+    },
   });
   const refresh = (id: RunId) => refresher.refresh(id);
   const lookUp = (id: RunId) => refresher.lookUp(id);
