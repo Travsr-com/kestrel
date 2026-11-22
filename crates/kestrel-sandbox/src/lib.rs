@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use std::process::Stdio;
 
@@ -78,6 +79,9 @@ pub enum SandboxError {
     /// `[A-Za-z0-9_.-]`.
     #[error("invalid container id `{id}`")]
     InvalidId { id: String },
+    /// Docker was already removing the container, and it was still there `secs` seconds later.
+    #[error("sandbox `{id}` is still being removed {secs}s after docker began removing it")]
+    StillRemoving { id: String, secs: u64 },
     /// A bridge step failed. `step` is `remove-stale`, `create-network`, `run`, `connect` or `inspect`.
     #[error("gateway bridge step `{step}` failed: {stderr}")]
     Bridge { step: &'static str, stderr: String },
@@ -463,6 +467,18 @@ pub trait SandboxDriver: Send + Sync {
     }
 }
 
+/// How long `destroy` waits for a removal that another `docker rm` already began. Shutdown cuts
+/// it shorter with its own grace period, and reports the run as timed out then.
+const REMOVAL_WAIT: Duration = Duration::from_secs(30);
+/// How often `destroy` looks whether that container is gone.
+const REMOVAL_POLL: Duration = Duration::from_millis(200);
+
+/// True for docker's answer to `rm` while another removal of the same container is running:
+/// "removal of container <id> is already in progress".
+fn removal_in_progress(stderr: &str) -> bool {
+    stderr.contains("removal of container") && stderr.contains("is already in progress")
+}
+
 /// Name of the internal network used for `NetworkPolicy::GatewayOnly`.
 const GATEWAY_NETWORK: &str = "kestrel-gw";
 
@@ -773,11 +789,50 @@ impl Cli {
         h: &SandboxHandle,
     ) -> Result<()> {
         exits.remove(&h.id);
+        let id = check_id(&h.id)?;
         let rm = if self.apple { "delete" } else { "rm" };
-        let argv = self.argv(&[rm, "--force", check_id(&h.id)?]);
-        self.run(runner, &argv, Some(self.not_found))
-            .await
-            .map(drop)
+        let argv = self.argv(&[rm, "--force", id]);
+        match self.run(runner, &argv, Some(self.not_found)).await {
+            Err(SandboxError::CommandFailed { stderr, .. })
+                if !self.apple && removal_in_progress(&stderr) =>
+            {
+                self.wait_removed(runner, id).await
+            }
+            done => done.map(drop),
+        }
+    }
+
+    /// Waits until docker no longer knows container `id`, looking every [`REMOVAL_POLL`] for at
+    /// most [`REMOVAL_WAIT`]. Used when another `rm` of it is already running: success is only
+    /// reported once the container is really gone, so a removal that stalls or fails is not
+    /// counted as destroyed. A failed look (other than "No such container") is the error.
+    async fn wait_removed(&self, runner: &dyn CommandRunner, id: &str) -> Result<()> {
+        let argv = self.argv(&[
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            "{{.State.Status}}",
+            id,
+        ]);
+        let deadline = tokio::time::Instant::now() + REMOVAL_WAIT;
+        loop {
+            match self.run(runner, &argv, None).await {
+                Err(SandboxError::CommandFailed { stderr, .. })
+                    if stderr.contains(self.not_found) =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(SandboxError::StillRemoving {
+                        id: id.to_string(),
+                        secs: REMOVAL_WAIT.as_secs(),
+                    });
+                }
+                Ok(_) => tokio::time::sleep(REMOVAL_POLL).await,
+            }
+        }
     }
 
     /// See [`SandboxDriver::prepare_network`]. `bridge` is the bridge container name; without
