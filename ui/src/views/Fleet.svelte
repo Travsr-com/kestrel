@@ -324,7 +324,9 @@
           <dt class="eyebrow">Needs you</dt>
           <!-- Not 0 before the approvals list has loaded: that would say nothing waits. -->
           <dd class="big mono">
-            {#if approvals && !approvals.loaded}<span aria-hidden="true">...</span><span class="visually-hidden"
+            {#if approvals && !approvals.loaded && approvals.error !== null}<span aria-hidden="true">?</span><span
+                class="visually-hidden">approvals could not be loaded</span
+              >{:else if approvals && !approvals.loaded}<span aria-hidden="true">...</span><span class="visually-hidden"
                 >loading</span
               >{:else}{needsYou}{/if}
           </dd>
