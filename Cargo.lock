@@ -1328,6 +1328,7 @@ dependencies = [
  "kestrel-store",
  "kestrel-types",
  "predicates",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

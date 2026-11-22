@@ -370,6 +370,72 @@ async fn process_runner_spawn_tags_lines_by_stream() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn kill_on_drop_runner_runs_like_process_runner() {
+    use kestrel_sandbox::{EnvScrub, KillOnDropRunner};
+
+    let out = KillOnDropRunner
+        .run(&s(&["echo", "hi"]))
+        .await
+        .expect("echo");
+    assert_eq!((out.status, out.stdout.as_str()), (0, "hi\n"));
+    let scrub = EnvScrub {
+        remove: Vec::new(),
+        set: vec![("KESTREL_SCRUB_TEST".to_string(), "on".to_string())],
+    };
+    let out = KillOnDropRunner
+        .run_with_env(&s(&["sh", "-c", "echo $KESTREL_SCRUB_TEST"]), &scrub)
+        .await
+        .expect("env");
+    assert_eq!(out.stdout, "on\n");
+    assert!(KillOnDropRunner.run(&[]).await.is_err());
+    let process = KillOnDropRunner.spawn(&s(&["false"])).await.expect("spawn");
+    assert_eq!(process.exit.await.expect("exit"), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_on_drop_runner_kills_a_command_given_up_on() {
+    use kestrel_sandbox::{EnvScrub, KillOnDropRunner};
+    use std::time::Duration;
+
+    // Each command marks that it started, then writes a file a second later unless killed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = |name: &str| {
+        let started = dir.path().join(format!("{name}.started"));
+        let done = dir.path().join(format!("{name}.done"));
+        let line = format!(
+            ": > '{}'; sleep 1; : > '{}'",
+            started.display(),
+            done.display()
+        );
+        (s(&["sh", "-c", &line]), started, done)
+    };
+    let (plain, plain_started, plain_done) = script("plain");
+    let (scrubbed, scrubbed_started, scrubbed_done) = script("scrubbed");
+    let scrub = EnvScrub::default();
+    let started = |p: &std::path::Path| {
+        let p = p.to_path_buf();
+        async move {
+            while !p.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = KillOnDropRunner.run(&plain) => panic!("finished"),
+        () = started(&plain_started) => {}
+    }
+    tokio::select! {
+        _ = KillOnDropRunner.run_with_env(&scrubbed, &scrub) => panic!("finished"),
+        () = started(&scrubbed_started) => {}
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!plain_done.exists());
+    assert!(!scrubbed_done.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn process_runner_run_with_env_removes_exact_names_and_prefixes_then_sets() {
     use kestrel_sandbox::EnvScrub;
 

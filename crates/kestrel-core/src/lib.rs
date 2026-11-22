@@ -11,9 +11,11 @@
 //! [`caps`] holds the capability grant a run carries and the signed tokens that narrow it per child.
 
 pub mod caps;
+mod index;
 mod join;
 mod slots;
 pub mod workspace;
+pub use index::{IndexLimits, IndexSource, RunIndexer};
 pub use join::{ChildResult, JoinError, JoinMode, JoinOutcome};
 
 /// Why [`Engine::ask_human`] has no answer. The text is what the agent reads.
@@ -313,6 +315,9 @@ pub struct RecoveryReport {
     /// Runs that were `Running` when the previous engine stopped. Their sandbox is gone, so they
     /// are now `Suspended(Error("engine restarted"))`.
     pub interrupted: Vec<RunId>,
+    /// Why the Travsr copies kept from before could not be listed, so none was forgotten (see
+    /// [`Engine::with_indexer`]). `None` when they were, or there is no indexer.
+    pub travsr_unlisted: Option<String>,
 }
 
 /// What [`Engine::shutdown`] could and could not clean up.
@@ -492,6 +497,8 @@ struct Inner {
     joins: Mutex<HashMap<RunId, JoinState>>,
     /// Runs a cancel was asked for, until it is delivered. `spawn_child` refuses them.
     cancelling: Mutex<HashSet<RunId>>,
+    /// Indexes runs' clones for Travsr, see [`Engine::with_indexer`].
+    indexing: Option<Arc<index::Indexing>>,
     /// Signals a change of `live`.
     changed: Notify,
 }
@@ -624,6 +631,7 @@ impl Engine {
                 rejoins: Mutex::default(),
                 joins: Mutex::default(),
                 cancelling: Mutex::default(),
+                indexing: None,
                 changed: Notify::new(),
             }),
         }
@@ -712,6 +720,79 @@ impl Engine {
             inner.tree_limit = runs;
         }
         self
+    }
+
+    /// Has each run's code indexed for Travsr by `indexer`, so its agent can use Travsr's tools.
+    /// Takes the engine by value, like [`Engine::with_workspaces`], which it needs.
+    ///
+    /// * **Which runs**: those with a `git-clone` workspace whose capability grants a
+    ///   `travsr.<tool>`. A child is indexed on its own.
+    /// * **What**: never the run's workspace, which the agent may rewrite and Travsr would read
+    ///   on the host. The indexer gets an [`IndexSource`]: the source repo, and the commit the
+    ///   workspace was cloned at ([`Workspaces::head`], read before the sandbox exists). It keeps
+    ///   its own copy of that commit. A resumed run reuses the workspace it had, so its source
+    ///   has no commit: the indexer uses the one it recorded. The index therefore shows the code
+    ///   the run started from, never the agent's edits.
+    /// * **When**: after the workspace exists and before the agent starts (while the sandbox is
+    ///   made). At most `limits.max_jobs` jobs run at once. A run waits at most `limits.timeout`
+    ///   for its index, the wait for a free job slot included. A job that fails or takes longer
+    ///   does not hold the run: it starts without Travsr, and its log says why.
+    ///   [`Engine::travsr_tools`] then lists nothing for it.
+    /// * **Released** (served no more, its copy kept for a resume) when [`Engine::shutdown`]
+    ///   stops a run.
+    /// * **Forgotten** (nothing kept) when the run ends, after its slot is given back, and by
+    ///   [`Engine::recover`] for every copy the indexer keeps ([`RunIndexer::kept`]) whose run
+    ///   ended or no longer exists. Only a run handed to the indexer (it got a job slot), or
+    ///   listed as kept, is forgotten; any other run never reaches the indexer. Each forget may
+    ///   take `limits.forget_timeout`. One that fails is logged on the run and tried again every
+    ///   `limits.retry_every` while `run_forever` runs. It never fails the run.
+    pub fn with_indexer(mut self, indexer: Arc<dyn RunIndexer>, limits: IndexLimits) -> Engine {
+        let inner = Arc::get_mut(&mut self.inner);
+        debug_assert!(inner.is_some(), "engine state is shared");
+        if let Some(inner) = inner {
+            inner.indexing = Some(Arc::new(index::Indexing::new(indexer, limits)));
+        }
+        self
+    }
+
+    /// The Travsr tools `run` may call, by Travsr's names (`get_callers` for
+    /// `travsr.get_callers`), in its capability's order; `None` once it has ended (or for an
+    /// unknown run). Empty unless its clone is indexed (see [`Engine::with_indexer`]).
+    pub fn travsr_tools(&self, run: RunId) -> Result<Option<Vec<String>>> {
+        let store = &self.inner.store;
+        let Some(row) = store.get_run(run)? else {
+            return Ok(None);
+        };
+        if row.status.is_terminal() {
+            return Ok(None);
+        }
+        let spec = if self.travsr_ready(run) {
+            store.run_spec(run)?
+        } else {
+            None
+        };
+        let Some(spec) = spec else {
+            return Ok(Some(Vec::new()));
+        };
+        // A spawned run's stored spec holds only what it was granted, as for `kestrel_tools`.
+        let mut tools: Vec<String> = Vec::new();
+        for tool in spec
+            .capabilities
+            .mcp
+            .iter()
+            .filter_map(|name| name.strip_prefix("travsr."))
+        {
+            if !tools.iter().any(|t| t == tool) {
+                tools.push(tool.to_string());
+            }
+        }
+        Ok(Some(tools))
+    }
+
+    /// Whether `run`'s code is indexed for Travsr and served, so the gateway may ask the indexer
+    /// about it (the indexer knows the run's copy by its id).
+    pub fn travsr_ready(&self, run: RunId) -> bool {
+        self.inner.indexing.as_ref().is_some_and(|ix| ix.ready(run))
     }
 
     /// The Kestrel tools `run` may call, in the order spawn, join, ask_human; `None` once it has
@@ -991,6 +1072,15 @@ impl Engine {
         let mut scheduler = Scheduler::default();
         scheduler.requeue = Some(self.inner.clone());
         let mut tick = self.inner.ticker();
+        // Failed Travsr forgets are tried again now and then, in a task of their own.
+        let indexing = self.inner.indexing.clone();
+        let mut retry = tokio::time::interval(
+            indexing
+                .as_ref()
+                .map_or(Duration::from_secs(3600), |ix| ix.retry_every())
+                .max(Duration::from_millis(1)),
+        );
+        retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let result = loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break Ok(()),
@@ -998,6 +1088,11 @@ impl Engine {
                 _ = tick.tick() => {
                     if let Err(e) = self.inner.poll(&mut scheduler) {
                         break Err(e);
+                    }
+                }
+                _ = retry.tick(), if indexing.is_some() => {
+                    if let Some(ix) = indexing.clone() {
+                        scheduler.tasks.spawn(async move { ix.retry().await });
                     }
                 }
             }
@@ -1050,6 +1145,16 @@ impl Engine {
             }
         }
         drop(pending);
+        // Travsr stops serving the runs stopped, in the grace period too. They stay resumable, so
+        // their copies are kept.
+        if let Some(indexing) = &inner.indexing {
+            let mut releases: FuturesUnordered<_> = report
+                .destroyed
+                .iter()
+                .map(|run| indexing.release(*run))
+                .collect();
+            while let Ok(Some(())) = timeout_at(deadline, releases.next()).await {}
+        }
         // Best effort, in what is left of the grace period: the networks no sandbox uses any more.
         let unused: Vec<RunId> = {
             let live = inner.live();
@@ -1152,6 +1257,7 @@ impl Engine {
                 _ => report.suspended.push(run.id),
             }
         }
+        report.travsr_unlisted = self.inner.forget_ended_indexes().await?;
         Ok(report)
     }
 }
@@ -2002,7 +2108,51 @@ impl Inner {
             let _ = self.destroy_tracked(idx, &SandboxHandle { id }).await;
         }
         self.remove_run_config(run);
+        // Its Travsr copy stays: a resumed run is served from it again.
         Ok(())
+    }
+
+    /// Forgets `run`'s Travsr copy. A failure is written to the run's log and tried again later
+    /// (see [`Engine::with_indexer`]).
+    async fn forget_index(&self, run: RunId) {
+        let Some(indexing) = &self.indexing else {
+            return;
+        };
+        if let Err(e) = indexing.forget(run).await {
+            let line = format!(
+                "kestrel: Travsr could not forget this run's copy, it will be retried: {e}"
+            );
+            // A run that no longer exists has no log; the retry still runs.
+            let _ = self.store.append(run, EventKind::AgentLog { line });
+        }
+    }
+
+    /// Forgets every Travsr copy whose run ended or no longer exists, a few at a time, then
+    /// retries the forgets that failed before. For [`Engine::recover`]: copies are kept by run
+    /// id, so a fresh engine finds them all. `Some` says why the copies could not be listed.
+    async fn forget_ended_indexes(&self) -> Result<Option<String>> {
+        let Some(indexing) = &self.indexing else {
+            return Ok(None);
+        };
+        let (kept, unlisted) = match indexing.kept().await {
+            Ok(kept) => (kept, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let mut ended = Vec::new();
+        for run in kept {
+            let gone = match self.store.get_run(run)? {
+                Some(row) => row.status.is_terminal(),
+                None => true,
+            };
+            if gone {
+                ended.push(run);
+            }
+        }
+        futures::stream::iter(ended)
+            .for_each_concurrent(4, |run| self.forget_index(run))
+            .await;
+        indexing.retry().await;
+        Ok(unlisted)
     }
 }
 
@@ -2043,6 +2193,18 @@ fn run_gateway(gateway: &Url, token: &str) -> Url {
 fn ignored(cmd: &ControlCommand, status: &RunStatus) -> EventKind {
     EventKind::AgentLog {
         line: format!("kestrel: ignored {cmd:?} while the run is {status:?}"),
+    }
+}
+
+/// A run's indexing job, see [`Actor::start_index`].
+type IndexJob =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+
+/// What `job` gives, or never when there is none.
+async fn some(job: &mut Option<IndexJob>) -> std::result::Result<(), String> {
+    match job {
+        Some(job) => job.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2138,6 +2300,13 @@ impl Actor {
         }
         // The run ended; whatever slot it still holds goes back.
         self.inner.slots().release(self.id);
+        // Last, so a slow Travsr never holds the slot: a run that ended is forgotten, one that
+        // did not (its status could not be stored) only stops being served.
+        if self.status.is_terminal() {
+            self.inner.forget_index(self.id).await;
+        } else if let Some(indexing) = &self.inner.indexing {
+            indexing.release(self.id).await;
+        }
     }
 
     /// Cancels the children still going and waits until they have ended, unless the spec says to
@@ -2242,8 +2411,10 @@ impl Actor {
         Ok(go)
     }
 
-    /// Creates the sandbox, applying commands while `create` runs. `None` when the run ended
-    /// meanwhile (the sandbox, if created, is destroyed on exit).
+    /// Creates the sandbox, applying commands while `create` runs, and has the run's clone
+    /// indexed for Travsr meanwhile (see [`Engine::with_indexer`]); the agent starts once both
+    /// are done. `None` when the run ended meanwhile (the sandbox, if created, is destroyed on
+    /// exit).
     async fn provision(&mut self) -> Result<Option<Sandbox>> {
         let inner = self.inner.clone();
         let idx = inner
@@ -2253,12 +2424,19 @@ impl Actor {
         // The network first: the launch plan holds the bridge's address on it.
         let network = self.prepare_network(idx).await?;
         let mut launch = self.launch_spec(network.as_ref())?;
-        launch.workspace = self.workspace().await?;
+        let (workspace, fresh) = self.workspace().await?;
+        launch.workspace = workspace;
+        // Before the sandbox exists: a fresh workspace's commit is read now or never.
+        let mut index = self.start_index(fresh).await;
         let mut create = inner.start_create(self.id, idx, launch);
         let created = loop {
             let deadline = self.clock.deadline();
             tokio::select! {
                 res = &mut create => break res.unwrap_or_else(|e| Err(create_died(&e))),
+                done = some(&mut index) => {
+                    index = None;
+                    self.indexed(done)?;
+                }
                 cmd = recv(&mut self.cmds) => {
                     self.on_command(cmd)?;
                 }
@@ -2282,14 +2460,81 @@ impl Actor {
                 sandbox_id: sb.handle.id.clone(),
             },
         )?;
+        // The agent waits for its clone's index, at most the indexing timeout.
+        while let Some(job) = index.as_mut()
+            && !self.status.is_terminal()
+        {
+            let deadline = self.clock.deadline();
+            tokio::select! {
+                done = job => {
+                    index = None;
+                    self.indexed(done)?;
+                }
+                cmd = recv(&mut self.cmds) => {
+                    self.on_command(cmd)?;
+                }
+                _ = until(deadline) => {
+                    self.set(RunStatus::Failed(WALL_CLOCK_EXCEEDED.into()))?;
+                }
+            }
+        }
+        if self.status.is_terminal() {
+            return Ok(None);
+        }
         Ok(Some(sb))
     }
 
+    /// The indexing of this run's code, when the engine has an indexer and workspaces, the
+    /// workspace is a `git-clone` and the run may call a Travsr tool. Dropping it gives the job
+    /// up.
+    ///
+    /// The indexer gets the source repo, never the workspace. For a `fresh` workspace (cloned
+    /// just now, its sandbox not made yet) it also gets the commit the workspace is at; a reused
+    /// one is the agent's, so git never runs in it and the indexer uses the commit it recorded.
+    async fn start_index(&self, fresh: bool) -> Option<IndexJob> {
+        let indexing = self.inner.indexing.clone()?;
+        let workspaces = self.inner.workspaces.as_ref()?;
+        let WorkspaceSpec::GitClone { repo, .. } = &self.spec.sandbox.workspace else {
+            return None;
+        };
+        if !index::wants_travsr(&self.spec) {
+            return None;
+        }
+        let commit = if fresh {
+            match workspaces.head(self.id).await {
+                Ok(commit) => Some(commit),
+                Err(e) => {
+                    let why = format!("the workspace's commit could not be read: {e}");
+                    return Some(Box::pin(std::future::ready(Err(why))));
+                }
+            }
+        } else {
+            None
+        };
+        let source = IndexSource {
+            repo: repo.clone(),
+            commit,
+        };
+        let run = self.id;
+        Some(Box::pin(async move { indexing.index(run, source).await }))
+    }
+
+    /// Notes how indexing ended: a run whose clone is not indexed starts without Travsr, and its
+    /// log says why.
+    fn indexed(&self, done: std::result::Result<(), String>) -> Result<()> {
+        if let Err(why) = done {
+            self.log(&format!(
+                "kestrel: Travsr is unavailable for this run ({why}); the agent starts without it"
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Prepares this run's workspace, if the engine has workspaces. Reuses an existing one, so
-    /// a resumed run gets the same directory back.
-    async fn workspace(&self) -> Result<Option<PathBuf>> {
+    /// a resumed run gets the same directory back. `true` with a workspace made just now.
+    async fn workspace(&self) -> Result<(Option<PathBuf>, bool)> {
         let Some(workspaces) = &self.inner.workspaces else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let spec = &self.spec.sandbox.workspace;
         if let WorkspaceSpec::GitClone { repo, .. } = spec
@@ -2297,7 +2542,12 @@ impl Actor {
         {
             return Err(EngineError::RelativeRepo { repo: repo.clone() });
         }
-        Ok(Some(workspaces.prepare(self.id, spec).await?))
+        // Only this run's actor makes its workspace, so nothing makes it in between.
+        let existed = tokio::fs::symlink_metadata(workspaces.path_for(self.id))
+            .await
+            .is_ok();
+        let path = workspaces.prepare(self.id, spec).await?;
+        Ok((Some(path), !existed))
     }
 
     /// The run's own network on a block of the engine's pool, when the engine has one and the
