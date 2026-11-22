@@ -235,8 +235,16 @@ pub(crate) struct McpState {
     max_held: usize,
 }
 
-/// The run already has [`MAX_WAITING`] calls waiting.
-struct Busy;
+/// Why a call could not be started or waited on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRoom {
+    /// The run already has [`MAX_WAITING`] calls waiting.
+    Busy,
+    /// No room for one more call held open, and the call is new: nothing was started.
+    FullNew,
+    /// No room for one more call held open, and the call is already running.
+    FullRunning,
+}
 
 /// Room for one tool call held open; given back when dropped, which is when its answer has been
 /// sent or its client went away.
@@ -258,15 +266,6 @@ impl McpState {
             held: Arc::default(),
             max_held: max_held.max(1),
         }
-    }
-
-    /// The call `run` made with `id`, running or finished, if there is one.
-    fn existing(&self, run: RunId, id: &Value) -> Option<CallResult> {
-        let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
-        calls
-            .get(&run)
-            .and_then(|mine| mine.by_id.get(&id.to_string()))
-            .map(|(result, _)| result.clone())
     }
 
     /// Room for one more call held open, or `None` when [`McpState::max_held`] are.
@@ -588,15 +587,18 @@ async fn call(
             );
         }
     };
-    // A long call holds its connection (through the shared bridge) until it answers, maybe for
-    // hours, so the number of those open at once is capped across all runs. A call made again
-    // with the id of one that has finished is answered at once and needs no room. Past the cap a
-    // new call is refused before anything starts, and one already running is told so.
-    let found = state.mcp.existing(run, &id);
-    let finished = found.as_ref().is_some_and(|r| r.borrow().is_some());
-    let held = if task.is_long() && !finished {
-        let Some(held) = state.mcp.hold() else {
-            let what = if found.is_some() {
+    let (mut result, held) = match start(state, run, &id, task) {
+        Ok(started) => started,
+        Err(NoRoom::Busy) => {
+            return rpc_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                id,
+                -32000,
+                "too many tool calls waiting for this run, wait for one to finish",
+            );
+        }
+        Err(full) => {
+            let what = if full == NoRoom::FullRunning {
                 "this call is still running; call again later with the same id for its result"
             } else {
                 "nothing was started; call again later"
@@ -608,18 +610,7 @@ async fn call(
             );
             state.deps.tools.refused(run, tool.name(), &reason).await;
             return Json(rpc_result(id, tool_result(Err(reason)))).into_response();
-        };
-        Some(held)
-    } else {
-        None
-    };
-    let Ok(mut result) = start(state, run, &id, task) else {
-        return rpc_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            id,
-            -32000,
-            "too many tool calls waiting for this run, wait for one to finish",
-        );
+        }
     };
     let wait = async move {
         // Given back once the answer is ready, or when the client goes away first.
@@ -645,10 +636,19 @@ async fn call(
         .into_response()
 }
 
-/// The call for `(run, id)`: the one already running or done, or a new one in its own task, so a
-/// client that goes away does not cancel it. [`Busy`] when the run has [`MAX_WAITING`] calls
-/// waiting; at [`MAX_KEPT`] results, the oldest finished one is let go.
-fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<CallResult, Busy> {
+/// The call for `(run, id)` and the room it holds while its answer is open: the one already done
+/// (no room needed), the one still running, or a new one in its own task, so a client that goes
+/// away does not cancel it. A long call holds its connection (through the shared bridge) until it
+/// answers, maybe for hours, so those are capped across all runs ([`McpState::hold`]). A running
+/// call needs room whatever the new request asks for, since the client waits on it; a new call
+/// needs room only when it is long. Decided under the lock, so no result can go between looking
+/// and starting. At [`MAX_KEPT`] results, the oldest finished one is let go.
+fn start(
+    state: &Arc<AppState>,
+    run: RunId,
+    id: &Value,
+    task: Task,
+) -> Result<(CallResult, Option<Held>), NoRoom> {
     let key = id.to_string();
     let mut calls = state
         .mcp
@@ -677,7 +677,11 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
     drop(pruned);
     let mine = calls.entry(run).or_default();
     if let Some((existing, _)) = mine.by_id.get(&key) {
-        return Ok(existing.clone());
+        if existing.borrow().is_some() {
+            return Ok((existing.clone(), None));
+        }
+        let held = state.mcp.hold().ok_or(NoRoom::FullRunning)?;
+        return Ok((existing.clone(), Some(held)));
     }
     let waiting = mine
         .by_id
@@ -685,8 +689,13 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
         .filter(|(r, _)| r.borrow().is_none())
         .count();
     if waiting >= MAX_WAITING {
-        return Err(Busy);
+        return Err(NoRoom::Busy);
     }
+    let held = if task.is_long() {
+        Some(state.mcp.hold().ok_or(NoRoom::FullNew)?)
+    } else {
+        None
+    };
     if mine.by_id.len() >= MAX_KEPT {
         let oldest = mine
             .by_id
@@ -719,7 +728,7 @@ fn start(state: &Arc<AppState>, run: RunId, id: &Value, task: Task) -> Result<Ca
             .unwrap_or_else(|_| Err("the call failed inside Kestrel; try again".into()));
         let _ = tx.send(Some((tool_result(outcome), Instant::now())));
     });
-    Ok(rx)
+    Ok((rx, held))
 }
 
 /// Checks a tool's arguments.

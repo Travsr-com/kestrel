@@ -924,6 +924,47 @@ async fn long_calls_give_their_room_back_when_they_answer_and_short_ones_need_no
     drop(held);
 }
 
+/// Waiting on a running call takes room whatever the new request names: a short spawn sent with
+/// the id of a running join attaches to the join and is counted, never started.
+#[tokio::test(start_paused = true)]
+async fn the_id_of_a_running_call_takes_room_whatever_tool_the_request_names() {
+    let (app, host, runs) = many(1, GatewayLimits { waiting_calls: 2 });
+    let token = &runs[0].0;
+    let join = join_held_open(&app, token, 7).await;
+    let short = json!({ "agent": "worker", "input": "x" });
+    let attached = send(
+        &app,
+        token,
+        call(7, "kestrel.spawn", short.clone())
+            .to_string()
+            .into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(attached.status(), StatusCode::OK);
+    // Both rooms are taken now: the next request with that id is refused, truthfully.
+    let refused = message(
+        send(
+            &app,
+            token,
+            call(7, "kestrel.spawn", short).to_string().into_bytes(),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    let reason = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(reason.contains("still running"), "{reason}");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        host.spawns.lock().unwrap().is_empty(),
+        "no spawn was started"
+    );
+    assert_eq!(host.joins.lock().unwrap().len(), 1);
+    drop((join, attached));
+}
+
 /// A cap of 0 would refuse every long call; it counts as 1.
 #[tokio::test(start_paused = true)]
 async fn a_cap_of_0_counts_as_1() {
