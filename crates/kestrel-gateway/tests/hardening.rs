@@ -368,25 +368,41 @@ async fn client_leaving_before_headers_still_meters_the_call() {
                     anthropic_response(CLAUDE_MODEL, 1200, 350, 8000, 2000).into_bytes(),
                     "application/json",
                 )
-                .set_delay(Duration::from_millis(500)),
+                .set_delay(Duration::from_secs(2)),
         )
         .mount(&upstream)
         .await;
     let h = start(&upstream.uri(), &upstream.uri(), true).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
-        .build()
-        .unwrap();
-    let sent = client
-        .post(h.anthropic_url(RUN_TOKEN))
-        .body(anthropic_request(CLAUDE_MODEL, false))
-        .send()
-        .await;
-    assert!(sent.is_err(), "client must give up before headers arrive");
-    drop(client);
+    // The client leaves once the upstream has the call, never on a fixed timer: a timer can fire
+    // before the gateway forwards the call on a slow machine, and then no record is right.
+    let url = h.anthropic_url(RUN_TOKEN);
+    let call = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .body(anthropic_request(CLAUDE_MODEL, false))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while upstream
+            .received_requests()
+            .await
+            .is_none_or(|r| r.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upstream never got the call");
+    assert!(
+        !call.is_finished(),
+        "client must give up before headers arrive"
+    );
+    call.abort();
+    assert!(call.await.is_err_and(|e| e.is_cancelled()));
 
-    let recs = tokio::time::timeout(Duration::from_secs(3), async {
+    let recs = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let recs = h.sink.records();
             if !recs.is_empty() {
@@ -396,7 +412,7 @@ async fn client_leaving_before_headers_still_meters_the_call() {
         }
     })
     .await
-    .expect("no record within 3s although the upstream answered");
+    .expect("no record within 10s although the upstream answered");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(h.sink.records().len(), 1, "{recs:?}");
     let rec = &recs[0];
