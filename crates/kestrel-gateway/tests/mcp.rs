@@ -17,7 +17,7 @@ use common::{FakeBudget, FakeSink, config};
 use futures::StreamExt;
 use kestrel_gateway::{
     DEFAULT_WAITING_CALLS, GatewayDeps, GatewayLimits, GatewayTimeouts, JoinCall, JoinWait,
-    KestrelTool, RunResolver, SpawnCall, ToolHost, ToolsError, router, router_with_limits,
+    KestrelTool, Liveness, RunResolver, SpawnCall, ToolHost, ToolsError, router, router_with_limits,
 };
 use kestrel_types::{MicroUsd, RunId};
 use serde_json::{Value, json};
@@ -34,6 +34,9 @@ struct Tokens(HashMap<String, RunId>);
 impl RunResolver for Tokens {
     async fn resolve(&self, token: &str) -> Option<RunId> {
         self.0.get(token).copied()
+    }
+    async fn liveness(&self, _run: RunId) -> Liveness {
+        Liveness::Live
     }
 }
 

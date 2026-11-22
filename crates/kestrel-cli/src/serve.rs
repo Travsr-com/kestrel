@@ -1677,6 +1677,7 @@ impl MeterSink for StoreDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kestrel_gateway::Liveness;
     use kestrel_types::{AgentSpec, RunStatus, SuspendReason};
 
     // #37 scenario 2: the API server binds 127.0.0.1 by default; another address starts it and
@@ -1792,8 +1793,8 @@ budget: { usd: 0.000010, wall_clock: 10m }
     }
 
     /// Issue #88: a run's token stops working once the run has ended. A live run (queued,
-    /// provisioning, running or suspended, so it can still be resumed) keeps it; a run the store
-    /// cannot read counts as ended, so nothing is let through on a doubt.
+    /// provisioning, running or suspended, so it can still be resumed) keeps it, and a run the
+    /// store does not have counts as ended.
     #[tokio::test]
     async fn store_deps_say_a_run_has_ended_once_it_completed_failed_or_was_cancelled() {
         let store = Arc::new(Store::open_in_memory().expect("store"));
@@ -1808,9 +1809,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
         };
 
         let live = store.create_run(&spec, "x").expect("create");
-        assert!(!deps.ended(live).await, "queued");
+        assert_eq!(deps.liveness(live).await, Liveness::Live, "queued");
         walk(live, &[RunStatus::Provisioning, RunStatus::Running]);
-        assert!(!deps.ended(live).await, "running");
+        assert_eq!(deps.liveness(live).await, Liveness::Live, "running");
         store
             .transition(
                 live,
@@ -1818,7 +1819,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 RunStatus::Suspended(SuspendReason::Manual),
             )
             .expect("suspend");
-        assert!(!deps.ended(live).await, "a suspended run can be resumed");
+        assert_eq!(
+            deps.liveness(live).await,
+            Liveness::Live,
+            "a suspended run can be resumed"
+        );
 
         for end in [
             RunStatus::Completed,
@@ -1829,10 +1834,11 @@ budget: { usd: 0.000010, wall_clock: 10m }
             let mut steps = vec![RunStatus::Provisioning, RunStatus::Running];
             steps.push(end.clone());
             walk(id, &steps);
-            assert!(deps.ended(id).await, "{end:?}");
+            assert_eq!(deps.liveness(id).await, Liveness::Ended, "{end:?}");
         }
-        assert!(
-            deps.ended(RunId::new()).await,
+        assert_eq!(
+            deps.liveness(RunId::new()).await,
+            Liveness::Ended,
             "a run the store does not have"
         );
     }

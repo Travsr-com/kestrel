@@ -244,7 +244,8 @@ fn a_run_that_has_ended_cannot_hold_a_request_open() {
     let (port, accepted) = stalled_upstream();
     let mut s = start_fake(
         &f,
-        &config(Some(port), &format!("shutdown_grace_secs = {GRACE}")),
+        // A long grace, so stopping well within it shows nothing was waited for.
+        &config(Some(port), "shutdown_grace_secs = 10"),
     );
     let run = queued_run(&f);
     poll("serve to claim and fail the run", || {
@@ -271,10 +272,10 @@ fn a_run_that_has_ended_cannot_hold_a_request_open() {
 
     let t = Instant::now();
     signal(&s.serve, "INT");
-    let status = exits_within(&mut s.serve, Duration::from_secs(GRACE) + SLACK)
+    let status = exits_within(&mut s.serve, Duration::from_secs(10) + SLACK)
         .unwrap_or_else(|| panic!("serve did not exit within the grace period (+slack)"));
     assert!(
-        t.elapsed() < Duration::from_millis(GRACE * 1000),
+        t.elapsed() < Duration::from_secs(5),
         "nothing was in flight, so serve did not wait for the grace"
     );
     assert_eq!(status.code(), Some(0), "everything was cleaned up");

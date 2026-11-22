@@ -4,13 +4,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use kestrel_gateway::{
-    BudgetGuard, GatewayConfig, GatewayDeps, MeterSink, ModelPrice, NoTools, ProviderConfig,
+    BudgetGuard, GatewayConfig, GatewayDeps, Liveness, MeterSink, ModelPrice, NoTools, ProviderConfig,
     RunResolver, router,
 };
 use kestrel_types::{MicroUsd, ModelCallRecord, RunId};
@@ -25,11 +24,11 @@ pub const OPENAI_MODEL: &str = "gpt-4o-mini";
 pub const UNPRICED_MODEL: &str = "claude-not-in-price-table";
 
 /// Fake `RunResolver`: knows a fixed set of tokens and records every lookup. Its runs are live
-/// until `end` is called.
+/// until `end` (or `lose_track`) is called.
 pub struct FakeResolver {
     known: HashMap<String, RunId>,
     pub calls: Mutex<Vec<String>>,
-    ended: AtomicBool,
+    liveness: Mutex<Liveness>,
 }
 
 impl FakeResolver {
@@ -39,7 +38,7 @@ impl FakeResolver {
         Self {
             known,
             calls: Mutex::new(Vec::new()),
-            ended: AtomicBool::new(false),
+            liveness: Mutex::new(Liveness::Live),
         }
     }
     pub fn calls(&self) -> Vec<String> {
@@ -47,7 +46,11 @@ impl FakeResolver {
     }
     /// The run has ended (completed, failed or cancelled) from now on.
     pub fn end(&self) {
-        self.ended.store(true, Ordering::SeqCst);
+        *self.liveness.lock().unwrap() = Liveness::Ended;
+    }
+    /// The store cannot say whether the run is live (for example a read failed).
+    pub fn lose_track(&self) {
+        *self.liveness.lock().unwrap() = Liveness::Unknown;
     }
 }
 
@@ -57,8 +60,8 @@ impl RunResolver for FakeResolver {
         self.calls.lock().unwrap().push(token.to_string());
         self.known.get(token).copied()
     }
-    async fn ended(&self, _run: RunId) -> bool {
-        self.ended.load(Ordering::SeqCst)
+    async fn liveness(&self, _run: RunId) -> Liveness {
+        *self.liveness.lock().unwrap()
     }
 }
 
