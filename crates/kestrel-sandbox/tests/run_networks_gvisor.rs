@@ -789,15 +789,38 @@ async fn s8_runs_start_when_the_daemon_default_pools_are_exhausted() {
 // #99 ---------------------------------------------------------------------------------------------
 
 /// #99 scenario 1: on a host with no `kestrel-gw` network whose default address pools are used
-/// up, the bridge still starts, because `kestrel-gw` gets a block of Kestrel's own plan, as serve
-/// plans it. A run on the same plan never gets that block, and reaches the gateway.
+/// up, the bridge still starts, because `kestrel-gw` gets a /24 of Kestrel's own plan, as serve
+/// plans it. A run on the same plan never gets a block of it, and reaches the gateway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kestrel_gw() {
     let _serial = SERIAL.lock().await;
     let instance = unique();
     let cleanup = Arc::new(Cleanup::new(&instance));
-    // Every bridge of an earlier test has stopped, so nothing is attached to `kestrel-gw`.
     if network_exists("kestrel-gw") {
+        // Bridges an earlier test leaked (label `kestrel.managed=bridge`) are removed. Anything
+        // else attached is not this suite's to remove, so the test is skipped.
+        let attached = docker_ok(&[
+            "network",
+            "inspect",
+            "kestrel-gw",
+            "--format",
+            "{{range $id, $_ := .Containers}}{{$id}} {{end}}",
+        ]);
+        for id in attached.split_whitespace() {
+            let managed = docker_ok(&[
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"kestrel.managed\"}}",
+                id,
+            ]);
+            if managed != "bridge" {
+                eprintln!(
+                    "skipped: container {id} without the label kestrel.managed=bridge is attached to kestrel-gw, so this test will not remove the network"
+                );
+                return;
+            }
+            docker_ok(&["rm", "--force", id]);
+        }
         docker_ok(&["network", "rm", "kestrel-gw"]);
     }
     assert!(!network_exists("kestrel-gw"));
@@ -828,22 +851,25 @@ async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kest
     assert!(exhausted, "64 networks did not use up the default pools");
 
     // The plan, as serve builds it.
-    let pool = SubnetPool::parse("10.231.9.0/24").expect("pool");
+    let pool = SubnetPool::parse("10.231.12.0/22").expect("pool");
     pool.exclude(
         &docker_subnets(&ProcessRunner)
             .await
             .expect("docker subnets"),
     );
     pool.exclude(&host_routes(&ProcessRunner).await);
-    let network = within(
+    let planned = within(
         "plan the bridge network",
         GatewayBridge::plan_network(&ProcessRunner, &pool),
     )
     .await
     .expect("planned");
+    assert!(planned.warning.is_none(), "{:?}", planned.warning);
+    let network = planned.network;
     let BridgeNetwork::Subnet(block) = network.clone() else {
-        panic!("no kestrel-gw, so it needs a block: {network:?}");
+        panic!("no kestrel-gw, so it needs a span: {network:?}");
     };
+    assert_eq!(block.cidr().prefix(), 24, "room for many bridges");
 
     let dir = tempfile::tempdir().expect("dir");
     let db: PathBuf = dir.path().join("kestrel.db");
@@ -866,10 +892,9 @@ async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kest
         .with_instance(instance.clone())
         .with_bridge(bridge_name.clone());
     let (run, net) = prepare(&driver, &pool, &cleanup).await;
-    assert_ne!(
-        net.subnet.cidr(),
-        block.cidr(),
-        "a run never gets the bridge's block"
+    assert!(
+        !net.subnet.cidr().overlaps(&block.cidr()),
+        "a run never gets a block of the bridge's span"
     );
     let script = format!("wget -q -T 20 -O- http://{}:{port}/", net.gateway_host);
     let (lines, code) = run_to_end(
