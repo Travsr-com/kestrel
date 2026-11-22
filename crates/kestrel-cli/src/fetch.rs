@@ -95,7 +95,7 @@ fn report(id: RunId, repo: &Path, result: &BroughtBack, out: Output) -> Result<(
     say(&match result {
         BroughtBack::Fetched { .. } => format!("fetched {branch} into {repo} at {short}"),
         BroughtBack::AlreadyFetched { .. } => {
-            format!("{branch} is already in {repo} at {short}; nothing to fetch")
+            format!("{branch} is already in {repo} and holds {short}; nothing to fetch")
         }
         BroughtBack::NothingNew { .. } => format!(
             "run {id} made no new commits ({branch} is at {short}, which {repo} already has); \

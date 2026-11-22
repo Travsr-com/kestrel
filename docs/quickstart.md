@@ -171,8 +171,9 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 
 ## 6. Get the work back
 
-When a `git-clone` run ends (completed, failed or cancelled), Kestrel fetches its work into your
-repository as branch `kestrel/run-<id>`, where `<id>` is the last 12 characters of the run id.
+A moment after a `git-clone` run ends (completed, failed or cancelled), Kestrel fetches its work
+into your repository as branch `kestrel/run-<id>`, where `<id>` is the last 12 characters of the
+run id. `kestrel watch` can exit before that; the branch still arrives.
 Children of a run come back the same way, each on its own branch, so six children that edit the
 same file give six branches and nothing conflicts. Review and merge them like any other branch:
 
@@ -185,10 +186,12 @@ git merge kestrel/run-5f3c9a1b2d4e
   uncommitted changes are never touched.
 * A run that made no commits brings nothing back.
 * The run's log says `kestrel: fetched branch ...`. If the fetch fails (you already have a branch
-  of that name that the run does not build on, or a commit fails git's object check), the log has
-  a `kestrel: warning:` line instead, and the run's outcome is unchanged.
+  of that name that the run does not build on, a commit fails git's object check, the clone's
+  `.git` points somewhere else, or git takes more than 2 minutes), the log has a
+  `kestrel: warning:` line instead, and the run's outcome is unchanged.
 
-To fetch by hand, for a run whose fetch failed or that ended before this existed:
+To fetch by hand, for a run whose fetch failed, that ended before this existed, or that ended just
+before `kestrel serve` stopped:
 
 ```sh
 kestrel fetch <run-id>
