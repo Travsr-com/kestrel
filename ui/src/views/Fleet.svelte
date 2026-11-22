@@ -1,7 +1,9 @@
 <script lang="ts">
   import { FleetState, type FleetRun } from '../lib/fleet.svelte';
-  import { newestFirst, statusName } from '../lib/format';
-  import { Unauthorized, type Api } from '../lib/api';
+  import type { ActiveRuns } from '../lib/active.svelte';
+  import type { ApprovalsState } from '../lib/approvals.svelte';
+  import { formatUsd, newestFirst, statusTone } from '../lib/format';
+  import { ApiFailure, Unauthorized, type Api } from '../lib/api';
   import { failureText, whileMounted, type OnUnauthorized } from '../lib/load';
   import { getToken } from '../lib/token';
   import type { RunId } from '../lib/types';
@@ -22,18 +24,32 @@
     onUnauthorized,
     sockets = browserSocket,
     base = socketBase(window.location),
+    approvals,
+    liveRuns,
   }: {
     api: Api;
     onUnauthorized: OnUnauthorized;
     sockets?: SocketFactory;
     base?: string;
+    /** The pending approvals App.svelte keeps; without it, Needs you counts the runs waiting. */
+    approvals?: ApprovalsState;
+    /** The live runs App.svelte keeps from its events socket: how a run started later is found. */
+    liveRuns?: ActiveRuns;
   } = $props();
 
   /** Cards per page: the list never holds more at once. */
   const PAGE = 50;
   /** How long a run that ended stays in the active view after it was seen to end. */
   const LINGER_MS = 5_000;
-  const STATUSES = ['queued', 'provisioning', 'running', 'suspended', 'completed', 'failed', 'cancelled'];
+  /** The filter chips. Running, Needs you and Suspended are the status tones of the same names. */
+  type Chip = 'all' | 'running' | 'approval' | 'suspended' | 'finished';
+  const CHIPS: { key: Chip; label: string }[] = [
+    { key: 'all', label: 'All' },
+    { key: 'running', label: 'Running' },
+    { key: 'approval', label: 'Needs you' },
+    { key: 'suspended', label: 'Suspended' },
+    { key: 'finished', label: 'Finished' },
+  ];
   /** Open tree sockets at most: each one is polled by the server. */
   const MAX_SOCKETS = 50;
 
@@ -49,10 +65,9 @@
    */
   let lingered = $state(Date.now());
 
-  let agent = $state('');
-  let status = $state('');
+  let search = $state('');
+  let chip: Chip = $state('all');
   let rootsOnly = $state(true);
-  let showFinished = $state(false);
   let page = $state(0);
   /** What the pager last announced: a page change, never the list changing under it. */
   let announce = $state('');
@@ -95,14 +110,37 @@
     return () => clearTimeout(timer);
   });
 
-  // A run the server has not answered for yet still needs its limit: its failed fetch is retried.
+  // Every fetch of one run goes through here: those the tree sockets ask for (a new run's limit, a
+  // parent's after a spawn) and the look-ups of runs the events socket brings. So a new run is
+  // fetched once, whichever socket brings it first. A run the server has not answered for yet (not
+  // known, or known only from its events) still needs its limit: its failed fetch is retried. A run
+  // not known here is retried only while it is live, and never after a 4xx: the server does not
+  // have it, or will not show it.
   const refresher = new Refresher({
     fetch: (id) => api.getRun(id),
-    answered: (summary) => fleet.update(summary, Date.now()),
+    answered: (summary) => (fleet.runs[summary.id] ? fleet.update(summary, Date.now()) : fleet.add(summary)),
     failed: (e) => failureText(e, onUnauthorized),
-    retry: (id, e) => !(e instanceof Unauthorized) && fleet.runs[id]?.fetched === false,
+    retry: (id, e) => {
+      if (e instanceof Unauthorized) return false;
+      const known = fleet.runs[id];
+      if (known) return !known.fetched;
+      const refused = e instanceof ApiFailure && e.status >= 400 && e.status < 500;
+      return !refused && (liveRuns?.ids.includes(id) ?? false);
+    },
   });
   const refresh = (id: RunId) => refresher.refresh(id);
+  const lookUp = (id: RunId) => refresher.lookUp(id);
+
+  // A run started after the list loaded, in a tree not followed yet, reaches this view only through
+  // the app's events socket. Each one not known here is looked up (a failure is tried again by
+  // itself), and then shows and is followed like the rest.
+  $effect(() => {
+    if (!loaded || !liveRuns) return;
+    const ids = liveRuns.ids;
+    untrack(() => {
+      for (const id of ids) if (!fleet.runs[id]) lookUp(id);
+    });
+  });
 
   function follow(root: RunId) {
     streams.set(
@@ -113,7 +151,7 @@
         after: 0,
         getToken,
         socketFactory: sockets,
-        onEvent: (event) => fleet.apply(event, Date.now(), refresh, root),
+        onEvent: (event) => fleet.apply(event, Date.now(), refresh, root, lookUp),
         onState: (state: ConnectionState) => {
           if (state === 'reconnecting') {
             down[root] = true;
@@ -143,17 +181,43 @@
   });
 
   const reconnecting = $derived(Object.keys(down).length > 0);
-  const agents = $derived([...new Set(Object.values(fleet.runs).map((r) => r.agent))].sort());
   const children = $derived(fleet.children());
-  /** A filter on a finished status shows those runs however long ago they ended. */
-  const finishedFilter = $derived(['completed', 'failed', 'cancelled'].includes(status));
 
-  function shown(run: FleetRun): boolean {
+  // The tiles: over every run that has not ended, whatever the filters.
+  const active = $derived(Object.values(fleet.runs).filter((run) => run.endedAt === null));
+  const onBudget = $derived(
+    active.filter((run) => typeof run.status === 'object' && 'Suspended' in run.status && run.status.Suspended === 'Budget')
+      .length,
+  );
+  const spend = $derived(active.reduce((sum, run) => sum + run.spent, 0));
+  const needsYou = $derived(approvals ? approvals.count : active.filter((run) => statusTone(run.status) === 'approval').length);
+  const subAgents = $derived(active.filter((run) => run.parent !== null).length);
+
+  /**
+   * What the approval a run waits on asks, picked by the approval's id in the run's status (a run
+   * can have more than one pending); `undefined` when the pending list does not have it.
+   */
+  function askOf(run: FleetRun): string | undefined {
+    const status = run.status;
+    if (typeof status !== 'object' || !('Suspended' in status)) return undefined;
+    const reason = status.Suspended;
+    if (typeof reason !== 'object' || !('Approval' in reason)) return undefined;
+    const row = approvals?.rows[reason.Approval];
+    return row?.ended === null ? row.approval.action : undefined;
+  }
+
+  const needle = $derived(search.trim().toLowerCase());
+
+  function matches(run: FleetRun): boolean {
     if (rootsOnly && run.parent !== null) return false;
-    if (agent && run.agent !== agent) return false;
-    if (status && statusName(run.status) !== status) return false;
-    if (!showFinished && !finishedFilter && run.endedAt !== null && lingered - run.endedAt >= LINGER_MS) return false;
-    return true;
+    return needle === '' || run.agent.toLowerCase().includes(needle) || run.id.toLowerCase().includes(needle);
+  }
+
+  function inChip(run: FleetRun, key: Chip): boolean {
+    if (key === 'all') return run.endedAt === null || lingered - run.endedAt < LINGER_MS;
+    // However long ago they ended.
+    if (key === 'finished') return run.endedAt !== null;
+    return statusTone(run.status) === key;
   }
 
   function firstPage() {
@@ -161,10 +225,21 @@
     announce = '';
   }
 
+  function choose(key: Chip) {
+    chip = key;
+    firstPage();
+  }
+
+  /** The runs the search and Roots only keep: the chips count these. */
+  const matching = $derived(Object.values(fleet.runs).filter(matches));
+  const counts = $derived(
+    Object.fromEntries(CHIPS.map(({ key }) => [key, matching.filter((run) => inChip(run, key)).length])) as Record<
+      Chip,
+      number
+    >,
+  );
   const visible = $derived(
-    Object.values(fleet.runs)
-      .filter(shown)
-      .sort((a, b) => newestFirst(a.created_at, b.created_at)),
+    matching.filter((run) => inChip(run, chip)).sort((a, b) => newestFirst(a.created_at, b.created_at)),
   );
   const pages = $derived(Math.max(1, Math.ceil(visible.length / PAGE)));
   const current = $derived(Math.min(page, pages - 1));
@@ -210,7 +285,21 @@
   });
 </script>
 
-<h1>Fleet</h1>
+<header class="head">
+  <div>
+    <h1>Fleet</h1>
+    <p class="sub">Every active run on this machine, live.</p>
+  </div>
+  <label class="visually-hidden" for="fleet-search">Search runs and agents</label>
+  <input
+    id="fleet-search"
+    class="search"
+    type="search"
+    placeholder="Search runs and agents"
+    bind:value={search}
+    oninput={firstPage}
+  />
+</header>
 
 <!-- Always in the page, so screen readers announce the text when it appears. -->
 <p class:banner={reconnecting} role="status">{reconnecting ? 'Reconnecting to live updates.' : ''}</p>
@@ -228,25 +317,46 @@
       <p>No runs yet.</p>
       <p>Start one with <code>kestrel run &lt;agent.yaml&gt;</code>.</p>
     {:else}
+      <dl class="tiles">
+        <div class="panel tile">
+          <dt class="eyebrow">Active runs</dt>
+          <dd class="big mono">{active.length}</dd>
+          <dd class="small">{onBudget} suspended on budget</dd>
+        </div>
+        <div class="panel tile">
+          <dt class="eyebrow">Spend</dt>
+          <dd class="big mono">{formatUsd(spend)}</dd>
+          <dd class="small">across {active.length} active runs</dd>
+        </div>
+        <div class="panel tile">
+          <dt class="eyebrow">Needs you</dt>
+          <!-- Not 0 before the approvals list has loaded: that would say nothing waits. -->
+          <dd class="big mono">
+            {#if approvals && !approvals.loaded && approvals.error !== null}<span aria-hidden="true">?</span><span
+                class="visually-hidden">approvals could not be loaded</span
+              >{:else if approvals && !approvals.loaded}<span aria-hidden="true">...</span><span class="visually-hidden"
+                >loading</span
+              >{:else}{needsYou}{/if}
+          </dd>
+          <dd class="small">approvals waiting</dd>
+        </div>
+        <div class="panel tile">
+          <dt class="eyebrow">Sub-agents</dt>
+          <dd class="big mono">{subAgents}</dd>
+          <dd class="small">live child runs</dd>
+        </div>
+      </dl>
+
       <div class="filters" role="group" aria-label="Filters">
-        <label for="fleet-agent">Agent</label>
-        <select id="fleet-agent" bind:value={agent} onchange={firstPage}>
-          <option value="">All</option>
-          {#each agents as name (name)}
-            <option value={name}>{name}</option>
-          {/each}
-        </select>
-        <label for="fleet-status">Status</label>
-        <select id="fleet-status" bind:value={status} onchange={firstPage}>
-          <option value="">All</option>
-          {#each STATUSES as name (name)}
-            <option value={name}>{name[0]?.toUpperCase()}{name.slice(1)}</option>
-          {/each}
-        </select>
-        <input id="fleet-roots" type="checkbox" bind:checked={rootsOnly} onchange={firstPage} />
-        <label for="fleet-roots">Roots only</label>
-        <input id="fleet-finished" type="checkbox" bind:checked={showFinished} onchange={firstPage} />
-        <label for="fleet-finished">Show finished</label>
+        {#each CHIPS as { key, label } (key)}
+          <button type="button" class="chip" aria-pressed={chip === key} onclick={() => choose(key)}>
+            {label} <span class="count">{counts[key]}</span>
+          </button>
+        {/each}
+        <span class="roots">
+          <input id="fleet-roots" type="checkbox" bind:checked={rootsOnly} onchange={firstPage} />
+          <label for="fleet-roots">Roots only</label>
+        </span>
       </div>
 
       {#if visible.length === 0}
@@ -260,6 +370,7 @@
                 {now}
                 children={children[run.id]}
                 parentAgent={run.parent === null ? undefined : fleet.runs[run.parent]?.agent}
+                ask={askOf(run)}
               />
             </li>
           {/each}
@@ -273,7 +384,7 @@
             <button type="button" aria-disabled={current === 0} onclick={() => goTo(current - 1)}>Previous</button>
             <button type="button" aria-disabled={current >= pages - 1} onclick={() => goTo(current + 1)}>Next</button>
           {/if}
-          <p class="hidden" role="status">{announce}</p>
+          <p class="visually-hidden" role="status">{announce}</p>
         </nav>
       {/if}
     {/if}
@@ -296,16 +407,83 @@
   .error p {
     margin: 0;
   }
+  .head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3) var(--space-5);
+    margin-bottom: var(--space-5);
+  }
+  h1 {
+    margin: 0;
+    font-size: 2rem;
+  }
+  .sub {
+    margin: var(--space-1) 0 0;
+    color: var(--color-muted);
+  }
+  .search {
+    flex: 0 1 22rem;
+    min-width: 0;
+  }
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(12rem, calc(50% - var(--space-4))), 1fr));
+    gap: var(--space-4);
+    margin: 0 0 var(--space-5);
+  }
+  @media (max-width: 48rem) {
+    .tiles :global(.panel) {
+      padding: var(--space-3) var(--space-4);
+    }
+    .big {
+      font-size: 1.5rem;
+    }
+  }
+  .tile dd {
+    margin: 0;
+  }
+  .big {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+  .small {
+    color: var(--color-muted);
+    font-size: 0.9rem;
+  }
   .filters {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
-    margin-bottom: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .chip {
+    border-radius: 999px;
+    background: transparent;
+  }
+  .chip[aria-pressed='true'] {
+    border-color: var(--color-accent);
+    background: var(--color-accent);
+    color: var(--color-on-accent);
+  }
+  .count {
+    margin-left: var(--space-1);
+    font-weight: 500;
+  }
+  .roots {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: var(--space-2);
+    color: var(--color-muted);
   }
   .cards {
     display: grid;
-    gap: var(--space-2);
+    grid-template-columns: repeat(auto-fill, minmax(min(20rem, 100%), 1fr));
+    gap: var(--space-4);
     margin: 0;
     padding: 0;
     list-style: none;
@@ -314,23 +492,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    margin-top: var(--space-3);
+    margin-top: var(--space-4);
     color: var(--color-muted);
-  }
-  button,
-  select {
-    font: inherit;
-  }
-  .hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-  button[aria-disabled='true'] {
-    opacity: 0.5;
-    cursor: default;
   }
 </style>

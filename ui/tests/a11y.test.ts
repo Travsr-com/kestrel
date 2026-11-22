@@ -67,7 +67,7 @@ describe('keyboard', () => {
     await screen.findByTestId('ready');
     const user = userEvent.setup();
     const link = screen.getByRole('link', { name: /planner/ });
-    for (let i = 0; i < 10 && document.activeElement !== link; i++) await user.tab();
+    for (let i = 0; i < 15 && document.activeElement !== link; i++) await user.tab();
     expect(document.activeElement).toBe(link);
     expect(link).toHaveAttribute('href', `#/runs/${ROOT}`);
   });

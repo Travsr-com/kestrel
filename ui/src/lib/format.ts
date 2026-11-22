@@ -14,6 +14,35 @@ export function statusLabel(status: RunStatus): string {
   return `Failed: ${status.Failed}`;
 }
 
+/** The colour family of a status: a pill, a meter and a card border use the same one. */
+export type Tone = 'running' | 'approval' | 'suspended' | 'done' | 'failed' | 'queued';
+
+/** The word on a status pill: shorter than `statusLabel`, which says why a run is suspended or failed. */
+export function statusPill(status: RunStatus): string {
+  if (typeof status === 'string') return status;
+  if ('Failed' in status) return 'Failed';
+  const reason = status.Suspended;
+  if (reason === 'Manual') return 'Paused';
+  if (typeof reason === 'object' && 'Approval' in reason) return 'Needs approval';
+  return 'Suspended';
+}
+
+export function statusTone(status: RunStatus): Tone {
+  if (status === 'Running' || status === 'Provisioning') return 'running';
+  if (status === 'Completed') return 'done';
+  if (typeof status === 'string') return 'queued';
+  if ('Failed' in status) return 'failed';
+  const reason = status.Suspended;
+  return typeof reason === 'object' && 'Approval' in reason ? 'approval' : 'suspended';
+}
+
+/** Whole percent of `limit` spent, at most 100; a zero limit is used up. `null` without a limit. */
+export function percentUsed(spent: MicroUsd, limit: MicroUsd | null): number | null {
+  if (limit === null) return null;
+  if (limit === 0) return 100;
+  return Math.min(100, Math.floor((spent * 100) / limit));
+}
+
 /** The lower-case name of a status, as the API's `?status=` filter takes it. */
 export function statusName(status: RunStatus): string {
   if (typeof status === 'string') return status.toLowerCase();
@@ -37,6 +66,32 @@ export function formatUsd(micro: MicroUsd | null): string {
   let fraction = String(abs % 1_000_000).padStart(6, '0');
   while (fraction.length > 2 && fraction.endsWith('0')) fraction = fraction.slice(0, -1);
   return `${micro < 0 ? '-' : ''}$${whole}.${fraction}`;
+}
+
+/**
+ * The first line of `text` (blank lines at the start skipped), at most `max` characters, with
+ * `...` when anything was left out. For lists, where an approval's action can be 50,000
+ * characters: only that slice is copied, never the whole text.
+ */
+export function firstLine(text: string, max = 120): string {
+  const start = text.search(/\S/);
+  if (start < 0) return '';
+  const newline = text.indexOf('\n', start);
+  const end = newline < 0 ? text.length : newline;
+  let line = text.slice(start, Math.min(end, start + max)).trimEnd();
+  const cut = start + max < end && nonBlank(text, start + max, end);
+  if (!cut && !(newline >= 0 && nonBlank(text, newline, text.length))) return line;
+  // Not half of a character made of two UTF-16 units.
+  if (/[\uD800-\uDBFF]$/.test(line)) line = line.slice(0, -1);
+  return `${line}...`;
+}
+
+/** True when `text` has a non-blank character between `from` and `to`, without copying it. */
+function nonBlank(text: string, from: number, to: number): boolean {
+  const re = /\S/g;
+  re.lastIndex = from;
+  const found = re.exec(text);
+  return found !== null && found.index < to;
 }
 
 const two = (n: number) => String(n).padStart(2, '0');

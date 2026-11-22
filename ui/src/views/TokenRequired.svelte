@@ -17,45 +17,52 @@
 </script>
 
 <h1>Token required</h1>
-<p>
-  Enter the API token that <code>kestrel up</code> printed. It stays in this tab's memory and is
-  forgotten when you close the tab.
-</p>
-{#if refused}
-  <p role="alert" class="refused">That token was refused.</p>
-{/if}
-<form onsubmit={submit}>
-  <label for="token">API token</label>
-  <input id="token" type="password" autocomplete="off" spellcheck="false" bind:value bind:this={input} />
-  <button type="submit">Continue</button>
-</form>
+<section class="panel">
+  <p class="lead">
+    Enter the API token that <code>kestrel up</code> printed. It stays in this tab's memory and is
+    forgotten when you close the tab.
+  </p>
+  {#if refused}
+    <p role="alert" class="refused">That token was refused.</p>
+  {/if}
+  <form onsubmit={submit}>
+    <label for="token">API token</label>
+    <div class="row">
+      <input id="token" type="password" autocomplete="off" spellcheck="false" bind:value bind:this={input} />
+      <button type="submit" class="primary">Continue</button>
+    </div>
+  </form>
+</section>
 
 <style>
+  h1 {
+    margin-top: 0;
+  }
+  .panel {
+    max-width: 36rem;
+  }
+  .lead {
+    margin: 0 0 var(--space-4);
+    color: var(--color-muted);
+  }
   form {
+    display: grid;
+    gap: var(--space-2);
+  }
+  label {
+    font-weight: 600;
+  }
+  .row {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
     gap: var(--space-2);
   }
   input {
-    min-width: 20rem;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
-    background: var(--color-bg);
-    color: var(--color-text);
-    font: inherit;
-  }
-  button {
-    padding: var(--space-1) var(--space-3);
-    border: 1px solid var(--color-accent);
-    border-radius: var(--radius);
-    background: var(--color-accent);
-    color: var(--color-on-accent);
-    font: inherit;
-    cursor: pointer;
+    flex: 1 1 16rem;
+    min-width: 0;
   }
   .refused {
+    margin: 0 0 var(--space-3);
     color: var(--color-danger);
   }
 </style>

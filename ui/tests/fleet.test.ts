@@ -92,6 +92,13 @@ function card(agent: string): HTMLElement {
   return found;
 }
 
+/** The filter chip named `name`, whatever its count. */
+function chip(name: string): HTMLElement {
+  return screen.getByRole('button', { name: new RegExp(`^${name} \\d+$`) });
+}
+
+const searchBox = () => screen.getByRole('searchbox', { name: 'Search runs and agents' });
+
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(NOW);
@@ -111,7 +118,7 @@ describe('Fleet', () => {
     expect(cards()).toHaveLength(3);
     const alpha = card('alpha');
     expect(alpha).toHaveTextContent('Running');
-    expect(alpha).toHaveTextContent('$0.42 / $2.00');
+    expect(alpha).toHaveTextContent('$0.42 of $2.00');
     expect(alpha).toHaveTextContent('2m 05s');
     expect(alpha).toHaveTextContent('gvisor');
   });
@@ -137,7 +144,7 @@ describe('Fleet', () => {
       tokens_cache_read: 0, tokens_cache_write: 0, cost: 50_000, latency_ms: 1, status: 200,
     }, 2));
     await vi.advanceTimersByTimeAsync(0);
-    expect(card('alpha')).toHaveTextContent('$0.05 / $2.00');
+    expect(card('alpha')).toHaveTextContent('$0.05 of $2.00');
     // Neither card was rendered again: both are the same nodes, and beta's cost did not change.
     expect(card('alpha')).toBe(before.alpha);
     expect(card('beta')).toBe(before.beta);
@@ -160,7 +167,7 @@ describe('Fleet', () => {
     show([root, ...children]);
     await screen.findByRole('link', { name: 'lead' });
     expect(cards()).toHaveLength(1);
-    expect(card('lead')).toHaveTextContent('5 children, 3 running');
+    expect(card('lead')).toHaveTextContent('5 sub-agents, 3 running');
     await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
     expect(cards()).toHaveLength(6);
     const child = card('child-0');
@@ -168,7 +175,7 @@ describe('Fleet', () => {
   });
 
   // 4
-  it('filters by status and agent, together, and clears', async () => {
+  it('filters by status chip and agent search, together, and clears', async () => {
     show([
       run({ agent: 'alpha', status: { Suspended: 'Budget' } }),
       run({ agent: 'beta', status: { Suspended: 'Manual' } }),
@@ -176,12 +183,12 @@ describe('Fleet', () => {
     ]);
     await screen.findAllByRole('article');
     const u = user();
-    await u.selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'suspended');
+    await u.click(chip('Suspended'));
     expect(cards()).toHaveLength(2);
-    await u.selectOptions(screen.getByRole('combobox', { name: 'Agent' }), 'alpha');
+    await u.type(searchBox(), 'alpha');
     expect(cards()).toHaveLength(1);
-    await u.selectOptions(screen.getByRole('combobox', { name: 'Status' }), '');
-    await u.selectOptions(screen.getByRole('combobox', { name: 'Agent' }), '');
+    await u.click(chip('All'));
+    await u.clear(searchBox());
     expect(cards()).toHaveLength(3);
   });
 
@@ -225,7 +232,7 @@ describe('Fleet', () => {
     second.event(3, event(a.id, cost(a.id, 40_000), 3));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.queryByText(/Reconnecting/)).not.toBeInTheDocument();
-    expect(card('alpha')).toHaveTextContent('$0.07 / $2.00');
+    expect(card('alpha')).toHaveTextContent('$0.07 of $2.00');
   });
 
   it('keeps the cost of a child created while it was away', async () => {
@@ -248,7 +255,7 @@ describe('Fleet', () => {
     socket.event(2, event(child.id, cost(child.id, 30_000), 2));
     await vi.advanceTimersByTimeAsync(0);
     await user().click(screen.getByRole('checkbox', { name: 'Roots only' }));
-    expect(card('kid')).toHaveTextContent('$0.03 / $2.00');
+    expect(card('kid')).toHaveTextContent('$0.03 of $2.00');
   });
 
   it('asks for a token when a socket is refused', async () => {
@@ -447,7 +454,7 @@ describe('Fleet', () => {
     again.open();
     again.event(1, event(r45, cost(r45, 10_000), 1));
     await vi.advanceTimersByTimeAsync(0);
-    expect(card('run-45')).toHaveTextContent('$0.01 / $2.00');
+    expect(card('run-45')).toHaveTextContent('$0.01 of $2.00');
   });
 
   it('asks for a token when a run fetch is refused', async () => {
@@ -512,7 +519,7 @@ describe('Fleet', () => {
     await user().click(screen.getByRole('button', { name: 'Previous' }));
     expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
     await user().click(screen.getByRole('button', { name: 'Next' }));
-    await user().selectOptions(screen.getByRole('combobox', { name: 'Agent' }), 'run-1');
+    await user().type(searchBox(), 'run-1');
     expect(screen.queryByText('Page 2 of 2')).not.toBeInTheDocument();
   });
 
@@ -573,10 +580,10 @@ describe('Fleet', () => {
     expect(card('lead')).toHaveTextContent('ran 2m 05s');
   });
 
-  it('a finished status filter shows finished runs without "Show finished"', async () => {
+  it('the Finished chip shows only finished runs', async () => {
     show([run({ agent: 'done', status: 'Completed' }), run({ agent: 'live' })]);
     await screen.findByRole('link', { name: 'live' });
-    await user().selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'completed');
+    await user().click(chip('Finished'));
     expect(cards()).toHaveLength(1);
     expect(card('done')).toBeInTheDocument();
   });
@@ -584,12 +591,12 @@ describe('Fleet', () => {
   it('says when no run matches the filters', async () => {
     show([run({ agent: 'live' })]);
     await screen.findByRole('link', { name: 'live' });
-    await user().selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'failed');
+    await user().click(chip('Finished'));
     expect(screen.getByText('No run matches these filters.')).toBeInTheDocument();
   });
 
   // 8
-  it('a run that completes leaves the active view 5 seconds after it was seen, unless finished runs are shown', async () => {
+  it('a run that completes leaves the active view 5 seconds after it was seen, and stays under Finished', async () => {
     const a = run({ agent: 'alpha' });
     const { sockets } = show([a, run({ agent: 'beta' })]);
     await screen.findByRole('link', { name: 'alpha' });
@@ -606,15 +613,15 @@ describe('Fleet', () => {
     expect(screen.queryByRole('link', { name: 'alpha' })).toBeInTheDocument();
     await vi.advanceTimersByTimeAsync(1_500);
     expect(screen.queryByRole('link', { name: 'alpha' })).not.toBeInTheDocument();
-    await user().click(screen.getByRole('checkbox', { name: 'Show finished' }));
+    await user().click(chip('Finished'));
     expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
   });
 
-  it('runs that had ended before the view loaded show only with finished runs', async () => {
+  it('runs that had ended before the view loaded show only under Finished', async () => {
     show([run({ agent: 'done', status: 'Completed' }), run({ agent: 'live' })]);
     await screen.findByRole('link', { name: 'live' });
     expect(screen.queryByRole('link', { name: 'done' })).not.toBeInTheDocument();
-    await user().click(screen.getByRole('checkbox', { name: 'Show finished' }));
+    await user().click(chip('Finished'));
     expect(screen.getByRole('link', { name: 'done' })).toBeInTheDocument();
   });
 
@@ -640,7 +647,7 @@ describe('Fleet', () => {
     // A filter change starts again at the first page.
     await u.click(screen.getByRole('button', { name: 'Next' }));
     await u.click(screen.getByRole('button', { name: 'Next' }));
-    await u.selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'running');
+    await u.click(chip('Running'));
     expect(screen.getByText('Showing 1 to 50 of 200')).toBeInTheDocument();
     // Tab order: the filters, then the cards' links in order.
     const links = screen.getAllByRole('link');
@@ -672,7 +679,7 @@ describe('Fleet', () => {
   // 12
   it('shows a tiny cost without rounding it to zero', async () => {
     show([run({ agent: 'alpha', spent: 1, limit: 2_000_000 })]);
-    expect(await screen.findByText('$0.000001 / $2.00')).toBeInTheDocument();
+    expect(await screen.findByText('$0.000001 of $2.00')).toBeInTheDocument();
   });
 
   it('opens one tree socket per live root, from the start of its tree', async () => {
@@ -699,7 +706,7 @@ describe('Fleet', () => {
     if (!socket) throw new Error('no socket');
     socket.open();
     socket.event(1, event(child.id, { kind: 'run_created', agent: 'kid', parent: root.id }, 1));
-    expect(await screen.findByText('1 child, 1 running')).toBeInTheDocument();
+    expect(await screen.findByText('1 sub-agent, 1 running')).toBeInTheDocument();
   });
 
   it('ignores replayed status changes that are older than what the list showed', async () => {

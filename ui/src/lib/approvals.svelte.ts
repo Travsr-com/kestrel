@@ -1,7 +1,8 @@
 // The pending approvals across all runs: what the inbox lists and the nav counts.
 //
 // The list comes from `GET /api/approvals?status=pending`, and live changes from the `/ws/events`
-// socket (requests, resolutions, and runs that end). The socket starts at the newest event, so
+// socket (requests, resolutions, and runs that end). It also counts what may change the decided
+// approvals and remembers when each was seen resolved. The socket starts at the newest event, so
 // the list is fetched again each time it opens: that covers whatever happened while it was not
 // connected. Two rules keep the two sources from fighting:
 //
@@ -11,6 +12,7 @@
 //   while the list was on its way is kept.
 // * A list older than one already taken is dropped (two can be on their way at once).
 
+import type { ActiveRuns } from './active.svelte';
 import type { Api } from './api';
 import { isTerminal } from './format';
 import { failureText, type OnUnauthorized } from './load';
@@ -26,15 +28,33 @@ export interface ApprovalRow {
   gen: number;
 }
 
+/**
+ * How a decision sent from an approval's panel is going: which one is in progress (until the
+ * resolved event takes the approval away), failed, or `null` when none is.
+ */
+export type DecisionState = 'approve' | 'reject' | 'answer' | 'failed' | null;
+
 export class ApprovalsState {
   rows: Record<ApprovalId, ApprovalRow> = $state({});
   loaded = $state(false);
   error: string | null = $state(null);
+  /**
+   * Bumped each time the decided approvals may have changed: pending ones were resolved, rows
+   * ended because their run did (the server now says expired), or an ended row was dismissed.
+   */
+  decidedChanges = $state(0);
+  /**
+   * When each approval was seen resolved: the time of its `approval_resolved` event, or of a
+   * decision accepted here until that event comes. One that ended with its run: the time of the
+   * run's end, or when a decision found the run no longer waiting. The API has no decision time.
+   */
+  decidedAt: Record<ApprovalId, string> = $state({});
   private gen = 0;
   /** The newest sync whose list was taken. */
   private loadedToken = 0;
   private readonly resolved: Record<ApprovalId, true> = {};
-  private readonly endedRuns: Record<RunId, 'cancelled' | 'ended'> = {};
+  /** Runs seen to end: how, and when (the time of their end event). */
+  private readonly endedRuns: Record<RunId, { how: 'cancelled' | 'ended'; at: string }> = {};
 
   /** Approvals that can still be decided. */
   get count(): number {
@@ -55,12 +75,20 @@ export class ApprovalsState {
     for (const approval of list) {
       listed[approval.id] = true;
       if (this.resolved[approval.id] || this.rows[approval.id]) continue;
-      this.rows[approval.id] = { approval, ended: this.endedRuns[approval.run_id] ?? null, gen: token };
+      const end = this.endedRuns[approval.run_id];
+      this.rows[approval.id] = { approval, ended: end?.how ?? null, gen: token };
+      // A run that ended before this list came: its approval was decided then.
+      if (end) this.decidedAt[approval.id] ??= end.at;
     }
+    let gone = 0;
     for (const [id, row] of Object.entries(this.rows)) {
       // Known before this list was asked for, and not on it any more: resolved meanwhile.
-      if (!listed[id] && row.gen < token && row.ended === null) delete this.rows[id];
+      if (!listed[id] && row.gen < token && row.ended === null) {
+        delete this.rows[id];
+        gone += 1;
+      }
     }
+    if (gone > 0) this.decidedChanges += 1;
     this.loaded = true;
     this.error = null;
   }
@@ -84,15 +112,21 @@ export class ApprovalsState {
         };
         return;
       case 'approval_resolved':
+        this.decidedAt[kind.id] = event.ts;
         this.remove(kind.id);
         return;
       case 'status_changed': {
         if (!isTerminal(kind.to)) return;
         const ended = kind.to === 'Cancelled' ? 'cancelled' : 'ended';
-        this.endedRuns[event.run_id] = ended;
+        this.endedRuns[event.run_id] = { how: ended, at: event.ts };
+        let changed = false;
         for (const row of Object.values(this.rows)) {
-          if (row.approval.run_id === event.run_id) row.ended = ended;
+          if (row.approval.run_id !== event.run_id) continue;
+          if (row.ended === null) changed = true;
+          row.ended = ended;
+          this.decidedAt[row.approval.id] ??= event.ts;
         }
+        if (changed) this.decidedChanges += 1;
         return;
       }
       default:
@@ -103,18 +137,33 @@ export class ApprovalsState {
   /** The approval is resolved (here, elsewhere, or by someone else). */
   remove(id: ApprovalId): void {
     this.resolved[id] = true;
+    if (!this.rows[id]) return;
     delete this.rows[id];
+    this.decidedChanges += 1;
+  }
+
+  /** A decision on it was accepted here: decided now, until its resolved event says when. */
+  accepted(id: ApprovalId): void {
+    // A time to compare and sort, never changed in place: no reactive date is needed.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    this.decidedAt[id] ??= new Date().toISOString();
   }
 
   /** The run stopped waiting on this approval (the server said so before its event came). */
   endRow(id: ApprovalId): void {
     const row = this.rows[id];
-    if (row) row.ended = 'ended';
+    if (!row || row.ended !== null) return;
+    row.ended = 'ended';
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    this.decidedAt[id] ??= new Date().toISOString();
+    this.decidedChanges += 1;
   }
 
   /** Takes away a row the user has seen (one whose run ended). */
   dismiss(id: ApprovalId): void {
+    if (!this.rows[id]) return;
     delete this.rows[id];
+    this.decidedChanges += 1;
   }
 }
 
@@ -124,12 +173,29 @@ export interface FollowOptions {
   onUnauthorized: OnUnauthorized;
   base: string;
   sockets?: SocketFactory;
+  /** Also kept current from the same socket: the runs that have not ended. */
+  runs?: ActiveRuns;
 }
 
-/** Keeps `state` current: a sync now and on every socket open, and live events between. */
-export function followApprovals({ api, state, onUnauthorized, base, sockets }: FollowOptions) {
+/** The run statuses that have not ended, as the API's `?status=` filter names them. */
+const LIVE = ['queued', 'provisioning', 'running', 'suspended'] as const;
+
+/** Keeps `state` (and `runs`) current: a sync now and on every socket open, and live events between. */
+export function followApprovals({ api, state, onUnauthorized, base, sockets, runs }: FollowOptions) {
   let alive = true;
   function sync() {
+    if (runs) {
+      const asked = runs.begin();
+      // Only the live runs, not the whole history: one request per live status, as the API takes
+      // one status at a time. The count is a hint: if any request fails it stays as it was. A
+      // refused token is found by the approvals request made at the same time.
+      Promise.all(LIVE.map((status) => api.listRuns({ status }))).then(
+        (lists) => {
+          if (alive) runs.load(lists.flat(), asked);
+        },
+        () => {},
+      );
+    }
     const token = state.beginSync();
     api.approvals('pending').then(
       (list) => {
@@ -146,11 +212,14 @@ export function followApprovals({ api, state, onUnauthorized, base, sockets }: F
   const stream = connectEvents({
     base,
     path: '/ws/events',
-    query: { kinds: 'approval_requested,approval_resolved,status_changed' },
+    query: { kinds: `approval_requested,approval_resolved,status_changed${runs ? ',run_created' : ''}` },
     after: null,
     getToken,
     socketFactory: sockets,
-    onEvent: (event) => state.apply(event),
+    onEvent: (event) => {
+      state.apply(event);
+      runs?.apply(event);
+    },
     onState: (s) => {
       if (s === 'open') sync();
       if (s === 'unauthorized') onUnauthorized(getToken());

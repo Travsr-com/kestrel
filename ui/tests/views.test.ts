@@ -50,8 +50,9 @@ describe('Run view', () => {
   it('shows the run and links to its parent', async () => {
     show(`#/runs/${CHILD}`, createMockServer().fetch);
     expect(await screen.findByRole('heading', { level: 1, name: 'fixer' })).toBeInTheDocument();
-    expect(screen.getAllByText('Suspended: waiting for approval').length).toBeGreaterThan(0);
-    expect(screen.getByText('$0.125 of $0.50, $0.00 carved to children')).toBeInTheDocument();
+    expect(screen.getAllByText('Needs approval').length).toBeGreaterThan(0);
+    expect(screen.getByText('$0.125', { selector: '.spent' })).toBeInTheDocument();
+    expect(screen.getByText('of $0.50 limit, 25% used')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Parent: planner' })).toHaveAttribute('href', `#/runs/${ROOT}`);
   });
 
@@ -80,8 +81,13 @@ describe('Run view', () => {
 describe('Approvals view', () => {
   it('lists pending approvals with a link to the run', async () => {
     show('#/approvals', createMockServer().fetch);
-    expect(await screen.findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
-    expect(screen.queryByText('delete branch old-work')).not.toBeInTheDocument();
+    // In the pending list and in the detail panel of the selected approval.
+    expect(await screen.findAllByText('git push origin kestrel/run-9a8b')).toHaveLength(2);
+    const pending = screen.getByRole('list', { name: 'Pending approvals' });
+    expect(pending).toHaveTextContent('git push origin kestrel/run-9a8b');
+    // Decided approvals are under "Recently decided", not in the pending list.
+    expect(pending).not.toHaveTextContent('delete branch old-work');
+    expect(await screen.findByRole('list', { name: 'Recently decided' })).toHaveTextContent('delete branch old-work');
     expect(screen.getByRole('link', { name: `Run ${CHILD.slice(-8)}` })).toHaveAttribute('href', `#/runs/${CHILD}`);
   });
 });

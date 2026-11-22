@@ -1,5 +1,6 @@
 // Issue #41: the approvals inbox and the pending count in the nav. Component tests of the whole
-// app against a fake API and fake sockets.
+// app against a fake API and fake sockets. Since #84 an approval is picked in the pending list and
+// decided in the detail panel next to it.
 
 import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
@@ -50,6 +51,12 @@ interface Call {
   body: unknown;
 }
 
+/** Answers the approvals list: nothing is decided, so `pending` for all and for `?status=pending`. */
+function approvalsList(url: URL, pending: Approval[]): Response {
+  const status = url.searchParams.get('status');
+  return new Response(JSON.stringify(status === null || status === 'pending' ? pending : []));
+}
+
 /** A fake API: pending approvals, runs by id, and resolve answering `resolve`. */
 function serve(pending: Approval[], runs: RunSummary[], resolve: () => Response | Promise<Response> = () => new Response(null, { status: 202 })) {
   const calls: Call[] = [];
@@ -58,7 +65,7 @@ function serve(pending: Approval[], runs: RunSummary[], resolve: () => Response 
     const method = init?.method ?? 'GET';
     const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
     calls.push({ method, path: url.pathname, body });
-    if (url.pathname === '/api/approvals') return new Response(JSON.stringify(pending));
+    if (url.pathname === '/api/approvals') return approvalsList(url, pending);
     if (url.pathname.startsWith('/api/approvals/')) return resolve();
     if (url.pathname === '/api/runs') return new Response(JSON.stringify(runs));
     const one = runs.find((r) => url.pathname === `/api/runs/${r.id}`);
@@ -86,9 +93,21 @@ function event(runId: string, kind: Event['kind'], at = NOW): Event {
   return { run_id: runId, seq: 1, ts: new Date(at).toISOString(), kind };
 }
 
+/** The items of the pending list. */
 function rows(): HTMLElement[] {
   return within(screen.getByRole('list', { name: 'Pending approvals' })).queryAllByRole('listitem');
 }
+
+/** The item of approval `id` in the pending list. */
+const item = (id: string) => rows().find((x) => x.dataset.id === id) as HTMLElement;
+
+/** Selects approval `id` in the pending list. */
+async function select(u: ReturnType<typeof user>, id: string) {
+  await u.click(within(item(id)).getByRole('button'));
+}
+
+/** The detail panel of the selected approval. */
+const detail = () => screen.getByRole('region', { name: /asks/ });
 
 function badge(): string {
   return screen.getByRole('link', { name: /^Approvals/ }).textContent?.replace(/\s+/g, ' ').trim() ?? '';
@@ -113,15 +132,11 @@ describe('Approvals inbox', () => {
     const lead = run({ agent: 'lead' });
     const kid = run({ agent: 'fixer', parent: lead.id, root: lead.id, depth: 1 });
     const other = run({ agent: 'mailer' });
-    show(
-      [
-        approval(lead, { action: 'git push origin main', requested_at: new Date(NOW - 300_000).toISOString() }),
-        approval(kid, { action: 'rm -rf build', requested_at: new Date(NOW - 45_000).toISOString() }),
-        approval(other, { action: 'send email to the team', requested_at: new Date(NOW - 125_000).toISOString() }),
-      ],
-      [lead, kid, other],
-    );
-    await screen.findByText('fixer');
+    const pushed = approval(lead, { action: 'git push origin main', requested_at: new Date(NOW - 300_000).toISOString() });
+    const removed = approval(kid, { action: 'rm -rf build', requested_at: new Date(NOW - 45_000).toISOString() });
+    const mailed = approval(other, { action: 'send email to the team', requested_at: new Date(NOW - 125_000).toISOString() });
+    show([pushed, removed, mailed], [lead, kid, other]);
+    await vi.waitFor(() => expect(rows()[0]).toHaveTextContent('fixer'));
     const list = rows();
     expect(list).toHaveLength(3);
     expect(list.map((r) => r.querySelector('.action')?.textContent)).toEqual([
@@ -129,25 +144,34 @@ describe('Approvals inbox', () => {
       'send email to the team',
       'git push origin main',
     ]);
-    const first = list[0] as HTMLElement;
+    expect(list[0]).toHaveTextContent('waiting 45s');
+    expect(list[1]).toHaveTextContent('waiting 2m 05s');
+    // The first is selected: its detail has the run, its root and the payload.
+    const first = detail();
     expect(first).toHaveTextContent('fixer');
+    expect(first).toHaveTextContent('rm -rf build');
     expect(within(first).getByRole('link', { name: /^Run / })).toHaveAttribute('href', `#/runs/${kid.id}`);
     expect(within(first).getByRole('link', { name: /^Root / })).toHaveAttribute('href', `#/runs/${lead.id}`);
     expect(first).toHaveTextContent('waiting 45s');
-    expect(list[1]).toHaveTextContent('waiting 2m 05s');
+    const u = user();
+    await select(u, mailed.id);
+    expect(detail()).toHaveTextContent('waiting 2m 05s');
     // A root's own approval has no separate root link.
-    expect(within(list[2] as HTMLElement).queryByRole('link', { name: /^Root / })).not.toBeInTheDocument();
+    await select(u, pushed.id);
+    expect(within(detail()).getByRole('link', { name: /^Run / })).toHaveAttribute('href', `#/runs/${lead.id}`);
+    expect(within(detail()).queryByRole('link', { name: /^Root / })).not.toBeInTheDocument();
   });
 
   // 2
   it('adds an approval that arrives live at the top, counts it in the nav, and leaves focus alone', async () => {
     const r = run({ agent: 'lead' });
-    const { sockets } = show([approval(r), approval(r), approval(r)], [r]);
+    const second = approval(r);
+    const { sockets } = show([approval(r), second, approval(r)], [r]);
     await vi.waitFor(() => expect(rows()).toHaveLength(3));
     expect(badge()).toBe('Approvals 3 pending');
-    const approve = within(rows()[1] as HTMLElement).getByRole('button', { name: 'Approve' });
+    await select(user(), second.id);
+    const approve = within(detail()).getByRole('button', { name: 'Approve' });
     approve.focus();
-    const focusedId = approve.closest('li')?.dataset.id;
     const s = feed(sockets);
     s.open();
     s.event(9, event(r.id, { kind: 'approval_requested', id: 'new-1', action: 'deploy to staging' }, NOW + 1_000));
@@ -155,7 +179,7 @@ describe('Approvals inbox', () => {
     expect(rows()[0]).toHaveTextContent('deploy to staging');
     expect(badge()).toBe('Approvals 4 pending');
     expect(document.activeElement).toBe(approve);
-    expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(focusedId);
+    expect((document.activeElement as HTMLElement).closest('section')?.dataset.id).toBe(second.id);
   });
 
   it('shows the count on every view', async () => {
@@ -174,7 +198,7 @@ describe('Approvals inbox', () => {
     const approve = await screen.findByRole('button', { name: 'Approve' });
     await user().click(approve);
     expect(posts(calls)).toEqual([{ method: 'POST', path: `/api/approvals/${a.id}/approve`, body: null }]);
-    const busy = within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approving' });
+    const busy = within(detail()).getByRole('button', { name: 'Approving' });
     expect(busy).toBeDisabled();
     const s = feed(sockets);
     s.open();
@@ -192,17 +216,20 @@ describe('Approvals inbox', () => {
     const { sockets, calls } = show([a, b], [r]);
     await vi.waitFor(() => expect(rows()).toHaveLength(2));
     const u = user();
-    const row = rows().find((x) => x.dataset.id === a.id) as HTMLElement;
-    await u.click(within(row).getByRole('button', { name: 'Reject' }));
-    await u.type(within(row).getByLabelText('Reason (optional)'), 'not on a Friday');
-    await u.click(within(row).getByRole('button', { name: 'Confirm reject' }));
+    await select(u, a.id);
+    await u.click(within(detail()).getByRole('button', { name: 'Reject' }));
+    await u.type(within(detail()).getByLabelText('Reason (optional)'), 'not on a Friday');
+    await u.click(within(detail()).getByRole('button', { name: 'Confirm reject' }));
     expect(posts(calls)).toEqual([
       { method: 'POST', path: `/api/approvals/${a.id}/reject`, body: { reason: 'not on a Friday' } },
     ]);
-    const other = rows().find((x) => x.dataset.id === b.id) as HTMLElement;
-    await u.click(within(other).getByRole('button', { name: 'Reject' }));
-    await u.click(within(other).getByRole('button', { name: 'Confirm reject' }));
+    await select(u, b.id);
+    await u.click(within(detail()).getByRole('button', { name: 'Reject' }));
+    await u.click(within(detail()).getByRole('button', { name: 'Confirm reject' }));
     expect(posts(calls)[1]).toEqual({ method: 'POST', path: `/api/approvals/${b.id}/reject`, body: null });
+    // Going back to the first keeps its rejection in progress.
+    await select(u, a.id);
+    expect(within(detail()).getByRole('button', { name: 'Rejecting' })).toBeDisabled();
     const s = feed(sockets);
     s.open();
     s.event(5, event(r.id, { kind: 'approval_resolved', id: a.id, approved: false, payload: 'not on a Friday' }));
@@ -245,18 +272,19 @@ describe('Approvals inbox', () => {
     const r = run({ agent: 'planner' });
     const q = approval(r, { action: 'Which branch should I release from?', question: true });
     const { calls } = show([q], [r]);
-    const row = await vi.waitFor(() => rows()[0] as HTMLElement);
-    expect(row).toHaveTextContent('Which branch should I release from?');
-    expect(within(row).queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    const panel = await vi.waitFor(() => detail());
+    expect(panel).toHaveTextContent('Which branch should I release from?');
+    expect(within(panel).queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
     const u = user();
-    await u.click(within(row).getByRole('button', { name: 'Send answer' }));
-    expect(within(row).getByRole('alert')).toHaveTextContent('Write an answer first.');
+    await u.click(within(panel).getByRole('button', { name: 'Send answer' }));
+    expect(within(panel).getByRole('alert')).toHaveTextContent('Write an answer first.');
     expect(posts(calls)).toEqual([]);
-    await u.type(within(row).getByLabelText('Answer'), 'release/2.4');
-    await u.click(within(row).getByRole('button', { name: 'Send answer' }));
+    await u.type(within(panel).getByLabelText('Answer'), 'release/2.4');
+    await u.click(within(panel).getByRole('button', { name: 'Send answer' }));
     expect(posts(calls)).toEqual([
       { method: 'POST', path: `/api/approvals/${q.id}/approve`, body: { payload: 'release/2.4' } },
     ]);
+    expect(within(panel).getByRole('button', { name: 'Sending answer' })).toBeDisabled();
   });
 
   // 8
@@ -272,11 +300,11 @@ describe('Approvals inbox', () => {
     const long = 'diff --git '.padEnd(50_000, 'x');
     show([approval(r, { action: long })], [r]);
     const toggle = await screen.findByRole('button', { name: 'Show all' });
-    const row = rows()[0] as HTMLElement;
-    expect(row.textContent?.includes(long)).toBe(false);
+    const panel = detail();
+    expect(panel.textContent?.includes(long)).toBe(false);
     await user().click(toggle);
-    expect(row.textContent?.includes(long)).toBe(true);
-    expect(within(row).getByRole('button', { name: 'Show less' })).toHaveAttribute('aria-expanded', 'true');
+    expect(panel.textContent?.includes(long)).toBe(true);
+    expect(within(panel).getByRole('button', { name: 'Show less' })).toHaveAttribute('aria-expanded', 'true');
   });
 
   // 10
@@ -293,10 +321,10 @@ describe('Approvals inbox', () => {
     });
     const u = user();
     await u.click(await screen.findByRole('button', { name: 'Approve' }));
-    const row = rows()[0] as HTMLElement;
-    expect(await within(row).findByRole('alert')).toHaveTextContent('Failed to fetch');
-    expect(within(row).getByRole('button', { name: 'Approve' })).toBeEnabled();
-    await u.click(within(row).getByRole('button', { name: 'Retry' }));
+    const panel = detail();
+    expect(await within(panel).findByRole('alert')).toHaveTextContent('Failed to fetch');
+    expect(within(panel).getByRole('button', { name: 'Approve' })).toBeEnabled();
+    await u.click(within(panel).getByRole('button', { name: 'Retry' }));
     expect(posts(calls)).toHaveLength(2);
     expect(posts(calls)[1]?.path).toBe(`/api/approvals/${a.id}/approve`);
   });
@@ -307,17 +335,16 @@ describe('Approvals inbox', () => {
     const a = approval(r);
     const { sockets } = show([a, approval(run())], [r]);
     await vi.waitFor(() => expect(rows()).toHaveLength(2));
+    const u = user();
+    await select(u, a.id);
     const s = feed(sockets);
     s.open();
     s.event(3, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Cancelled' }));
-    const row = await vi.waitFor(() => {
-      const found = rows().find((x) => x.dataset.id === a.id) as HTMLElement;
-      expect(found).toHaveTextContent('Run cancelled');
-      return found;
-    });
-    expect(within(row).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual(['Dismiss']);
+    await vi.waitFor(() => expect(detail()).toHaveTextContent('Run cancelled'));
+    expect(item(a.id)).toHaveTextContent('Command, run cancelled');
+    expect(within(detail()).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual(['Dismiss']);
     expect(badge()).toBe('Approvals 1 pending');
-    await user().click(within(row).getByRole('button', { name: 'Dismiss' }));
+    await u.click(within(detail()).getByRole('button', { name: 'Dismiss' }));
     expect(rows()).toHaveLength(1);
   });
 
@@ -332,7 +359,8 @@ describe('Approvals inbox', () => {
     expect(document.activeElement).toBe(approve);
     await u.keyboard('{Enter}');
     expect(posts(calls)).toEqual([{ method: 'POST', path: `/api/approvals/${a.id}/approve`, body: null }]);
-    await u.click(screen.getAllByRole('button', { name: 'Reject' })[0] as HTMLElement);
+    await u.click(screen.getByRole('button', { name: /Which branch/ }));
+    await u.click(within(detail()).getByRole('button', { name: 'Reject' }));
     vi.useRealTimers();
     expect(ids(await seriousViolations(container))).toEqual([]);
   });
@@ -346,8 +374,9 @@ describe('Approvals inbox', () => {
     const s = feed(sockets);
     s.event(4, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
     s.open();
-    // The list fetched on open still has `a` (it was taken before the resolve was seen).
-    await vi.waitFor(() => expect(calls.filter((c) => c.path === '/api/approvals').length).toBeGreaterThanOrEqual(2));
+    // The list fetched on open still has `a` (it was taken before the resolve was seen). Three
+    // lists: pending at start, every approval for the decided list, and pending again on open.
+    await vi.waitFor(() => expect(calls.filter((c) => c.path === '/api/approvals').length).toBeGreaterThanOrEqual(3));
     await vi.advanceTimersByTimeAsync(0);
     expect(rows().map((x) => x.dataset.id)).toEqual([b.id]);
   });
@@ -357,11 +386,13 @@ describe('Approvals inbox', () => {
     const r = run();
     const fetch: typeof globalThis.fetch = async (input) => {
       const url = new URL(String(input), 'http://kestrel.test');
-      if (url.pathname === '/api/approvals' && fail) {
+      if (url.pathname === '/api/approvals' && url.searchParams.get('status') === 'pending' && fail) {
         fail = false;
         return new Response('{"error":"database is locked"}', { status: 500 });
       }
-      if (url.pathname === '/api/approvals') return new Response(JSON.stringify([approval(r)]));
+      if (url.pathname === '/api/approvals') return approvalsList(url, [approval(r)]);
+      // The sidebar's count of active runs.
+      if (url.pathname === '/api/runs') return new Response('[]');
       return new Response(JSON.stringify(r));
     };
     window.location.hash = '#/approvals';
@@ -380,18 +411,34 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     const { sockets } = show([a, b], [r]);
     await vi.waitFor(() => expect(rows()).toHaveLength(2));
     const u = user();
-    const first = within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' });
-    first.focus();
+    within(detail()).getByRole('button', { name: 'Approve' }).focus();
     await u.keyboard('{Enter}');
     const s = feed(sockets);
     s.open();
     s.event(5, event(r.id, { kind: 'approval_resolved', id: a.id, approved: true }));
     await vi.waitFor(() => expect(rows()).toHaveLength(1));
     expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(b.id);
+    within(detail()).getByRole('button', { name: 'Approve' }).focus();
     await u.keyboard('{Enter}');
     s.event(6, event(r.id, { kind: 'approval_resolved', id: b.id, approved: true }));
     await vi.waitFor(() => expect(screen.getByText('Nothing waiting for you')).toBeInTheDocument());
     expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Approvals' }));
+  });
+
+  it('moves focus to the item now in its place when a focused item that was not selected goes', async () => {
+    const r = run();
+    const a = approval(r, { requested_at: new Date(NOW - 10_000).toISOString() });
+    const b = approval(r, { requested_at: new Date(NOW - 20_000).toISOString() });
+    const c = approval(r, { requested_at: new Date(NOW - 30_000).toISOString() });
+    const { sockets } = show([a, b, c], [r]);
+    await vi.waitFor(() => expect(rows()).toHaveLength(3));
+    within(item(b.id)).getByRole('button').focus();
+    const s = feed(sockets);
+    s.open();
+    s.event(5, event(r.id, { kind: 'approval_resolved', id: b.id, approved: true }));
+    await vi.waitFor(() => expect(rows()).toHaveLength(2));
+    expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(c.id);
+    expect(within(item(a.id)).getByRole('button')).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('a 409 because the run stopped waiting marks the row ended instead of resolved', async () => {
@@ -399,12 +446,9 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     const a = approval(r);
     show([a], [r], () => new Response(JSON.stringify({ error: `run ${r.id} is not waiting on approval ${a.id}` }), { status: 409 }));
     await user().click(await screen.findByRole('button', { name: 'Approve' }));
-    const row = await vi.waitFor(() => {
-      const found = rows()[0] as HTMLElement;
-      expect(found).toHaveTextContent('Run ended');
-      return found;
-    });
-    expect(within(row).getAllByRole('button').map((x) => x.textContent?.trim())).toEqual(['Dismiss']);
+    await vi.waitFor(() => expect(detail()).toHaveTextContent('Run ended'));
+    expect(within(detail()).getAllByRole('button').map((x) => x.textContent?.trim())).toEqual(['Dismiss']);
+    expect(rows()[0]).toHaveTextContent('Command, run ended');
     expect(screen.queryByText('Already resolved by someone else')).not.toBeInTheDocument();
   });
 
@@ -417,12 +461,12 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     const status = screen.getByRole('status');
     expect(status).toHaveTextContent('');
     const u = user();
-    await u.click(within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' }));
+    await u.click(within(detail()).getByRole('button', { name: 'Approve' }));
     await vi.waitFor(() => expect(status).toHaveTextContent('Already resolved by someone else'));
     const seen: string[] = [];
     const watch = new MutationObserver(() => seen.push(status.textContent ?? ''));
     watch.observe(status, { childList: true, characterData: true, subtree: true });
-    await u.click(within(rows()[0] as HTMLElement).getByRole('button', { name: 'Approve' }));
+    await u.click(within(detail()).getByRole('button', { name: 'Approve' }));
     await vi.waitFor(() => expect(seen.at(-1)).toBe('Already resolved by someone else'));
     // It was cleared first, so screen readers hear it again.
     expect(seen).toContain('');
@@ -469,15 +513,19 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     ]);
   });
 
-  it('describes each row\'s buttons by who asks, so rows are told apart', async () => {
+  it('describes the buttons by who asks, so approvals are told apart', async () => {
     const lead = run({ agent: 'lead' });
     const kid = run({ agent: 'kid' });
-    show([approval(lead), approval(kid)], [lead, kid]);
-    await screen.findByText('kid');
-    const approves = screen.getAllByRole('button', { name: 'Approve' });
-    const described = approves.map((b) => document.getElementById(b.getAttribute('aria-describedby') ?? '')?.textContent);
-    expect(described[0]).not.toEqual(described[1]);
-    expect(described.join(' ')).toMatch(/lead/);
+    const fromKid = approval(kid, { requested_at: new Date(NOW - 20_000).toISOString() });
+    show([approval(lead, { requested_at: new Date(NOW - 10_000).toISOString() }), fromKid], [lead, kid]);
+    await vi.waitFor(() => expect(rows()[1]).toHaveTextContent('kid'));
+    const description = () => {
+      const approve = within(detail()).getByRole('button', { name: 'Approve' });
+      return document.getElementById(approve.getAttribute('aria-describedby') ?? '')?.textContent;
+    };
+    await vi.waitFor(() => expect(description()).toMatch(/lead/));
+    await select(user(), fromKid.id);
+    expect(description()).toMatch(/kid/);
   });
 
   it('asks again for a run whose details failed to load', async () => {
@@ -485,7 +533,9 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     let fails = 1;
     const fetch: typeof globalThis.fetch = async (input) => {
       const url = new URL(String(input), 'http://kestrel.test');
-      if (url.pathname === '/api/approvals') return new Response(JSON.stringify([approval(r)]));
+      if (url.pathname === '/api/approvals') return approvalsList(url, [approval(r)]);
+      // The sidebar's count of active runs.
+      if (url.pathname === '/api/runs') return new Response('[]');
       if (fails-- > 0) return new Response('{"error":"busy"}', { status: 503 });
       return new Response(JSON.stringify(r));
     };
@@ -495,11 +545,11 @@ describe('Approvals inbox: focus, refusals and retries', () => {
     await vi.waitFor(() => expect(rows()).toHaveLength(1));
     expect(rows()[0]).toHaveTextContent('agent not known yet');
     await vi.advanceTimersByTimeAsync(6_000);
-    expect(await screen.findByText('planner')).toBeInTheDocument();
+    expect(await within(rows()[0] as HTMLElement).findByText('planner')).toBeInTheDocument();
   });
 });
 
-describe('Approvals inbox: focus inside a row', () => {
+describe('Approvals inbox: focus inside the detail panel', () => {
   it('opening Reject or Edit focuses its field, and Cancel goes back to the button', async () => {
     const r = run();
     show([approval(r)], [r]);
@@ -517,7 +567,7 @@ describe('Approvals inbox: focus inside a row', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Edit and approve' }));
   });
 
-  it('when the run ends while a button of its row is focused, focus goes to Dismiss', async () => {
+  it('when the run ends while a button of its panel is focused, focus goes to Dismiss', async () => {
     const r = run();
     const a = approval(r);
     const { sockets } = show([a], [r]);
@@ -527,6 +577,21 @@ describe('Approvals inbox: focus inside a row', () => {
     s.open();
     s.event(3, event(r.id, { kind: 'status_changed', from: { Suspended: { Approval: a.id } }, to: 'Cancelled' }));
     await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Dismiss' })));
+  });
+
+  it('dismissing the selected ended approval moves focus to the next item', async () => {
+    const r = run();
+    const a = approval(r, { requested_at: new Date(NOW - 10_000).toISOString() });
+    const b = approval(run(), { requested_at: new Date(NOW - 20_000).toISOString() });
+    const { sockets } = show([a, b], [r]);
+    await vi.waitFor(() => expect(rows()).toHaveLength(2));
+    const s = feed(sockets);
+    s.open();
+    s.event(3, event(r.id, { kind: 'status_changed', from: 'Running', to: { Failed: 'boom' } }));
+    const dismiss = await within(detail()).findByRole('button', { name: 'Dismiss' });
+    await user().click(dismiss);
+    expect(rows().map((x) => x.dataset.id)).toEqual([b.id]);
+    expect((document.activeElement as HTMLElement).closest('li')?.dataset.id).toBe(b.id);
   });
 
   it('Retry does not send an answer that was cleared', async () => {
@@ -589,6 +654,15 @@ describe('ApprovalsState', () => {
     expect(state.count).toBe(1);
   });
 
+  it('dates a row the list brings for a run already seen to end, with the time the run ended', () => {
+    const state = new ApprovalsState();
+    const token = state.beginSync();
+    state.apply(event('r1', { kind: 'status_changed', from: 'Running', to: 'Cancelled' }, NOW - 5_000));
+    state.load([a1], token);
+    expect(state.rows.a1?.ended).toBe('cancelled');
+    expect(state.decidedAt.a1).toBe(new Date(NOW - 5_000).toISOString());
+  });
+
   it('ignores a list older than one already loaded', () => {
     const state = new ApprovalsState();
     const older = state.beginSync();
@@ -620,5 +694,44 @@ describe('ApprovalsState', () => {
     state.apply(event('r1', { kind: 'agent_log', line: 'x' }));
     state.dismiss('a1');
     expect(Object.keys(state.rows)).toEqual(['a2']);
+  });
+
+  it('remembers when each approval was seen resolved: the event time, or now for a decision accepted here (PR #85 review)', () => {
+    const state = new ApprovalsState();
+    state.load([a1, a2], state.beginSync());
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a1', approved: true }, NOW + 5_000));
+    // One never listed here too.
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'gone', approved: false }, NOW + 6_000));
+    expect(state.decidedAt).toEqual({ a1: new Date(NOW + 5_000).toISOString(), gone: new Date(NOW + 6_000).toISOString() });
+    const t0 = Date.now();
+    state.accepted('a2');
+    const at = Date.parse(state.decidedAt.a2 ?? '');
+    expect(at).toBeGreaterThanOrEqual(t0);
+    expect(at).toBeLessThanOrEqual(Date.now());
+    // The event, when it comes, says when it really was.
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a2', approved: true }, NOW + 9_000));
+    expect(state.decidedAt.a2).toBe(new Date(NOW + 9_000).toISOString());
+  });
+
+  it('counts each change that can change the decided list, and nothing else (PR #85 review)', () => {
+    const state = new ApprovalsState();
+    state.load([a1, a2, { ...a2, id: 'a3', run_id: 'r3' }], state.beginSync());
+    const changes = () => state.decidedChanges;
+    expect(changes()).toBe(0);
+    state.apply(event('r1', { kind: 'approval_resolved', id: 'a1', approved: true }));
+    expect(changes()).toBe(1);
+    // A run with no pending row ending changes nothing here.
+    state.apply(event('r9', { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    expect(changes()).toBe(1);
+    state.apply(event('r1', { kind: 'status_changed', from: 'Running', to: 'Completed' }));
+    expect(changes()).toBe(2);
+    state.endRow('a3');
+    expect(changes()).toBe(3);
+    state.dismiss('a2');
+    expect(changes()).toBe(4);
+    // A row no longer there.
+    state.endRow('a2');
+    state.dismiss('a2');
+    expect(changes()).toBe(4);
   });
 });

@@ -60,6 +60,14 @@ describe('createApi', () => {
     expect(server.calls[0]?.path).toBe('/api/approvals?status=pending');
   });
 
+  it('lists every approval, of any status, without a status (PR #85 review)', async () => {
+    const { server, api } = client();
+    const all = await api.approvals();
+    expect(all.map((a) => a.id)).toEqual(contract.approvals.map((a) => a.id));
+    expect(all.map((a) => a.id)).toContain(APPROVED);
+    expect(server.calls[0]?.path).toBe('/api/approvals');
+  });
+
   it('posts run commands', async () => {
     const { server, api } = client();
     await api.pause(ROOT);

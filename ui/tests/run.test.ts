@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
 import Run from '../src/views/Run.svelte';
 import { createApi } from '../src/lib/api';
-import { allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
+import { addTokens, allowed, carved, formatSize, liveBelow, parseUsd } from '../src/lib/run';
 import type { Event, RunStatus, RunSummary } from '../src/lib/types';
 import { fakeSockets, type FakeSocket } from './fake-socket';
 import { ids, seriousViolations } from './axe';
@@ -140,7 +140,7 @@ describe('Run view', () => {
     first.event(1, event(r.id, 1, log('one')));
     first.event(2, event(r.id, 2, log('two')));
     first.drop();
-    expect(await screen.findByText(/Reconnecting/)).toBeInTheDocument();
+    expect(await screen.findByText('Reconnecting', { selector: '.link' })).toBeInTheDocument();
     await vi.advanceTimersByTimeAsync(600);
     const second = stream(sockets, r.id);
     expect(second).not.toBe(first);
@@ -198,7 +198,7 @@ describe('Run view', () => {
     expect(kid.closest('ul')?.closest('li')).toBe(within(nav).getByRole('link', { name: /lead/ }).closest('li'));
     expect(within(nav).getByRole('link', { name: /lead/ })).toHaveAttribute('aria-current', 'page');
     expect(box.scrollTop).toBe(37);
-    expect(within(nav).getByRole('link', { name: /kid/ })).toHaveAccessibleDescription('Queued, $0.00');
+    expect(within(nav).getByRole('link', { name: /kid/ })).toHaveAccessibleDescription('Queued $0.00');
   });
 
   // 5
@@ -284,14 +284,16 @@ describe('Run view', () => {
     const meter = await screen.findByRole('meter', { name: 'Budget used' });
     expect(meter).toHaveAttribute('aria-valuenow', '80');
     expect(meter.className).toContain('warn');
-    expect(screen.getByText('$1.60 of $2.00, $0.15 carved to children')).toBeInTheDocument();
-    expect(screen.getByText('$0.40 left to spend')).toBeInTheDocument();
+    expect(screen.getByText('of $2.00 limit, 80% used')).toBeInTheDocument();
+    expect(screen.getByText('Carved to children').nextElementSibling).toHaveTextContent('$0.15');
+    expect(screen.getByText('Left to spend').nextElementSibling).toHaveTextContent('$0.40');
   });
 
   it('shows a run without a limit as spent only', async () => {
     const r = run({ spent: 250_000, limit: null });
     show(r.id, [r]);
-    expect(await screen.findByText('$0.25 spent, no limit')).toBeInTheDocument();
+    expect(await screen.findByText('$0.25', { selector: '.spent' })).toBeInTheDocument();
+    expect(screen.getByText('no limit', { selector: 'p' })).toBeInTheDocument();
     expect(screen.queryByRole('meter')).not.toBeInTheDocument();
   });
 
@@ -302,19 +304,43 @@ describe('Run view', () => {
     const { unmount } = show(r.id, [r]);
     await screen.findByRole('button', { name: 'Pause' });
     expect(button('Pause')).toBeEnabled();
-    expect(button('Cancel')).toBeEnabled();
-    expect(button('Resume')).toBeDisabled();
+    expect(button('Cancel run')).toBeEnabled();
+    // Pause and Resume share one button: it offers only what the status allows.
+    expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument();
     unmount();
     const p = run({ status: { Suspended: 'Manual' } });
     const second = show(p.id, [p]);
     await screen.findByRole('button', { name: 'Resume' });
     expect(button('Resume')).toBeEnabled();
-    expect(button('Pause')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
     second.unmount();
+    const a = run({ status: { Suspended: { Approval: 'ap-1' } } });
+    const third = show(a.id, [a]);
+    await screen.findByRole('button', { name: 'Pause' });
+    expect(button('Pause')).toBeDisabled();
+    expect(button('Cancel run')).toBeEnabled();
+    third.unmount();
     const c = run({ status: 'Completed' });
     show(c.id, [c]);
-    await screen.findByRole('button', { name: 'Resume' });
-    for (const name of ['Pause', 'Resume', 'Cancel', 'Set budget', 'Send']) expect(button(name)).toBeDisabled();
+    await screen.findByRole('button', { name: 'Pause' });
+    for (const name of ['Pause', 'Cancel run', 'Set', 'Send']) expect(button(name)).toBeDisabled();
+  });
+
+  it('turns Pause into Resume on the same button when the run is paused, keeping focus on it', async () => {
+    const r = run({ status: 'Running' });
+    const { sockets, calls } = show(r.id, [r]);
+    const pause = await screen.findByRole('button', { name: 'Pause' });
+    pause.focus();
+    await user().keyboard('{Enter}');
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([`/api/runs/${r.id}/pause`]);
+    const t = tree(sockets, r.id);
+    t.open();
+    t.event(1, event(r.id, 1, { kind: 'status_changed', from: 'Running', to: { Suspended: 'Manual' } }));
+    await settle();
+    expect(pause).toHaveAccessibleName('Resume');
+    expect(document.activeElement).toBe(pause);
+    await user().keyboard('{Enter}');
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path).at(-1)).toBe(`/api/runs/${r.id}/resume`);
   });
 
   it('names what each status allows', () => {
@@ -339,7 +365,7 @@ describe('Run view', () => {
       run({ parent: kids[1]?.id ?? '', root: root.id, depth: 2, status: { Suspended: 'Manual' } }),
     ];
     const { calls } = show(root.id, [root, ...kids, ...grand]);
-    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    const cancel = await screen.findByRole('button', { name: 'Cancel run' });
     const u = user();
     await u.click(cancel);
     const dialog = screen.getByRole('dialog');
@@ -349,7 +375,7 @@ describe('Run view', () => {
     expect(document.activeElement).toBe(cancel);
     expect(calls.filter((c) => c.method === 'POST')).toEqual([]);
     await u.click(cancel);
-    await u.click(screen.getByRole('button', { name: 'Cancel run' }));
+    await u.click(screen.getByRole('button', { name: 'Yes, cancel it' }));
     expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([`/api/runs/${root.id}/cancel`]);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(document.activeElement).toBe(cancel);
@@ -359,11 +385,11 @@ describe('Run view', () => {
     const r = run();
     show(r.id, [r]);
     const u = user();
-    await u.click(await screen.findByRole('button', { name: 'Cancel' }));
+    await u.click(await screen.findByRole('button', { name: 'Cancel run' }));
     const dialog = screen.getByRole('dialog');
     expect(dialog).toHaveTextContent('Cancel this run?');
     const keep = within(dialog).getByRole('button', { name: 'Keep running' });
-    const confirm = within(dialog).getByRole('button', { name: 'Cancel run' });
+    const confirm = within(dialog).getByRole('button', { name: 'Yes, cancel it' });
     expect(document.activeElement).toBe(keep);
     await u.tab();
     expect(document.activeElement).toBe(confirm);
@@ -379,18 +405,18 @@ describe('Run view', () => {
   it('validates a new budget and posts it as a decimal string', async () => {
     const r = run();
     const { calls } = show(r.id, [r]);
-    const input = await screen.findByLabelText('New budget (USD)');
+    const input = await screen.findByLabelText('Change limit (USD)');
     const u = user();
     for (const bad of ['abc', '-1', '1.2345678']) {
       await u.clear(input);
       await u.type(input, bad);
-      await u.click(screen.getByRole('button', { name: 'Set budget' }));
+      await u.click(screen.getByRole('button', { name: 'Set' }));
       expect(screen.getByRole('alert')).toHaveTextContent('Enter an amount in dollars');
     }
     expect(calls.filter((c) => c.method === 'POST')).toEqual([]);
     await u.clear(input);
     await u.type(input, '3.50');
-    await u.click(screen.getByRole('button', { name: 'Set budget' }));
+    await u.click(screen.getByRole('button', { name: 'Set' }));
     const post = calls.find((c) => c.method === 'POST');
     expect(post).toEqual({ method: 'POST', path: `/api/runs/${r.id}/budget`, body: { usd: '3.50' } });
     expect(parseUsd('3.50')).toBe(3_500_000);
@@ -413,6 +439,18 @@ describe('Run view', () => {
     expect(liveBelow(nodes, 'r')).toBe(2);
     expect(liveBelow(nodes, 'c')).toBe(0);
     expect(carved(nodes, 'r')).toBe(3);
+  });
+
+  it('adds the tokens of only the new events to running totals, without changing them (PR #85 review)', () => {
+    const call = (tokens: number): Event['kind'] => ({
+      kind: 'model_call', run_id: 'r', provider: 'p', model: 'm', tokens_in: tokens, tokens_out: tokens * 2,
+      tokens_cache_read: tokens * 3, tokens_cache_write: tokens * 4, cost: null, latency_ms: 1, status: 200,
+    });
+    const before = { input: 10, output: 20, cacheRead: 30, cacheWrite: 40 };
+    const after = addTokens(before, [event('r', 1, call(1)), event('r', 2, log('not a call')), event('r', 3, call(5))]);
+    expect(after).toEqual({ input: 16, output: 32, cacheRead: 48, cacheWrite: 64 });
+    expect(before).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40 });
+    expect(addTokens(after, [])).toEqual(after);
   });
 
   it('parses dollars to micro-dollars without float math', () => {
@@ -508,7 +546,7 @@ describe('Run view', () => {
     await settle();
     vi.useRealTimers();
     expect(ids(await seriousViolations(container))).toEqual([]);
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel run' }));
     expect(ids(await seriousViolations(container))).toEqual([]);
   });
 
@@ -605,18 +643,18 @@ describe('Run view: moving between runs, the dialog and budgets', () => {
     await u.type(await screen.findByLabelText('Message'), 'hi');
     await u.click(screen.getByRole('button', { name: 'Send' }));
     expect(await screen.findByText('nope')).toBeInTheDocument();
-    await u.type(screen.getByLabelText('New budget (USD)'), 'abc');
+    await u.type(screen.getByLabelText('Change limit (USD)'), 'abc');
     await rerender({ id: root.id });
     await screen.findByRole('heading', { level: 1, name: 'lead' });
     expect(screen.queryByText('nope')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('New budget (USD)')).toHaveValue('');
+    expect(screen.getByLabelText('Change limit (USD)')).toHaveValue('');
   });
 
   it('closes an open cancel dialog when another run is shown, so it never cancels the wrong run', async () => {
     const root = run({ agent: 'lead' });
     const kid = run({ agent: 'kid', parent: root.id, root: root.id, depth: 1 });
     const { rerender, calls } = show(kid.id, [root, kid]);
-    await user().click(await screen.findByRole('button', { name: 'Cancel' }));
+    await user().click(await screen.findByRole('button', { name: 'Cancel run' }));
     expect(screen.getByRole('dialog')).toHaveTextContent('This cancels kid.');
     await rerender({ id: root.id });
     await screen.findByRole('heading', { level: 1, name: 'lead' });
@@ -677,20 +715,21 @@ describe('Run view: moving between runs, the dialog and budgets', () => {
     const runs = [r];
     show(r.id, runs);
     const u = user();
-    await u.type(await screen.findByLabelText('New budget (USD)'), '3.50');
+    await u.type(await screen.findByLabelText('Change limit (USD)'), '3.50');
     runs[0] = { ...r, limit: 3_500_000 };
-    await u.click(screen.getByRole('button', { name: 'Set budget' }));
+    await u.click(screen.getByRole('button', { name: 'Set' }));
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(screen.getByText('$0.00 of $3.50, $0.00 carved to children')).toBeInTheDocument();
+    expect(screen.getByText('of $3.50 limit, 0% used')).toBeInTheDocument();
+    expect(screen.getByText('Left to spend').nextElementSibling).toHaveTextContent('$3.50');
     // The box is ready for the next amount.
-    expect(screen.getByLabelText('New budget (USD)')).toHaveValue('');
+    expect(screen.getByLabelText('Change limit (USD)')).toHaveValue('');
   });
 
   it('keeps focus in the dialog after a click on its text or the backdrop; Esc still closes it', async () => {
     const r = run();
     show(r.id, [r]);
     const u = user();
-    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    const cancel = await screen.findByRole('button', { name: 'Cancel run' });
     await u.click(cancel);
     const dialog = screen.getByRole('dialog');
     await u.click(within(dialog).getByText('Cancel this run?'));
@@ -711,7 +750,7 @@ describe('Run view: moving between runs, the dialog and budgets', () => {
   it('closes the dialog when the run ends while it is open, keeping focus in the controls', async () => {
     const r = run();
     const { sockets } = show(r.id, [r]);
-    await user().click(await screen.findByRole('button', { name: 'Cancel' }));
+    await user().click(await screen.findByRole('button', { name: 'Cancel run' }));
     const t = tree(sockets, r.id);
     t.open();
     t.event(1, event(r.id, 1, { kind: 'status_changed', from: 'Running', to: 'Completed' }));

@@ -56,19 +56,25 @@ export function formatUsd(micro: number | null): string {
   return `${micro < 0 ? '-' : ''}$${whole}.${fraction}`;
 }
 
-/** One node of the spawn tree on the page: its run id and its status text ("Running, $0.01"). */
+/** One node of the spawn tree on the page: its run id and its status and cost ("Running, $0.01"). */
 export interface Node {
   id: string;
   text: string;
 }
 
-/** The spawn tree as the page shows it right now, read in one go. */
+/**
+ * The spawn tree as the page shows it right now, read in one go. Each node has a status element
+ * (`node-status-<id>`, which also holds a failed run's reason after a colon) and a cost element
+ * (`node-cost-<id>`).
+ */
 export async function readTree(page: Page): Promise<Node[]> {
   return page.evaluate(() =>
-    Array.from(document.querySelectorAll('nav[aria-label="Spawn tree"] [id^="node-"]')).map((el) => ({
-      id: el.id.slice('node-'.length),
-      text: (el.textContent ?? '').replace(/\s+/g, ' ').trim(),
-    })),
+    Array.from(document.querySelectorAll('nav[aria-label="Spawn tree"] [id^="node-status-"]')).map((el) => {
+      const id = el.id.slice('node-status-'.length);
+      const clean = (s: string | null | undefined) => (s ?? '').replace(/\s+/g, ' ').trim();
+      const status = clean(el.textContent).split(':')[0] ?? '';
+      return { id, text: `${status}, ${clean(document.getElementById(`node-cost-${id}`)?.textContent)}` };
+    }),
   );
 }
 

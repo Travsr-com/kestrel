@@ -1,7 +1,7 @@
 // Scenario 6: a 401 shows "Token required"; the token entered is kept in memory only, and the
 // request is retried with it.
 
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
@@ -55,7 +55,8 @@ describe('late answers', () => {
     window.dispatchEvent(new HashChangeEvent('hashchange'));
     const user = userEvent.setup();
     await user.type(await screen.findByLabelText('API token'), 's3cret{Enter}');
-    expect(await screen.findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
+    const pending = await screen.findByRole('list', { name: 'Pending approvals' });
+    expect(await within(pending).findByText('git push origin kestrel/run-9a8b')).toBeInTheDocument();
 
     // Fleet's old request now comes back 401.
     release();
@@ -89,6 +90,15 @@ describe('late answers', () => {
 });
 
 describe('Token required screen', () => {
+  it('is a panel in the restyled look: the shared input and the primary Continue button (#84)', async () => {
+    window.location.hash = '#/fleet';
+    render(App, { fetch: createMockServer('s3cret').fetch });
+    const input = await screen.findByLabelText('API token');
+    const form = input.closest('form');
+    expect(form?.closest('.panel')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toHaveClass('primary');
+  });
+
   it('appears on 401, then retries with the entered token', async () => {
     const setItem = vi.spyOn(Storage.prototype, 'setItem');
     const server = createMockServer('s3cret');
