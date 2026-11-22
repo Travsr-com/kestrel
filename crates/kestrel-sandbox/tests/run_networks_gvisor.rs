@@ -45,6 +45,26 @@ const STEP: Duration = Duration::from_secs(240);
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Instance ids (`kestrel.db` labels) of the databases this binary's tests start bridges for.
+static TEST_DBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Remembers `db` as a test database, so a bridge it leaks may be removed by a later test.
+fn test_db(db: &std::path::Path) -> String {
+    let id = GatewayBridge::instance_id(db);
+    TEST_DBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(id.clone());
+    id
+}
+
+fn is_test_db(id: &str) -> bool {
+    TEST_DBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|t| t == id)
+}
 
 /// `[A-Za-z0-9]` only, unique per call in this process and across runs.
 fn unique() -> String {
@@ -262,7 +282,7 @@ impl World {
         let db: PathBuf = dir.path().join("kestrel.db");
         let instance = unique();
         let cleanup = Arc::new(Cleanup::new(&instance));
-        let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
+        let bridge_name = GatewayBridge::container_name(&test_db(&db));
         cleanup.container(&bridge_name);
         let bridge = within(
             "bridge start",
@@ -797,28 +817,31 @@ async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kest
     let instance = unique();
     let cleanup = Arc::new(Cleanup::new(&instance));
     if network_exists("kestrel-gw") {
-        // Bridges an earlier test leaked (label `kestrel.managed=bridge`) are removed. Anything
-        // else attached is not this suite's to remove, so the test is skipped.
-        let attached = docker_ok(&[
-            "network",
-            "inspect",
-            "kestrel-gw",
-            "--format",
-            "{{range $id, $_ := .Containers}}{{$id}} {{end}}",
-        ]);
-        for id in attached.split_whitespace() {
-            let managed = docker_ok(&[
+        // Only bridges of this binary's own test databases may be removed (an earlier test leaked
+        // them). Anything else on kestrel-gw, such as a real serve's bridge on a developer's
+        // machine, is not ours: the test is skipped and nothing is touched. `ps -a` also lists
+        // created and stopped containers.
+        let attached = docker_ok(&["ps", "-aq", "--filter", "network=kestrel-gw"]);
+        let attached: Vec<&str> = attached.split_whitespace().collect();
+        for id in &attached {
+            let labels = docker_ok(&[
                 "inspect",
                 "--format",
-                "{{index .Config.Labels \"kestrel.managed\"}}",
+                "{{index .Config.Labels \"kestrel.managed\"}} {{index .Config.Labels \"kestrel.db\"}}",
                 id,
             ]);
-            if managed != "bridge" {
+            let ours = matches!(
+                labels.split_whitespace().collect::<Vec<_>>().as_slice(),
+                ["bridge", db] if is_test_db(db)
+            );
+            if !ours {
                 eprintln!(
-                    "skipped: container {id} without the label kestrel.managed=bridge is attached to kestrel-gw, so this test will not remove the network"
+                    "skipped: container {id} on kestrel-gw is not a bridge of this test binary's databases (labels: {labels:?}), so this test will not remove kestrel-gw. Remove it yourself to run the test"
                 );
                 return;
             }
+        }
+        for id in attached {
             docker_ok(&["rm", "--force", id]);
         }
         docker_ok(&["network", "rm", "kestrel-gw"]);
@@ -873,7 +896,7 @@ async fn issue_99_the_bridge_starts_with_the_default_pools_exhausted_and_no_kest
 
     let dir = tempfile::tempdir().expect("dir");
     let db: PathBuf = dir.path().join("kestrel.db");
-    let bridge_name = GatewayBridge::container_name(&GatewayBridge::instance_id(&db));
+    let bridge_name = GatewayBridge::container_name(&test_db(&db));
     cleanup.container(&bridge_name);
     let port = start_gateway();
     let bridge_spec = BridgeSpec {
