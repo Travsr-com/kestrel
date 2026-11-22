@@ -3439,6 +3439,9 @@ budget: { usd: 0.000010, wall_clock: 10m }
         /// What `docker network ls` prints when filtered to the name `kestrel-gw`: by default it
         /// exists, so the bridge takes no block.
         gw: &'static str,
+        /// What `docker network inspect` of `kestrel-gw` prints: attached containers, then its
+        /// subnets. By default a `/24` with one bridge on it.
+        gw_inspect: &'static str,
     }
 
     impl Host {
@@ -3450,6 +3453,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                 docker_fails: false,
                 ours: "",
                 gw: "kestrel-gw\n",
+                gw_inspect: "1;172.30.0.0/24 ",
             }
         }
 
@@ -3490,6 +3494,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
                     self.gw
                 }
                 ["docker", "network", "ls", ..] => "1a2b3c4d5e6f\n",
+                ["docker", "network", "inspect", "--format", _, "kestrel-gw"] => self.gw_inspect,
                 ["docker", "network", "inspect", ..] => self.subnets,
                 _ => "",
             };
@@ -3550,24 +3555,28 @@ budget: { usd: 0.000010, wall_clock: 10m }
     // ---- the bridge's own network gets a block of the plan (issue #99) ----
 
     #[tokio::test]
-    async fn s1_without_kestrel_gw_the_plan_gives_it_the_lowest_free_block() {
+    async fn s1_without_kestrel_gw_the_plan_gives_it_an_aligned_24() {
         let host = Host::without_gw("10.200.0.0/29\n", "");
         let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
         let (plan, network) = got.expect("plan");
-        let BridgeNetwork::Subnet(block) = network else {
-            panic!("expected a block for kestrel-gw, got {network:?}");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span for kestrel-gw, got {network:?}");
         };
-        assert_eq!(block.cidr(), cidr("10.200.0.8/29"));
-        assert_eq!(plan.available(), 8190, "the bridge's block is gone");
+        // The first /24 holds a taken block, so the span is the next aligned one.
+        assert_eq!(span.cidr(), cidr("10.200.1.0/24"));
+        assert_eq!(plan.available(), 8191 - 32, "the bridge's span is gone");
         assert_eq!(
             plan.reserve().map(|s| s.cidr()),
-            Some(cidr("10.200.0.16/29")),
-            "a run never gets the bridge's block"
+            Some(cidr("10.200.0.8/29")),
+            "runs still get the blocks around it"
         );
+        while let Some(run) = plan.reserve() {
+            assert!(!run.cidr().overlaps(&span.cidr()), "{:?}", run.cidr());
+        }
         assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.contains("8190"), "{line}");
+        assert!(line.contains(&(8191 - 32).to_string()), "{line}");
         assert!(
-            line.contains("kestrel-gw") && line.contains("10.200.0.8/29"),
+            line.contains("kestrel-gw") && line.contains("10.200.1.0/24"),
             "{line}"
         );
     }
@@ -3614,12 +3623,59 @@ budget: { usd: 0.000010, wall_clock: 10m }
     }
 
     #[tokio::test]
-    async fn the_bridge_creates_kestrel_gw_on_the_planned_block() {
+    async fn a_small_pool_gives_kestrel_gw_a_smaller_span_that_leaves_a_run_block() {
+        let host = Host::without_gw("", "");
+        let (got, line) = plan_with_bridge("10.200.0.0/24", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span, got {network:?}");
+        };
+        assert_eq!(span.cidr(), cidr("10.200.0.0/25"));
+        assert_eq!(plan.available(), 16);
+        assert!(line.contains("10.200.0.0/25"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_smaller_kestrel_gw_in_use_is_kept_and_serve_warns_how_to_grow_it() {
+        let mut host = Host::new("", "");
+        host.gw_inspect = "2;172.30.0.0/29 ";
+        let (got, line) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (plan, network) = got.expect("plan");
+        assert_eq!(network, BridgeNetwork::Existing);
+        assert_eq!(plan.available(), 8192);
+        assert_eq!(line.lines().count(), 2, "{line}");
+        let warning = line.lines().next().unwrap_or_default();
+        assert!(warning.starts_with("warning:"), "{warning}");
+        assert!(warning.contains("172.30.0.0/29"), "{warning}");
+        assert!(
+            warning.contains("docker network rm kestrel-gw"),
+            "{warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_smaller_kestrel_gw_with_nothing_attached_is_recreated_larger() {
+        let mut host = Host::new("", "");
+        host.gw_inspect = "0;172.30.0.0/29 ";
+        let (got, _) = plan_with_bridge("10.200.0.0/16", &host, DockerHost::Vm).await;
+        let (_, network) = got.expect("plan");
+        let BridgeNetwork::Subnet(span) = network else {
+            panic!("expected a span, got {network:?}");
+        };
+        assert_eq!(span.cidr(), cidr("10.200.0.0/24"));
+        let rm: Vec<String> = ["docker", "network", "rm", "kestrel-gw"]
+            .map(String::from)
+            .to_vec();
+        assert!(host.calls().contains(&rm), "{:?}", host.calls());
+    }
+
+    #[tokio::test]
+    async fn the_bridge_creates_kestrel_gw_on_the_planned_span() {
         let r = recorder(0);
         let block = SubnetPool::parse("10.200.0.0/16")
             .expect("pool")
-            .claim()
-            .expect("a block");
+            .claim_span(24)
+            .expect("a span");
         start_bridge(
             r.clone(),
             bridge_spec(
@@ -3646,7 +3702,7 @@ budget: { usd: 0.000010, wall_clock: 10m }
             "create",
             "--internal",
             "--subnet",
-            "10.200.0.0/29",
+            "10.200.0.0/24",
             "--gateway",
             "10.200.0.1",
             "kestrel-gw",
