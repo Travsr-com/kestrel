@@ -333,6 +333,23 @@ impl SubnetPool {
     /// Reserves the lowest free block, or `None` when every block is in use or excluded.
     pub fn reserve(&self) -> Option<Subnet> {
         let mut state = self.state();
+        let block = self.lowest_free(&state)?;
+        state.used.insert(block);
+        Some(self.subnet(block))
+    }
+
+    /// Takes the lowest free block out of the pool for good, for a network that outlives every
+    /// run (the bridge's `kestrel-gw`). The block is excluded: it is never handed out, never
+    /// counts as in use, and releasing it changes nothing. `None` when no block is free.
+    pub fn claim(&self) -> Option<Subnet> {
+        let mut state = self.state();
+        let block = self.lowest_free(&state)?;
+        state.exclude(block, block + 1);
+        Some(self.subnet(block))
+    }
+
+    /// The index of the lowest block neither excluded nor in use.
+    fn lowest_free(&self, state: &PoolState) -> Option<u32> {
         let mut block = 0;
         while block < self.blocks {
             if let Some((_, end)) = state.excluded_range(block) {
@@ -340,18 +357,22 @@ impl SubnetPool {
             } else if state.used.contains(&block) {
                 block += 1;
             } else {
-                // Inside the pool, so it fits: the pool's last address is at most 2^32 - 1.
-                let offset = block.wrapping_mul(BLOCK_SIZE);
-                state.used.insert(block);
-                return Some(Subnet {
-                    block: Ipv4Cidr {
-                        addr: Ipv4Addr::from(u32::from(self.pool.addr).wrapping_add(offset)),
-                        prefix: SUBNET_BLOCK_PREFIX,
-                    },
-                });
+                return Some(block);
             }
         }
         None
+    }
+
+    /// The block at index `block` of the pool.
+    fn subnet(&self, block: u32) -> Subnet {
+        // Inside the pool, so it fits: the pool's last address is at most 2^32 - 1.
+        let offset = block.wrapping_mul(BLOCK_SIZE);
+        Subnet {
+            block: Ipv4Cidr {
+                addr: Ipv4Addr::from(u32::from(self.pool.addr).wrapping_add(offset)),
+                prefix: SUBNET_BLOCK_PREFIX,
+            },
+        }
     }
 
     /// Gives a block back. One found taken while held is excluded instead. Releasing a block that

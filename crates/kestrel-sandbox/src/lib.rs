@@ -23,8 +23,8 @@ mod roots;
 mod subnet;
 use bridge::is_container_name;
 pub use bridge::{
-    BRIDGE_NAME, BridgeSpec, DEFAULT_BRIDGE_CONNECTIONS, DEFAULT_BRIDGE_IMAGE, GatewayBridge,
-    MAX_BRIDGE_CONNECTIONS,
+    BRIDGE_NAME, BridgeNetwork, BridgeSpec, DEFAULT_BRIDGE_CONNECTIONS, DEFAULT_BRIDGE_IMAGE,
+    GatewayBridge, MAX_BRIDGE_CONNECTIONS,
 };
 pub use roots::{RootsError, resolve_workspace};
 pub use subnet::{

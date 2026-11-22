@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use url::Url;
 
-use crate::{CommandRunner, SandboxError, check_image};
+use crate::{CommandRunner, SandboxError, Subnet, SubnetPool, check_image};
 
 /// Pinned `socat` image used when [`BridgeSpec::image`] is not set.
 pub const DEFAULT_BRIDGE_IMAGE: &str =
@@ -55,6 +55,9 @@ pub struct BridgeSpec {
     /// [`MAX_BRIDGE_CONNECTIONS`]. Defaults to [`DEFAULT_BRIDGE_CONNECTIONS`]. A connection past
     /// it waits for one to close. The container's process and memory limits grow with it.
     pub connections: u32,
+    /// Where the shared `kestrel-gw` network comes from. `kestrel serve` sets it from
+    /// [`GatewayBridge::plan_network`]. Defaults to [`BridgeNetwork::DockerPools`].
+    pub network: BridgeNetwork,
 }
 
 impl Default for BridgeSpec {
@@ -63,8 +66,22 @@ impl Default for BridgeSpec {
             image: DEFAULT_BRIDGE_IMAGE.to_string(),
             add_host_gateway: true,
             connections: DEFAULT_BRIDGE_CONNECTIONS,
+            network: BridgeNetwork::DockerPools,
         }
     }
+}
+
+/// Where the bridge's shared `kestrel-gw` network comes from (issue #99).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BridgeNetwork {
+    /// Create it when missing, on a subnet docker picks from its default address pools.
+    #[default]
+    DockerPools,
+    /// It exists already: use it as it is, whatever its subnet, and never create it.
+    Existing,
+    /// Create it on this block (`--subnet`, `--gateway`). One made by someone else in the
+    /// meantime is used as it is.
+    Subnet(Subnet),
 }
 
 /// A running bridge container. Not published on any host port.
@@ -172,10 +189,28 @@ impl GatewayBridge {
                 .await
                 .map_err(step("remove-stale"))?;
         }
-        let network = argv(&["docker", "network", "create", "--internal", NETWORK]);
-        match docker(&*runner, &network).await {
-            Err(e) if !e.contains("already exists") => return Err(step("create-network")(e)),
-            _ => {}
+        let create = match &spec.network {
+            BridgeNetwork::DockerPools => {
+                Some(argv(&["docker", "network", "create", "--internal"]))
+            }
+            BridgeNetwork::Existing => None,
+            BridgeNetwork::Subnet(subnet) => Some(argv(&[
+                "docker",
+                "network",
+                "create",
+                "--internal",
+                "--subnet",
+                &subnet.cidr().to_string(),
+                "--gateway",
+                &subnet.gateway().to_string(),
+            ])),
+        };
+        if let Some(mut create) = create {
+            create.push(NETWORK.to_string());
+            match docker(&*runner, &create).await {
+                Err(e) if !e.contains("already exists") => return Err(step("create-network")(e)),
+                _ => {}
+            }
         }
 
         let listen = format!("TCP-LISTEN:{host_port},fork,reuseaddr,max-children={connections}");
@@ -260,6 +295,46 @@ impl GatewayBridge {
                 Err(e)
             }
         }
+    }
+
+    /// Decides where `kestrel-gw` comes from, before [`GatewayBridge::start`]: an existing one is
+    /// reused as it is ([`BridgeNetwork::Existing`]) and takes nothing from `plan`. Otherwise it
+    /// gets the lowest free block of `plan` ([`BridgeNetwork::Subnet`]), taken out of the plan for
+    /// good, so no run network ever gets it.
+    ///
+    /// # Errors
+    /// [`SandboxError::Bridge`] (step `create-network`) when docker cannot list its networks, or
+    /// when `kestrel-gw` is missing and `plan` has fewer than two free blocks: one for
+    /// `kestrel-gw` and at least one for runs. Nothing is taken from `plan` then.
+    pub async fn plan_network(
+        runner: &dyn CommandRunner,
+        plan: &SubnetPool,
+    ) -> Result<BridgeNetwork, SandboxError> {
+        let name = format!("name=^{NETWORK}$");
+        let lookup = argv(&[
+            "docker",
+            "network",
+            "ls",
+            "--filter",
+            &name,
+            "--format",
+            "{{.Name}}",
+        ]);
+        let listed = docker(runner, &lookup)
+            .await
+            .map_err(step("create-network"))?;
+        // The filter is a pattern: only the exact name counts.
+        if listed.lines().any(|l| l.trim() == NETWORK) {
+            return Ok(BridgeNetwork::Existing);
+        }
+        let free = plan.available();
+        let claimed = if free >= 2 { plan.claim() } else { None };
+        claimed.map(BridgeNetwork::Subnet).ok_or_else(|| {
+            step("create-network")(format!(
+                "subnet pool {} has {free} free /29 block(s), but the {NETWORK} network needs one and runs need at least one more. Set gateway.subnet_pool to a larger or free range",
+                plan.pool()
+            ))
+        })
     }
 
     /// The 8 hex chars naming the bridge of the database at `db`: the first 8 of the 16-digit
