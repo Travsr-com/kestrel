@@ -88,11 +88,17 @@ pub enum KestrelTool {
     Spawn,
     Join,
     AskHuman,
+    /// `kestrel.messages`: the messages a person sent the run, each handed over once (#95).
+    Messages,
 }
 
 impl KestrelTool {
-    pub const ALL: [KestrelTool; 3] =
-        [KestrelTool::Spawn, KestrelTool::Join, KestrelTool::AskHuman];
+    pub const ALL: [KestrelTool; 4] = [
+        KestrelTool::Spawn,
+        KestrelTool::Join,
+        KestrelTool::AskHuman,
+        KestrelTool::Messages,
+    ];
 
     /// Its MCP name, which is also its name in a capability's tools.
     pub fn name(self) -> &'static str {
@@ -100,6 +106,7 @@ impl KestrelTool {
             KestrelTool::Spawn => "kestrel.spawn",
             KestrelTool::Join => "kestrel.join",
             KestrelTool::AskHuman => "kestrel.ask_human",
+            KestrelTool::Messages => "kestrel.messages",
         }
     }
 
@@ -146,6 +153,12 @@ impl KestrelTool {
                     "properties": { "question": { "type": "string", "description": "What to ask." } },
                     "required": ["question"]
                 }),
+            ),
+            KestrelTool::Messages => (
+                "Get the messages a person sent you since you last checked, oldest first. Each \
+                 message comes once. Check between steps and before you finish, and take what \
+                 they say into account.",
+                json!({ "type": "object", "properties": {} }),
             ),
         };
         json!({ "name": self.name(), "description": description, "inputSchema": schema })
@@ -195,6 +208,11 @@ pub trait ToolHost: Send + Sync {
     async fn join(&self, run: RunId, call: JoinCall) -> Result<Value, String>;
     /// Asks a person; the answer text once they decide.
     async fn ask_human(&self, run: RunId, question: String) -> Result<String, String>;
+    /// The messages a person sent `run` that it has not taken yet, now delivered. The default has
+    /// none to give.
+    async fn messages(&self, _run: RunId) -> Result<Value, String> {
+        Err("this host keeps no messages for agents".into())
+    }
     /// Records that `run`'s call of `tool` was refused for lack of room, with the reason the
     /// agent was given. Does nothing unless the host records it.
     async fn refused(&self, _run: RunId, _tool: &str, _reason: &str) {}
@@ -539,6 +557,7 @@ enum Task {
     Spawn(SpawnCall),
     Join(JoinCall),
     Ask(String),
+    Messages,
 }
 
 impl Task {
@@ -548,6 +567,7 @@ impl Task {
         match self {
             Task::Spawn(call) => call.wait,
             Task::Join(_) | Task::Ask(_) => true,
+            Task::Messages => false,
         }
     }
 }
@@ -766,6 +786,7 @@ fn start(
                 Task::Spawn(call) => host.spawn(run, call).await,
                 Task::Join(call) => host.join(run, call).await,
                 Task::Ask(question) => host.ask_human(run, question).await.map(Value::String),
+                Task::Messages => host.messages(run).await,
             }
         });
         let outcome = work
@@ -841,6 +862,8 @@ fn check(tool: KestrelTool, args: &Value) -> Result<Task, String> {
                 .ok_or("question is required")?;
             Ok(Task::Ask(question))
         }
+        // Takes no arguments; any given are ignored.
+        KestrelTool::Messages => Ok(Task::Messages),
     }
 }
 
