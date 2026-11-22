@@ -178,6 +178,7 @@ pub async fn start(anthropic_base: &str, openai_base: &str, allow_budget: bool) 
         budget: budget.clone(),
         meter: sink.clone(),
         tools: Arc::new(NoTools),
+        travsr: None,
     };
     let app = router(config(anthropic_base, openai_base), deps);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

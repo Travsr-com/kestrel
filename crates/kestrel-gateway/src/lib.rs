@@ -5,12 +5,16 @@
 //! * `POST /r/{run_token}/v1/messages` forwards to `{anthropic.base_url}/v1/messages`.
 //! * `POST /r/{run_token}/v1/chat/completions` forwards to `{openai.base_url}/v1/chat/completions`.
 //! * `POST /r/{run_token}/mcp` serves the Kestrel tools over MCP (see [`mcp`]).
+//! * `POST /r/{run_token}/travsr` serves Travsr's read tools over MCP, when the gateway has a
+//!   [`TravsrHost`] (see [`travsr`]).
 
 pub mod mcp;
+pub mod travsr;
 
 pub use mcp::{
     JoinCall, JoinWait, KestrelTool, MCP_PROTOCOL_VERSION, NoTools, SpawnCall, ToolHost, ToolsError,
 };
+pub use travsr::{TRAVSR_RESPONSE_CAP, TRAVSR_TOOLS, TravsrHost};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,6 +114,8 @@ pub struct GatewayDeps {
     pub meter: Arc<dyn MeterSink>,
     /// Serves the Kestrel tools at `/r/{run_token}/mcp`; [`NoTools`] for none.
     pub tools: Arc<dyn ToolHost>,
+    /// Serves Travsr at `/r/{run_token}/travsr`. `None` when Travsr is off: the route is 404.
+    pub travsr: Option<Arc<dyn TravsrHost>>,
 }
 
 /// Largest request body the gateway accepts (LLM prompts can be large).
@@ -227,13 +233,30 @@ pub fn router_with_timeouts(
         .read_timeout(timeouts.idle)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+    let travsr_host = deps.travsr.clone();
     let state = Arc::new(AppState {
         cfg,
         deps,
         http,
         mcp: mcp::McpState::default(),
     });
-    axum::Router::new()
+    let mut routes = axum::Router::new();
+    if let Some(host) = travsr_host {
+        routes = routes.route(
+            "/r/{run_token}/travsr",
+            post(
+                move |State(s): State<Arc<AppState>>,
+                      Path(token): Path<String>,
+                      headers: HeaderMap,
+                      body: Body| {
+                    let host = host.clone();
+                    async move { travsr::post(s, host, token, headers, body).await }
+                },
+            )
+            .merge(get(travsr::get)),
+        );
+    }
+    routes
         .route(
             "/r/{run_token}/v1/messages",
             post(

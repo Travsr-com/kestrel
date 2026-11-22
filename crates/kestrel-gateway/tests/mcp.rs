@@ -123,6 +123,7 @@ fn setup(allowed_a: &[KestrelTool]) -> Setup {
         budget: Arc::new(FakeBudget::new(true)),
         meter: Arc::new(FakeSink::default()),
         tools: host.clone(),
+        travsr: None,
     };
     let app = router(config("http://127.0.0.1:9", "http://127.0.0.1:9"), deps);
     Setup {
@@ -1089,6 +1090,7 @@ async fn the_allowance_of_runs_that_went_quiet_is_forgotten() {
         budget: Arc::new(FakeBudget::new(true)),
         meter: Arc::new(FakeSink::default()),
         tools: host.clone(),
+        travsr: None,
     };
     let app = router(config("http://127.0.0.1:9", "http://127.0.0.1:9"), deps);
     for token in &tokens {
