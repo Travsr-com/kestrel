@@ -728,6 +728,18 @@ async fn s12_a_provisioning_child_that_is_cancelled_never_starts() {
     settle().await;
     assert_eq!(h.driver.starts(), 1, "only the parent's agent ever started");
     assert!(h.is(child, &RunStatus::Cancelled));
+    // Checked again once the gated `create` has surely returned: the sandbox it made after the
+    // cancel is destroyed too, not left behind.
+    assert_eq!(
+        h.driver.leaked(),
+        Vec::<String>::new(),
+        "a sandbox was left behind"
+    );
+    assert_eq!(
+        h.driver.count(&Call::Destroy("fake-2".into())),
+        1,
+        "the child's sandbox was made after the cancel and destroyed"
+    );
 }
 
 // 13. After a restart, a join returns the results of children that finished, at once.
