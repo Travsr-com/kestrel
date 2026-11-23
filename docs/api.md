@@ -155,8 +155,10 @@ curl -X POST -H "Authorization: Bearer $T" -d '{"reason":"not on main"}' "$K/api
   `kestrel.v1, kestrel.token.<token>` (the server answers `kestrel.v1`), or as `?token=`.
 * **Refusals and close frames.** A missing or wrong token is refused before the socket opens
   (`401`). Close code 4401 is reserved for a token refused after it opens. A client that stops
-  reading is dropped with a close frame once its queue stays full for 10 s. When the server stops,
-  every socket gets a close frame.
+  reading is dropped once its queue stays full for 10 s (`ws_stall`): it gets close code 1008,
+  "the client is not reading", and has `ws_close_grace` (10 s by default) to read what was sent
+  and that frame before the connection is cut. When the server stops, every socket gets a close
+  frame (code 1001) and at most 1 s to take it, a slow client in its grace too.
 
 ```sh
 websocat -H "Authorization: Bearer $T" "ws://127.0.0.1:7171/ws/runs/$RUN?after=0"
