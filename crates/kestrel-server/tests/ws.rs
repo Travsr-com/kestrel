@@ -280,6 +280,46 @@ async fn s9_a_client_that_never_reads_is_cut_after_the_close_grace() {
     .expect("the socket task ended while the client still does not read");
 }
 
+// ...and a slow client in its close grace does not hold up a stop: once the server stops, the
+// grace is cut to the short one every socket gets, so `serve` returns promptly and no socket task
+// outlives it.
+#[tokio::test]
+async fn s9_stopping_cuts_a_slow_clients_close_grace() {
+    let store = store();
+    let id = store.create_run(&agent("a"), "x").unwrap();
+    let server = start(store.clone(), |c| {
+        c.ws_queue = 2;
+        c.ws_stall = Duration::from_millis(200);
+        c.ws_close_grace = Duration::from_secs(60);
+    })
+    .await;
+    let _socket = open(&server, &format!("/ws/runs/{id}")).await;
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..300 {
+        log(&store, id, &big);
+    }
+    // Long enough for the queue to stay full past `ws_stall`: the socket is now in its grace.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(server.sockets.len(), 1, "the slow client's socket is open");
+    let started = std::time::Instant::now();
+    server.shutdown.cancel();
+    timeout(Duration::from_secs(10), server.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(2500),
+        "serve waited {waited:?} for a slow client's grace"
+    );
+    assert!(
+        server.sockets.is_empty(),
+        "a socket task outlived serve ({} left)",
+        server.sockets.len()
+    );
+}
+
 // 16. When the server stops, open sockets get a close frame and the port is released.
 #[tokio::test]
 async fn s16_stopping_closes_sockets_and_frees_the_port() {
