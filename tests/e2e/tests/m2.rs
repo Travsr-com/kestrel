@@ -155,18 +155,25 @@ fn assert_source_untouched(env: &Env, main_sha: &str, files: &str) {
     assert_eq!(git(&env.repo, &["ls-files", "-s"]), files);
 }
 
-/// Brings the branch of `run` home into the source repo (`fetch_back`, as in M1 scenario 6).
-fn fetch_back(env: &Env, run: &str) {
-    let workspaces = kestrel_core::Workspaces::new(
-        env.dir.path().join("workspaces"),
-        Arc::new(kestrel_sandbox::ProcessRunner),
+/// Waits until Kestrel has brought the branch of `run` home into the source repo by itself
+/// (#93): the run's log says it fetched the branch, and the branch is there.
+fn wait_branch_home(env: &Env, run: &str) {
+    let branch = branch_of(run);
+    let said = format!("kestrel: fetched branch {branch}");
+    wait_until(RUN_DEADLINE, &format!("{branch} fetched home"), || {
+        let events = env.events_now(run);
+        of_kind(&events, "agent_log").iter().any(|e| {
+            e["kind"]["line"]
+                .as_str()
+                .is_some_and(|l| l.starts_with(&said))
+        })
+    });
+    let tip = git(
+        &env.repo,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
     );
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(workspaces.fetch_back(run_id(run), &env.repo))
-        .unwrap_or_else(|e| panic!("fetch_back of {run}: {e}"));
+    let clone_tip = git(&env.workspace(run), &["rev-parse", "HEAD"]);
+    assert_eq!(tip.trim(), clone_tip.trim(), "{branch} is the clone's tip");
 }
 
 /// Scenarios 1 and 2: a parent spawns 6 children that each commit in their own clone (`same`:
@@ -263,19 +270,13 @@ fn fan_out_and_commit(same: bool) {
     let want: BTreeSet<String> = (1..=6).map(|n| n.to_string()).collect();
     assert_eq!(numbers, want, "kids 1 to 6, each once");
 
-    // Nothing reached the source repo while the children worked.
-    assert_source_untouched(&env, &main_sha, &files);
-    assert_eq!(
-        git(&env.repo, &["branch", "--format=%(refname:short)"]).trim(),
-        "main"
-    );
-
-    // Each branch comes home on its own: no conflict, each holds its own version.
+    // Each branch comes home by itself when its child ends (#93), with no test or user step: no
+    // conflict, each holds its own version.
     let mut versions = BTreeSet::new();
     for kid in &kids {
         let id = kid.id.to_string();
         let n = kid_number(&kid.input);
-        fetch_back(&env, &id);
+        wait_branch_home(&env, &id);
         let branch = branch_of(&id);
         let file = if same {
             "shared.txt".to_string()
@@ -300,7 +301,7 @@ fn fan_out_and_commit(same: bool) {
         7,
         "main and 6 run branches: {listed}"
     );
-    // fetch_back never moves the user's checkout or touches its files.
+    // Bringing branches home never moves the user's checkout or touches its files.
     assert_source_untouched(&env, &main_sha, &files);
     assert!(!env.repo.join("shared.txt").exists());
 }

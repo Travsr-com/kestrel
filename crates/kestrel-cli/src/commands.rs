@@ -199,7 +199,7 @@ fn describe(kind: &EventKind) -> String {
 }
 
 /// A run status as plain text.
-fn label(status: &RunStatus) -> String {
+pub(crate) fn label(status: &RunStatus) -> String {
     match status {
         RunStatus::Queued => "Queued".into(),
         RunStatus::Provisioning => "Provisioning".into(),

@@ -184,6 +184,7 @@ impl FakeOk {
         if argv.get(1).is_some_and(|a| a == "clone") {
             let dest = PathBuf::from(argv.last().expect("clone target"));
             std::fs::create_dir_all(dest.join(".git"))?;
+            std::fs::write(dest.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
         }
         Ok(CommandOutput::default())
     }
@@ -686,8 +687,16 @@ async fn s4_fetch_has_double_dash_right_before_the_clone_path_and_the_refspec_la
     let fetch = &calls.last().unwrap().0;
     let n = fetch.len();
     assert_eq!(fetch[n - 3], "--", "{fetch:?}");
-    assert_eq!(fetch[n - 2], path.to_str().unwrap(), "{fetch:?}");
-    assert_eq!(fetch[n - 1], format!("{BRANCH_A}:{BRANCH_A}"), "{fetch:?}");
+    assert_eq!(
+        fetch[n - 2],
+        path.join(".git").to_str().unwrap(),
+        "{fetch:?}"
+    );
+    assert_eq!(
+        fetch[n - 1],
+        format!("refs/heads/{BRANCH_A}:refs/heads/{BRANCH_A}"),
+        "{fetch:?}"
+    );
 }
 
 #[tokio::test]

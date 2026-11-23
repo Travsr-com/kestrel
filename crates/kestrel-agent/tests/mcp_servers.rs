@@ -335,9 +335,11 @@ fn the_agent_note_is_short_and_holds_no_token_or_path() {
     let full = agent_note(&worker(), true, true).expect("a note");
     assert!(full.lines().count() <= 30, "{} lines", full.lines().count());
     assert!(full.contains("kestrel.spawn") && full.contains("kestrel.join"));
-    // What a child sees is what the engine does: a clone of the original repository, and no
-    // branch handed back, so the summary is how its work returns.
+    // What a child sees is what the engine does: a clone of the original repository, and its
+    // commits come back there as its own branch when it ends (#93), not into the parent's copy.
     assert!(full.contains("original repository"), "{full}");
+    assert!(full.contains("branch kestrel/run-<id>"), "{full}");
+    assert!(full.contains("not into yours"), "{full}");
     // The model learns which agents it may name in kestrel.spawn.
     let two =
         agent_note(&["worker".to_string(), "reviewer".to_string()], true, false).expect("a note");
@@ -347,7 +349,6 @@ fn the_agent_note_is_short_and_holds_no_token_or_path() {
     // A timed-out child is not stopped, so spawning it again would pay twice.
     assert!(full.contains("still running"), "{full}");
     assert!(full.contains("summary"), "{full}");
-    assert!(!full.contains("branch"), "{full}");
     for note in [full.clone(), agent_note(&[], true, true).expect("a note")] {
         for leak in [
             "tok_",

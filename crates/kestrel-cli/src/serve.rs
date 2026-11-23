@@ -1371,12 +1371,8 @@ async fn start_engine(
     let store = Arc::new(open(Some(db.to_path_buf()))?);
     // Workspaces and run configs live next to the database, so a temp `--db` keeps everything
     // in one place.
-    let data_dir = std::path::absolute(db)
-        .map_err(|e| Failure::runtime(format!("{}: {e}", db.display())))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| Failure::runtime(format!("{}: no parent dir", db.display())))?;
-    let workspace_root = data_dir.join("workspaces");
+    let data_dir = crate::data_dir_of(db)?;
+    let workspace_root = crate::workspace_root(&data_dir);
 
     let adapters: AdapterFactory = Arc::new(kestrel_agent::adapter_for);
     let engine = Engine::with_models(

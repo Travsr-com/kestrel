@@ -2,8 +2,8 @@
 
 Run one AI coding agent in a sandbox, with a spending limit, and watch it work.
 
-This is the M1 slice. It works on Linux with Docker and gVisor. The web UI, schedules, chat and
-meeting agents come in later milestones (see [architecture](architecture.md)).
+It works on Linux with Docker and gVisor. The web UI comes with `kestrel up` (step 4). Schedules,
+chat and meeting agents come in later milestones (see [architecture](architecture.md)).
 
 ## What you need
 
@@ -39,8 +39,9 @@ Kestrel warns you if other users can read it.
 # Long tool calls (a waiting `kestrel.join`, a question) held open at once across all runs,
 # from 1 to 4096. Default 256. Past the limit a call is refused with a clear error.
 # max_waiting_calls = 256
-# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24) get their
-# addresses. Default 10.200.0.0/16. Change it if that range is already used on your network.
+# Where the run networks (one /29 each) and the bridge's `kestrel-gw` network (a /24, less in a
+# small pool) get their addresses. An IPv4 CIDR string, default "10.200.0.0/16". Change it if that
+# range is already used on your network.
 # subnet_pool = "10.200.0.0/16"
 
 [engine]
@@ -183,6 +184,37 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 
 `--watch` follows the run live. Without it, `run` prints the run id and returns.
 
+## 6. Get the work back
+
+A moment after a `git-clone` run ends (completed, failed or cancelled), Kestrel fetches its work
+into your repository as branch `kestrel/run-<id>`, where `<id>` is the last 12 characters of the
+run id. `kestrel watch` can exit before that; the branch still arrives.
+Children of a run come back the same way, each on its own branch, so six children that edit the
+same file give six branches and nothing conflicts. Review and merge them like any other branch:
+
+```sh
+git log main..kestrel/run-5f3c9a1b2d4e
+git merge kestrel/run-5f3c9a1b2d4e
+```
+
+* Only that branch is created or moved. Your checkout, your index, your other branches and your
+  uncommitted changes are never touched.
+* A run that made no commits brings nothing back.
+* The run's log says `kestrel: fetched branch ...`. If the fetch fails (you already have a branch
+  of that name that the run does not build on, a commit fails git's object check, the clone's
+  `.git` points somewhere else, or git takes more than 2 minutes), the log has a
+  `kestrel: warning:` line instead, and the run's outcome is unchanged.
+
+To fetch by hand, for a run whose fetch failed, that ended before this existed, or that ended just
+before `kestrel serve` stopped:
+
+```sh
+kestrel fetch <run-id>
+```
+
+It prints what it did and exits 0 when the branch is there or there was nothing to fetch, 1 when
+the run is unknown, still going, has no clone, or git refuses.
+
 ## Everyday commands
 
 | Command | What it does |
@@ -193,6 +225,7 @@ kestrel run agent.yaml --input "Fix the failing test in src/lib.rs" --watch
 | `kestrel cancel <run-id>` | Stop a run for good. |
 | `kestrel budget <run-id> 5` | Set the run's budget to 5 USD. |
 | `kestrel approve <approval-id>` | Approve an action the agent asked about. Add `--reject` to refuse. |
+| `kestrel fetch <run-id>` | Fetch a finished run's branch `kestrel/run-<id>` into its repository. |
 | `kestrel message <run-id> "also fix the docs"` | Send a message to a running agent. See [Messages](#messages-to-a-running-agent). |
 
 Add `--json` to any command for machine-readable output.
@@ -267,15 +300,14 @@ The upgrade to schema v5 rewrites the whole event log once, in one transaction:
 * If it fails (a full disk, say), nothing is changed: the database stays as it was. Free some
   space and start again.
 
-## Known limits in M1
+## Known limits
 
 * Resuming a paused run restarts the agent from the beginning.
-* The agent cannot run `git` inside the sandbox yet ([#22](https://github.com/Travsr-com/kestrel/issues/22)).
 * The macOS driver (Apple `container`) is not verified against the real tool yet
   ([#11](https://github.com/Travsr-com/kestrel/issues/11)).
 * With `gateway.advertise_url` set there is no bridge, so all sandboxes share one network and can reach each other.
   Without it, each run gets its own network from `gateway.subnet_pool` (default `10.200.0.0/16`), and the
-  bridge's `kestrel-gw` network gets a `/24` of it the first time serve creates it.
+  bridge's `kestrel-gw` network gets a `/24` of it (less in a small pool) the first time serve creates it.
 
 ## If something goes wrong
 
