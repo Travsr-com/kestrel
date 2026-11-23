@@ -886,6 +886,11 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
 /// over its share by less than one call, so the tree goes over the root budget, but by no more
 /// than one call in flight per run (architecture section 3.3, Budget).
 ///
+/// "One call in flight per run" leans on timing: the gateway writes a call's meter record after
+/// the client has the whole body, so a sequential agent's next call can pass the budget check
+/// before the last spend is recorded. In practice the record lands first; the gap is a separate
+/// gateway issue.
+///
 /// This bound can fail: a spawn that did not move the share out of the root's limit would let
 /// the root make its 20 calls, $0.1293 more than the bound allows.
 #[test]
