@@ -162,8 +162,8 @@ agent cannot write.
   limit, and answers 404 without a `[travsr]` section.
 
 This is a deliberate limit: **the index shows the code the run started from, not the agent's
-edits.** Indexing the agent's edits safely means running Travsr inside the sandbox, which is the
-follow-up.
+edits.** Indexing the agent's edits safely means running Travsr inside the sandbox
+([#120](https://github.com/Travsr-com/kestrel/issues/120)).
 
 ### What a run sees
 
@@ -174,10 +174,10 @@ follow-up.
 | Another run's edits, or its index | No: each run has its own copy and its own server |
 | A later commit of the source repo | No, until a new run starts from it |
 
-Seeing a run's own edits after a re-index (issue #96, scenario 1) waits on Travsr indexing a repo
-by path from another process ([#1133](https://github.com/Travsr-com/travsr/issues/1133)) and
-serving every read tool over MCP from a long-running server
-([#1134](https://github.com/Travsr-com/travsr/issues/1134)). The test
+A run does not see its own edits, even after a re-index. On the host that would mean indexing
+agent-written code, and Travsr's language pass can run that code's build tooling (see "Code
+Travsr may run" above). Running Travsr inside each run's sandbox would close the gap safely; it is
+tracked in [#120](https://github.com/Travsr-com/kestrel/issues/120). The test
 `m2_s11_travsr_answers_from_the_run_s_own_copy` holds today's behaviour.
 
 ## Testing against a real Travsr
