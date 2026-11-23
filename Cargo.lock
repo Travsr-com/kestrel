@@ -1388,11 +1388,13 @@ dependencies = [
  "bytes",
  "futures",
  "kestrel-types",
+ "log",
  "reqwest",
  "serde_json",
  "tokio",
  "tokio-stream",
  "tower",
+ "tracing",
  "url",
  "wiremock",
 ]
