@@ -307,3 +307,72 @@ async fn s4_a_streamed_event_reaches_the_client_before_the_upstream_sends_the_ne
     assert_eq!(sink.records().len(), 1);
     assert_eq!(sink.records()[0].tokens_out, 350);
 }
+
+/// An upstream that sends Anthropic's first event, then breaks the body off with an error once
+/// `go` is notified (so the first event is surely through first).
+async fn upstream_failing_mid_body(go: Arc<Notify>) -> String {
+    let first = anthropic_sse_events(CLAUDE_MODEL, 1200, 350, 0, 0).remove(0);
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let (first, go) = (first.clone(), go.clone());
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(Bytes::from(first))).await;
+                    go.notified().await;
+                    let _ = tx
+                        .send(Err(std::io::Error::other("upstream broke off")))
+                        .await;
+                });
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn s3_a_client_that_sees_the_upstream_break_off_finds_the_record_stored() {
+    let go = Arc::new(Notify::new());
+    let up = upstream_failing_mid_body(go.clone()).await;
+    let (base, sink) = gateway(&up, STORE_DELAY).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .body(anthropic_request(CLAUDE_MODEL, true))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = resp.bytes_stream();
+    let first = stream.next().await.expect("the first event").unwrap();
+    assert!(!first.is_empty());
+    go.notify_one();
+    let broke_off = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return,
+            }
+        }
+    })
+    .await;
+    assert!(broke_off.is_ok(), "the client never saw the body end");
+    let recs = sink.records();
+    assert_eq!(
+        recs.len(),
+        1,
+        "the client saw the upstream break off before the record was stored"
+    );
+    assert_eq!(recs[0].tokens_in, 1200, "the usage seen so far is billed");
+}
