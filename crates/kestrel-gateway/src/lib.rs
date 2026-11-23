@@ -474,8 +474,8 @@ async fn proxy(
     }
 }
 
-/// Send the upstream request, hand the response to the waiting handler, then pipe the body
-/// and write the record.
+/// Send the upstream request, hand the response to the waiting handler, then pipe the body.
+/// The record is written before the client can see the answer end (see the loop).
 async fn forward(
     call: Call,
     request: reqwest::RequestBuilder,
@@ -541,7 +541,7 @@ async fn forward(
             parser.feed(chunk);
         }
         if failed || parser.ended() {
-            record_once(&mut call, status, &parser).await;
+            record_once(&mut call, status, &mut parser).await;
         }
         // An upstream error is forwarded too, so the client sees the stream was cut.
         if (!client_gone && tx.send(item).await.is_err()) || failed {
@@ -549,16 +549,16 @@ async fn forward(
         }
     }
     drop(upstream_body);
-    record_once(&mut call, status, &parser).await;
+    record_once(&mut call, status, &mut parser).await;
     drop(tx);
 }
 
 /// Writes the call's record from what `parser` has seen, the first time only.
-async fn record_once(call: &mut Option<Call>, status: StatusCode, parser: &UsageParser) {
+async fn record_once(call: &mut Option<Call>, status: StatusCode, parser: &mut UsageParser) {
     let Some(call) = call.take() else {
         return;
     };
-    let (usage, response_model) = parser.clone().finish();
+    let (usage, response_model) = parser.finish();
     // A failed call is not billed: zero tokens, zero cost.
     let usage = status.is_success().then_some(usage);
     call.record(status.as_u16(), usage, response_model).await;
@@ -574,7 +574,6 @@ struct Usage {
 }
 
 /// Reads usage out of a response body as it streams past.
-#[derive(Clone)]
 struct UsageParser {
     provider: Provider,
     sse: bool,
@@ -612,15 +611,16 @@ impl UsageParser {
         }
     }
 
-    /// The usage seen, and the first model name the response reported.
-    fn finish(mut self) -> (Usage, Option<String>) {
+    /// The usage seen, and the first model name the response reported. Takes what is left in the
+    /// buffer, so the body is not copied.
+    fn finish(&mut self) -> (Usage, Option<String>) {
         let rest = std::mem::take(&mut self.buf);
         if self.sse {
             self.sse_line(&rest);
         } else if let Ok(v) = serde_json::from_slice::<Value>(&rest) {
             self.apply(&v);
         }
-        (self.usage, self.model)
+        (self.usage, self.model.clone())
     }
 
     fn sse_line(&mut self, line: &[u8]) {

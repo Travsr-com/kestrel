@@ -102,7 +102,7 @@ impl FakeSink {
         self.records.lock().unwrap().clone()
     }
 
-    /// Records may be written after the response body ends, so poll briefly.
+    /// A record is written after the body ends only when the client has left, so poll briefly.
     pub async fn wait_for(&self, n: usize) -> Vec<ModelCallRecord> {
         for _ in 0..100 {
             let recs = self.records();
