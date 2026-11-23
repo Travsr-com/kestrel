@@ -115,6 +115,7 @@ impl ToolHost for FakeHost {
 struct Setup {
     app: Router,
     host: Arc<FakeHost>,
+    sink: Arc<FakeSink>,
     a: RunId,
     b: RunId,
     done: RunId,
@@ -134,10 +135,11 @@ fn setup(allowed_a: &[KestrelTool]) -> Setup {
         .unwrap()
         .insert(b, KestrelTool::ALL.to_vec());
     host.gone.lock().unwrap().push(done);
+    let sink = Arc::new(FakeSink::default());
     let deps = GatewayDeps {
         resolver: Arc::new(tokens),
         budget: Arc::new(FakeBudget::new(true)),
-        meter: Arc::new(FakeSink::default()),
+        meter: sink.clone(),
         tools: host.clone(),
         travsr: None,
     };
@@ -145,6 +147,7 @@ fn setup(allowed_a: &[KestrelTool]) -> Setup {
     Setup {
         app,
         host,
+        sink,
         a,
         b,
         done,
@@ -318,6 +321,230 @@ async fn a_finished_run_is_410_and_spawns_nothing() {
     assert!(!body.contains(FINISHED), "{body}");
     assert!(s.host.spawns.lock().unwrap().is_empty());
     let _ = s.done;
+}
+
+/// Text written by every tracing event and `log` record while a [`capture`] guard is held.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<String>>);
+
+impl Captured {
+    fn push(&self, line: &str) {
+        let mut text = self.0.lock().unwrap();
+        text.push_str(line);
+        text.push('\n');
+    }
+
+    fn text(&self) -> String {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Writes every field of an event or a span, by name.
+struct Fields<'a>(&'a mut String);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+/// A tracing subscriber that keeps everything, from any crate at any level.
+struct Collect {
+    out: Captured,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl tracing::Subscriber for Collect {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut line = format!(
+            "span {} {}",
+            span.metadata().target(),
+            span.metadata().name()
+        );
+        span.record(&mut Fields(&mut line));
+        self.out.push(&line);
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::span::Id::from_u64(id + 1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let mut line = "record".to_string();
+        values.record(&mut Fields(&mut line));
+        self.out.push(&line);
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = format!("{} {}", event.metadata().level(), event.metadata().target());
+        event.record(&mut Fields(&mut line));
+        self.out.push(&line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The `log` records of the whole test binary (the logger is global).
+static LOGGED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+
+struct LogCapture;
+
+impl log::Log for LogCapture {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if let Some(out) = LOGGED.get() {
+            out.push(&format!(
+                "{} {} {}",
+                record.level(),
+                record.target(),
+                record.args()
+            ));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Captures tracing on this thread (a `#[tokio::test]` runs all its tasks on it) while the guard
+/// lives, and `log` records process wide. Returns the tracing and the log captures.
+fn capture() -> (tracing::subscriber::DefaultGuard, Captured, Captured) {
+    let traced = Captured::default();
+    let guard = tracing::subscriber::set_default(Collect {
+        out: traced.clone(),
+        next: std::sync::atomic::AtomicU64::new(0),
+    });
+    let logged = LOGGED.get_or_init(|| {
+        static LOGGER: LogCapture = LogCapture;
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+        Captured::default()
+    });
+    (guard, traced, logged.clone())
+}
+
+// 14. Token strings never appear in what the gateway logs, records or answers. Everything it and
+//     the crates under it log is captured (tracing at every level, and `log` records) while
+//     requests carrying tokens go through every refusal path and a proxied model call. No token
+//     appears in that, in what the host was asked to record, in a meter record, or in an answer.
+#[tokio::test]
+async fn s14_no_token_appears_in_logs_records_or_answers() {
+    let (_guard, traced, logged) = capture();
+    tracing::info!(target: "s14", "tracing capture is on");
+    log::info!(target: "s14", "log capture is on");
+
+    let s = setup(&[KestrelTool::Join]);
+    *s.host.spawn_refusal.lock().unwrap() = Some("budget: the parent has $0.10 left".into());
+    let unknown = "rt_live_not_a_real_token_123";
+    let spawn = call(1, "kestrel.spawn", json!({ "agent": "w", "input": "x" }))
+        .to_string()
+        .into_bytes();
+    let requests: Vec<(&str, Vec<u8>)> = vec![
+        // 401: no run has this token.
+        (unknown, spawn.clone()),
+        // 410: the run has ended.
+        (FINISHED, spawn.clone()),
+        // A tool outside the grant: denied and recorded.
+        (TOKEN_A, spawn.clone()),
+        // A spawn the host refuses: the reason is recorded.
+        (TOKEN_B, spawn),
+        // An unknown tool, bad JSON, a body over the limit.
+        (
+            TOKEN_A,
+            call(2, "kestrel.nope", json!({})).to_string().into_bytes(),
+        ),
+        (TOKEN_A, b"{not json".to_vec()),
+        (TOKEN_A, vec![b' '; 1024 * 1024 + 1]),
+        (
+            TOKEN_B,
+            rpc(json!(3), "tools/list", json!({}))
+                .to_string()
+                .into_bytes(),
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (token, body) in requests {
+        let response = send(&s.app, token, body, true).await;
+        let head = format!("{} {:?}", response.status(), response.headers());
+        answers.push(format!("{head} {}", text(response).await));
+    }
+    // A model call: the upstream refuses the connection, so it is a 502 and a meter record.
+    let request = Request::post(format!("/r/{TOKEN_A}/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "placeholder")
+        .header("anthropic-version", "2023-06-01")
+        .body(Body::from(common::anthropic_request(
+            common::CLAUDE_MODEL,
+            false,
+        )))
+        .unwrap();
+    let response = s.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let head = format!("{} {:?}", response.status(), response.headers());
+    answers.push(format!("{head} {}", text(response).await));
+    let metered = s.sink.wait_for(1).await;
+    assert_eq!(metered.len(), 1, "the failed model call is recorded");
+
+    // The capture saw real traffic, so finding nothing in it means something.
+    let traced = traced.text();
+    let logged = logged.text();
+    assert!(traced.contains("tracing capture is on"), "{traced}");
+    assert!(logged.contains("log capture is on"), "{logged}");
+    assert_eq!(
+        *s.host.denied.lock().unwrap(),
+        [(s.a, "kestrel.spawn".to_string())]
+    );
+    assert_eq!(
+        s.host.spawns.lock().unwrap().len(),
+        1,
+        "the spawn the host refused reached it"
+    );
+    let host = format!(
+        "{:?} {:?} {:?} {:?} {:?}",
+        s.host.denied.lock().unwrap(),
+        s.host.refused.lock().unwrap(),
+        s.host.spawns.lock().unwrap(),
+        s.host.joins.lock().unwrap(),
+        s.host.asks.lock().unwrap(),
+    );
+    let meter = format!("{metered:?}");
+    for secret in [
+        unknown,
+        FINISHED,
+        TOKEN_A,
+        TOKEN_B,
+        common::ANTHROPIC_KEY,
+        common::OPENAI_KEY,
+    ] {
+        assert!(
+            !traced.contains(secret),
+            "{secret} in the tracing log:\n{traced}"
+        );
+        assert!(
+            !logged.contains(secret),
+            "{secret} in the log records:\n{logged}"
+        );
+        assert!(
+            !host.contains(secret),
+            "{secret} recorded by the host: {host}"
+        );
+        assert!(
+            !meter.contains(secret),
+            "{secret} in a meter record: {meter}"
+        );
+        for answer in &answers {
+            assert!(!answer.contains(secret), "{secret} in an answer: {answer}");
+        }
+    }
+    let _ = (s.b, s.done);
 }
 
 // 5, 12

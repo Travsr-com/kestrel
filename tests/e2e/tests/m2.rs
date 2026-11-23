@@ -369,11 +369,14 @@ fn strings(v: &Value) -> Vec<String> {
 /// show them, and a direct call is refused with `not permitted` and recorded. A call of a tool it
 /// holds (`kestrel.join`) on the same route succeeds.
 ///
-/// Travsr is off in this test, so the direct call is made to `kestrel.ask_human`, a tool the child
-/// asked for and did not get; `travsr.get_callers` is checked in the grant.
+/// Both routes are tried. On `/mcp` the refused call is `kestrel.ask_human`. Travsr is on (the
+/// fake of scenario 11), so on `/travsr` the child also calls `get_callers`, which it asked for
+/// and did not get: the gateway refuses it and forwards nothing, while `search_symbol`, which it
+/// holds, reaches Travsr on the same route.
 #[test]
 fn m2_s03_child_cannot_use_a_tool_its_parent_lacks() {
     let env = Env::with_max(8);
+    let fake = fake_travsr(&env);
     let _up = env.up();
     let (root, child) = probe_tree(&env, "c.tools=1");
 
@@ -413,15 +416,43 @@ fn m2_s03_child_cannot_use_a_tool_its_parent_lacks() {
     assert!(!call.contains(r#""isError":true"#), "{report}");
     assert!(call.contains(r#""children":[]"#), "{report}");
 
-    let events = env.events(&child);
+    // The Travsr route: the tool the child was not granted is refused by the gateway...
+    let call = section(&report, "travsr.get_callers");
     assert!(
-        of_kind(&events, "agent_log")
-            .iter()
-            .any(|e| e["kind"]["line"]
-                .as_str()
-                .is_some_and(|l| l.contains("kestrel.ask_human is not permitted"))),
-        "the refused call is recorded on the child: {events:?}"
+        call.contains("not permitted") && call.contains("travsr.get_callers"),
+        "{report}"
     );
+    assert!(call.contains(r#""isError":true"#), "{report}");
+    // ...and the one it holds is answered by Travsr, so the refusal is not a route that is down.
+    let call = section(&report, "travsr.search_symbol");
+    assert!(call.contains("root="), "{report}");
+    assert!(!call.contains(r#""isError":true"#), "{report}");
+    // Nothing of the refused call reached Travsr; the allowed one did.
+    let log = std::fs::read_to_string(fake.join("log")).expect("the fake travsr's log");
+    let calls: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("req ") && l.contains(r#""method":"tools/call""#))
+        .collect();
+    assert!(
+        calls.iter().all(|l| !l.contains("get_callers")),
+        "the refused call was forwarded: {log}"
+    );
+    assert!(
+        calls.iter().any(|l| l.contains("search_symbol")),
+        "the allowed call never reached Travsr: {log}"
+    );
+
+    let events = env.events(&child);
+    for tool in ["kestrel.ask_human", "travsr.get_callers"] {
+        assert!(
+            of_kind(&events, "agent_log")
+                .iter()
+                .any(|e| e["kind"]["line"]
+                    .as_str()
+                    .is_some_and(|l| l.contains(&format!("{tool} is not permitted")))),
+            "the refused {tool} call is recorded on the child: {events:?}"
+        );
+    }
     assert!(
         of_kind(&events, "approval_requested").is_empty(),
         "the refused question never reached a person"
@@ -829,17 +860,102 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
     // $0.30 is 47 calls of 6465 micro-USD.
     let root = env.submit_file(&lead, "fanout=6 each=0.15 c.spend=47");
     let kids = env.wait_children(&root, 6);
-    let share = 150_000;
+    let (children_spent, mut calls) = held_to_their_share(&env, &root, &kids);
+    calls += assert_exact_cost(&env, &root);
+    let parent_spent = env.spent(&root);
+    // Given each child's pin above, this cannot fail on its own: the tree stays within $1.00
+    // because $0.10 of it is not carved out, and the overshoots and the parent's call fit in it.
+    // The scenario below carves out the whole root budget, where the bound is a real one.
+    assert!(
+        children_spent <= 1_000_000 - parent_spent,
+        "children spent {children_spent}, more than $1.00 minus the parent's {parent_spent}"
+    );
+    // Every call the mock answered is counted once, and no refused call reached it.
+    assert_eq!(env.mock.keys_seen().len(), calls);
+    eprintln!(
+        "m2-result: budget carving: 6 children held at {} micro-USD each, tree spend {} of 1000000",
+        children_spent / 6,
+        children_spent + parent_spent
+    );
+    cancel_tree(&env, &up, &root, &kids);
+}
+
+/// Scenario 7 with no slack: the root carves out everything it has. Its budget is its own first
+/// call plus 6 shares of $0.15 ($0.906465), so after the 6 spawns its limit is what it spent.
+/// It then tries 20 more calls of its own, and the gateway refuses the first. Each child goes
+/// over its share by less than one call, so the tree goes over the root budget, but by no more
+/// than one call in flight per run (architecture section 3.3, Budget).
+///
+/// "One call in flight per run" leans on timing: the gateway writes a call's meter record after
+/// the client has the whole body, so a sequential agent's next call can pass the budget check
+/// before the last spend is recorded. In practice the record lands first; the gap is a separate
+/// gateway issue.
+///
+/// This bound can fail: a spawn that did not move the share out of the root's limit would let
+/// the root make its 20 calls, $0.1293 more than the bound allows.
+#[test]
+fn m2_s07_a_root_that_carves_out_all_it_has_stays_within_its_budget_plus_calls_in_flight() {
+    let env = Env::with_max(8);
+    env.spawnable("worker", "1", WORKER_CAPS);
+    let root_budget = 6 * SHARE + ONE_CALL_MICRO_USD;
+    assert_eq!(root_budget, 906_465);
+    let lead = env.root_agent("lead", "0.906465", &lead_caps(6, "worker"));
+    let up = env.up();
+    let root = env.submit_file(&lead, "fanout=6 each=0.15 after=20 c.spend=47");
+    let kids = env.wait_children(&root, 6);
+    let (children_spent, mut calls) = held_to_their_share(&env, &root, &kids);
+
+    // The root kept only what it had spent before it spawned, so its own calls after the
+    // spawns were refused at once.
+    assert_eq!(
+        env.store().limit(run_id(&root)).expect("read limit").0,
+        ONE_CALL_MICRO_USD,
+        "the 6 carves moved all the root had left out of its limit"
+    );
+    wait_until(RUN_DEADLINE, "the root wrote after.out", || {
+        env.workspace(&root).join("after.out").exists()
+    });
+    let after = env.read_out(&root, "after.out");
+    assert_eq!(after.trim(), "made=0 refused=yes", "the root's own calls");
+    assert_eq!(assert_exact_cost(&env, &root), 1, "the root's one call");
+    calls += 1;
+    let parent_spent = env.spent(&root);
+
+    let tree = children_spent + parent_spent;
+    let runs: i64 = 7;
+    assert!(
+        tree > root_budget,
+        "the children's overshoots took the tree over its root budget: {tree} of {root_budget}"
+    );
+    assert!(
+        tree <= root_budget + runs * ONE_CALL_MICRO_USD,
+        "the tree spent {tree}, more than the root budget {root_budget} plus one call in flight \
+         for each of its {runs} runs"
+    );
+    assert_eq!(env.mock.keys_seen().len(), calls);
+    eprintln!("m2-result: budget carving with no slack: tree spend {tree} of {root_budget}");
+    cancel_tree(&env, &up, &root, &kids);
+}
+
+/// The share scenario 7 carves for each child: $0.15.
+const SHARE: i64 = 150_000;
+
+/// Scenario 7's children: each asked for 47 calls ($0.30) with a share of [`SHARE`]. Waits for
+/// each to be suspended for its budget and checks it was held to its share plus less than one
+/// call, at exact costs, and that the root carved [`SHARE`] for each. Returns their total spend
+/// and their number of model calls.
+fn held_to_their_share(env: &Env, root: &str, kids: &[kestrel_store::RunRow]) -> (i64, usize) {
+    let share = SHARE;
     // The gateway refuses a call once the spend reaches the limit, so a child stops after the
     // first call that crosses it: $0.15 plus less than one call (155160 = 24 calls).
     let at_share = (share + ONE_CALL_MICRO_USD - 1) / ONE_CALL_MICRO_USD * ONE_CALL_MICRO_USD;
     assert!(at_share - share < ONE_CALL_MICRO_USD);
     let mut children_spent = 0;
     let mut calls = 0;
-    for kid in &kids {
+    for kid in kids {
         let id = kid.id.to_string();
         env.wait_status(&id, "Suspended(Budget)");
-        let n = assert_exact_cost(&env, &id);
+        let n = assert_exact_cost(env, &id);
         calls += n;
         let spent = env.spent(&id);
         assert_eq!(
@@ -871,35 +987,26 @@ fn m2_s07_budget_carving_holds_each_child_to_its_share() {
         }
         children_spent += spent;
     }
-    let events = env.events_now(&root);
+    let events = env.events_now(root);
     let carved: Vec<i64> = of_kind(&events, "child_spawned")
         .iter()
         .map(|e| e["kind"]["budget"].as_i64().expect("budget"))
         .collect();
     assert_eq!(carved, vec![share; 6], "each child got $0.15 carved out");
-    calls += assert_exact_cost(&env, &root);
-    let parent_spent = env.spent(&root);
-    // Given each child's pin above, this cannot fail on its own: the tree stays within $1.00
-    // because $0.10 of it is not carved out, and the overshoots and the parent's call fit in it.
-    assert!(
-        children_spent <= 1_000_000 - parent_spent,
-        "children spent {children_spent}, more than $1.00 minus the parent's {parent_spent}"
-    );
-    // Every call the mock answered is counted once, and no refused call reached it.
-    assert_eq!(env.mock.keys_seen().len(), calls);
-    eprintln!(
-        "m2-result: budget carving: 6 children held at {at_share} micro-USD each, tree spend {} of 1000000",
-        children_spent + parent_spent
-    );
+    (children_spent, calls)
+}
 
-    // Clean up through the API: the tree is cancelled and the spend stays as recorded.
+/// Cleans up scenario 7 through the API: the tree is cancelled and each child's spend stays as
+/// recorded.
+fn cancel_tree(env: &Env, up: &common::Up, root: &str, kids: &[kestrel_store::RunRow]) {
+    let spent: Vec<i64> = kids.iter().map(|k| env.spent(&k.id.to_string())).collect();
     let (status, body) = up.http("POST", &format!("/api/runs/{root}/cancel"), None);
     assert_eq!(status, 202, "cancel: {body}");
-    env.wait_status(&root, "Cancelled");
-    for kid in &kids {
+    env.wait_status(root, "Cancelled");
+    for (kid, before) in kids.iter().zip(spent) {
         let id = kid.id.to_string();
         env.wait_status(&id, "Cancelled");
-        assert_eq!(env.spent(&id), at_share);
+        assert_eq!(env.spent(&id), before);
     }
 }
 

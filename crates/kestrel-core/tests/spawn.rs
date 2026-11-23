@@ -127,37 +127,78 @@ async fn s2_over_budget_is_refused_and_creates_nothing() {
     assert_eq!(h.store.remaining(lead).unwrap(), MicroUsd(4 * DOLLAR / 10));
 }
 
+/// Polls `cond` in real time (for tests on a multi-thread runtime, where the clock cannot be
+/// paused) until it holds, or panics naming `what` after 30 s.
+async fn until_real(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 // 3. Given concurrent spawns that together ask for more than the parent has, then exactly the
-//    spawns that fit succeed (no overspend). The race itself is tested in the store
-//    (`spawn_carving::s3_*`, eight threads on separate connections); the paused clock needs a
-//    single-threaded runtime, so here the tasks interleave and this checks the engine's mapping of
-//    the refusals.
-#[tokio::test(start_paused = true)]
+//    spawns that fit succeed (no overspend). Eight spawns of $0.30 against $1 start together on a
+//    multi-thread runtime, so the engine's spawn path really runs in parallel, 20 rounds. The
+//    store has its own race test (`spawn_carving::s3_*`, eight threads on separate connections).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn s3_concurrent_spawns_never_overspend() {
-    let key = RootKey::generate();
-    let mut h = harness(16, &key);
-    let (lead, _s) = running_lead(&mut h, "1").await;
-    let engine = h.engine.clone();
-    let tasks: Vec<_> = (0..5)
-        .map(|_| {
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                engine
-                    .spawn_child(lead, &worker(), "help", Some(MicroUsd(3 * DOLLAR / 10)))
-                    .await
+    const SPAWNS: usize = 8;
+    for round in 0..20 {
+        let key = RootKey::generate();
+        let mut h = harness(16, &key);
+        let _s = h.driver.live();
+        h.start();
+        let parent = h.submit(lead("1")).await;
+        until_real("lead running", || h.is(parent, &RunStatus::Running)).await;
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(SPAWNS));
+        let tasks: Vec<_> = (0..SPAWNS)
+            .map(|_| {
+                let engine = h.engine.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    engine
+                        .spawn_child(parent, &worker(), "help", Some(MicroUsd(3 * DOLLAR / 10)))
+                        .await
+                })
             })
-        })
-        .collect();
-    let mut ok = 0;
-    for t in tasks {
-        match t.await.unwrap() {
-            Ok(_) => ok += 1,
-            Err(SpawnError::Budget { .. }) => {}
-            Err(other) => panic!("unexpected {other:?}"),
+            .collect();
+        let mut ok = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(SpawnError::Budget { .. }) => {}
+                Err(other) => panic!("round {round}: unexpected {other:?}"),
+            }
+        }
+        assert_eq!(ok, 3, "round {round}: the spawns that fit in $1");
+        assert_eq!(
+            h.store.remaining(parent).unwrap(),
+            MicroUsd(DOLLAR / 10),
+            "round {round}"
+        );
+        assert_eq!(h.store.children(parent).unwrap().len(), 3, "round {round}");
+        let carved: i64 = h
+            .store
+            .children(parent)
+            .unwrap()
+            .iter()
+            .map(|c| h.store.limit(c.id).unwrap().0)
+            .sum();
+        assert_eq!(
+            carved + h.store.limit(parent).unwrap().0,
+            DOLLAR,
+            "round {round}: the limits of the tree add up to the root budget"
+        );
+        h.shutdown.cancel();
+        if let Some(task) = h.task.take() {
+            let _ = task.await;
         }
     }
-    assert_eq!(ok, 3);
-    assert_eq!(h.store.remaining(lead).unwrap(), MicroUsd(DOLLAR / 10));
 }
 
 // 4. Given a child that spent $0.20 of $0.50 and then finished, then $0.30 returns to the parent.

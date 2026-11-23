@@ -28,3 +28,6 @@ url.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 wiremock.workspace = true
+# Issue #42 scenario 14: every tracing event and log record is captured, and no token is in it.
+tracing.workspace = true
+log.workspace = true

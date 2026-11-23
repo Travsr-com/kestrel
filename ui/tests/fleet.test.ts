@@ -626,8 +626,10 @@ describe('Fleet', () => {
     expect(screen.getByRole('link', { name: 'done' })).toBeInTheDocument();
   });
 
-  // 9
-  it('pages 200 runs 50 at a time and keeps them reachable by keyboard', async () => {
+  // 9. Renders 200 cards and walks pages and tabs with user-event: about 0.4 s alone, but it took
+  //    7.2 s on Windows in the full suite under coverage, past the 5 s default. Its own timeout
+  //    keeps a slow host from failing it.
+  it('pages 200 runs 50 at a time and keeps them reachable by keyboard', { timeout: 30_000 }, async () => {
     show(Array.from({ length: 200 }, (_, i) => run({ agent: `run-${i}` })));
     await screen.findAllByRole('article');
     expect(cards()).toHaveLength(50);

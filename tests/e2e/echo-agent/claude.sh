@@ -34,7 +34,10 @@
 #   kids=NAME    the agent to spawn (default `worker`); each=USD the budget_usd of each child;
 #                first=S sleep S seconds before the first spawn (once per workspace); gap=S sleep
 #                S seconds between spawns.
-#   c.WORD       passed on to every child as WORD, after `kid=<n>` (so `c.c.nap=9` reaches a
+#   after=N      once every child is spawned, and before the join, make model calls until N were
+#                made or the gateway refuses one, then write `made=<made> refused=<yes|no>` to
+#                after.out. A parent that carved out all it had is refused at once.
+#   c.WORD      passed on to every child as WORD, after `kid=<n>` (so `c.c.nap=9` reaches a
 #                grandchild as `nap=9`).
 # A child:
 #   nap=N        sleep N seconds after the model call, once per workspace.
@@ -46,7 +49,8 @@
 #                `calls=<made> refused=no` when all N were made.
 #   hosts=1      also try api.github.com and evil.example (egress.txt).
 #   tools=1      the `--allowedTools`, a tools/list, a call of kestrel.ask_human and a call of
-#                kestrel.join with no children (tools.out).
+#                kestrel.join with no children (tools.out). When its `--mcp-config` file has a
+#                `travsr` server, also a call of get_callers and one of search_symbol there.
 #   ask=1        asks a person with kestrel.ask_human (ask.out) and writes the answer (answer.out).
 #   escalate=1   spawns with a budget above its own, then a grandchild with escalate=2 and wait
 #                (escalate.out); escalate=2 lists its tools and tries to spawn (escalate.out).
@@ -264,6 +268,19 @@ if marker tools > /dev/null; then
     echo "== kestrel.join"
     mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 30
     echo
+    travsr_url=$(sed -n 's/.*"travsr":{[^}]*"url":"\([^"]*\)".*/\1/p' "$mcp_config" 2> /dev/null)
+    if [ -n "$travsr_url" ]; then
+      to_travsr() { # $1 = request; the answer on stdout
+        curl -sS -f --max-time 300 -H "content-type: application/json" \
+          -H "accept: application/json, text/event-stream" -d "$1" "$travsr_url"
+      }
+      echo "== travsr.get_callers"
+      to_travsr '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_callers","arguments":{"name":"main"}}}'
+      echo
+      echo "== travsr.search_symbol"
+      to_travsr '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_symbol","arguments":{"name":"main"}}}'
+      echo
+    fi
   } > /workspace/tools.out 2>&1
 fi
 
@@ -397,6 +414,19 @@ if [ -n "$n" ]; then
     fi
     i=$((i + 1))
   done
+  after=$(marker after || true)
+  if [ -n "$after" ]; then
+    made=0
+    refused=no
+    while [ "$made" -lt "$after" ]; do
+      if ! model_call; then
+        refused=yes
+        break
+      fi
+      made=$((made + 1))
+    done
+    echo "made=$made refused=$refused" > /workspace/after.out
+  fi
   echo joining > /workspace/joining.out
   mcp_call '{"jsonrpc":"2.0","id":"join","method":"tools/call","params":{"name":"kestrel.join","arguments":{}}}' 3600 > /workspace/join.out 2>&1
 fi

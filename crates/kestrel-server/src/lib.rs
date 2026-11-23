@@ -42,6 +42,9 @@ pub struct Config {
     pub ws_queue: usize,
     /// How long a full queue may stay full before the client is dropped. 10 s by default.
     pub ws_stall: Duration,
+    /// How long a client dropped for not reading has to read what was sent and its close frame
+    /// before the connection is cut. 10 s by default.
+    pub ws_close_grace: Duration,
     /// The open event sockets. [`serve`] waits for them after it stops accepting, so each one
     /// gets to send its close frame.
     pub sockets: TaskTracker,
@@ -56,6 +59,7 @@ impl Config {
             poll: Duration::from_millis(200),
             ws_queue: 256,
             ws_stall: Duration::from_secs(10),
+            ws_close_grace: Duration::from_secs(10),
             sockets: TaskTracker::new(),
         }
     }

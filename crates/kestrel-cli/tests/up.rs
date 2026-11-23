@@ -92,6 +92,54 @@ fn up_serves_the_api_with_the_printed_token_and_stops_on_sigint() {
     std::net::TcpListener::bind(&api).unwrap();
 }
 
+// #37 scenario 2: `kestrel up --listen 0.0.0.0:<port>` really starts there, opens the UI on
+// loopback, and warns that the API is reachable beyond this machine. Stopped with a kill, not
+// SIGINT, so it runs on every host.
+#[test]
+fn up_on_all_interfaces_starts_and_warns() {
+    let f = Fixture::new();
+    let config = f.write("config.toml", CONFIG);
+    let mut cmd = f.kestrel_std();
+    cmd.args([
+        "up",
+        "--config",
+        path_str(&config),
+        "--sandbox-driver",
+        "fake",
+        "--listen",
+        "0.0.0.0:0",
+        "--no-open",
+        "--json",
+    ]);
+    let mut up = ChildGuard::spawn(cmd);
+    let ready = common::json_line(&up.stdout_lines().next_line("up ready line"));
+    let api = ready["api"].as_str().expect("api address").to_string();
+    let port = api
+        .strip_prefix("0.0.0.0:")
+        .unwrap_or_else(|| panic!("the API is bound on all interfaces: {ready}"));
+    assert_ne!(port, "0", "{ready}");
+    let url = ready["url"].as_str().expect("ui url");
+    let token = url.split("?token=").nth(1).expect("token in the url");
+    assert_eq!(
+        url,
+        format!("http://127.0.0.1:{port}/?token={token}"),
+        "the UI opens on loopback"
+    );
+    let local = format!("127.0.0.1:{port}");
+    let (status, body) = http_get(&local, "/api/runs", Some(token));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(http_get(&local, "/api/runs", None).0, 401);
+
+    up.child.kill().expect("kill up");
+    up.wait_exit("up to stop after the kill");
+    let stderr = up.stderr();
+    assert!(
+        stderr.contains("the API server listens on 0.0.0.0:")
+            && stderr.contains("which is not loopback"),
+        "no warning about the bind on stderr: {stderr}"
+    );
+}
+
 #[test]
 fn up_reuses_the_token_across_starts() {
     let f = Fixture::new();

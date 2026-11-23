@@ -618,6 +618,54 @@ describe('Run view', () => {
     expect(screen.getByText(/"cmd": "ls"/)).toBeInTheDocument();
   });
 
+  // 15. The commands too, with the keyboard alone: set a limit, send a message, then open the
+  //     cancel dialog and confirm it. No click anywhere.
+  it('sets a limit, sends a message and cancels with the keyboard alone', async () => {
+    const r = run({ agent: 'lead' });
+    const { calls } = show(r.id, [r]);
+    const limit = await screen.findByLabelText('Change limit (USD)');
+    const u = user();
+    const reach = async (el: HTMLElement) => {
+      for (let i = 0; i < 60 && document.activeElement !== el; i++) await u.tab();
+      expect(document.activeElement).toBe(el);
+    };
+    const posts = () => calls.filter((c) => c.method === 'POST');
+
+    // Set: Tab to the field, type, Tab to Set, Enter.
+    await reach(limit);
+    await u.keyboard('2.25');
+    await u.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Set' }));
+    await u.keyboard('{Enter}');
+    await vi.waitFor(() =>
+      expect(posts()).toEqual([{ method: 'POST', path: `/api/runs/${r.id}/budget`, body: { usd: '2.25' } }]),
+    );
+
+    // Send: Tab to the field, type, Tab to Send, Space.
+    await reach(screen.getByLabelText('Message'));
+    await u.keyboard('wrap up');
+    await u.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Send' }));
+    await u.keyboard(' ');
+    await vi.waitFor(() =>
+      expect(posts().at(-1)).toEqual({ method: 'POST', path: `/api/runs/${r.id}/message`, body: { text: 'wrap up' } }),
+    );
+
+    // Cancel: Enter opens the dialog with focus inside it, Tab reaches the confirm, Enter.
+    const cancel = screen.getByRole('button', { name: 'Cancel run' });
+    await reach(cancel);
+    await u.keyboard('{Enter}');
+    const dialog = screen.getByRole('dialog');
+    expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Keep running' }));
+    await u.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Yes, cancel it' }));
+    await u.keyboard('{Enter}');
+    await vi.waitFor(() => expect(posts().at(-1)?.path).toBe(`/api/runs/${r.id}/cancel`));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(cancel);
+    expect(posts()).toHaveLength(3);
+  });
+
   it('renders every kind of event', async () => {
     const r = run();
     const { sockets } = show(r.id, [r]);

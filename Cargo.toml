@@ -44,7 +44,9 @@ uuid         = { version = "1", features = ["v7", "serde"] }
 getrandom    = "0.4"
 time         = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 rusqlite     = { version = "0.41", features = ["bundled"] }
-tracing      = "0.1"
+tracing      = { version = "0.1", default-features = false, features = ["std"] }
+# Only to capture what dependencies log in tests. Already in the tree through reqwest.
+log          = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap         = { version = "4", features = ["derive"] }
 axum         = "0.8"
