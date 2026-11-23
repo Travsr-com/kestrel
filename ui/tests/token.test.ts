@@ -101,9 +101,10 @@ describe('Token required screen', () => {
     expect(screen.getByRole('button', { name: 'Continue' })).toHaveClass('primary');
   });
 
-  // #84: the field was invisible on the dark page before it took the shared input style. With the
-  // app's stylesheet on the page, the token field must get that style: its border, its sunken
-  // background and the text colour, the same as every other field.
+  // #84: the field was invisible on the dark page because the component's own scoped `input` rule
+  // overrode the shared input style. Components inject their styles in tests (vitest.config.ts),
+  // so with the app's stylesheet on the page too, this sees both: the token field must end up
+  // with the shared border, sunken background and text colour, the same as every other field.
   it('styles the token field with the shared input style (#84)', async () => {
     const css = readFileSync(resolve('src/styles/tokens.css'), 'utf8');
     /** A colour token of `tokens.css` as the browser computes it, `rgb(r, g, b)`. */

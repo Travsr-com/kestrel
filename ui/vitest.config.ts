@@ -3,7 +3,9 @@ import { svelteTesting } from '@testing-library/svelte/vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  plugins: [svelte(), svelteTesting()],
+  // Components inject their own `<style>` when they mount, so a test sees what a component's
+  // scoped rules do (#84: the token field's own rule hid it). The app build keeps external CSS.
+  plugins: [svelte({ compilerOptions: { css: 'injected' } }), svelteTesting()],
   test: {
     environment: 'jsdom',
     include: ['tests/**/*.test.ts'],
