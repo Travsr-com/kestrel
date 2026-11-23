@@ -510,11 +510,13 @@ async fn host_routes_reads_the_ipv4_routes_and_ignores_the_default_route() {
 async fn s3_a_host_route_over_the_whole_pool_leaves_no_block() {
     let runner = FakeRunner::with(|_| out("10.0.0.0/8 dev tun0 scope link\n"));
     let pool = SubnetPool::parse(DEFAULT_SUBNET_POOL).expect("pool");
-    pool.exclude(&host_routes(runner.as_ref()).await);
-    if !runner.runs().is_empty() {
-        assert_eq!(pool.available(), 0);
-        assert!(pool.reserve().is_none());
-    }
+    assert!(pool.available() > 0, "the pool has blocks before the route");
+    let routes = host_routes(runner.as_ref()).await;
+    assert_eq!(routes, vec![cidr("10.0.0.0/8")], "the route was read");
+    assert_eq!(runner.runs().len(), 1, "one `ip` call: {:?}", runner.runs());
+    pool.exclude(&routes);
+    assert_eq!(pool.available(), 0);
+    assert!(pool.reserve().is_none());
 }
 
 #[tokio::test]
