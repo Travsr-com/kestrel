@@ -195,6 +195,7 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
     let ending = stop.clone();
     let (end_tx, end_rx) = tokio::sync::oneshot::channel::<End>();
     let slow_grace = s.config.ws_close_grace;
+    let shutdown = s.shutdown.clone();
     let writer = tokio::spawn(async move {
         let mut end_rx = end_rx;
         loop {
@@ -219,14 +220,18 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
             // frame; closing the sink below flushes it, so the client sees a clean handshake.
             Ok(End::Client) | Err(_) => None,
         };
+        // Nothing more is sent from the queue: let its frames go before the grace, not after.
+        drop(rx);
         // A client that does not read may never take it: give up after a while. A slow client
         // gets `ws_close_grace` to read again, so it learns why it was dropped instead of seeing
-        // the connection reset under it.
+        // the connection reset under it. A stop cuts that grace to `CLOSE_GRACE`, so `serve`
+        // is not held up and no socket outlives it.
         let grace = match close {
             Some((code, _)) if code == close_code::POLICY => slow_grace,
             _ => CLOSE_GRACE,
         };
-        let _ = timeout(grace, async {
+        let deadline = tokio::time::Instant::now() + grace;
+        let closing = async {
             if let Some((code, reason)) = close {
                 let frame = CloseFrame {
                     code,
@@ -235,8 +240,16 @@ async fn follow(socket: WebSocket, s: AppState, source: Source, mut cursor: u64)
                 sink.send(Message::Close(Some(frame))).await?;
             }
             sink.close().await
-        })
-        .await;
+        };
+        tokio::pin!(closing);
+        tokio::select! {
+            _ = &mut closing => {}
+            () = tokio::time::sleep_until(deadline) => {}
+            () = shutdown.cancelled(), if grace > CLOSE_GRACE => {
+                let cut = deadline.min(tokio::time::Instant::now() + CLOSE_GRACE);
+                let _ = tokio::time::timeout_at(cut, &mut closing).await;
+            }
+        }
     });
 
     let end = pump(&s, &source, &mut cursor, &tx, &mut incoming).await;
