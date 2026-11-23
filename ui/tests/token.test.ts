@@ -1,6 +1,8 @@
 // Scenario 6: a 401 shows "Token required"; the token entered is kept in memory only, and the
 // request is retried with it.
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -97,6 +99,39 @@ describe('Token required screen', () => {
     const form = input.closest('form');
     expect(form?.closest('.panel')).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Continue' })).toHaveClass('primary');
+  });
+
+  // #84: the field was invisible on the dark page before it took the shared input style. With the
+  // app's stylesheet on the page, the token field must get that style: its border, its sunken
+  // background and the text colour, the same as every other field.
+  it('styles the token field with the shared input style (#84)', async () => {
+    const css = readFileSync(resolve('src/styles/tokens.css'), 'utf8');
+    /** A colour token of `tokens.css` as the browser computes it, `rgb(r, g, b)`. */
+    const rgb = (name: string): string => {
+      const hex = new RegExp(`--${name}:\\s*#([0-9a-fA-F]{6})\\s*;`).exec(css)?.[1];
+      if (!hex) throw new Error(`no colour token --${name}`);
+      const [r, g, b] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+      return `rgb(${r}, ${g}, ${b})`;
+    };
+    const sheet = document.createElement('style');
+    sheet.textContent = css;
+    document.head.append(sheet);
+    try {
+      window.location.hash = '#/fleet';
+      render(App, { fetch: createMockServer('s3cret').fetch });
+      const input = await screen.findByLabelText('API token');
+      const style = getComputedStyle(input);
+      expect(style.borderTopStyle).toBe('solid');
+      expect(style.borderTopWidth).toBe('1px');
+      expect(style.borderTopColor).toBe(rgb('color-border-strong'));
+      expect(style.backgroundColor).toBe(rgb('color-sunken'));
+      expect(style.color).toBe(rgb('color-text'));
+      expect(style.display).not.toBe('none');
+      expect(style.visibility).not.toBe('hidden');
+      expect(style.opacity === '' || Number(style.opacity) > 0).toBe(true);
+    } finally {
+      sheet.remove();
+    }
   });
 
   it('appears on 401, then retries with the entered token', async () => {
