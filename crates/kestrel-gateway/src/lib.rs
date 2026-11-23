@@ -799,6 +799,28 @@ mod tests {
     }
 
     #[test]
+    fn only_the_final_event_itself_ends_a_stream() {
+        let mut p = UsageParser::new(Provider::Anthropic, true);
+        // The words in the answer's text do not count, nor a line not yet complete.
+        p.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"message_stop [DONE]\"}}\n\n");
+        p.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}");
+        assert!(!p.ended());
+        p.feed(b"\n\n");
+        assert!(p.ended());
+
+        let mut p = UsageParser::new(Provider::OpenAi, true);
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n");
+        assert!(!p.ended());
+        p.feed(b"data: [DONE]\r\n\r\n");
+        assert!(p.ended());
+
+        // A JSON answer has no final event: its end is the end of the body.
+        let mut p = UsageParser::new(Provider::Anthropic, false);
+        p.feed(br#"{"type":"message_stop"}"#);
+        assert!(!p.ended());
+    }
+
+    #[test]
     fn json_parser_ignores_bodies_without_usage() {
         let mut p = UsageParser::new(Provider::OpenAi, false);
         p.feed(br#"{"id":"x","usage":null}"#);
