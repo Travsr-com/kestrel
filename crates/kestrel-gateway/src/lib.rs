@@ -474,8 +474,8 @@ async fn proxy(
     }
 }
 
-/// Send the upstream request, hand the response to the waiting handler, then pipe the body
-/// and write the record.
+/// Send the upstream request, hand the response to the waiting handler, then pipe the body.
+/// The record is written before the client can see the answer end (see the loop).
 async fn forward(
     call: Call,
     request: reqwest::RequestBuilder,
@@ -518,8 +518,14 @@ async fn forward(
     // Pipe the upstream body to the client chunk by chunk, teeing each chunk to the usage
     // parser. The record is written once the body ends, the upstream fails or stalls past
     // the idle timeout, or the client goes away mid-body (even while the upstream is silent).
+    //
+    // The record is stored before the client can see the answer end (#118): before the chunk
+    // with a stream's final event or an upstream error, and before the body closes. An agent
+    // that reads the whole answer and calls again at once is then checked against this spend.
+    // No chunk waits on anything but that one write.
     let mut upstream_body = upstream_resp.bytes_stream();
     let mut parser = UsageParser::new(provider, is_sse);
+    let mut call = Some(call);
     loop {
         let next = if client_gone {
             upstream_body.next().await
@@ -534,13 +540,24 @@ async fn forward(
         if let Ok(chunk) = &item {
             parser.feed(chunk);
         }
+        if failed || parser.ended() {
+            record_once(&mut call, status, &mut parser).await;
+        }
         // An upstream error is forwarded too, so the client sees the stream was cut.
         if (!client_gone && tx.send(item).await.is_err()) || failed {
             break;
         }
     }
-    drop(tx);
     drop(upstream_body);
+    record_once(&mut call, status, &mut parser).await;
+    drop(tx);
+}
+
+/// Writes the call's record from what `parser` has seen, the first time only.
+async fn record_once(call: &mut Option<Call>, status: StatusCode, parser: &mut UsageParser) {
+    let Some(call) = call.take() else {
+        return;
+    };
     let (usage, response_model) = parser.finish();
     // A failed call is not billed: zero tokens, zero cost.
     let usage = status.is_success().then_some(usage);
@@ -563,6 +580,7 @@ struct UsageParser {
     buf: Vec<u8>,
     usage: Usage,
     model: Option<String>,
+    ended: bool,
 }
 
 impl UsageParser {
@@ -573,7 +591,14 @@ impl UsageParser {
             buf: Vec::new(),
             usage: Usage::default(),
             model: None,
+            ended: false,
         }
+    }
+
+    /// Whether a stream's final event has gone past: Anthropic's `message_stop`, OpenAI's
+    /// `[DONE]`. All the usage comes before it. A JSON answer has none.
+    fn ended(&self) -> bool {
+        self.ended
     }
 
     fn feed(&mut self, chunk: &[u8]) {
@@ -586,23 +611,29 @@ impl UsageParser {
         }
     }
 
-    /// The usage seen, and the first model name the response reported.
-    fn finish(mut self) -> (Usage, Option<String>) {
+    /// The usage seen, and the first model name the response reported. Takes what is left in the
+    /// buffer, so the body is not copied.
+    fn finish(&mut self) -> (Usage, Option<String>) {
         let rest = std::mem::take(&mut self.buf);
         if self.sse {
             self.sse_line(&rest);
         } else if let Ok(v) = serde_json::from_slice::<Value>(&rest) {
             self.apply(&v);
         }
-        (self.usage, self.model)
+        (self.usage, self.model.clone())
     }
 
     fn sse_line(&mut self, line: &[u8]) {
         let Some(data) = line.strip_prefix(b"data:") else {
             return;
         };
-        if let Ok(v) = serde_json::from_slice::<Value>(data) {
+        if data.trim_ascii() == b"[DONE]" {
+            self.ended = true;
+        } else if let Ok(v) = serde_json::from_slice::<Value>(data) {
             self.apply(&v);
+            if v.get("type").and_then(Value::as_str) == Some("message_stop") {
+                self.ended = true;
+            }
         }
     }
 
@@ -796,6 +827,28 @@ mod tests {
         p.feed(b"data: not json\n\n");
         p.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}");
         assert_eq!(p.finish(), (usage(7, 9, 0, 0), None));
+    }
+
+    #[test]
+    fn only_the_final_event_itself_ends_a_stream() {
+        let mut p = UsageParser::new(Provider::Anthropic, true);
+        // The words in the answer's text do not count, nor a line not yet complete.
+        p.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"message_stop [DONE]\"}}\n\n");
+        p.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}");
+        assert!(!p.ended());
+        p.feed(b"\n\n");
+        assert!(p.ended());
+
+        let mut p = UsageParser::new(Provider::OpenAi, true);
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n");
+        assert!(!p.ended());
+        p.feed(b"data: [DONE]\r\n\r\n");
+        assert!(p.ended());
+
+        // A JSON answer has no final event: its end is the end of the body.
+        let mut p = UsageParser::new(Provider::Anthropic, false);
+        p.feed(br#"{"type":"message_stop"}"#);
+        assert!(!p.ended());
     }
 
     #[test]
