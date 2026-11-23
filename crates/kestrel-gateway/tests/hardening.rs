@@ -400,7 +400,10 @@ async fn client_leaving_before_headers_still_meters_the_call() {
         "client must give up before headers arrive"
     );
     call.abort();
-    assert!(call.await.is_err_and(|e| e.is_cancelled()));
+    assert!(
+        call.await.is_err_and(|e| e.is_cancelled()),
+        "the client call must be cancelled, not finished"
+    );
 
     let recs = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
